@@ -19,7 +19,9 @@
 -- separately guards against 5.0.2 SYNTAX incompatibilities.
 
 -- ---------- Lua 5.0.2 compatibility shims ----------
-table.getn  = table.getn  or function(t) return #t end
+-- 5.0.2 has table.getn natively. No '#' fallback: '#' is rejected at PARSE
+-- time by 5.0.2, so even a branch that never runs stops the file loading.
+if table.getn == nil then error('this suite requires Lua 5.0.2 (table.getn)') end
 math.log10  = math.log10  or function(x) return math.log(x, 10) end
 math.mod    = math.mod    or math.fmod
 
@@ -67,7 +69,7 @@ local function newbuf(cap)
     b.n = 0
     b.readings, b.relativetimestamps, b.extra = {}, {}, {}
   end
-  BUFS[#BUFS + 1] = b
+  BUFS[table.getn(BUFS) + 1] = b
   return b
 end
 local function livebufs()
@@ -88,10 +90,14 @@ display = {
   NFORMAT_PREFIX = 1, TIMER_FOREVER = -1,
   YSCALE_OFF = 0, XSCALE_OFF = 0, AXIS_NORMAL = 0, STYLE_LINE = 1,
   ELEMENT_DATA = 'data', ELEMENT_TIME = 'time',
+  -- Object states. Only these two are modelled, because they are the two the
+  -- app uses: STATE_DISABLE and STATE_READONLY are refused on a Graph with
+  -- event 1717 on the real firmware, so modelling them would model a bug.
+  STATE_ENABLE = 0, STATE_INVISIBLE = 3,
   active = nil, events = {},
 }
 function display.create(parent, kind, ...)
-  local a = {...}
+  local a = arg
   -- The firmware rejects a width outside 1..799 with "1130 Parameter width,
   -- expected value from 1 to 799" -- and returns nil rather than raising, so the
   -- object silently does not exist. Mirror the limit here so a geometry mistake
@@ -124,6 +130,28 @@ function display.settext(h, txt)
   o.text = txt
   o.sets = (o.sets or 0) + 1     -- counted so tests can assert per-frame traffic
 end
+-- The hide/show the per-frame refill brackets itself with. `hidden` is what the
+-- tests read; `hides` counts the transitions so per-frame traffic can be
+-- asserted rather than assumed.
+function display.setstate(h, st)
+  local o = use(h, 'setstate')
+  if st == display.STATE_INVISIBLE then
+    o.hidden = true
+    o.hides = (o.hides or 0) + 1
+  elseif st == display.STATE_ENABLE then
+    o.hidden = false
+  else
+    error('state ' .. tostring(st) .. ' is refused on this object type (1717)', 0)
+  end
+end
+-- The per-frame yield. Counted rather than ignored: it is the only thing in the
+-- frame that lets the display task paint, so a test must be able to see it.
+DELAYED, DELAYS = 0, 0
+function delay(s)
+  DELAYED = DELAYED + (s or 0)
+  DELAYS = DELAYS + 1
+end
+
 function display.setvalue(h, v)  use(h, 'setvalue').value = v end
 function display.getvalue(h)     return use(h, 'getvalue').value end
 function display.setevent(h, ev, cmd)
@@ -132,8 +160,20 @@ function display.setevent(h, ev, cmd)
   display.events[h][ev] = cmd
 end
 display.graph = {}
-function display.graph.add(g, ...)      use(g, 'graph.add'); OBJ[g].traces = (OBJ[g].traces or 0) + 1 end
-function display.graph.removeall(g)     use(g, 'graph.removeall'); OBJ[g].traces = 0 end
+-- `traces` is the live trace count; `adds` and `removes` count the CALLS. The
+-- distinction matters: a removeall+add pair leaves the count at 1, exactly as
+-- never touching it does, so only the call counters can see a per-frame
+-- detach and re-attach -- the thing that used to cost 43 ms a frame.
+function display.graph.add(g, ...)
+  use(g, 'graph.add')
+  OBJ[g].traces = (OBJ[g].traces or 0) + 1
+  OBJ[g].adds = (OBJ[g].adds or 0) + 1
+end
+function display.graph.removeall(g)
+  use(g, 'graph.removeall')
+  OBJ[g].traces = 0
+  OBJ[g].removes = (OBJ[g].removes or 0) + 1
+end
 function display.graph.drawstyle(g, s)  use(g, 'graph.drawstyle') end
 function display.graph.scaley(g, ...)   use(g, 'graph.scaley') end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
@@ -142,7 +182,7 @@ function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h
 -- returns it when called with the id alone, like the real readback.
 function display.graph.scalex(g, ...)
   use(g, 'graph.scalex')
-  local a = {...}
+  local a = arg
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
@@ -199,10 +239,10 @@ print('module load')
 check('all four modules load and define fftsa', type(fftsa) == 'table')
 local globals = 0
 for k, v in pairs(_G) do
-  if (type(v) == 'function' or k:match('^sg_') or k:match('^fft_') or k:match('^opt'))
-     and k:match('^[a-z]') and k ~= 'fftsa' and _G[k] ~= nil then
+  if (type(v) == 'function' or string.find(k, '^sg_') or string.find(k, '^fft_') or string.find(k, '^opt'))
+     and string.find(k, '^[a-z]') and k ~= 'fftsa' and _G[k] ~= nil then
     -- only count names the modules could plausibly have leaked
-    if k:match('^sg_') or k:match('^fft_') or k:match('^opt') or k:match('^app_') then
+    if string.find(k, '^sg_') or string.find(k, '^fft_') or string.find(k, '^opt') or string.find(k, '^app_') then
       globals = globals + 1
       print('      leaked global: ' .. k)
     end
@@ -221,17 +261,19 @@ dmm.digitize.count, dmm.digitize.samplerate = N, 100000
 dmm.digitize.read(cap)
 fftsa.fft_load(cap)
 fftsa.fft_run()
-local nb = fftsa.fft_magnitude()
+local nb = fftsa.fft_power()
 local binhz = 100000 / N
-check('magnitude returns N/2 bins', nb == N / 2, 'nb=' .. tostring(nb))
+check('power returns N/2 bins', nb == N / 2, 'nb=' .. tostring(nb))
 local bestk, bestv = 0, -1
-for k = 1, nb do if fftsa.fft_mag[k] > bestv then bestk, bestv = k, fftsa.fft_mag[k] end end
+for k = 1, nb do if fftsa.fft_pwr[k] > bestv then bestk, bestv = k, fftsa.fft_pwr[k] end end
 check('peak in the right bin', near((bestk - 1) * binhz, SIG.f, binhz),
       string.format('bin %d = %.0f Hz', bestk, (bestk - 1) * binhz))
-check('amplitude within 0.5%', near(bestv, SIG.amp, 0.005),
-      string.format('%.6f V (%.3f%% error)', bestv, math.abs(bestv - SIG.amp) * 100))
-check('DC pedestal removed', fftsa.fft_mag[1] < bestv * 1e-3,
-      string.format('dc bin %.3e with 2.5 V offset', fftsa.fft_mag[1]))
+local bestamp = math.sqrt(bestv)
+check('amplitude within 0.5%', near(bestamp, SIG.amp, 0.005),
+      string.format('%.6f V (%.3f%% error)', bestamp,
+                    math.abs(bestamp - SIG.amp) * 100))
+check('DC pedestal removed', fftsa.fft_pwr[1] < bestv * 1e-6,
+      string.format('dc bin %.3e with 2.5 V offset', fftsa.fft_pwr[1]))
 
 -- ---------- find_peaks ----------
 print('\nfind_peaks (real code)')
@@ -241,23 +283,23 @@ local sorted = true
 for p = 1, 5 do if bv[p] < bv[p + 1] then sorted = false end end
 check('sorted strongest first', sorted)
 -- Bin 1 is DC, so bin 2 is the first real frequency bin and must be reportable.
-fftsa.fft_mag = {}
-for k = 1, nb do fftsa.fft_mag[k] = 1e-6 end
-fftsa.fft_mag[2] = 0.5
+fftsa.fft_pwr = {}
+for k = 1, nb do fftsa.fft_pwr[k] = 1e-12 end
+fftsa.fft_pwr[2] = 0.25
 local b2 = fftsa.find_peaks(nb, 6)
 check('a tone in bin 2 is reportable', b2[1] == 2, 'bi[1]=' .. tostring(b2[1]))
 -- windowing keeps an out-of-window tone out of the table
-for k = 1, nb do fftsa.fft_mag[k] = 1e-6 end
-fftsa.fft_mag[62] = 0.2      -- ~12 kHz, inside 8-16 kHz
-fftsa.fft_mag[205] = 1.0     -- ~40 kHz, outside
+for k = 1, nb do fftsa.fft_pwr[k] = 1e-12 end
+fftsa.fft_pwr[62] = 0.04      -- ~12 kHz, inside 8-16 kHz
+fftsa.fft_pwr[205] = 1.0     -- ~40 kHz, outside
 local wi = fftsa.find_peaks(nb, 6, 41, 82)
 check('windowed search ignores the off-screen tone', wi[1] == 62, 'bi[1]=' .. tostring(wi[1]))
 local outside = false
 for p = 1, 6 do if wi[p] ~= 0 and (wi[p] < 41 or wi[p] > 82) then outside = true end end
 check('no reported peak outside the window', not outside)
-check('nil-sparse magnitudes do not raise', (function()
-  fftsa.fft_mag = {}
-  fftsa.fft_mag[5] = 0.1                    -- everything else nil
+check('nil-sparse power bins do not raise', (function()
+  fftsa.fft_pwr = {}
+  fftsa.fft_pwr[5] = 0.01                    -- everything else nil
   local ok = pcall(function() fftsa.find_peaks(nb, 6) end)
   return ok
 end)())
@@ -271,14 +313,18 @@ SIG.f, SIG.amp = 12000, 1.0
 dmm.digitize.read(cap)
 fftsa.fft_load(cap)
 fftsa.fft_run()
-local nbi = fftsa.fft_magnitude()
+local nbi = fftsa.fft_power()
 local pk, pv = 0, -1
-for k = 1, nbi do if fftsa.fft_mag[k] > pv then pk, pv = k, fftsa.fft_mag[k] end end
+for k = 1, nbi do if fftsa.fft_pwr[k] > pv then pk, pv = k, fftsa.fft_pwr[k] end end
 local dk, iv = fftsa.peak_interp(pk, nbi)
 local fi = (pk - 1 + dk) * binhz
+-- pv is POWER, so the amplitude comparison has to take the root. Left as pv it
+-- still passed, by luck: 0.777 is far enough from 1.0 either way. The bound is
+-- a voltage bound, so compare a voltage with it.
+local pvamp = math.sqrt(pv)
 check('the raw peak bin really is off (so this test has teeth)',
-      math.abs((pk - 1) * binhz - 12000) > 50 and math.abs(pv - 1.0) > 0.05,
-      string.format('raw %.1f Hz / %.5f V', (pk - 1) * binhz, pv))
+      math.abs((pk - 1) * binhz - 12000) > 50 and math.abs(pvamp - 1.0) > 0.05,
+      string.format('raw %.1f Hz / %.5f V', (pk - 1) * binhz, pvamp))
 check('interpolated frequency within 1 Hz of 12 kHz', near(fi, 12000, 1.0),
       string.format('%.2f Hz (d=%.5f)', fi, dk))
 check('interpolated amplitude within 0.5% of 1 V', near(iv, 1.0, 0.005),
@@ -290,11 +336,11 @@ check('spectrum-edge bins fall back instead of indexing off the end', (function(
   return a == 0 and b == nil and c == 0 and e == nil
 end)())
 check('a sparse spectrum falls back', (function()
-  local save = fftsa.fft_mag
-  fftsa.fft_mag = {}
-  fftsa.fft_mag[5] = 0.1
+  local save = fftsa.fft_pwr
+  fftsa.fft_pwr = {}
+  fftsa.fft_pwr[5] = 0.01
   local a, b = fftsa.peak_interp(5, nbi)
-  fftsa.fft_mag = save
+  fftsa.fft_pwr = save
   return a == 0 and b == nil
 end)())
 -- An on-bin tone must come back unchanged, not nudged by the correction.
@@ -302,7 +348,7 @@ SIG.f = 25 * binhz
 dmm.digitize.read(cap)
 fftsa.fft_load(cap)
 fftsa.fft_run()
-fftsa.fft_magnitude()
+fftsa.fft_power()
 local dk0, iv0 = fftsa.peak_interp(26, nbi)
 check('an on-bin tone is left alone', math.abs(dk0) < 0.01 and near(iv0, 1.0, 0.005),
       string.format('d=%.5f v=%.5f', dk0, iv0))
@@ -323,7 +369,7 @@ end
 check('every span (incl. inverted) stays inside 1..nbins', allin)
 fftsa.sg_set_xrange(499000, 500)
 local k0, k1 = fftsa.sg_window_bins(nb, binhz)
-check('inverted span cannot index past fft_mag', k0 <= nb and k1 <= nb,
+check('inverted span cannot index past fft_pwr', k0 <= nb and k1 <= nb,
       string.format('kmin=%d kmax=%d nbins=%d', k0, k1, nb))
 check('binhz of zero degrades safely', (function()
   local a, b = fftsa.sg_window_bins(nb, 0)
@@ -332,18 +378,30 @@ end)())
 
 -- ---------- axis scale ----------
 print('\nseconds-trick axis scale (real code)')
-check('50 kHz span labels directly in kHz', fftsa.sg_pick_fscale(50000) == 1000)
+check('a 50 kHz span labels directly in kHz', fftsa.sg_pick_fscale(50000) == 1000)
+check('a wider span steps by a decade rather than rolling over',
+      fftsa.sg_pick_fscale(500000) == 10000,
+      tostring(fftsa.sg_pick_fscale(500000)))
 local rollover = false
 for _, f in ipairs({500, 5000, 50000, 58999, 60000, 100000, 500000, 1000000}) do
   if f / fftsa.sg_pick_fscale(f) >= 59 then rollover = true end
 end
 check('no span up to 1 MHz hits the MM:SS rollover', not rollover)
+-- The label count the firmware chooses has to be stable, which is what fixing
+-- the scale at 1e6 broke: it put a 50 kHz span at 50 ms, where the row drew six
+-- labels on most frames and eleven on some. A decade scale keeps every span in
+-- a range whose divisions are wide and distinct.
+check('a 50 kHz span sits in tens of label-seconds, not hundredths',
+      50000 / fftsa.sg_pick_fscale(50000) == 50,
+      tostring(50000 / fftsa.sg_pick_fscale(50000)))
 fftsa.sg_fscale = fftsa.sg_pick_fscale(50000)
 check('legend names both units at the default scale',
       fftsa.sg_xunit_text() == 'X: kHz   Y: dBV', fftsa.sg_xunit_text())
 fftsa.sg_fscale = fftsa.sg_pick_fscale(500000)
-check('legend still states the graph multiplier when scaled',
+check('legend states the multiplier once the decade has stepped',
       fftsa.sg_xunit_text() == 'X: kHz   Y: dBV   (graph x10)', fftsa.sg_xunit_text())
+-- Back to the real default: later checks divide by this.
+fftsa.sg_fscale = 1000
 
 -- ---------- range mapping / sample rate ----------
 print('\nrange + sample rate (real code)')
@@ -400,10 +458,73 @@ for _ = 1, 5 do fftsa.frame() end
 check('5 frames run without a dropped frame', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount .. ' lasterr=' .. tostring(fftsa.lasterr))
 check('peak fields were populated', OBJ[fftsa.sg_pk_f[1]].text ~= nil
-      and OBJ[fftsa.sg_pk_f[1]].text:match('kHz') ~= nil,
+      and string.find(OBJ[fftsa.sg_pk_f[1]].text, 'kHz') ~= nil,
       tostring(OBJ[fftsa.sg_pk_f[1]].text))
 check('the x-axis legend is on screen', OBJ[fftsa.sg_xunit].text ~= nil,
       tostring(OBJ[fftsa.sg_xunit].text))
+
+-- The peak-text gate, asserted in both directions. Five frames ran above and
+-- only the first of them is allowed to have drawn the block; a gate that never
+-- opens would pass the "populated" check above just as well as a correct one,
+-- so suppression and drawing are both tested.
+check('the block drew at least once across those five frames',
+      fftsa.sg_pk_last ~= nil, tostring(fftsa.sg_pk_last))
+local pbi, pbv = fftsa.find_peaks(fftsa.n / 2, fftsa.sg_npeak, 1, fftsa.n / 2)
+check('a second call inside the same second is suppressed',
+      fftsa.sg_show_peaks(pbi, pbv, fftsa.sg_npeak, fftsa.binhz) == false)
+-- Open the clock gate by hand: the tolerance alone must still hold it shut
+-- when nothing has moved, which is the other half of the requirement.
+fftsa.sg_pk_last = fftsa.sg_pk_last - 2 * fftsa.sg_pk_period
+check('past the clock gate, an unchanged spectrum draws nothing',
+      fftsa.sg_show_peaks(pbi, pbv, fftsa.sg_npeak, fftsa.binhz) == false)
+-- And prove it is not simply stuck shut.
+fftsa.sg_pk_last  = fftsa.sg_pk_last - 2 * fftsa.sg_pk_period
+fftsa.sg_pk_lf[1] = nil
+check('past the clock gate, a moved peak does draw',
+      fftsa.sg_show_peaks(pbi, pbv, fftsa.sg_npeak, fftsa.binhz) == true)
+
+-- The per-frame repaint refills IN PLACE and then yields. It must not detach,
+-- re-attach or hide the graph: all three repaint the whole widget, and the
+-- operator sees the graph's own axis label text flicker once per frame. This is
+-- the only order that leaves the axes alone, so the absence of those calls is
+-- the behaviour under test, not an implementation detail.
+--
+-- Counted calls, not the live trace count: a removeall+add pair leaves the
+-- count at 1, exactly as never touching it does, so a count cannot tell them
+-- apart. An earlier version of this test asserted the count and passed with the
+-- pair restored, which is how that was found.
+print('\nper-frame repaint is in place, with a yield (real code)')
+local gh = fftsa.sg_graph
+local ad0, rm0 = (OBJ[gh].adds or 0), (OBJ[gh].removes or 0)
+local dl0 = DELAYS
+fftsa.frame_body()
+check('the frame does not detach the trace', (OBJ[gh].removes or 0) == rm0,
+      'removes=' .. tostring(OBJ[gh].removes) .. ' was ' .. tostring(rm0))
+check('nor re-attach it', (OBJ[gh].adds or 0) == ad0,
+      'adds=' .. tostring(OBJ[gh].adds) .. ' was ' .. tostring(ad0))
+check('nor hide it', (OBJ[gh].hides or 0) == 0,
+      'hides=' .. tostring(OBJ[gh].hides))
+check('the trace stays attached throughout', OBJ[gh].traces == 1,
+      'traces=' .. tostring(OBJ[gh].traces))
+check('and the frame yields exactly once for the paint', DELAYS == dl0 + 1,
+      'delays=' .. DELAYS .. ' was ' .. dl0)
+
+-- The yield is the only thing feeding the display task, so a zero or missing
+-- one is a silent regression into the jumpy behaviour. Assert the value too.
+check('the yield is the configured amount', fftsa.sg_yield > 0.005
+      and fftsa.sg_yield < 0.1, tostring(fftsa.sg_yield))
+
+-- A frame that raises part way through must still leave a usable graph.
+local realupd = fftsa.sg_update
+fftsa.sg_update = function() error('raised mid-refill', 0) end
+fftsa.errcount, fftsa.errrun = 0, 0
+fftsa.frame()
+fftsa.sg_update = realupd
+check('a frame raising mid-refill still leaves a trace attached',
+      OBJ[gh].traces == 1, 'traces=' .. tostring(OBJ[gh].traces))
+check('and the failure was counted rather than swallowed', fftsa.errcount == 1,
+      'errcount=' .. tostring(fftsa.errcount))
+fftsa.errcount, fftsa.errrun, fftsa.lasterr = 0, 0, nil
 
 -- Our own X tick labels, in kHz, below the plot (the firmware's read seconds).
 print('\ncustom axis labels (real code)')
@@ -490,7 +611,7 @@ check('a zoom applies', fftsa.flo == 8000 and fftsa.fhi == 16000,
       string.format('%g..%g', fftsa.flo, fftsa.fhi))
 check('apply returns to the spectrum', display.active == fftsa.sg_scr)
 -- An inverted span must be repaired: a stop below the start describes no bins,
--- and every frame then indexes past fft_mag and dies on a nil comparison.
+-- and every frame then indexes past fft_pwr and dies on a nil comparison.
 display.setvalue(fftsa.opt_flo, 8000)
 display.setvalue(fftsa.opt_fhi, 5000)
 fftsa.options_apply()
@@ -551,10 +672,15 @@ check('a refused delete returns false and is counted',
 -- End App pressed while the OPTIONS form is on screen must still tear down.
 fftsa.options()
 local ev = display.events[fftsa.optscr]
+-- Substring, not equality: the command is a STRING the firmware evaluates
+-- later, possibly after this app's table is gone, so it is wrapped in a nil
+-- guard. What matters is that cleanup is what gets called.
 check('End App is hooked on the options screen too',
-      ev ~= nil and ev['endapp'] == 'fftsa.cleanup()')
+      ev ~= nil and ev['endapp'] ~= nil
+      and string.find(ev['endapp'], 'fftsa.cleanup()', 1, true) ~= nil,
+      tostring(ev and ev['endapp']))
 if ev ~= nil and ev['endapp'] ~= nil then
-  (load or loadstring)(ev['endapp'])()
+  loadstring(ev['endapp'])()
 end
 check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
 check('End App from the options screen frees every buffer', livebufs() == base_bufs,
@@ -575,6 +701,198 @@ check('the halt is stated on screen', OBJ[fftsa.sg_xunit].text ~= nil
 check('a halted app still tears down cleanly',
       (function() fftsa.stop(); return live() == 0 and livebufs() == base_bufs end)(),
       'live=' .. live())
+
+-- ---------- the transform against a direct DFT ----------
+-- The gate for replacing the transform. Every other check here looks at the
+-- peak bin of a single tone, which a transform can get right while being wrong
+-- everywhere else -- a bin-ordering or scaling error in the untangle pass would
+-- pass all of them. This compares ALL bins against the textbook sum.
+--
+-- The scaling being asserted is the one fft_power() applies: power is
+-- |2*X[k]|^2 / (sum of the window)^2, so a bin's square root is the peak
+-- amplitude of a tone sitting on it, window-corrected.
+print('\ntransform vs a direct DFT (real code)')
+do
+  local NS = 64
+  fftsa.fft_init(NS)
+  local cap64 = buffer.make(NS * 4, buffer.STYLE_STANDARD)
+  dmm.digitize.count = NS
+  SIG.f, SIG.amp = 11000, 0.7
+  dmm.digitize.read(cap64)
+  local mean = fftsa.fft_load(cap64)
+  fftsa.fft_run()
+  local MS = fftsa.fft_power()
+
+  local win, x = fftsa.fft_win, fftsa.fft_x
+  local wsum = 0
+  for n = 1, NS do wsum = wsum + win[n] end
+  local worst, worstk = 0, 0
+  for b = 0, MS - 1 do
+    local sr, si = 0, 0
+    for n = 1, NS do
+      local ang = -2 * math.pi * b * (n - 1) / NS
+      local v = (x[n] - mean) * win[n]
+      sr = sr + v * math.cos(ang)
+      si = si + v * math.sin(ang)
+    end
+    local want = 4 * (sr * sr + si * si) / (wsum * wsum)
+    local got = fftsa.fft_pwr[b + 1]
+    -- Relative where the bin carries energy, absolute in the noise floor,
+    -- because a 1e-30 bin cannot be compared relatively in doubles.
+    local err
+    if want > 1e-12 then err = math.abs(got - want) / want
+    else err = math.abs(got - want) end
+    if err > worst then worst, worstk = err, b end
+  end
+  check('every bin matches a direct DFT', worst < 1e-9,
+        string.format('worst %.3e at bin %d of %d', worst, worstk, MS))
+
+  -- And that the comparison could fail: perturb one bin and re-measure.
+  local keep = fftsa.fft_pwr[8]
+  fftsa.fft_pwr[8] = keep * 1.01
+  local b, sr, si = 7, 0, 0
+  for n = 1, NS do
+    local ang = -2 * math.pi * b * (n - 1) / NS
+    local v = (x[n] - mean) * win[n]
+    sr = sr + v * math.cos(ang); si = si + v * math.sin(ang)
+  end
+  local want8 = 4 * (sr * sr + si * si) / (wsum * wsum)
+  check('and the comparison has teeth',
+        math.abs(fftsa.fft_pwr[8] - want8) / want8 > 1e-3,
+        string.format('perturbed bin 8 by 1%%, err %.3e',
+                      math.abs(fftsa.fft_pwr[8] - want8) / want8))
+  fftsa.fft_pwr[8] = keep
+
+  -- Restore: later nothing runs, but a suite that grows must not inherit N=64.
+  cap64 = nil
+  fftsa.fft_init(512)
+  dmm.digitize.count = 512
+end
+
+-- ---------- the busy-guard watchdog ----------
+-- A frame killed from outside never clears fftsa.busy, and every later frame
+-- then returns at the top: a frozen trace that stop() cannot recover from.
+-- Both directions are asserted, because a watchdog that always fires is just
+-- a missing guard and would pass a one-sided test.
+print('\nbusy-guard watchdog (real code)')
+do
+  fftsa.errcount, fftsa.errrun, fftsa.busy_stuck = 0, 0, 0
+  fftsa.halted = false
+  -- Count body calls rather than display writes: this is about the guard, and
+  -- the app has been torn down by this point in the suite.
+  local ran = 0
+  local realbody = fftsa.frame_body
+  fftsa.frame_body = function() ran = ran + 1 end
+
+  -- A guard held for less than busy_max is a frame that really is running.
+  fftsa.busy = true
+  fftsa.busy_since = os.clock()
+  fftsa.frame()
+  check('a freshly held guard still blocks re-entry',
+        ran == 0 and fftsa.busy_stuck == 0,
+        'ran=' .. ran .. ' stuck=' .. tostring(fftsa.busy_stuck))
+
+  -- A guard older than busy_max cannot be a frame that is still running.
+  fftsa.busy_since = os.clock() - (fftsa.busy_max + 1)
+  fftsa.frame()
+  check('a stale guard is broken and the frame runs',
+        ran == 1 and fftsa.busy_stuck == 1,
+        'ran=' .. ran .. ' stuck=' .. tostring(fftsa.busy_stuck))
+  check('and the guard is left clear afterwards', fftsa.busy == false,
+        tostring(fftsa.busy))
+
+  fftsa.frame_body = realbody
+  fftsa.busy, fftsa.busy_since, fftsa.busy_stuck = false, nil, 0
+  fftsa.errcount, fftsa.errrun, fftsa.lasterr = 0, 0, nil
+end
+
+-- ---------- pinned reference values ----------
+-- The DFT check above recomputes the truth in this file, which catches a wrong
+-- transform but not a changed INPUT: if the signal mock drifts, both sides move
+-- together and the check still passes. These are literals, computed off-tree by
+-- a direct DFT, against a deterministic three-tone input with no math.random
+-- (which differs between Lua versions). They also pin the two scale constants,
+-- where a silent change would shift every bin by the same factor and so be
+-- invisible to a self-consistent comparison.
+print('\npinned DFT reference values (real code)')
+do
+  local N, fs = 512, 100000
+  local xs = {}
+  for i = 1, N do
+    local t = (i - 1) / fs
+    xs[i] = 2.5 + 0.7 * math.sin(2 * math.pi * 12345 * t)
+                + 0.3 * math.sin(2 * math.pi * 4000 * t + 0.5)
+                + 0.1 * math.cos(2 * math.pi * 27777 * t)
+  end
+  fftsa.fft_init(N)
+  fftsa.fft_load({readings = xs, n = N})
+  fftsa.fft_run()
+  local nbr = fftsa.fft_power()
+  check('the reference case returns 256 bins', nbr == 256, 'nb=' .. tostring(nbr))
+  -- 511/1024 to within rounding, not bit-exact: fft_cg is a sum of 512 window
+  -- samples divided by N, so the last bit is accumulation error (measured
+  -- 0.4990234374999999). Asserting equality here fails for no useful reason.
+  check('Hann coherent gain is 511/1024',
+        math.abs(fftsa.fft_cg - 0.4990234375) <= 1e-15,
+        string.format('%.17g', fftsa.fft_cg))
+  check('the power scale constant is unchanged',
+        math.abs(fftsa.fft_ksq - 1.53185687861183e-05) <= 1e-19,
+        string.format('%.15e', fftsa.fft_ksq))
+
+  local REF = {
+    [1]   = 1.070382007807e-04, [2]   = 2.658610401077e-05,
+    [3]   = 8.503625571883e-10, [20]  = 2.976892050182e-03,
+    [21]  = 6.663921764242e-02, [22]  = 6.319272858275e-02,
+    [23]  = 2.332822427426e-03, [63]  = 6.055496103585e-02,
+    [64]  = 4.638311666827e-01, [65]  = 2.105245157564e-01,
+    [66]  = 1.196709564878e-03, [128] = 2.277048179723e-11,
+    [142] = 1.179005997114e-03, [143] = 9.404682971391e-03,
+    [144] = 4.410196791709e-03, [200] = 4.102219056977e-14,
+    [255] = 2.881843089179e-15, [256] = 2.871639894807e-15,
+  }
+  -- Mixed bound, not relative: the sub-1e-14 bins are rounding noise and a pure
+  -- relative test fails them at around 1e-7 while telling you nothing.
+  local worst, worstk = 0, 0
+  for k, ref in pairs(REF) do
+    local d = math.abs(fftsa.fft_pwr[k] - ref)
+    local allow = 1e-9 * ref + 1e-14
+    if d / allow > worst then worst, worstk = d / allow, k end
+  end
+  check('every pinned bin is within tolerance', worst <= 1.0,
+        string.format('worst %.3f of budget at bin %d', worst, worstk))
+  local tot = 0
+  for k = 1, 256 do tot = tot + fftsa.fft_pwr[k] end
+  check('the total power matches the reference',
+        math.abs(tot - 8.868655233713e-01) <= 1e-9 * 8.868655233713e-01,
+        string.format('%.12e', tot))
+
+  -- Second case: a half-bin offset, which is what exercises peak_interp's
+  -- square roots and the untangle away from a bin centre.
+  local ys = {}
+  for i = 1, N do
+    ys[i] = 1.0 + 0.5 * math.sin(2 * math.pi * 12345 * (i - 1) / fs)
+  end
+  fftsa.fft_load({readings = ys, n = N})
+  fftsa.fft_run()
+  fftsa.fft_power()
+  local pk, pv = 0, -1
+  for k = 2, 256 do if fftsa.fft_pwr[k] > pv then pk, pv = k, fftsa.fft_pwr[k] end end
+  check('the offset tone peaks in bin 64', pk == 64, 'bin=' .. tostring(pk))
+  check('the raw scalloped read is 0.4865 V',
+        math.abs(math.sqrt(pv) - 0.486465471) <= 1e-6,
+        string.format('%.9f V', math.sqrt(pv)))
+  local d64, a64 = fftsa.peak_interp(64, 256)
+  check('interpolation recovers 12345 Hz within 0.5 Hz',
+        math.abs((64 - 1 + d64) * 195.3125 - 12345) <= 0.5,
+        string.format('%.6f Hz (d=%.9f)', (64 - 1 + d64) * 195.3125, d64))
+  check('interpolation recovers 0.5 V within 0.5%',
+        math.abs(a64 - 0.5) <= 0.005 * 0.5, string.format('%.9f V', a64))
+  check('the 1 V pedestal is removed to under 1e-5 power',
+        fftsa.fft_pwr[1] < 1e-5, string.format('%.4e', fftsa.fft_pwr[1]))
+
+  fftsa.fft_init(512)
+  dmm.digitize.count = 512
+end
 
 print()
 print(string.format('%d passed, %d failed', pass, fail))

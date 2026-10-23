@@ -2,8 +2,10 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- Top `count` local maxima of fftsa.fft_mag, strongest first. O(nbins), negligible cost.
--- Returns two 1..count arrays: bin indices (bi) and their magnitudes (bv).
+-- Top `count` local maxima of fftsa.fft_pwr, strongest first. O(nbins), negligible cost.
+-- Returns two 1..count arrays: bin indices (bi) and their POWER (bv, volts-squared).
+-- Power orders bins exactly as magnitude would, so the search needs no square
+-- roots; fftsa.sg_show_peaks takes them for the few bins it reports.
 --
 -- kmin/kmax (optional, default 2..nbins) restrict the search to the bins the
 -- graph is actually DISPLAYING. Without them a strong tone outside the zoom
@@ -14,18 +16,18 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- Bin 1 is DC (removed before the transform) and is never a candidate, so the
 -- search starts at bin 2 -- the first real frequency bin, and reportable.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
-  local mag = fftsa.fft_mag
+  local pwr = fftsa.fft_pwr
   local bi, bv = {}, {}
   for s = 1, count do bi[s] = 0; bv[s] = -1 end
   if kmin == nil or kmin < 2 then kmin = 2 end
   if kmax == nil or kmax > nbins then kmax = nbins end
   for k = kmin, kmax do
-    local m = mag[k]
-    -- nil-safe: a partial fftsa.fft_mag (e.g. after a short read) may hold nils,
+    local m = pwr[k]
+    -- nil-safe: a partial fftsa.fft_pwr (e.g. after a short read) may hold nils,
     -- and comparing nils raises a runtime error -- guard against it.
     if m ~= nil then
-      local ml = mag[k-1]
-      local mr = mag[k+1]
+      local ml = pwr[k-1]
+      local mr = pwr[k+1]
       -- A missing neighbour means we are at the end of the spectrum, so treat it
       -- as lower than anything: that lets the final bin qualify. Inside a zoom
       -- window the neighbours are real bins even when they are off-screen, which

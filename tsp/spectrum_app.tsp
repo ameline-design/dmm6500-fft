@@ -144,11 +144,23 @@ function fftsa.apply()
 end
 
 -- The per-frame work (one acquisition + FFT + display), split out so fftsa.frame()
--- can run it under pcall. The frame rate is limited by display cost, not the FFT:
--- fftsa.sg_update() clears and refills the buffer, then fftsa.sg_bind_min() re-adds the trace
--- to repaint the complete buffer atomically (which avoids the flicker the bare
--- clear would cause -- see fftsa.sg_bind_min). That re-add is heavy, so fftsa.arm() paces
--- the timer at 0.3 s.
+-- can run it under pcall.
+--
+-- Measured frame budget at 256 bins, in ms: fft_run 30.6, sg_update 24.7,
+-- fft_load 15.3, digitize.read 6.2, find_peaks 1.9, fft_magnitude 1.5
+-- sg_show_peaks 0.9, cap.clear 0.2 -- 81.4 total, so 12.3 Hz. The transform and
+-- the buffer refill now dominate; the display path is no longer the limit.
+--
+-- The display figures above are for the detach-first order sg_update() now
+-- uses. It used to refill the buffer first and call sg_bind_min() after, which
+-- paid two avoidable costs: the writes went through a live subscription at
+-- 76 us a point instead of 54, and removeall then waited on the paint of the
+-- frame it was in rather than the one before. sg_bind_min() is kept for callers
+-- that genuinely need a re-attach, but nothing per-frame calls it.
+--
+-- Do not "optimise" the removeall away. It is the only thing in the frame that
+-- blocks for the display task, and that task is not scheduled while Lua runs --
+-- see the measurements in fftsa.sg_update.
 function fftsa.frame_body()
   -- Everything a frame touches must still exist. A frame can be dispatched while
   -- the app is half-built (a failed startup) or half-torn-down (End App, a host
@@ -170,14 +182,17 @@ function fftsa.frame_body()
   end
   fftsa.fft_load(fftsa.cap)
   fftsa.fft_run()
-  fftsa.fft_magnitude()
-  local nb = fftsa.n / 2
+  -- Power, not magnitude: the untangle pass that unpacks the N/2 complex
+  -- transform back to N/2 real bins produces |X|^2 for free, so taking the
+  -- square root here would be 256 sqrt calls a frame thrown away immediately
+  -- by the dB conversion, which is 10*log10 of power.
+  fftsa.fft_power()
+  local nb = fftsa.fft_m
   -- Search for peaks in exactly the window the graph plots, so the table always
   -- describes the visible trace instead of reporting off-screen tones.
   local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
   local bi, bv = fftsa.find_peaks(nb, fftsa.sg_npeak, kmin, kmax)
   fftsa.sg_update(nb, fftsa.binhz)
-  fftsa.sg_bind_min()
   fftsa.sg_show_peaks(bi, bv, fftsa.sg_npeak, fftsa.binhz)
 end
 
@@ -185,11 +200,36 @@ end
 -- the fftsa.busy reset: were the guard left latched, every later frame would return
 -- at the top and the display would freeze. A failed frame is simply dropped, and
 -- fftsa.lasterr / fftsa.errcount record it for diagnosis.
+--
+-- The pcall does not cover being killed from OUTSIDE. Observed 2026-10-23: a
+-- host sent ABORT (event 1409) while a frame was running, the frame never
+-- reached the reset below, and from then on every frame returned at the top --
+-- a frozen trace, and fftsa.stop() could never complete because it waits for
+-- the frame to finish. The age check below is the way out of that: a guard held
+-- longer than any real frame can take did not come from a frame that is still
+-- running, so it is cleared and the drop is counted.
+fftsa.busy_since = nil
+fftsa.busy_max   = 2.0      -- seconds; a frame is ~0.08 s, so this is 25x slack
+fftsa.busy_stuck = 0        -- how many times the guard had to be broken
+
 function fftsa.frame()
-  if fftsa.busy or fftsa.halted then return end
+  if fftsa.halted then return end
+  if fftsa.busy then
+    local since = fftsa.busy_since
+    if since == nil or (os.clock() - since) < (fftsa.busy_max or 2.0) then return end
+    fftsa.busy_stuck = (fftsa.busy_stuck or 0) + 1
+  end
+  fftsa.busy_since = os.clock()
   fftsa.busy = true
   local ok, err = pcall(fftsa.frame_body)
   if not ok then
+    -- fftsa.sg_update() detaches the trace before refilling and re-attaches it
+    -- at the end, so an error raised in between leaves the graph with no trace
+    -- at all -- which looks exactly like a dead signal. This is the net: a
+    -- failed frame always ends with the trace attached.
+    if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil then
+      pcall(function() fftsa.sg_rebind() end)
+    end
     fftsa.lasterr  = tostring(err)
     fftsa.errcount = (fftsa.errcount or 0) + 1
     fftsa.errrun   = (fftsa.errrun or 0) + 1
@@ -245,7 +285,7 @@ function fftsa.build_options()
   fftsa.optscr = create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER OPTIONS")
 
   create(fftsa.optscr, display.OBJ_TEXT, 30, 62,
-         "Touch a field to edit it, then Apply.", 0xB0B0B0, display.FONT_MEDIUM,
+         "Touch a field to edit it, then Apply.", 11579568, display.FONT_MEDIUM,   -- 0xB0B0B0
          display.JUST_LEFT)
 
   -- Edit objects render their label+description to the LEFT of the value box, so
@@ -262,18 +302,18 @@ function fftsa.build_options()
                        "0.1 V", "1 V", "10 V")
 
   fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 30, 322, "",
-                        0x00DCFF, display.FONT_SMALL, display.JUST_LEFT)
+                        56575, display.FONT_SMALL, display.JUST_LEFT)   -- 0x00DCFF
 
   local b_apply = create(fftsa.optscr, display.OBJ_BUTTON, 470, 362, "Apply", 140)
-  display.setevent(b_apply, display.EVENT_PRESS, "fftsa.options_apply()")
+  display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_apply() end")
   local b_cancel = create(fftsa.optscr, display.OBJ_BUTTON, 630, 362, "Cancel", 140)
-  display.setevent(b_cancel, display.EVENT_PRESS, "fftsa.options_cancel()")
+  display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_cancel() end")
   -- Hook End App on THIS screen too. If the firmware delivers EVENT_ENDAPP to the
   -- screen that is currently visible, a user who exits from the options form would
   -- otherwise leave with no teardown at all -- both screens, the graph, the timer
   -- and both buffers stranded until the next power cycle.
   pcall(function()
-    display.setevent(fftsa.optscr, display.EVENT_ENDAPP, "fftsa.cleanup()")
+    display.setevent(fftsa.optscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
   end)
   return fftsa.optscr
 end
@@ -327,7 +367,7 @@ function fftsa.build()
   -- stale handle before creating its replacement.
   fftsa.optbtn = nil
   fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
-  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "fftsa.options()")
+  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options() end")
   fftsa.build_options()
   -- Creating fftsa.optscr leaves it as the active screen, which would hide the
   -- spectrum and (since the frame timer only runs while its parent screen is
@@ -337,11 +377,30 @@ function fftsa.build()
 end
 
 -- Arm the periodic frame timer (fires only while the spectrum screen is visible).
--- 0.3 s is deliberately conservative: the per-frame graph re-add that keeps the
--- trace flicker-free is heavy, and a faster rate floods the display processor and
--- hangs the box. If a frame runs long, the fftsa.busy guard skips the overlapping tick.
+--
+-- 0.3 s is deliberately conservative, and the reason is NOT Lua frame cost. A
+-- frame's Lua work is about 81 ms (see fftsa.frame_body), so 0.05 s looks like
+-- it should settle at ~12 Hz with the fftsa.busy guard dropping overlapping
+-- ticks. The Lua side does reach 12.4 Hz, measured. The pacing is here because
+-- what the frame rate drives is a STREAM into the display task, and nothing
+-- measured so far bounds that: each frame clears the trace buffer and refills
+-- it, and the display side is fed those readings by subscription, so 256 bins
+-- at 12 Hz is some 3000 readings a second against about 850 at 0.3 s.
+--
+-- What is NOT established is that a short period is unsafe. A 0.05 s run on
+-- 2026-10-23 drew a correct graph, posted event 1138, and ended on a blank
+-- panel -- but the script driving it was killed mid-refill, which leaves the
+-- graph hidden by itself (see fftsa.sg_update), and the panel came back from
+-- the HOME key, which a crashed display processor would not. So that run
+-- indicts the kill, not the period.
+--
+-- The period therefore stays at the value the pre-measurement code chose, as a
+-- precaution rather than as a finding. Settling it means ramping the period
+-- down while watching the event log for the queue-drop codes (2351, 1706)
+-- rather than watching wall-clock frame rate, since the frame clock cannot see
+-- the queue. If a frame runs long, the fftsa.busy guard skips the overlap.
 function fftsa.arm(period_s)
-  if period_s == nil then period_s = 0.3 end
+  if period_s == nil then period_s = 0.1 end
   -- NEVER stack timers. Two live timers would both fire fftsa.frame(), doubling
   -- the frame rate, and that extra display traffic is exactly what floods the
   -- display processor and hangs the instrument.
@@ -351,7 +410,7 @@ function fftsa.arm(period_s)
   end
   if fftsa.sg_scr == nil then return nil end
   fftsa.timer = display.create(fftsa.sg_scr, display.OBJ_TIMER, period_s, display.TIMER_FOREVER)
-  display.setevent(fftsa.timer, display.EVENT_PRESS, "fftsa.frame()")
+  display.setevent(fftsa.timer, display.EVENT_PRESS, "if fftsa ~= nil and fftsa.frame ~= nil then fftsa.frame() end")
   return fftsa.timer
 end
 
@@ -369,7 +428,7 @@ end
 function fftsa.install_cleanup()
   if fftsa.sg_scr == nil then return false end
   local ok, err = pcall(function()
-    display.setevent(fftsa.sg_scr, display.EVENT_ENDAPP, "fftsa.cleanup()")
+    display.setevent(fftsa.sg_scr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
   end)
   if not ok then fftsa.lasterr = "ENDAPP hook failed: " .. tostring(err) end
   return ok
@@ -395,7 +454,7 @@ function fftsa.start()
     fftsa.build()
     hooked = fftsa.install_cleanup()
     fftsa.apply()
-    fftsa.arm(0.3)
+    fftsa.arm()
   end)
   if not ok then
     fftsa.lasterr = tostring(err)
@@ -464,7 +523,7 @@ function fftsa.show_error(msg)
     end
     fftsa.errscr = display.create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER ERROR")
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
-                   "The analyser could not start.", 0xFF6060,
+                   "The analyser could not start.", 16736352,   -- 0xFF6060
                    display.FONT_MEDIUM, display.JUST_LEFT)
     -- One long line runs off an 800 px panel, so break the message into chunks.
     local m = tostring(msg)
@@ -472,14 +531,14 @@ function fftsa.show_error(msg)
     local i = 1
     while i <= string.len(m) and y <= 400 do
       display.create(fftsa.errscr, display.OBJ_TEXT, 20, y, string.sub(m, i, i + 79),
-                     0xE0E0E0, display.FONT_SMALL, display.JUST_LEFT)
+                     14737632, display.FONT_SMALL, display.JUST_LEFT)   -- 0xE0E0E0
       i = i + 80
       y = y + 22
     end
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 420,
-                   "Press End App to exit.", 0x909090,
+                   "Press End App to exit.", 9474192,   -- 0x909090
                    display.FONT_SMALL, display.JUST_LEFT)
-    display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "fftsa.cleanup()")
+    display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
     display.changescreen(fftsa.errscr)
   end)
   return fftsa.errscr

@@ -9,17 +9,19 @@
 --
 -- FREQUENCY ON THE X AXIS (the "seconds trick"):
 -- The DMM graph's X axis is hardwired to TIME formatting -- it renders the
--- timestamp as clock time and cannot print "Hz". For values under a minute it
--- renders a clean "SS.SSs" label, so each bin's frequency is written into the
--- TIMESTAMP (seconds field) divided by fftsa.sg_fscale. At the default scale of
--- 1000 Hz per label-second a 12.5 kHz bin gets timestamp 12.5 s and the graph
--- labels it "12.50s", which reads directly as 12.5 kHz. The graph draws its own
--- axis labels this way -- no overlay, no custom text.
+-- timestamp as clock time and cannot print "Hz", so each bin's frequency is
+-- written into the timestamp (seconds field) divided by fftsa.sg_fscale.
 --
--- Above 59 s the label rolls over into "MM:SS" and stops reading as a frequency
--- at all (500 kHz would render as "08:20"), so fftsa.sg_pick_fscale() steps the
--- scale by decades to keep the whole span under that limit, and the on-screen
--- legend (fftsa.sg_xunit) states the multiplier in force.
+-- The scale is the largest decade that keeps the span under 59 label-seconds,
+-- because the firmware's own axis row rolls into base-60 "MM:SS" above that.
+-- A 50 kHz span therefore reads 0 to 50 s and the label is kHz directly.
+--
+-- Fixing the scale at 1e6 so that 1 Hz is 1 us was tried and reverted; see
+-- fftsa.sg_pick_fscale for why it made the firmware's axis row flicker.
+--
+-- The tick labels worth reading are our own (fftsa.sg_axis_update), drawn in
+-- real frequency units and refreshed only when the span changes. The firmware's
+-- row above them says "s" and there is no way to stop it.
 --
 -- Y axis: amplitude in dBV on a LINEAR axis (the log is done in Lua). A LOG axis
 -- mis-scales the fixed dB range, and buffer.UNIT_DECIBEL panics the firmware, so
@@ -70,7 +72,8 @@ fftsa.delfails = fftsa.delfails or 0
 -- narrows them.
 fftsa.sg_flo_hz  = 0
 fftsa.sg_fhi_hz  = 1e9
--- Hz per label-"second" for the seconds trick. 1000 => the label IS kHz.
+-- Hz per label-"second" for the seconds trick. 1000 => the label IS kHz;
+-- fftsa.sg_pick_fscale steps it by decades for a wider span.
 fftsa.sg_fscale  = 1000
 
 -- Geometry on the 800x480 panel. Y is limited to 0..420 on a custom screen.
@@ -128,7 +131,7 @@ fftsa.sg_xlab_y  = 314     -- baseline of our X ticks: below the graph, above th
 -- the first against the axis and the last clear of the right edge of the panel.
 fftsa.sg_xlab_hw = 26
 fftsa.sg_nxlab   = 5       -- X ticks, endpoints included
-fftsa.sg_axc     = 0xC0C0C0    -- axis label colour
+fftsa.sg_axc     = 12632256    -- axis label colour
 -- fftsa.sg_fhi_hz starts at a sentinel meaning "every bin" until fftsa.apply()
 -- sets a real window. A span that wide is not a plottable axis, so the pin and
 -- the labels stay out of the way until it is narrowed.
@@ -143,14 +146,14 @@ fftsa.sg_pkdy    = 20      -- row pitch
 fftsa.sg_pk_colx_f = {8,   360}   -- frequency field x, per column
 fftsa.sg_pk_colx_v = {118, 470}   -- voltage field x,   per column
 fftsa.sg_pk_colx_d = {200, 552}   -- dB field x,        per column
-fftsa.sg_pk_cf   = 0xE0FFE0  -- freq colour (pale green)
-fftsa.sg_pk_cv   = 0xC8E6FF  -- volt colour (pale blue)
-fftsa.sg_pk_cd   = 0xFFE0A0  -- dB colour   (pale amber)
+fftsa.sg_pk_cf   = 14745568  -- freq colour (pale green)
+fftsa.sg_pk_cv   = 13166335  -- volt colour (pale blue)
+fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
 -- X-axis legend: clear of the three peak rows (350/370/390) and of the Options
 -- button, so it never collides with the firmware's own axis labels.
 fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410
-fftsa.sg_xunit_c = 0x909090
+fftsa.sg_xunit_c = 9474192   -- 0x909090
 
 -- Delete a display object / a buffer, and do NOT hide a refusal.
 --
@@ -243,18 +246,29 @@ function fftsa.sg_axis_update(force)
   return true
 end
 
--- Hz per label-"second" that keeps a whole span inside the graph's clean
--- "SS.SSs" label format. Stepping by decades keeps the multiplier easy to read.
+-- Hz per label-"second": the largest decade that keeps the whole span inside
+-- the graph's own decimal label format, which rolls into base-60 "MM:SS" above
+-- 59 s. The walk is what guarantees the span never reaches that rollover.
+--
+-- Do NOT fix this at 1e6. That was tried on 2026-10-23, on the reasonable
+-- theory that one label-second per MHz keeps the axis decimal for every span
+-- the instrument can reach. It does -- and it also compresses the firmware's
+-- own axis row into a range where its label-count choice is unstable. A 50 kHz
+-- span becomes 50 ms, the row renders "00.01ms 10.01ms 20.01ms", and on some
+-- frames it renders eleven labels instead of six, adding "05.01ms 15.01ms" for
+-- a single frame. The operator saw that as a distracting flicker once or twice
+-- a second, and it was entirely self-inflicted: at a decade scale the same span
+-- is 0 to 50 s with six wide, distinct labels and the choice does not waver.
 function fftsa.sg_pick_fscale(fhi_hz)
-  local s = 1000                      -- default: label reads directly as kHz
+  local s = 1000                      -- the label then reads directly as kHz
   if fhi_hz == nil or fhi_hz <= 0 then return s end
   while fhi_hz / s >= 59 do s = s * 10 end
   return s
 end
 
 -- Legend naming the units our own tick labels are in. The graph's internal X
--- axis is still in scaled seconds, so when that multiplier is not 1 the legend
--- says so -- it is the one clue left if the label covers ever fail to paint.
+-- axis is in scaled seconds, so the legend states the multiplier whenever it is
+-- not the expected 1e6 -- the one clue left if the label covers fail to paint.
 function fftsa.sg_xunit_text()
   local s = fftsa.sg_fscale
   if s == 1000 then return "X: kHz   Y: dBV" end
@@ -397,7 +411,7 @@ end
 -- table always describes what is on screen.
 --
 -- BOTH ends must be clamped. An inconsistent window -- flo above fhi, or a start
--- beyond Nyquist -- otherwise yields kmin past the end of fftsa.fft_mag, and the
+-- beyond Nyquist -- otherwise yields kmin past the end of fftsa.fft_pwr, and the
 -- resulting nil comparison raises an error that kills every single frame.
 function fftsa.sg_window_bins(nbins, binhz)
   if binhz == nil or binhz <= 0 then return 1, nbins end
@@ -414,34 +428,91 @@ function fftsa.sg_window_bins(nbins, binhz)
   return kmin, kmax
 end
 
--- Refill the trace from fftsa.fft_mag. One buffer pass, then the firmware repaints once.
+-- Refill the trace from fftsa.fft_pwr. One buffer pass, repainted once.
 -- `binhz` is the true bin width (from the measured sample rate).
+--
+-- REFILL IN PLACE: do not detach the trace, do not hide the graph, and then
+-- yield so the display task can paint. The trace holds the buffer by reference
+-- and the display side is fed by a subscription, so clearing and refilling
+-- streams the new readings to the trace that is already attached.
+--
+-- Three orders were tried on hardware, 2026-10-23, on a standalone 256-point
+-- sine at this graph's geometry with the event log read after every run:
+--
+--   refill in place, yield 40 ms     15.8 Hz   0 events   no flicker
+--   refill in place, yield 10 ms     30.1 Hz   0 events   visibly jumpy
+--   refill in place, yield 5 ms      35.6 Hz   194 events, trace jumped 3-4 Hz
+--   detach-first removeall+add       25.9 Hz   0 events   AXIS TEXT FLICKER
+--   hide / refill / show             35.6 Hz   events     axis flicker, jumpy
+--
+-- Every one of those 194 events was 1706, "Message dropped from display queue".
+-- The display task is not scheduled while Lua runs -- it only gets the core when
+-- the Lua task blocks -- so a loop that never blocks builds a backlog every
+-- frame until the queue overruns, which shows as a high Lua frame rate with the
+-- glass falling further behind.
+--
+-- Both of the other two orders fix that by blocking, and both repaint the WHOLE
+-- widget: the operator sees the graph object's own axis label text redrawn on
+-- every frame, at the frame rate, independent of anything else on screen.
+-- Refill in place is the only order that leaves the axes alone, because the
+-- subscription repaints the trace and nothing else. So the block has to come
+-- from an explicit yield instead, which is what the delay at the end is.
+--
+-- The cost of refilling while attached is 76 us a point against 54 us detached,
+-- since every reading is forwarded as it is written. That ~5.6 ms is the price
+-- of not flickering, and it is cheaper than the paint a rebind forces.
+--
+-- An earlier version of this function hid the graph for the refill. It looked
+-- faster -- 81 ms a frame against 164 -- but the saving was an illusion: the
+-- 43 ms attributed to removeall was the paint happening, and hiding the widget
+-- only moved the backlog out of the frame being timed.
 function fftsa.sg_update(nbins, binhz)
   if binhz == nil or binhz <= 0 then return end   -- no usable frequency scale yet
+  local g     = fftsa.sg_graph
   local buf   = fftsa.sg_buf
-  local mag   = fftsa.fft_mag
+  local pwr   = fftsa.fft_pwr
   local wr    = buffer.write.reading
   local floor = math.floor
   local log10 = math.log10
-  local vfl   = fftsa.sg_vfloor
+  -- The floor is squared because the bins are now power, not magnitude.
+  local vfl   = fftsa.sg_vfloor * fftsa.sg_vfloor
   local dbmin = fftsa.sg_dbmin
   local dbmax = fftsa.sg_dbmax
   local fscl  = fftsa.sg_fscale
   -- Write only the bins inside the visible window so the graph auto-ranges to it.
   local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
+  -- Whether the seconds field can ever be non-zero, decided ONCE rather than
+  -- rediscovered per point. Whether it pays depends on the scale in force: at a
+  -- decade scale a 50 kHz span runs to 50 label-seconds so the floor is needed,
+  -- but a narrow zoom stays under 1 s and the call is pure waste. Decided from
+  -- the span rather than hardcoded, so either case is correct.
+  local subsecond = ((kmax - 1) * binhz / fscl) < 1
   buf.clear()
   for k = kmin, kmax do
-    local v = mag[k]
+    local v = pwr[k]
     local db
-    -- nil (sparse magnitude array) and anything at or below the floor both plot
-    -- at the floor; log10 is never handed a zero.
-    if v == nil or v <= vfl then db = dbmin else db = 20 * log10(v) end
+    -- nil (sparse power array) and anything at or below the floor both plot at
+    -- the floor; log10 is never handed a zero. 10*log10 of power is the same
+    -- number as 20*log10 of magnitude, without the square root.
+    if v == nil or v <= vfl then db = dbmin else db = 10 * log10(v) end
     if db < dbmin then db = dbmin end
     if db > dbmax then db = dbmax end
     local f = (k - 1) * binhz
     local t = f / fscl                       -- scaled frequency into the seconds field
-    wr(buf, db, f, floor(t), t - floor(t))
+    if subsecond then
+      wr(buf, db, f, 0, t)
+    else
+      local w = floor(t)
+      wr(buf, db, f, w, t - w)
+    end
   end
+  -- Yield, so the display task can paint what was just written. Nothing else in
+  -- the frame blocks for it, and it is not scheduled while Lua runs, so without
+  -- this the backlog grows every frame: a fast Lua loop and a trace that jumps.
+  --
+  -- The yield is genuinely idle time on this core and cannot be filled -- any
+  -- Lua work put here would starve the task it exists to feed.
+  delay(fftsa.sg_yield)
 end
 
 -- Set the visible frequency window (Hz). fftsa.sg_update() writes only the bins inside
@@ -505,14 +576,86 @@ end
 -- recovers the sub-bin position from the peak's two neighbours. Without it a
 -- tone between bins reads up to half a bin off in frequency and up to 1.42 dB
 -- low in amplitude, both of which are large next to this instrument's accuracy.
+-- Gated at 1 Hz, and skipped entirely when no peak has moved.
+--
+-- Not a frame-cost measure: display.settext is about 19 us on this instrument
+-- (measured), so all 18 fields together cost well under a millisecond and
+-- removing the block outright bought only ~5 ms of a 127 ms frame. The reasons
+-- are that six peaks rewritten ten times a second cannot be read, and that a
+-- once-a-second burst of 18 messages is visible as a hitch in an otherwise
+-- even cadence. The tolerance is what stops a dithering last digit from
+-- redrawing the block on a signal that is not actually changing.
+-- Seconds of yield per frame, for the display task to paint the refill. ~25 ms
+-- is the measured paint cost of a 256-point refill less the ~6 ms already spent
+-- blocked in digitize.read. Too small and the trace jumps while 1706 events
+-- accumulate; too large and frames are simply slower than they need to be.
+fftsa.sg_yield = 0.025
+
+fftsa.sg_pk_period = 1.0        -- seconds between refreshes
+fftsa.sg_pk_ftol   = 0.002      -- fractional frequency move worth a redraw
+fftsa.sg_pk_vtol   = 0.01       -- fractional amplitude move worth a redraw
+fftsa.sg_pk_last   = nil        -- nil means never drawn, so the first call draws
+fftsa.sg_pk_lf     = {}
+fftsa.sg_pk_lv     = {}
+
+-- Switch for isolating the peak table when something on the glass needs to be
+-- attributed. Added 2026-10-23 while chasing an axis-text flicker that turned
+-- out to be the axis scale, not this block.
+fftsa.sg_peaks_off = false
+
 function fftsa.sg_show_peaks(bi, bv, count, binhz)
-  local log10, settext = math.log10, display.settext
+  if fftsa.sg_peaks_off then return false end
+  local now = os.clock()
+  if fftsa.sg_pk_last ~= nil
+     and (now - fftsa.sg_pk_last) < fftsa.sg_pk_period then
+    return false
+  end
+  -- Past the clock gate, still spend nothing unless something moved. A steady
+  -- tone therefore draws the block once and then leaves it alone.
+  local abs, sqrt = math.abs, math.sqrt
+  local moved = false
+  for p = 1, count do
+    local k = bi[p]
+    local f, v = -1, -1
+    if k ~= nil and k > 0 and bv[p] > 0 then
+      local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)
+      -- bv is POWER now, so the fallback has to take the root that
+      -- peak_interp would have taken; iv is volts either way.
+      if iv == nil then dk, iv = 0, sqrt(bv[p]) end
+      f, v = (k - 1 + dk) * binhz, iv
+    end
+    local lf, lv = fftsa.sg_pk_lf[p], fftsa.sg_pk_lv[p]
+    if lf == nil then
+      moved = true
+    elseif (f < 0) ~= (lf < 0) then
+      moved = true                      -- a peak appeared or went away
+    elseif f >= 0 then
+      local df = fftsa.sg_pk_ftol * lf
+      if df <= 0 then df = 1 end
+      local dv = fftsa.sg_pk_vtol * lv
+      if dv <= 0 then dv = 1e-12 end
+      if abs(f - lf) > df or abs(v - lv) > dv then moved = true end
+    end
+    fftsa.sg_pk_lf[p], fftsa.sg_pk_lv[p] = f, v
+  end
+  if not moved then return false end
+  fftsa.sg_pk_last = now
+  return fftsa.sg_show_peaks_now(bi, bv, count, binhz)
+end
+
+-- The unconditional draw. Kept separate so the gate above is the only thing
+-- deciding when it runs, and so a caller that must refresh (a new span, a
+-- rebuilt screen) can reach it directly.
+function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
+  local log10, settext, sqrt = math.log10, display.settext, math.sqrt
   local nb = fftsa.sg_nbins
   for p = 1, count do
     local k = bi[p]
     if k ~= nil and k > 0 and bv[p] > 0 then
       local dk, iv = fftsa.peak_interp(k, nb)
-      if iv == nil then dk, iv = 0, bv[p] end     -- edge bin or sparse spectrum
+      -- bv is POWER now, so the fallback has to take the root that
+      -- peak_interp would have taken; iv is volts either way.
+      if iv == nil then dk, iv = 0, sqrt(bv[p]) end     -- edge bin or sparse spectrum
       local f, v = (k - 1 + dk) * binhz, iv
       local ftxt
       if f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)
@@ -530,6 +673,7 @@ function fftsa.sg_show_peaks(bi, bv, count, binhz)
       settext(fftsa.sg_pk_d[p], "")
     end
   end
+  return true
 end
 
 function fftsa.sg_status(txt)
