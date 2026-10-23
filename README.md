@@ -8,7 +8,7 @@ Lua, and the firmware's own graph object draws the trace. Touch the front panel 
 
 The DMM6500 is a bench multimeter, not a spectrum analyser. It does have a 1 MS/s digitizer, a
 400 MHz processor and a touchscreen, and that turns out to be enough for a usable instrument at
-around 12 frames a second.
+around 20 frames a second.
 
 ## What it does
 
@@ -56,11 +56,22 @@ Copy `FFT_Spectrum.tspa` to a USB key, plug it into the instrument, and install 
 
 Two things shaped the whole design, and both are measured rather than assumed.
 
-**Display calls are asynchronous messages to a second processor.** The CPU board carries two 400 MHz
-PowerPC chips; the one with its own memory is the raster graphics engine. So what costs time is the
-*number* of display messages per frame, not the amount of Lua work. Three render paths were
-benchmarked -- the built-in graph object, N line objects, and the undocumented `display.setpixel` --
-and the graph won by an order of magnitude. `docs/pixel-drawing.pdf` has the numbers.
+**The display runs in another task on the same core, and only while Lua is blocked.** The drawing is
+done by a separate GUI task, not by the second PowerPC: the start-up code creates it locally, and the
+"channel" the display API talks over is in-process. Because it shares the one core with the
+interpreter, it is scheduled only when the Lua task blocks -- so a Lua frame rate means nothing on
+its own. Measured: a frame loop with a 5 ms yield ran at 35.6 Hz in Lua while dropping display
+messages and updating the glass about three times a second. Every frame must therefore block once,
+deliberately, for the paint.
+
+That also fixes what the frame rate is. A timer tick arriving mid-frame is dropped rather than
+queued, and the shortest period the firmware accepts is 0.05 s, so the displayed rate is quantised to
+`1/(0.05 × ceil(frame/0.05))` -- 20, 10, 6.67 fps and nothing between. Getting the frame under 50 ms
+is worth double; shaving it from 81 ms to 55 ms is worth nothing at all.
+
+Three render paths were benchmarked -- the built-in graph object, N line objects, and the
+undocumented `display.setpixel` -- and the graph won by an order of magnitude.
+`docs/pixel-drawing.pdf` has the numbers.
 
 **The arithmetic is not the bottleneck; the interpreter is.** A Lua table read costs about 1.4 µs and
 an arithmetic operation about 1.2 µs, which at 400 MHz is some 480 cycles for one multiply whose

@@ -9,6 +9,82 @@ The short version: **precision is not what this app pays for, and neither is the
 It pays for interpreter dispatch and for marshalled calls across the TSP API. Every lever below is
 about doing fewer operations, not cheaper ones.
 
+## The displayed frame rate is quantised, and that is the whole story
+
+The rate the app achieves is not the rate the frame can sustain, and the gap is not small.
+
+Two measured facts set it. **The display task shares the application CPU with the Lua interpreter and
+is scheduled only when Lua blocks** -- so a frame that never blocks runs fast in Lua while the glass
+falls further behind every frame. Measured: a 5 ms yield gave 35.6 Hz in Lua, 194 dropped-message
+events (1706), and a trace updating about three times a second. And **a timer tick landing while a
+frame is still running is dropped, not queued**, with the shortest period the firmware accepts being
+0.05 s -- `arm(0.045)` is refused with event 1131, *"Parameter, period, expected value from 0.05 to
+120"*. So
+
+```
+displayed = 1 / (0.05 * ceil(frame / 0.05))
+```
+
+which admits 20, 10, 6.67, 5 fps and nothing between. **Shaving a frame from 81 ms to 55 ms buys
+nothing; getting it from 51 to 49 doubles the rate.** Optimising this app means crossing a boundary,
+not reducing a number.
+
+### Measured, N=512, 256 bins, timer frozen, frames back to back
+
+| phase | ms |
+|---|---|
+| `digitize.read` | 6.4 |
+| `fft_load` | 14.3 |
+| `fft_run` | 14.4 |
+| `fft_power` | 2.0 |
+| `find_peaks` | 1.9 |
+| `sg_update` | 42.6 |
+| peak text | 0.2 |
+| **total** | **81.8 -- 12.3 fps capability, 10 fps displayed** |
+
+Confirmed from the other end: 3.20 fps displayed at the old 0.3 s period and 8.55 fps at 0.1 s with
+no host traffic, both consistent with the formula.
+
+The paint inside `sg_update` is proportional to graph **area**, not point count: 784x272 costs
+14.4 ms, 784x200 11.6, 784x136 8.7, 392x136 7.3. Point count does not move it -- 16 and 710 points
+measured the same.
+
+### Why N=256
+
+Modelled from the per-unit costs, since halving N halves acquisition, buffer read-out, transform,
+fill and peak search at once:
+
+| | frame | capability | displayed |
+|---|---|---|---|
+| N=512, 256 bins | 81.6 ms | 12.3 fps | **10 fps** |
+| N=256, 128 bins | 47.9 ms | 20.9 fps | **20 fps** |
+| N=256, graph 784x136 | 40.7 ms | 24.6 fps | 20 fps |
+| N=128, 64 bins | 31.4 ms | 31.8 fps | 20 fps |
+
+No combination of the smaller levers crosses 50 ms from 81.6: radix-4 ~3 ms, graph height ~4, the
+fill's arithmetic ~3. Halving N is the only cut large enough, and it is one constant.
+
+It costs **resolution, not accuracy.** Bin width goes 195.3 -> 390.6 Hz, so tones closer than ~391 Hz
+merge. An isolated peak barely moves, because the three-bin interpolation absorbs the coarser grid --
+measured offline under Lua 5.0.2 on a 12345 Hz 0.5 V tone:
+
+| N | bin width | interpolated | error | amplitude error |
+|---|---|---|---|---|
+| 512 | 195.3 Hz | 12344.89 Hz | 0.11 Hz | 0.004 % |
+| 256 | 390.6 Hz | 12345.81 Hz | 0.81 Hz | 0.028 % |
+| 128 | 781.3 Hz | 12346.65 Hz | 1.65 Hz | 0.014 % |
+
+**The margin is thin and the cliff is binary.** 47.9 ms leaves about 2 ms before 50. If a measurement
+puts the real frame over it, the cheapest headroom is `fftsa.sg_yield` -- it need only cover the
+display task's work, which halves with the bin count -- and then the graph height. Note that
+**radix-4 does not help at N=256**: it needs M a power of four and M is 128, so it falls back to
+radix-2. It applies at N=512 and N=2048, neither of which reaches 20 fps.
+
+### Not yet verified on hardware
+
+The 47.9 ms is modelled, not measured. The check is one count of completed frames against the wall
+clock with the event log read afterwards; if 1706 appears, `sg_yield` is short.
+
 ## The cost model
 
 | operation | cost | how measured |
@@ -174,8 +250,10 @@ Both from reading the firmware, and both make the existing notes wrong as writte
 
 ## Two things about the pixel path, if it is ever revisited
 
-It is still the wrong path -- the graph object plots 200 points end to end in ~32 ms, against a flush
-alone at 0.203 s -- but the reasons are worth recording, because neither is obvious.
+It is still the wrong path -- a graph refill and repaint costs tens of milliseconds against a flush
+alone at 0.203 s -- but the reasons are worth recording, because neither is obvious. (The "~32 ms for
+200 points" this paragraph used to quote was wrong, and is superseded by the measured phase table
+above.)
 
 **The image's surface is owned by its *name*, not by the object.**
 `display.create(parent, display.OBJ_IMAGE, x, y, name, w, h)` takes a string as its 5th argument, and
@@ -187,7 +265,8 @@ allocated a surface and worked; later fresh names got the placeholder, which sug
 not released when the object is deleted.
 
 **`flush` is a chunked bulk copy, so its cost is proportional to surface area.** It pushes the entire
-pixel block to the display processor over channel 9 in 240-byte chunks under a per-channel lock: an
+pixel block over channel 9 in 240-byte chunks under a per-channel lock. Channel 9 is an in-process
+channel to the GUI task on this same core, not a link to the second processor: an
 800x480 32-bit surface is 1,536,000 bytes, 6,400 chunks. Measuring 0.203 s for both a 400x200 and an
 800x480 object looks like a fixed cost and is not -- both were flushing the same surface, per the
 name rule above.
