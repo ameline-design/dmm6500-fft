@@ -378,29 +378,23 @@ end
 
 -- Arm the periodic frame timer (fires only while the spectrum screen is visible).
 --
--- 0.3 s is deliberately conservative, and the reason is NOT Lua frame cost. A
--- frame's Lua work is about 81 ms (see fftsa.frame_body), so 0.05 s looks like
--- it should settle at ~12 Hz with the fftsa.busy guard dropping overlapping
--- ticks. The Lua side does reach 12.4 Hz, measured. The pacing is here because
--- what the frame rate drives is a STREAM into the display task, and nothing
--- measured so far bounds that: each frame clears the trace buffer and refills
--- it, and the display side is fed those readings by subscription, so 256 bins
--- at 12 Hz is some 3000 readings a second against about 850 at 0.3 s.
+-- 0.05 s is the firmware's floor: arm(0.045) is refused with event 1131,
+-- "Parameter, period, expected value from 0.05 to 120". Measured 2026-10-23.
 --
--- What is NOT established is that a short period is unsafe. A 0.05 s run on
--- 2026-10-23 drew a correct graph, posted event 1138, and ended on a blank
--- panel -- but the script driving it was killed mid-refill, which leaves the
--- graph hidden by itself (see fftsa.sg_update), and the panel came back from
--- the HOME key, which a crashed display processor would not. So that run
--- indicts the kill, not the period.
+-- The period matters more than it looks, because a tick that lands while a
+-- frame is still running is DROPPED, not queued, so the displayed rate is
+-- quantised: displayed = 1 / (P * ceil(frame / P)). With an 81.8 ms frame that
+-- is 10 fps at P=0.05 and 8.55 fps measured at P=0.1 -- never the 12.3 fps the
+-- frame itself can sustain. The reachable rates at the floor are 20, 10, 6.67,
+-- 5 fps and nothing in between, so the only way past 12 is to bring the frame
+-- under 50 ms, which lands on 20. Tuning the period cannot do it.
 --
--- The period therefore stays at the value the pre-measurement code chose, as a
--- precaution rather than as a finding. Settling it means ramping the period
--- down while watching the event log for the queue-drop codes (2351, 1706)
--- rather than watching wall-clock frame rate, since the frame clock cannot see
--- the queue. If a frame runs long, the fftsa.busy guard skips the overlap.
+-- Do NOT batch frames inside the callback to beat this. Running frames
+-- back-to-back for most of a period holds the interpreter away from its event
+-- loop, and a peer session testing exactly that pattern lost the instrument
+-- (cause unproven, but the risk is not worth the fps).
 function fftsa.arm(period_s)
-  if period_s == nil then period_s = 0.1 end
+  if period_s == nil then period_s = 0.05 end
   -- NEVER stack timers. Two live timers would both fire fftsa.frame(), doubling
   -- the frame rate, and that extra display traffic is exactly what floods the
   -- display processor and hangs the instrument.
