@@ -24,7 +24,28 @@ MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
 
 MANIFEST = [
     ('Title', 'FFT Spectrum Analyser'),
-    ('Product', 'DMM6500'),
+    # The DAQ6510 and DMM7510 run the same boards, the same firmware family and
+    # the same Lua 5.0.2 as the DMM6500, and all three reach the digitizer as
+    # dmm.digitize, which is the only instrument namespace this app uses. The
+    # firmware is literally shared across the line: on a DMM6500 the display
+    # task is created under the name "DAQ Display".
+    #
+    # ONLY THE DMM6500 IS TESTED. The other two are listed so that they can be.
+    #
+    # DMM7510 is not in the documented value set -- Keithley's app-header spec
+    # permits 2450, 2460, 2461, 2470, DMM6500 and DAQ6510, yet Keithley ship TSP
+    # apps of their own declaring DMM7510, so the published list is stale or
+    # incomplete. Listed deliberately with the risk named: if the installer
+    # validates tokens strictly an unrecognised one could be rejected, and the
+    # rejection might not be scoped to that model. The check is one install on
+    # the DMM6500, and if that stops working this field is the first thing to
+    # revert. The sibling serial-decode app ships the same three tokens and
+    # installs, which is the evidence for both the syntax and the token.
+    #
+    # No SMU. Every SMU reaches its measurement subsystem as smu.*, so this app
+    # would install and then fail at the first capture, and $Product means "can
+    # run the script without errors" -- listing one would be a false claim.
+    ('Product', 'DMM6500, DAQ6510, DMM7510'),
     ('Tag', 'FFT, Spectrum, Digitize, Audio'),
     ('Description', 'On-instrument FFT spectrum analyser: digitize mode + FFT '
                     'with a live graph, top-6 peaks, and a touch options form '
