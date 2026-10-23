@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Package the FFT spectrum analyser as a single .tspa TTI App for the DMM6500.
+
+Concatenates the four TSP modules into one `loadscript` wrapper with an App
+manifest, an auto-start entry point, an EVENT_ENDAPP cleanup hook, and an
+embedded base64 PNG icon -- matching the Keithley example .tspa apps
+(loadscript / -- $manifest / endscript, then loadimage / <base64> / endimage).
+
+The modules are script BODIES (they populate the single `fftsa` table), so opening
+the App runs the concatenated definitions and then fftsa.start().
+"""
+import base64
+import os
+import struct
+import textwrap
+import zlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+NAME = 'FFT_Spectrum'          # internal script name (loadscript <NAME>)
+ICON = 'fft_icon'              # icon name (matches -- $Icon and loadimage)
+OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
+MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
+           'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp']
+
+MANIFEST = [
+    ('Title', 'FFT Spectrum Analyser'),
+    ('Product', 'DMM6500'),
+    ('Tag', 'FFT, Spectrum, Digitize, Audio'),
+    ('Description', 'On-instrument FFT spectrum analyser: digitize mode + FFT '
+                    'with a live graph, top-6 peaks, and a touch options form '
+                    '(start/stop frequency, input range).'),
+    ('Version', '1'),
+    # Stated minimum firmware. Kept low deliberately: the app is developed against
+    # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
+    # sorts above "1.7.17a" and the app refuses to install on the very unit it was
+    # written on. "1.7.0" is satisfied under either a string or a numeric compare.
+    ('Requires', '1.7.0'),
+    ('Icon', ICON),
+]
+
+ENTRY = '''
+-- ==================== TTI App entry point ====================
+-- fftsa.start() builds the screens, hooks End App (EVENT_ENDAPP -> fftsa.cleanup)
+-- as soon as the spectrum screen exists, configures the hardware and arms the
+-- frame timer -- all under pcall, so a failure part-way through tears its own
+-- display objects back down instead of stranding them until the next power cycle.
+fftsa.start()
+'''
+
+
+def png_icon(W=60, H=60):
+    """RGB PNG (pure stdlib): a green spectrum trace with 'FFT' in magenta over it,
+    rendered at 8x and box-downsampled to W x H so the edges are anti-aliased."""
+    import math
+    SS = 8                               # supersample; box-downsampled below -> AA
+    HW, HH = W * SS, H * SS
+    hi = bytearray(HW * HH * 3)          # black background, at SSx
+
+    def hset(x, y, r, g, b):
+        if 0 <= x < HW and 0 <= y < HH:
+            i = (y * HW + x) * 3
+            hi[i], hi[i + 1], hi[i + 2] = r, g, b
+
+    # Green spectrum trace (heights in W/H units, rasterised at SSx).
+    def col_h(xr):
+        peak = (H - 12) * math.exp(-((xr - W * 0.5) ** 2) / 40.0)
+        wob = 4 * (0.5 + 0.5 * math.sin(xr * 0.9))
+        return max(0.0, min(H - 4.0, 5 + peak + wob))
+    for hx in range(3 * SS, (W - 3) * SS):
+        top = int((H - 2) * SS - col_h(hx / SS) * SS)
+        for hy in range(top, (H - 2) * SS):
+            hi[(hy * HW + hx) * 3 + 1] = 255      # green channel
+
+    # "FFT" (5x7 bitmap glyphs) in magenta with a black halo, centred.
+    font = {
+        'F': ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
+        'T': ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+    }
+    text = "FFT"
+    s, gap = 3 * SS, 3 * SS               # glyph-pixel size and inter-glyph gap
+    gw = 5 * s
+    total_w = len(text) * gw + (len(text) - 1) * gap
+    x0, y0 = (HW - total_w) // 2, (HH - 7 * s) // 2
+    lit, cx = set(), x0
+    for chn in text:
+        rows = font[chn]
+        for ry in range(7):
+            for rx in range(5):
+                if rows[ry][rx] == '1':
+                    for sy in range(s):
+                        for sx in range(s):
+                            lit.add((cx + rx * s + sx, y0 + ry * s + sy))
+        cx += gw + gap
+    halo = SS                            # ~1 final px of black outline
+    for (x, y) in lit:
+        for dx in range(-halo, halo + 1):
+            for dy in range(-halo, halo + 1):
+                if (x + dx, y + dy) not in lit:
+                    hset(x + dx, y + dy, 0, 0, 0)
+    for (x, y) in lit:
+        hset(x, y, 255, 0, 255)
+
+    # Box-downsample each SSxSS block to one pixel -> anti-aliased W x H.
+    img = bytearray(W * H * 3)
+    n = SS * SS
+    for oy in range(H):
+        for ox in range(W):
+            r = g = b = 0
+            for dy in range(SS):
+                base = ((oy * SS + dy) * HW + ox * SS) * 3
+                for dx in range(SS):
+                    k = base + dx * 3
+                    r += hi[k]; g += hi[k + 1]; b += hi[k + 2]
+            j = (oy * W + ox) * 3
+            img[j], img[j + 1], img[j + 2] = r // n, g // n, b // n
+
+    raw = bytearray()
+    for y in range(H):
+        raw.append(0)                       # filter byte per scanline
+        raw.extend(img[y * W * 3:(y + 1) * W * 3])
+
+    def chunk(typ, data):
+        return (struct.pack('>I', len(data)) + typ + data
+                + struct.pack('>I', zlib.crc32(typ + data) & 0xffffffff))
+
+    png = b'\x89PNG\r\n\x1a\n'
+    png += chunk(b'IHDR', struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0))  # 8-bit RGB
+    png += chunk(b'IDAT', zlib.compress(bytes(raw), 9))
+    png += chunk(b'IEND', b'')
+    return png
+
+
+def main():
+    out = []
+    out.append('loadscript ' + NAME)
+    for k, v in MANIFEST:
+        out.append('-- $%s: %s' % (k, v))
+    out.append('')
+
+    for m in MODULES:
+        out.append('-- ================= %s =================' % m)
+        with open(os.path.join(ROOT, m)) as f:
+            for ln in f.read().split('\n'):
+                out.append(ln.rstrip('\r'))
+        out.append('')
+
+    for ln in ENTRY.strip('\n').split('\n'):
+        out.append(ln)
+    out.append('endscript')
+
+    b64 = base64.b64encode(png_icon()).decode('ascii')
+    out.append('loadimage %s %s' % (ICON, NAME))
+    out.extend(textwrap.wrap(b64, 76))
+    out.append('endimage')
+
+    text = '\r\n'.join(out) + '\r\n'        # CRLF, like the Keithley examples
+    with open(OUT, 'w', newline='') as f:
+        f.write(text)
+    print('wrote %s (%d bytes, %d lines)' % (OUT, len(text), len(out)))
+    print('  script: %s   icon: %s   modules: %d' % (NAME, ICON, len(MODULES)))
+
+
+if __name__ == '__main__':
+    main()

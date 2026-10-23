@@ -1,0 +1,44 @@
+# THIRD-PARTY DOCUMENTATION IS NOT OURS TO REDISTRIBUTE.
+#
+# docs/ doubles as the working reference shelf for this project: Keithley's DMM6500 manuals and TSP app
+# examples, and the two processor reference manuals the display and timing work was done against. They
+# are what the measurements were made against and they are cited throughout the code, but they are
+# vendor copyright and this repository is public -- so they stay local.
+#
+# Listed by vendor rather than by a blanket docs/*.txt rule, so a document WE write in docs/ is
+# published by default instead of silently disappearing.
+
+# Keithley
+docs/DMM6500_*.txt
+docs/DMM6500-*.txt
+docs/DMM6500DisplayDoc.md
+docs/Display API Command Reference.md
+docs/Keithley_DMM6500_Notes-*.txt
+docs/1KW-*.txt
+docs/2000SCAN-*.txt
+docs/K10SCAN_schematic.txt
+docs/LowLevelHandbook_*.txt
+docs/TSPAPP-*.txt
+docs/TSPAPP_*.txt
+
+# Processor reference manuals
+docs/Arm-Cortex-M4-Processor-Datasheet.txt
+docs/e300coreRM.txt
+docs/MPC5125RM.txt
+
+# THE WORKING LOG STAYS LOCAL. notes/ is a session-by-session engineering journal -- bench wiring, the
+# instruments' addresses, this unit's serial number and calibration date, firmware quirks, what was
+# tried and abandoned. It is the most useful directory in the project to whoever is holding the probe
+# and the least useful to whoever is reading the code, and publishing it would put a lot of unreviewed
+# detail about a specific bench on the open web. What a reader needs is in docs/.
+notes/
+
+# Build output: regenerable by re-running the harness, and it dates immediately.
+out/
+
+# Local tooling and OS noise
+.claude/
+.DS_Store
+**/.DS_Store
+__pycache__/
+*.pyc
