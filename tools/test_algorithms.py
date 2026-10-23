@@ -1,14 +1,28 @@
 #!/usr/bin/env python3
-"""Host-side tests for the TSP algorithms, ported literally from the .tsp modules.
+"""Host-side tests for the TSP algorithms, re-implemented in Python.
 
-The instrument is the only place this code can really run, and getting there
-costs a power cycle (one build per power cycle). So the arithmetic that does not
-depend on the instrument -- the FFT, the peak picker, the window/bin clamping,
-the options validation, the axis scaling -- is re-implemented here 1:1 (same
-1-based indexing, same expression order) and checked against known inputs.
+The transform here is SUPERSEDED, and this file is no longer the primary gate.
 
-This is a port, not the shipped code: it proves the ALGORITHMS are right. It
-cannot prove the display/digitize calls are right. Run: python3 test_algorithms.py
+It used to claim everything was ported 1:1 from the .tsp modules. That stopped
+being true on 2026-10-23: the FFT below is the old radix-2 transform producing
+MAGNITUDE, while tsp/fft_core.tsp now runs a packed N/2 complex transform
+producing POWER. The two no longer correspond, and nothing re-ports this when
+the Lua changes -- which is how a stale port becomes worse than no port, because
+it keeps passing and reassuring.
+
+Use tools/test_tsp.lua instead. It runs the SHIPPED Lua under Lua 5.0.2, the
+instrument's own dialect, so it catches a whole class of faults this cannot:
+hex literals, '#', {...}, string methods, string.match. Every one of those
+passes on a host interpreter and fails on the instrument, and that gap cost a
+full afternoon of popped errors. The Lua suite also carries a direct-DFT
+cross-check over every bin plus eighteen independently computed reference values
+pinned as literals -- strictly better evidence than a re-implementation, which
+can be wrong in the same way twice.
+
+Still sound here, because they have not diverged: the peak picker, the
+window/bin clamping, the options validation and the sample-rate choice. The FFT
+section wants re-porting or deleting; it is kept only because deleting it now
+would take those with it.
 """
 import math
 import sys
