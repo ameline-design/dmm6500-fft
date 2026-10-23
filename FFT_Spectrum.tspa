@@ -1085,33 +1085,31 @@ end
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- FFT size, a power of two. 128 bins. This is the frame-rate knob, and the
--- only one big enough to matter -- docs/PERFORMANCE.md has the model.
+-- FFT size, a power of two. 256 bins, 195.3 Hz each at 100 kS/s.
 --
--- Why 256 rather than 512. A timer tick landing while a frame is still running
--- is dropped rather than queued, so the DISPLAYED rate is quantised to
--- 1/(0.05*ceil(frame/0.05)): 20, 10, 6.67, 5 fps and nothing in between. At
--- N=512 the frame is 81.6 ms measured -- capable of 12.3 fps, displaying 10. At
--- N=256 it is about 48 ms, which clears the 50 ms boundary and displays 20.
--- Halving N roughly halves acq, load, fft, the fill and the peak search at
--- once; no combination of the smaller cuts (radix-4 ~3 ms, graph height ~4,
--- fill arithmetic ~3) gets under 50 on its own.
+-- This is the frame-rate knob and the only one large enough to matter, because
+-- the DISPLAYED rate is quantised: a timer tick landing while a frame is still
+-- running is dropped rather than queued, and the firmware's shortest period is
+-- 0.05 s, so the achievable rates are 1/(0.05*k) -- 20, 10, 6.67, 5 fps and
+-- nothing between. At N=512 the frame is 81.6 ms measured: capable of 12.3 fps,
+-- displaying 10. At N=256 it models to ~48 ms, which crosses the 50 ms boundary
+-- and displays 20.
 --
--- What it costs is RESOLUTION, not accuracy. Bin width goes from 195.3 Hz to
--- 390.6 Hz, so two tones closer than ~391 Hz merge. Accuracy on an isolated
--- peak barely moves, because the three-bin interpolation absorbs the coarser
--- grid: measured offline on a 12345 Hz 0.5 V tone, N=512 reads 12344.89 Hz and
--- N=256 reads 12345.81 Hz -- 0.81 Hz, or 0.007 %, with 0.03 % amplitude error.
+-- 512 IS A DELIBERATE CHOICE, not an unexamined default. The operator decided
+-- on 2026-10-23 that 10 fps is fast enough and resolution is not to be traded
+-- for speed. Halving N would halve resolution -- 390.6 Hz bins, so two tones
+-- closer than ~391 Hz merge -- and that is what the instrument is for.
 --
--- Set it back to 512 for 195 Hz bins and accept 10 fps. Nothing else needs
--- changing: every table, window and twiddle is sized from this one value.
+-- What halving does NOT cost is accuracy on an isolated peak, which is worth
+-- knowing if the decision is ever revisited: the three-bin interpolation
+-- absorbs the coarser grid, and measured offline under 5.0.2 on a 12345 Hz
+-- 0.5 V tone, N=512 reads 12344.89 Hz against N=256's 12345.81 Hz -- 0.81 Hz,
+-- or 0.007 %, with 0.03 % amplitude error. So the trade is resolution for
+-- frame rate, never precision for frame rate.
 --
--- Margin warning: 48 ms leaves only ~2 ms before the boundary, and crossing it
--- costs half the frame rate rather than a few per cent. If a measurement puts
--- the frame over 50, the cheapest headroom is fftsa.sg_yield -- it need only
--- cover the display task's work, which halves with the bin count -- and then
--- the graph height, which the paint cost is proportional to.
-fftsa.n       = 256
+-- Changing it needs nothing else: every table, window and twiddle is sized from
+-- this one value. docs/PERFORMANCE.md has the full model and the alternatives.
+fftsa.n       = 512
 
 -- Lowest start frequency the app will accept or display. Bin 1 is DC, and
 -- fftsa.fft_load() subtracts the mean, so bin 1 carries only the residual the

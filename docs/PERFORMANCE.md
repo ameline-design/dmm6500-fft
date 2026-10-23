@@ -49,7 +49,7 @@ The paint inside `sg_update` is proportional to graph **area**, not point count:
 14.4 ms, 784x200 11.6, 784x136 8.7, 392x136 7.3. Point count does not move it -- 16 and 710 points
 measured the same.
 
-### Why N=256
+### The N trade, and why 512 stays the default
 
 Modelled from the per-unit costs, since halving N halves acquisition, buffer read-out, transform,
 fill and peak search at once:
@@ -62,7 +62,12 @@ fill and peak search at once:
 | N=128, 64 bins | 31.4 ms | 31.8 fps | 20 fps |
 
 No combination of the smaller levers crosses 50 ms from 81.6: radix-4 ~3 ms, graph height ~4, the
-fill's arithmetic ~3. Halving N is the only cut large enough, and it is one constant.
+fill's arithmetic ~3. Halving N is the only cut large enough, and it is one constant. Note that
+`acq 6.4 + load 14.3` is irreducible at N=512, so even with radix-4, power, peaks and a 14 ms floor
+on the paint, N=512 reaches ~48 ms *with zero fill* -- it cannot comfortably cross.
+
+**The operator chose 512 on 2026-10-23: 10 fps is fast enough, and resolution is not for trading.**
+What follows is therefore the record of an option, not a plan.
 
 It costs **resolution, not accuracy.** Bin width goes 195.3 -> 390.6 Hz, so tones closer than ~391 Hz
 merge. An isolated peak barely moves, because the three-bin interpolation absorbs the coarser grid --
@@ -74,16 +79,24 @@ measured offline under Lua 5.0.2 on a 12345 Hz 0.5 V tone:
 | 256 | 390.6 Hz | 12345.81 Hz | 0.81 Hz | 0.028 % |
 | 128 | 781.3 Hz | 12346.65 Hz | 1.65 Hz | 0.014 % |
 
-**The margin is thin and the cliff is binary.** 47.9 ms leaves about 2 ms before 50. If a measurement
-puts the real frame over it, the cheapest headroom is `fftsa.sg_yield` -- it need only cover the
-display task's work, which halves with the bin count -- and then the graph height. Note that
-**radix-4 does not help at N=256**: it needs M a power of four and M is 128, so it falls back to
-radix-2. It applies at N=512 and N=2048, neither of which reaches 20 fps.
+**If it is ever revisited, the margin is thin and the cliff is binary.** 47.9 ms leaves about 2 ms
+before 50, and crossing back costs half the rate rather than a few per cent. The cheapest headroom is
+`fftsa.sg_yield` -- it need only cover the display task's work, which halves with the bin count --
+then the graph height. Note that **radix-4 does not help at N=256**: it needs M a power of four and M
+would be 128, so it falls back to radix-2. It applies at N=512 and N=2048, and at N=512 it saves
+~5 ms, which crosses no boundary and so changes nothing the operator sees.
+
+**The other route past the quantisation, unmeasured:** at the 0.05 s floor, a *count-bounded* second
+frame per tick (never a time loop) gives 13.3 fps displayed for a frame at or under 75 ms, and three
+frames gives 15 at or under 66 ms. That recovers some of the dropped-tick loss without needing the
+frame under 50 at all, and it keeps 195 Hz bins. It wants measuring before it is trusted: holding the
+interpreter away from its event loop is what the firmware is least forgiving of.
 
 ### Not yet verified on hardware
 
-The 47.9 ms is modelled, not measured. The check is one count of completed frames against the wall
-clock with the event log read afterwards; if 1706 appears, `sg_yield` is short.
+The 47.9 ms for N=256 is modelled, not measured, and so is the 10 fps at the 0.05 s floor for the
+shipped N=512. The check for either is one count of completed frames against the wall clock with the
+event log read afterwards; if 1706 appears, `sg_yield` is short of the display task's work.
 
 ## The cost model
 

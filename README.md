@@ -8,7 +8,7 @@ Lua, and the firmware's own graph object draws the trace. Touch the front panel 
 
 The DMM6500 is a bench multimeter, not a spectrum analyser. It does have a 1 MS/s digitizer, a
 400 MHz processor and a touchscreen, and that turns out to be enough for a usable instrument at
-around 20 frames a second.
+around 10 frames a second at 195 Hz resolution.
 
 ## What it does
 
