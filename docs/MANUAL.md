@@ -16,7 +16,7 @@ Leave with **End App**. That frees every screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 21.1 kHz tone at 4.5 V with its second harmonic at 42.2 kHz, 0 to 50 kHz span, Hann window](manual-spectrum.png)
+![The spectrum screen: two tones at 21.1 and 42.2 kHz, 4.5 and 4.0 V, over a 0 to 50 kHz span with the Hann window](manual-spectrum.png)
 
 The trace runs +20 to −120 dBV against frequency.
 
@@ -32,14 +32,14 @@ Six peaks sit below the trace in two columns, strongest first, each as frequency
 1  21.100 kHz   4.5122 V   13.1 dBV
 ```
 
-In the capture above, peak 1 is the generator's fundamental and peak 2 its second harmonic, 1.0 dB
-down. Peaks 3 to 6 are noise, 70 dB below the tones.
+In the capture above, peak 2 sits at exactly twice peak 1's frequency and 1.0 dB below it. Peaks 3 to
+6 are noise, about 74 dB down.
 
 **Options** opens the settings form. **End App** exits.
 
 ## Options
 
-![The options form: five fields in two columns](manual-options.png)
+![The options form: Start Freq, Stop Freq and Input Range in the left column, Window and Kaiser Beta in the right, with the readback line beneath](manual-options.png)
 
 Touch a field, set it, then **Apply**. **Cancel** discards.
 
