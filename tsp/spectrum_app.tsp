@@ -190,8 +190,9 @@ function fftsa.apply()
   dmm.digitize.read(fftsa.cap)
   fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
   fftsa.binhz = fftsa.fs / fftsa.n
-  -- Large transforms can legitimately take longer than the default stuck guard.
-  fftsa.busy_max = math.max(2.0, 2.0 * fftsa.n / 512)
+  -- Large transforms outrun the 2 s default, so the guard follows the measured frame
+  -- cost with margin rather than a multiple of the sample count.
+  fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   -- Again with the measured rate, which refines binhz and so the bin count the
   -- legend reports for a narrow span.
@@ -232,6 +233,21 @@ end
 -- so a guard held longer than fftsa.busy_max is broken and the break counted.
 fftsa.busy_since = nil
 fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged stuck
+
+-- Seconds one frame costs at a given sample count, from costs measured on the
+-- instrument on 2026-10-24 (docs/PERFORMANCE.md): 10.9 us a sample to acquire, 32.0
+-- to load and window, 3.593e-6 per butterfly-equivalent for the transform and its
+-- power, 3.7 us a sample for the peak search, and a fill now capped by sg_maxpts.
+-- Predicts 0.080 s at 512 against 81.8 ms measured, and 3.33 s at 32768.
+--
+-- busy_max exists to break a guard a host abort left set, and until it expires the
+-- app looks dead -- so it has to clear a legitimate frame and not much more. Scaling
+-- it as 2.0 * n/512 gave 128 s at 32768 against a real frame of 3.3.
+function fftsa.frame_estimate(n)
+  if n == nil or n < 2 then n = 512 end
+  local log2n = math.log(n) / 0.69314718055995
+  return n * 46.6e-6 + 3.593e-6 * n * log2n + 0.04
+end
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
 function fftsa.frame()
@@ -555,9 +571,9 @@ end
 function fftsa.build()
   fftsa.loading_build()
   fftsa.loading_front()
-  -- Keep the graph and its backing buffer bound for the whole app lifetime.
-  local maxn = fftsa.sample_counts[table.getn(fftsa.sample_counts)]
-  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, maxn / 2)
+  -- Keep the graph and its backing buffer bound for the whole app lifetime. One
+  -- fixed size serves every sample count, since the trace is capped at sg_maxpts.
+  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2)
   -- The button died with the screen fftsa.sg_build() just destroyed: clear the
   -- stale handle, do not delete it.
   fftsa.optbtn = nil

@@ -22,6 +22,13 @@ fftsa = fftsa or {}   -- the single global this app exposes
 fftsa.sg_nbins   = 256
 fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 
+-- Trace columns. The graph is 784 px wide, so plotting more bins than this asks the
+-- firmware to decimate by a rule we do not control and which can drop the bin a tone
+-- lives in. 256 is what the app has always drawn at the default 512 samples, and two
+-- points a column (min and max) is 512 writes whatever the sample count is.
+fftsa.sg_ncol    = 256
+fftsa.sg_maxpts  = 2 * 256
+
 -- Firmware handles, initialised only on the first load: opening the App again
 -- re-runs this body and `fftsa = fftsa or {}` keeps the table, so nil-ing a live
 -- handle here would strand the previous launch's objects. fftsa.sg_destroy()
@@ -198,20 +205,23 @@ end
 -- WRITABLE_FULL carries value, extra and timestamp per point: UNIT_VOLT holding dB
 -- numbers, extra UNIT_HERTZ. The caller must have detached the graph first
 -- (fftsa.sg_destroy() does).
-function fftsa.sg_make_buffer(nbins, capacity)
+function fftsa.sg_make_buffer(nbins)
   fftsa.sg_nbins = nbins
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
     fftsa.sg_buf = nil
   end
-  fftsa.sg_buf = buffer.make(math.max(nbins, capacity or nbins) + 16,
-                            buffer.STYLE_WRITABLE_FULL)
+  -- One size for every sample count, because sg_update() never writes more than
+  -- sg_maxpts. Nothing here has to grow when the count does.
+  fftsa.sg_buf = buffer.make(fftsa.sg_maxpts + 16, buffer.STYLE_WRITABLE_FULL)
   -- Not buffer.UNIT_DECIBEL: it panics the instrument during build.
   buffer.write.format(fftsa.sg_buf, buffer.UNIT_VOLT,  buffer.DIGITS_4_5,
                               buffer.UNIT_HERTZ, buffer.DIGITS_6_5)
   -- An empty buffer binds no trace, and later writes never draw. Seed here so
   -- the initial graph binding has data to attach.
-  for k = 1, nbins do
+  local nseed = nbins
+  if nseed > fftsa.sg_ncol then nseed = fftsa.sg_ncol end
+  for k = 1, nseed do
     fftsa.sg_write_point(fftsa.sg_buf, fftsa.sg_dbmin, (k - 1) * 1.0)
   end
   return fftsa.sg_buf
@@ -228,8 +238,12 @@ end
 -- configuration the naive floor refuses at most 3 points of 256 in one frame, and
 -- nothing at all in 514691 of 515052 -- worst at a measured 199999.99999999997 S/s,
 -- where 390.62499999999994 Hz bins put bins 64, 128 and 192 a hair under 25, 50 and
--- 75 label-seconds. So this is cheap insurance, and the bench symptom it was written
--- for is still unexplained: tools/test_tsp.lua carries the query that settles it.
+-- 75 label-seconds. Those figures, and the round-trip argument above, are N = 512.
+-- At 2048 and 16384 the round trip lands one ulp BELOW exact at 500 kS/s and 1 MS/s,
+-- and the naive floor would then refuse one point every frame rather than once --
+-- measured, bin 513 and bin 4097 respectively. So this is not merely cheap insurance
+-- at the larger counts, and the bench symptom it was written for is still
+-- unexplained: tools/test_tsp.lua carries the query that settles it.
 function fftsa.sg_split_t(t)
   local w = math.floor(t)
   local fr = t - w
@@ -262,10 +276,10 @@ end
 
 -- Build the screen once, at launch: graph, tick labels, peak table, legend. The
 -- frame loop only refills the buffer and updates text.
-function fftsa.sg_build(title, nbins, capacity)
+function fftsa.sg_build(title, nbins)
   fftsa.sg_destroy()
 
-  fftsa.sg_make_buffer(nbins, capacity)
+  fftsa.sg_make_buffer(nbins)
   local create = display.create
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
@@ -365,28 +379,79 @@ function fftsa.sg_update(nbins, binhz)
   local dbmax = fftsa.sg_dbmax
   local fscl  = fftsa.sg_fscale
   local split = fftsa.sg_split_t
+  local floor = math.floor
   local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
+  local npts = kmax - kmin + 1
+  local ncol = fftsa.sg_ncol
   buf.clear()
-  for k = kmin, kmax do
-    local v = pwr[k]
-    local db
-    -- nil (sparse power array) and anything at or below the floor plot at the
-    -- floor, so log10 is never handed a zero. The range tests are positives because
-    -- every comparison with a NaN is false, so `db < dbmin` would pass one through
-    -- to buffer.write.reading and a refused parameter is event 1131 again. No
-    -- reachable NaN was found, so that half is hardening.
-    if v == nil or v <= vfl then
-      db = dbmin
-    else
-      db = 10 * log10(v)
-      if not (db > dbmin) then db = dbmin
-      elseif not (db < dbmax) then db = dbmax end
+  if npts <= ncol then
+    -- One point per bin. The default span at 512 samples is about 250 points, so this
+    -- is the shipped path and it is unchanged.
+    for k = kmin, kmax do
+      local v = pwr[k]
+      local db
+      -- nil (sparse power array) and anything at or below the floor plot at the
+      -- floor, so log10 is never handed a zero. The range tests are positives because
+      -- every comparison with a NaN is false, so `db < dbmin` would pass one through
+      -- to buffer.write.reading and a refused parameter is event 1131 again. No
+      -- reachable NaN was found, so that half is hardening.
+      if v == nil or v <= vfl then
+        db = dbmin
+      else
+        db = 10 * log10(v)
+        if not (db > dbmin) then db = dbmin
+        elseif not (db < dbmax) then db = dbmax end
+      end
+      local f = (k - 1) * binhz
+      -- Scaled frequency into the seconds field, split so the fraction cannot reach
+      -- the 0.9999999 the firmware refuses with event 1131.
+      local w, fr = split(f / fscl)
+      wr(buf, db, f, w, fr)
     end
-    local f = (k - 1) * binhz
-    -- Scaled frequency into the seconds field, split so the fraction cannot reach
-    -- the 0.9999999 the firmware refuses with event 1131.
-    local w, fr = split(f / fscl)
-    wr(buf, db, f, w, fr)
+  else
+    -- More bins than columns. Writing them all costs 51.6 us a point for the firmware
+    -- to then decimate by its own rule, which can discard the bin a tone sits in. Take
+    -- the min and the max of each column instead: a narrow tone always reaches the
+    -- trace, and the floor still reads as a band rather than as its upper envelope,
+    -- which max alone would lift by about 6 dB at 64 bins a column.
+    local c
+    for c = 0, ncol - 1 do
+      local a = kmin + floor(c * npts / ncol)
+      local b = kmin + floor((c + 1) * npts / ncol) - 1
+      if b < a then b = a end
+      local lo, hi, hik = nil, nil, a
+      local k
+      for k = a, b do
+        local v = pwr[k]
+        if v == nil then v = 0 end
+        if lo == nil or v < lo then lo = v end
+        if hi == nil or v > hi then hi = v; hik = k end
+      end
+      -- The min carries the column's own start frequency and the max the frequency of
+      -- the bin that won it, so x never decreases and a peak lands where it really is.
+      -- When the winner is the first bin the two would share an x, and a duplicate
+      -- timestamp is not worth the risk, so the min is dropped for that column.
+      if hik > a then
+        local db = dbmin
+        if lo ~= nil and lo > vfl then
+          db = 10 * log10(lo)
+          if not (db > dbmin) then db = dbmin
+          elseif not (db < dbmax) then db = dbmax end
+        end
+        local fa = (a - 1) * binhz
+        local w, fr = split(fa / fscl)
+        wr(buf, db, fa, w, fr)
+      end
+      local db = dbmin
+      if hi ~= nil and hi > vfl then
+        db = 10 * log10(hi)
+        if not (db > dbmin) then db = dbmin
+        elseif not (db < dbmax) then db = dbmax end
+      end
+      local fh = (hik - 1) * binhz
+      local w, fr = split(fh / fscl)
+      wr(buf, db, fh, w, fr)
+    end
   end
   delay(fftsa.sg_yield)                      -- lets the display task paint the refill
 end

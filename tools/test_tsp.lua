@@ -1147,13 +1147,17 @@ end)())
 -- refused write, and math.floor() produces one when the scaled frequency lands a
 -- rounding error below an integer.
 --
--- How often: over every reachable configuration the naive floor refuses at most 3
--- points of 256 in one frame, and nothing at all in 514691 of 515052. The
--- 255-of-256 figure recorded with the fix came from a bin width of 999.9999999999,
--- which needs 512000 S/s -- 2.4 % off the commanded rate -- so it is outside the
--- reachable set, not at its edge. measure_fs's round trip 511/(511/fs) is exact or
--- lands above exact at every rate, never below, so the hazard cannot repeat every
--- frame for a stated reason.
+-- How often: at N = 512 the naive floor refuses at most 3 points of 256 in one frame,
+-- and nothing at all in 514691 of 515052. The 255-of-256 figure recorded with the fix
+-- came from a bin width of 999.9999999999, which needs 512000 S/s -- 2.4 % off the
+-- commanded rate -- so it is outside the reachable set at any count, not at its edge.
+--
+-- The round trip (n-1)/((n-1)/fs) is exact or above exact at N = 512, which is what
+-- the 'cannot repeat every frame' claim rested on. That claim does NOT generalise:
+-- at N = 2048 and N = 16384 the round trip lands one ulp BELOW exact at 500 kS/s and
+-- 1 MS/s, and the naive floor then refuses one point on EVERY frame -- bin 513 at
+-- 2048/1 MS/s, bin 4097 at 16384/1 MS/s. sg_split_t carries both, so there is no live
+-- defect, but the sweep below is scoped to 512 and does not see them.
 --
 -- The bench symptom is therefore still unexplained. This query, with the app
 -- running, settles whether a real frame goes near the limit -- counting in place,
@@ -1561,19 +1565,25 @@ check('all size transitions keep the original trace bound and plot without leaks
     if not fftsa.options_apply() then return false, fftsa.lasterr end
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
        or dmm.digitize.count ~= n or fftsa.cap.cap ~= n * 4
-       or fftsa.sg_buf.cap ~= 16384 / 2 + 16 or OBJ[graph0].buffer ~= graphbuf0
+       or fftsa.sg_buf.cap ~= fftsa.sg_maxpts + 16 or OBJ[graph0].buffer ~= graphbuf0
        or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
        or OBJ[graph0].adds ~= adds0 or OBJ[graph0].removes ~= removes0
        or live() ~= objects0 or livebufs() ~= buffers0
-       or fftsa.busy_max < 2 * n / 512
+       or fftsa.busy_max < 2.0
+       or fftsa.busy_max < 3.0 * fftsa.frame_estimate(n) - 1e-9
     then return false, 'wrong size or leaked resource at N=' .. n end
     if oldcap ~= fftsa.cap and oldcap.alive then
       return false, 'old buffer still alive at N=' .. n
     end
     fftsa.frame()
     local kmin, kmax = fftsa.sg_window_bins(n / 2, fftsa.binhz)
-    if fftsa.errrun ~= 0 or fftsa.sg_buf.n ~= kmax - kmin + 1 then
-      return false, 'frame failed at N=' .. n .. ': ' .. tostring(fftsa.lasterr)
+    local npts = kmax - kmin + 1
+    -- Below the column cap every bin is a point; above it, one or two a column.
+    local want, lim = npts, npts
+    if npts > fftsa.sg_ncol then want, lim = fftsa.sg_ncol, fftsa.sg_maxpts end
+    if fftsa.errrun ~= 0 or fftsa.sg_buf.n < want or fftsa.sg_buf.n > lim then
+      return false, string.format('frame at N=%d: %d points, wanted %d..%d (%s)',
+                                  n, fftsa.sg_buf.n, want, lim, tostring(fftsa.lasterr))
     end
     local bi, bv = fftsa.find_peaks(n / 2, 1)
     local dk = fftsa.peak_interp(bi[1], n / 2)
@@ -1751,6 +1761,121 @@ check('the legend bin count follows a resize in the same Apply', (function()
 end)())
 
 -- F13. Three constants that have to agree and nothing said so.
+-- ---------- the trace column cap ----------
+
+-- The graph is 784 px wide. Above the cap the firmware was being handed up to 16056
+-- points to throw away by a rule that can discard the bin a tone sits in.
+check('the trace never exceeds the column cap at any sample count', (function()
+  local worst, worstn = 0, 0
+  local i
+  for i = 1, table.getn(fftsa.sample_counts) do
+    display.setvalue(fftsa.opt_n, i)
+    if not fftsa.options_apply() then return false, fftsa.lasterr end
+    fftsa.frame()
+    if fftsa.sg_buf.n > worst then worst, worstn = fftsa.sg_buf.n, fftsa.sample_counts[i] end
+    if fftsa.sg_buf.n > fftsa.sg_maxpts then
+      return false, string.format('N=%d wrote %d > cap %d', fftsa.sample_counts[i],
+                                  fftsa.sg_buf.n, fftsa.sg_maxpts)
+    end
+    if fftsa.sg_buf.n > fftsa.sg_buf.cap then
+      return false, 'overran the buffer at N=' .. fftsa.sample_counts[i]
+    end
+  end
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  return true, string.format('worst %d points at N=%d, cap %d', worst, worstn,
+                             fftsa.sg_maxpts)
+end)())
+
+-- The default must be untouched: fewer bins in the span than columns, so every bin
+-- is still its own point and the shipped appearance does not change.
+check('the default sample count does not decimate at all', (function()
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  fftsa.frame()
+  local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, fftsa.binhz)
+  local npts = kmax - kmin + 1
+  return npts <= fftsa.sg_ncol and fftsa.sg_buf.n == npts,
+         string.format('%d bins in span, %d points written', npts, fftsa.sg_buf.n)
+end)())
+
+-- The point of max-per-column: a tone in any bin reaches the trace. Stride sampling
+-- would miss it, and so can the firmware's own decimation.
+check('a tone survives decimation whatever bin it lands in', (function()
+  display.setvalue(fftsa.opt_n, 6)                     -- 16384, 8192 bins
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local nb = fftsa.sg_nbins
+  local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
+  local pwr = fftsa.fft_pwr
+  local keep = {}
+  local j
+  for j = kmin, kmax do keep[j] = pwr[j]; pwr[j] = 1e-18 end
+  local tried, found, missed = 0, 0, -1
+  local off
+  for off = 0, 71 do                                   -- more than one column wide
+    local k = kmin + 97 + off
+    if k <= kmax then
+      pwr[k] = 1.0                                     -- a lone 1 V^2 tone
+      fftsa.sg_update(nb, fftsa.binhz)
+      pwr[k] = 1e-18
+      local want = (k - 1) * fftsa.binhz
+      local hit = false
+      local q
+      for q = 1, fftsa.sg_buf.n do
+        if fftsa.sg_buf.readings[q] > -10
+           and math.abs(fftsa.sg_buf.extra[q] - want) < 1e-6 then hit = true end
+      end
+      tried = tried + 1
+      if hit then found = found + 1 elseif missed < 0 then missed = k end
+    end
+  end
+  for j = kmin, kmax do pwr[j] = keep[j] end
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  return tried > 0 and found == tried,
+         string.format('%d of %d bin positions reached the trace, first miss at bin %d',
+                       found, tried, missed)
+end)())
+
+-- The floor reads as a band, not as its upper envelope: min and max both present.
+check('decimated columns carry a min as well as a max', (function()
+  display.setvalue(fftsa.opt_n, 6)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.frame()
+  local n = fftsa.sg_buf.n
+  local spread = 0
+  local q
+  for q = 2, n do
+    local d = fftsa.sg_buf.readings[q] - fftsa.sg_buf.readings[q-1]
+    if d > spread then spread = d end
+  end
+  local pts = n
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  return pts > fftsa.sg_ncol and pts <= fftsa.sg_maxpts,
+         string.format('%d points for %d columns, worst step %.1f dB', pts,
+                       fftsa.sg_ncol, spread)
+end)())
+
+-- Frequencies must never go backwards: the graph plots x from the timestamp field.
+check('a decimated refill writes no non-monotonic timestamp', (function()
+  local i
+  local worst = 0
+  NONMONO = 0
+  for i = 1, table.getn(fftsa.sample_counts) do
+    display.setvalue(fftsa.opt_n, i)
+    if not fftsa.options_apply() then return false, fftsa.lasterr end
+    fftsa.frame()
+    if fftsa.sg_buf.n > worst then worst = fftsa.sg_buf.n end
+  end
+  local bad = NONMONO
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  NONMONO = 0
+  return bad == 0, string.format('%d non-monotonic writes, worst refill %d points',
+                                 bad, worst)
+end)())
+
 check('sample_counts, sample_labels and opt_nf agree',
       table.getn(fftsa.sample_counts) == table.getn(fftsa.sample_labels)
         and fftsa.opt_nf == 6,

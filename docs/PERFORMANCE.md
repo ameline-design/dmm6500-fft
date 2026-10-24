@@ -11,10 +11,10 @@ about doing fewer operations, not cheaper ones.
 
 ## The displayed frame rate is quantised, and that is the whole story
 
-The app now offers 512 through 16,384 samples in Options, retaining 512 as the default.
-The measurements and models below describe the original small-record configurations, not benchmarks
-of the larger selectable sizes. Their memory use and update rates still need hardware validation.
-The Options acquisition-duration readout is `N / fs` only; it does not include processing or display.
+The app offers 512 through 16,384 samples in Options, retaining 512 as the default. Every size was
+measured on the instrument on 2026-10-24 -- see **Every selectable sample count, measured** below --
+so the caveat that once stood here about needing hardware validation is discharged. The Options
+acquisition-duration readout is `N / fs` only; it does not include processing or display.
 
 The rate the app achieves is not the rate the frame can sustain, and the gap is not small.
 
@@ -131,6 +131,63 @@ call, ~4 µs); it now does two table lookups and a multiply instead, six times a
 The 47.9 ms for N=256 is modelled, not measured, and so is the 10 fps at the 0.05 s floor for the
 shipped N=512. The check for either is one count of completed frames against the wall clock with the
 event log read afterwards; if 1706 appears, `sg_yield` is short of the display task's work.
+
+## Every selectable sample count, measured
+
+Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, a 12.5 kHz 1.000 V tone, graph
+784x292, frame timer parked so each figure is one synchronous call. Taken 2026-10-24.
+
+| N | Apply | frame | displayed | trace points | bin width |
+|---|---|---|---|---|---|
+| 512 | 0.105 s | 0.095 s | 10 fps | 255 | 195.31 Hz |
+| 1024 | 0.232 s | 0.161 s | 5 fps | 380 | 97.66 Hz |
+| 2048 | 0.393 s | 0.258 s | 3.3 fps | 441 | 48.83 Hz |
+| 4096 | 0.755 s | 0.456 s | 2 fps | 475 | 24.41 Hz |
+| 8192 | 1.488 s | 0.855 s | 1.1 fps | 496 | 12.21 Hz |
+| 16384 | 2.906 s | 1.681 s | 0.6 fps | 502 | 6.10 Hz |
+
+The 0.095 s frame at 512 against the 81.8 ms of the phase table above is the same configuration
+measured a different way, through `options_apply` rather than per phase.
+
+### Where a frame goes, per sample and per bin
+
+Each measured on its own, so the frame can be built from them for any count:
+
+| term | cost | scaling |
+|---|---|---|
+| `dmm.digitize.read` | **10.9 us a sample** | N; at 100 kS/s, 10 of those are the sampling itself |
+| `fftsa.fft_load` | **32.0 us a sample** | N; about 22 of it is `buf.readings[i]`, one C call per sample |
+| `fft_run` + `fft_power` | **3.59e-6 s per N*log2(N)** | 0.017 s at 512, 0.826 at 16384, 1.766 at 32768 |
+| `buffer.write.reading` | **51.6 us a point** | per trace point written |
+| max-scan over `fft_pwr` | **2.5 us a bin** | per bin examined by the column reduction |
+
+`fftsa.frame_estimate(n)` in `spectrum_app.tsp` is these numbers, and predicts 0.080 s at 512
+against 0.095 measured and 1.63 s at 16384 against 1.681. `busy_max` is three times it.
+
+**The column cap is why the larger counts are usable.** Writing every bin at 16384 would be 8191
+points at 51.6 us, about 0.42 s a frame -- a quarter of the whole frame -- for points the firmware
+then discards, 784 pixels being all it has. Reducing to 256 columns costs a 2.5 us scan per bin plus
+about 500 writes: 0.05 s.
+
+### Apply, and why it is the figure an operator notices
+
+Apply is `fft_init`, and `fft_init` is linear at **0.163 ms a sample** -- 2.667 s at 16384 measured
+directly, 5.333 s at 32768. The gain table is 61 cosines per N/2 and the Kaiser window is an `I0`
+series per N/2, and both are rebuilt whenever anything on the form changes. There is no `delay()`
+anywhere in it, so the loading screen is the only thing that keeps it from looking like a wedge.
+
+### Heap
+
+`gcinfo()` after a collect, with only `fft_core` loaded, so these are the transform's own tables:
+
+| N | 512 | 2048 | 8192 | 16384 | 32768 |
+|---|---|---|---|---|---|
+| heap in use | 565 KB | 657 KB | 1002 KB | 1459 KB | **2359 KB** |
+| its tables | ~60 KB | ~152 KB | ~497 KB | ~954 KB | ~1854 KB |
+
+Baseline is about 505 KB. **32768 completes and allocates 2.36 MB**, which is well inside what this
+instrument has been seen to give -- so heap is not what limits the sample count. Time is: a 3.3 s
+frame and a 5.3 s Apply are the reasons 32768 is not on the Options list.
 
 ## The cost model
 

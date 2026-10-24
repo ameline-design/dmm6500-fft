@@ -17,7 +17,9 @@ and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
   and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
 - **Plots** through `display.OBJ_GRAPH`, one call a frame rather than one a point, which brings axes,
-  grid, labels and auto-scaling with it.
+  grid, labels and auto-scaling with it. Above 256 bins in the span the trace is reduced to the
+  graph's 256 columns by the **minimum and maximum of each column**, so a narrow tone always reaches
+  it and the noise floor reads as a band.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Previews acquisition settings** in Options: sampling rate, bin spacing and record duration
@@ -31,7 +33,10 @@ content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, d
 
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
 6.10 Hz spacing and a 163.84 ms record. Acquisition duration is `N / fs`, not the full frame time;
-processing and display add overhead. Larger sizes will reslt in sluggish interface updates and reaction times.
+processing and display add overhead. Larger sizes cost update rate, and measurably so: the frame goes
+from 0.095 s at 512 samples to 1.681 s at 16,384, and Apply from 0.11 s to 2.91 s. The trace repaints
+about every 1.7 s at the top size and the glass is unresponsive for most of each frame, because the
+display task only runs while Lua is blocked. `docs/PERFORMANCE.md` has every size measured.
 
 ## Choosing a window
 

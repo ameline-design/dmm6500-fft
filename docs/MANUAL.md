@@ -8,7 +8,7 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: two tones at 21.1 and 42.2 kHz, 4.5 and 4.0 V, over a 0 to 50 kHz span with the Hann window](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.000 V tone at 0.0 dBV over a 10 Hz to 50 kHz span, 512 samples, Hann window, noise floor near -100 dBV](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, about 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
@@ -30,7 +30,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 
 ## Options
 
-![The options form: Start Freq, Stop Freq and Input Range in the left column, Window and Kaiser Beta in the right, with the readback line beneath](manual-options.png)
+![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath](manual-options.png)
 
 | Field | |
 |---|---|
@@ -64,11 +64,23 @@ between the first and last samples (which is `(N - 1) / fs`). Processing and dis
 Windowing spreads each tone across several bins, so bin spacing is not a guarantee of tone separation.
 
 Apply rebuilds the window and its tables behind the loading screen, and resizes the acquisition
-buffer if needed. The graph buffer is allocated for the largest count at startup and stays attached
-throughout size changes. At 512 samples Apply takes about a third of a second; larger sizes take longer.
-The larger sizes pass offline tests but still need on-instrument memory and speed validation.
-If Apply fails, an error appears beneath the spectrum and frames stay halted; reopen Options and
-apply a smaller count to retry.
+buffer if needed. The graph buffer is one fixed size for every sample count and stays attached
+throughout, because the trace is capped at the graph's width (see **How many points the trace
+carries** below).
+
+**Apply costs roughly 0.2 ms per sample**, measured on 2026-10-24 and linear in the count:
+
+| FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| Apply | 0.11 s | 0.23 s | 0.39 s | 0.76 s | 1.49 s | **2.91 s** |
+
+Most of it is the gain table and the window: both are rebuilt for the new size, and both are
+proportional to it. The loading screen is up for all of it.
+
+If Apply fails, the message appears beneath the spectrum. Frames stop only when the **sample count
+changed**, because a half-finished resize is the one case where the transform and the buffers can
+disagree; a failure at an unchanged count leaves the previous tables intact and the trace running.
+Reopen Options and apply again to retry.
 
 ## Windows
 
@@ -142,6 +154,41 @@ default span a 63 kHz tone appears at 37 kHz and an 84 kHz tone at 16 kHz. Two w
 from a tone: widen the span, and a real tone stays put while an alias moves; or change the signal and
 watch which peak follows.
 
+## How many points the trace carries
+
+The graph is 784 pixels wide, so a sample count above 512 gives more bins than there are columns to
+draw them in -- 8192 bins at 16384 samples. The app therefore reduces the trace to **256 columns**,
+and the reduction is not a stride: each column reports the **minimum and the maximum** of the bins
+that fall in it.
+
+Three consequences, and the first is the point of it:
+
+- **A narrow tone always reaches the trace.** Taking every nth bin would miss a tone that lands in a
+  skipped one. Measured over 72 consecutive bin positions at 16384 samples, max-per-column draws all
+  72; taking each column's first bin draws 2.
+- **The noise floor reads as a band, not a line**, because the minimum is drawn as well as the
+  maximum. Maximum alone would lift the apparent floor by about 6 dB at 64 bins a column, since the
+  largest of 64 noise samples sits well above their average.
+- **Below 256 points nothing is reduced.** The default 512 samples puts about 255 bins in a 10 Hz to
+  50 kHz span, so the default trace is every bin, exactly as it has always been.
+
+| FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|
+| bins in a 50 kHz span | 255 | 511 | 1023 | 2047 | 4095 | 8191 |
+| points drawn | 255 | 380 | 441 | 475 | 496 | 502 |
+
+![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
+and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
+as a band between about -100 and -118 dBV](manual-spectrum-16384.png)
+
+The band along the bottom is the per-column minimum and maximum. Compare the 512-sample shot at the
+top of this manual, where the same tone is a single 195 Hz-wide lump and the harmonics are lost in
+the floor.
+
+Reducing the trace does not reduce the **table**: `find_peaks` reads every bin at full resolution, so
+a reported frequency is never a column edge. It is also what makes the larger counts usable at all --
+writing 8191 points costs 51.6 us each, about 0.42 s a frame, against 0.03 s for 502.
+
 ## The peak table is more accurate than the trace
 
 A tone almost never lands on a bin centre, and reading the tallest bin pays for that twice: the
@@ -191,17 +238,21 @@ below the limit shows up:
 | Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | **390.6 Hz** |
 | Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | **585.9 Hz** |
 
-The limit is in **bins**, so it moves with the sample rate: at a 500 kHz span the bins are 1953 Hz
-and two of them is 3.9 kHz. A narrower window main lobe reaches closer to DC, which is the one thing
-Kaiser β=4 is better at than β=18.
+The limit is in **bins**, so it moves with both the sample rate and the sample count: at a 500 kHz
+span and 512 samples the bins are 1953 Hz and two of them is 3.9 kHz, while at 16384 samples and a
+50 kHz span they are 6.10 Hz and two of them is 12.2 Hz. A narrower window main lobe reaches closer
+to DC, which is the one thing Kaiser β=4 is better at than β=18.
 
 What you get either side of it, measured over a 1.000 V tone swept in 0.01-bin steps at four phases:
+
+The two boundaries below are **in bins**, and the Hz are the default 512 samples at 100 kS/s. At
+16384 samples the same 0.3 bins is 1.8 Hz rather than 58.6.
 
 | tone sits | the table |
 |---|---|
 | at or above the lowest reported bin | always reports it, within **0.11 bins and 0.19 dB** |
-| between about 60 Hz and that bin | usually empty; where it does report, within **0.28 bins and 1.7 dB** |
-| below about 60 Hz (0.3 bins) | never reports it |
+| between 0.3 bins and that bin | usually empty; where it does report, within **0.28 bins and 1.7 dB** |
+| below **0.3 bins** (58.6 Hz at 512 samples, 1.8 Hz at 16384) | never reports it |
 
 A peak the app cannot place is refused rather than guessed: the estimator saturates when the three
 bins around a candidate are not one tone centred there, and a candidate whose own estimate lands a
@@ -215,11 +266,21 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 - **Bin width is the sample rate divided by the selected sample count**, and the sample rate is
   100 kS/s for any span up to 50 kHz. At the default 512 samples bins are 195.3 Hz; at 16384 they are
   6.10 Hz. **Zooming in alone does not make them finer**; increase FFT Samples instead.
-- **A span wider than 50 kHz raises the rate** and coarsens the bins with it: 200 kS/s to 100 kHz
-  (390.6 Hz bins at 512 samples), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz). 500 kHz is the
-  highest tone the instrument can show.
-- **About 10 frames a second at 512 samples; larger records update more slowly.** The firmware's shortest timer period is 0.05 s and a tick arriving
-  mid-frame is dropped, so the rate is quantised to 20, 10, 6.67 and 5 fps.
+- **A span wider than 50 kHz raises the rate** and coarsens the bins with it. At 512 samples:
+  200 kS/s to 100 kHz (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz).
+  Divide all three by 32 at 16384 samples. 500 kHz is the highest tone the instrument can show.
+- **About 10 frames a second at 512 samples, and far slower above it.** The firmware's shortest
+  timer period is 0.05 s and a tick arriving mid-frame is dropped, so the displayed rate is
+  `1 / (0.05 * ceil(frame / 0.05))` -- a ladder of 20, 10, 6.67, 5 fps and on down, not just those
+  four. Measured frame times and the rates they give:
+
+  | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+  |---|---|---|---|---|---|---|
+  | frame | 0.095 s | 0.161 s | 0.258 s | 0.456 s | 0.855 s | 1.681 s |
+  | displayed | 10 fps | 5 fps | 3.3 fps | 2 fps | 1.1 fps | **0.6 fps** |
+
+  At 16384 the trace repaints about every 1.7 s, and the glass is unresponsive for most of it: the
+  display task only runs while Lua is blocked.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
 - **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin
@@ -232,7 +293,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 |---|---|
 | Trace pinned at the bottom | Range too high, or no signal. |
 | Peak flat-topped at +20 dBV | Over range. |
-| Peaks update but the trace is missing after changing FFT Samples | Install the rebuilt app that retains the original graph buffer through size changes, then End App and reopen it. |
+| Peaks update but the trace is missing | A frame failed inside the refill, leaving the trace unbound. Fixed in this build; on an older one, change the span or the sample count to force a rebind. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | Peak width changes as you tune | Expected. See above. |
