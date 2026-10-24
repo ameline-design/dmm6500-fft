@@ -36,9 +36,9 @@ fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 -- has a null one bin from the peak, which leaves the three-bin interpolation below
 -- ill-conditioned, so the peak readings would be wrong in a way the trace does not
 -- show.
--- Hamming was here and is out: it exited the app on the instrument on 2026-10-23,
--- with no offline reproduction and no mechanism found. Kaiser at beta 5 is the same
--- window to within a fraction of a dB if it is ever wanted back.
+-- No Hamming: it exited the app on the instrument, with no offline reproduction and
+-- no mechanism found, so it is not offered. Kaiser at beta 6 covers it to within a
+-- dB of sidelobe level and a fraction of a bin of main-lobe width.
 fftsa.win_names = {"Hann", "Blackman", "Blk-Harris", "Kaiser"}
 -- Index-parallel to fftsa.win_names, coefficients a0 - a1*cos + a2*cos2 - a3*cos3.
 -- Kaiser has no entry, which is how fftsa.win_build() tells it apart.
