@@ -13,19 +13,25 @@ and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
 
 ## What it does
 
-- **Digitizes** up to 1 MS/s, 512 samples a frame, into a reading buffer.
+- **Digitizes** up to 1 MS/s, with selectable 512 to 16,384 samples per frame (default 512).
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
-  and every twiddle factor are precomputed once. 256 bins.
+  and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
 - **Plots** through `display.OBJ_GRAPH`, one call a frame rather than one a point, which brings axes,
   grid, labels and auto-scaling with it.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
+- **Previews acquisition settings** in Options: sampling rate, bin spacing and record duration
+  update as the stop frequency or FFT sample count changes.
 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
-acquisition at 100 kS/s and 195.3 Hz bins, while widening past 50 kHz steps the rate up to 1 MS/s and
+acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps the rate up to 1 MS/s and
 coarsens the bins with it. There is no anti-alias filter, so a rate chosen below the signal's own
 content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, drew a 4.51 V peak at
 1.100 kHz. Raising the rate can only remove aliases; lowering it is what creates them.
+
+More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
+6.10 Hz spacing and a 163.84 ms record. Acquisition duration is `N / fs`, not the full frame time;
+processing and display add overhead. Larger sizes will reslt in sluggish interface updates and reaction times.
 
 ## Choosing a window
 
@@ -77,8 +83,9 @@ anywhere in the spectrum. `fft_init` measures how far the damage reaches (`fft_k
 and two for Blackman-Harris) and `find_peaks` will not report those bins, nor accept a candidate
 whose own interpolated centre lands a quarter bin below them -- that is leakage from a tone inside
 the region, and it used to be reported a whole bin and 16 dB out. The trace still draws those bins.
-`docs/MANUAL.md` states the resulting lowest reported frequency: **390.6 Hz** at the default span,
-585.9 Hz for the wide windows.
+`docs/MANUAL.md` states the resulting lowest reported frequency: **390.6 Hz** at the default span and
+512 samples, 585.9 Hz for the wide windows. Both are multiples of the bin width, so 16,384 samples put
+them at 12.2 and 18.3 Hz.
 
 Rectangular and Hamming are absent. Rectangular's transform nulls one bin from the peak, which leaves
 the three-bin estimate ill-conditioned; Kaiser β=6 covers Hamming to within a dB.

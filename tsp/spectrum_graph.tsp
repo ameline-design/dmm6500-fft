@@ -198,16 +198,22 @@ end
 -- WRITABLE_FULL carries value, extra and timestamp per point: UNIT_VOLT holding dB
 -- numbers, extra UNIT_HERTZ. The caller must have detached the graph first
 -- (fftsa.sg_destroy() does).
-function fftsa.sg_make_buffer(nbins)
+function fftsa.sg_make_buffer(nbins, capacity)
   fftsa.sg_nbins = nbins
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
     fftsa.sg_buf = nil
   end
-  fftsa.sg_buf = buffer.make(nbins + 16, buffer.STYLE_WRITABLE_FULL)
+  fftsa.sg_buf = buffer.make(math.max(nbins, capacity or nbins) + 16,
+                            buffer.STYLE_WRITABLE_FULL)
   -- Not buffer.UNIT_DECIBEL: it panics the instrument during build.
   buffer.write.format(fftsa.sg_buf, buffer.UNIT_VOLT,  buffer.DIGITS_4_5,
                               buffer.UNIT_HERTZ, buffer.DIGITS_6_5)
+  -- An empty buffer binds no trace, and later writes never draw. Seed here so
+  -- the initial graph binding has data to attach.
+  for k = 1, nbins do
+    fftsa.sg_write_point(fftsa.sg_buf, fftsa.sg_dbmin, (k - 1) * 1.0)
+  end
   return fftsa.sg_buf
 end
 
@@ -256,10 +262,10 @@ end
 
 -- Build the screen once, at launch: graph, tick labels, peak table, legend. The
 -- frame loop only refills the buffer and updates text.
-function fftsa.sg_build(title, nbins)
+function fftsa.sg_build(title, nbins, capacity)
   fftsa.sg_destroy()
 
-  fftsa.sg_make_buffer(nbins)
+  fftsa.sg_make_buffer(nbins, capacity)
   local create = display.create
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
@@ -273,13 +279,6 @@ function fftsa.sg_build(title, nbins)
   -- Creating a screen makes it active, so the cover goes back in front before the
   -- first child: otherwise the operator watches the screen assemble itself.
   fftsa.loading_front()
-
-  -- Fill the buffer before graph.add(): a trace added over an empty buffer binds
-  -- nothing and later writes never draw.
-  fftsa.sg_buf.clear()
-  for k = 1, nbins do
-    fftsa.sg_write_point(fftsa.sg_buf, fftsa.sg_dbmin, (k - 1) * 1.0)
-  end
 
   fftsa.sg_graph = create(fftsa.sg_scr, display.OBJ_GRAPH, fftsa.sg_gx, fftsa.sg_gy, fftsa.sg_gw, fftsa.sg_gh)
   -- X is ELEMENT_TIME (our scaled-frequency timestamps); Y is ELEMENT_DATA (dB).

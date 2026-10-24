@@ -56,7 +56,7 @@ MANIFEST = [
     # The repo versions by git tag (v1.1, v1.2, ...) and this field had never
     # moved from the initial '1'. Tracks the tag from here on, so the version in
     # MENU > Manage Apps identifies which tree is installed.
-    ('Version', '1.3'),
+    ('Version', '1.4'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was

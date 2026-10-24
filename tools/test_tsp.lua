@@ -123,6 +123,8 @@ function display.create(parent, kind, ...)
   if kind == display.OBJ_EDIT_NUMBER then OBJ[h].value = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].value = 1 end
   if kind == display.OBJ_TEXT then OBJ[h].text = a[3] end
+  if kind == display.OBJ_TEXT then OBJ[h].justify = a[6] end
+  if kind == display.OBJ_EDIT_OPTION then OBJ[h].help = a[4] end
   -- Creating a screen makes it the active one. Modelled because it is the whole
   -- reason the cover has to be raised again after every screen create.
   if kind == display.OBJ_SCREEN then display.active = h end
@@ -196,11 +198,15 @@ display.graph = {}
 -- detach and re-attach -- the thing that used to cost 43 ms a frame.
 function display.graph.add(g, ...)
   use(g, 'graph.add')
-  OBJ[g].traces = (OBJ[g].traces or 0) + 1
   OBJ[g].adds = (OBJ[g].adds or 0) + 1
+  -- Firmware binds nothing for an empty buffer, even if later frames fill it.
+  if arg[1].n == 0 then return end
+  OBJ[g].buffer = arg[1]
+  OBJ[g].traces = (OBJ[g].traces or 0) + 1
 end
 function display.graph.removeall(g)
   use(g, 'graph.removeall')
+  OBJ[g].buffer = nil
   OBJ[g].traces = 0
   OBJ[g].removes = (OBJ[g].removes or 0) + 1
 end
@@ -228,6 +234,9 @@ buffer = {
 function buffer.make(cap, style) return newbuf(cap) end
 function buffer.delete(b)
   if type(b) ~= 'table' or not b.alive then error('buffer.delete on a dead buffer', 0) end
+  for _, o in pairs(OBJ) do
+    if o.alive and o.buffer == b then error('deleting a buffer still bound to a graph', 0) end
+  end
   b.alive = false
 end
 function buffer.write.format(b, ...) if not b.alive then error('format on dead buffer', 0) end end
@@ -833,7 +842,7 @@ local ok, err = pcall(function() fftsa.start() end)
 check('start() succeeds', ok, tostring(err))
 local after1, bufs1 = live(), livebufs()
 check('start() created objects', after1 > 0, 'live=' .. after1 .. ' buffers=' .. bufs1)
-check('exactly one timer is live', live('timer') == 1)
+check('frame and preview timers are live', live('timer') == 2)
 check('exactly three screens are live', live('screen') == 3,
       'screens=' .. live('screen') .. ' (cover + spectrum + options)')
 check('the graph has exactly one trace bound', (function()
@@ -847,14 +856,14 @@ check('rebuilding leaks NO display objects', live() == after1,
       'live=' .. live() .. ' vs ' .. after1)
 check('rebuilding leaks NO buffers', livebufs() == bufs1,
       'buffers=' .. livebufs() .. ' vs ' .. bufs1)
-check('still exactly one timer after rebuild', live('timer') == 1,
+check('still exactly two timers after rebuild', live('timer') == 2,
       'timers=' .. live('timer'))
 check('still exactly three screens after rebuild', live('screen') == 3,
       'screens=' .. live('screen'))
 
 -- arm() must never stack timers (two would double the frame rate and flood)
 fftsa.arm(0.3); fftsa.arm(0.3); fftsa.arm(0.3)
-check('arm() three more times still leaves one timer', live('timer') == 1,
+check('arm() three more times still leaves two timers', live('timer') == 2,
       'timers=' .. live('timer'))
 
 -- frames run clean
@@ -1226,10 +1235,9 @@ check('no buffer fill anywhere in this suite went back in time', NONMONO == 0,
 
 -- the options round trip, including an inverted span
 print('\noptions form (real code)')
--- Two columns, five fields, three rows. The pitch is clamped so the last box clears
--- the button row; a sixth field has to still fit, which is what the clamp is for.
+-- Two columns, six fields, three rows.
 local nrows, pitch, top = fftsa.opt_layout()
-check('five fields lay out as three rows in two columns', nrows == 3,
+check('six fields lay out as three rows in two columns', nrows == 3,
       'nrows=' .. nrows)
 check('the last box ends above the button row',
       top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h
@@ -1244,11 +1252,15 @@ check('the readback line clears the last box and the buttons',
                              + fftsa.opt_edit_h
         and fftsa.opt_info_y < fftsa.opt_btn_y,
       'info_y=' .. fftsa.opt_info_y)
+check('the readout is centered and five pixels lower', (function()
+  local o = obj_at(fftsa.opt_info)
+  return o.x == 400 and o.y == 323 and o.justify == display.JUST_CENTER
+end)())
 -- Nine fields, five rows: the first count where the clamp changes the outcome and
 -- not just the pitch. 274 px over four gaps is 68, and unclamped the last box would
--- end at 454 against a button row at 360. Six fields -- what this check used to use
--- -- still lay out as three rows at the same pitch and top as five, so it was a
--- second copy of 'the last box ends above the button row'.
+-- end at 454 against a button row at 360. Six fields -- now the live count -- still
+-- lay out as three rows at the same pitch and top as five, so a six-field case here
+-- would be a second copy of 'the readback line clears the last box'.
 check('a field count that overruns is clamped to fit above the button row',
       (function()
   local keep = fftsa.opt_nf
@@ -1266,14 +1278,16 @@ check('the first three fields are in column one at opt_x', (function()
   return obj_at(fftsa.opt_flo).x == x and obj_at(fftsa.opt_fhi).x == x
          and obj_at(fftsa.opt_rng).x == x
 end)(), 'x=' .. tostring(obj_at(fftsa.opt_flo).x))
-check('the window fields are in column two at opt_x_c2', (function()
+check('the window and sample fields are in column two at opt_x_c2', (function()
   local x = fftsa.opt_x_c2
   return obj_at(fftsa.opt_win).x == x and obj_at(fftsa.opt_beta).x == x
+         and obj_at(fftsa.opt_n).x == x
 end)(), 'x=' .. tostring(obj_at(fftsa.opt_win).x))
 check('each column runs top to bottom at the layout pitch', (function()
   return obj_at(fftsa.opt_fhi).y - obj_at(fftsa.opt_flo).y == pitch
          and obj_at(fftsa.opt_rng).y - obj_at(fftsa.opt_fhi).y == pitch
          and obj_at(fftsa.opt_beta).y - obj_at(fftsa.opt_win).y == pitch
+         and obj_at(fftsa.opt_n).y - obj_at(fftsa.opt_beta).y == pitch
 end)())
 check('the two columns start on the same row',
       obj_at(fftsa.opt_win).y == obj_at(fftsa.opt_flo).y)
@@ -1312,11 +1326,13 @@ check('a failed Apply says so, and a good one restores the legend', (function()
   fftsa.apply = function() error('apply-boom', 0) end
   fftsa.options_apply()
   local bad = obj_at(fftsa.sg_xunit).text
+  -- No halt asserted here: this failure does not resize, so frames must survive it.
+  -- 'a buffer allocation failure halts frames' covers the resize case.
   fftsa.apply = real
   fftsa.options_apply()
   local good = obj_at(fftsa.sg_xunit).text
   return string.find(tostring(bad), 'apply-boom', 1, true) ~= nil
-         and good == fftsa.sg_xunit_text(),
+         and not fftsa.halted and good == fftsa.sg_xunit_text(),
          tostring(bad) .. ' | then ' .. tostring(good)
 end)())
 -- The check above stubs fftsa.apply out, so it never reaches the real body. This
@@ -1443,6 +1459,177 @@ end)())
 display.setvalue(fftsa.opt_win, 1)
 fftsa.options_apply()
 check('the form returns to Hann', fftsa.win_name() == 'Hann')
+
+print('\nFFT sample selection and preview (real code)')
+check('sample-rate labels use SI prefixes', (function()
+  return fftsa.sample_rate_text(512) == '512 S/s'
+         and fftsa.sample_rate_text(100000) == '100 kS/s'
+         and fftsa.sample_rate_text(200000) == '200 kS/s'
+         and fftsa.sample_rate_text(500000) == '500 kS/s'
+         and fftsa.sample_rate_text(1000000) == '1 MS/s'
+end)())
+check('all count/rate combinations preview bin spacing and record duration', (function()
+  local count0, fs0, n0 = dmm.digitize.count, dmm.digitize.samplerate, fftsa.n
+  local objects0, buffers0 = live(), livebufs()
+  for i = 1, table.getn(fftsa.sample_counts) do
+    local n = fftsa.sample_counts[i]
+    display.setvalue(fftsa.opt_n, i)
+    for j = 1, table.getn(fftsa.rates) do
+      local fs = fftsa.rates[j]
+      display.setvalue(fftsa.opt_fhi, fs / 2)
+      fftsa.options_preview()
+      local text = obj_at(fftsa.opt_info).text
+      if string.find(text, 'fs ' .. fftsa.sample_rate_text(fs), 1, true) == nil
+         or string.find(text, string.format('bin %.2f Hz', fs / n), 1, true) == nil
+         or string.find(text, string.format('acq %.2f ms', 1000 * n / fs), 1, true) == nil
+      then return false, text end
+    end
+  end
+  return dmm.digitize.count == count0 and dmm.digitize.samplerate == fs0
+         and fftsa.n == n0 and live() == objects0 and livebufs() == buffers0
+end)())
+check('unchanged previews do not redraw the info line', (function()
+  local before = obj_at(fftsa.opt_info).sets
+  fftsa.options_preview()
+  return obj_at(fftsa.opt_info).sets == before
+end)())
+check('the preview uses the timestamp-measured rate for the active rate', (function()
+  local fs = fftsa.fs
+  fftsa.fs = fs - 0.25
+  display.setvalue(fftsa.opt_fhi, fftsa.fhi)
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_preview()
+  local text = obj_at(fftsa.opt_info).text
+  local expected = fftsa.opt_info_text(fftsa.fs, 512)
+  fftsa.fs = fs
+  return text == expected
+end)())
+check('preview and Apply share stop-frequency clamping', (function()
+  display.setvalue(fftsa.opt_fhi, 1)
+  fftsa.options_preview()
+  local low = obj_at(fftsa.opt_info).text
+  display.setvalue(fftsa.opt_fhi, fftsa.fhi_max * 2)
+  fftsa.options_preview()
+  return string.find(low, 'fs 100 kS/s', 1, true) ~= nil
+         and string.find(obj_at(fftsa.opt_info).text, 'fs 1 MS/s', 1, true) ~= nil
+end)())
+check('Cancel discards a pending sample-count edit', (function()
+  local n = fftsa.n
+  fftsa.options_cancel()
+  fftsa.options()
+  return fftsa.n == n and display.getvalue(fftsa.opt_n) == fftsa.sample_to_idx(n)
+end)())
+check('the preview timer is attached to the options screen and refreshes the readout',
+      (function()
+  for h, o in pairs(OBJ) do
+    if o.alive and o.type == display.OBJ_TIMER and o.parent == fftsa.optscr then
+      display.setvalue(fftsa.opt_n, '16384')
+      display.setvalue(fftsa.opt_fhi, 50000)
+      local callback = loadstring(display.events[h][display.EVENT_PRESS])
+      callback()
+      return string.find(obj_at(fftsa.opt_info).text, 'bin 6.10 Hz', 1, true) ~= nil
+             and string.find(obj_at(fftsa.opt_info).text, 'acq 163.84 ms', 1, true) ~= nil
+    end
+  end
+  return false
+end)())
+check('the graph mock rejects empty bindings until explicitly rebound', (function()
+  local b = buffer.make(16, buffer.STYLE_WRITABLE_FULL)
+  local g = display.create(fftsa.loadscr, display.OBJ_GRAPH, 0, 0, 100, 100)
+  display.graph.add(g, b, display.ELEMENT_DATA, b, display.ELEMENT_TIME)
+  fftsa.sg_write_point(b, -20, 1)
+  local rejected = OBJ[g].buffer == nil and (OBJ[g].traces or 0) == 0
+  display.graph.add(g, b, display.ELEMENT_DATA, b, display.ELEMENT_TIME)
+  local rebound = OBJ[g].buffer == b and OBJ[g].traces == 1
+  display.graph.removeall(g)
+  display.delete(g)
+  buffer.delete(b)
+  return rejected and rebound
+end)())
+check('all size transitions keep the original trace bound and plot without leaks',
+      (function()
+  display.setvalue(fftsa.opt_flo, 10)
+  local objects0, buffers0 = live(), livebufs()
+  local graph0, screen0 = fftsa.sg_graph, fftsa.sg_scr
+  local graphbuf0 = fftsa.sg_buf
+  local adds0, removes0 = OBJ[graph0].adds, OBJ[graph0].removes
+  local transitions = {1, 2, 1, 3, 1, 4, 1, 5, 1, 6, 1, 6, 5, 4, 3, 2, 1}
+  for _, i in ipairs(transitions) do
+    local oldcap = fftsa.cap
+    local n = fftsa.sample_counts[i]
+    display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])
+    if not fftsa.options_apply() then return false, fftsa.lasterr end
+    if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
+       or dmm.digitize.count ~= n or fftsa.cap.cap ~= n * 4
+       or fftsa.sg_buf.cap ~= 16384 / 2 + 16 or OBJ[graph0].buffer ~= graphbuf0
+       or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
+       or OBJ[graph0].adds ~= adds0 or OBJ[graph0].removes ~= removes0
+       or live() ~= objects0 or livebufs() ~= buffers0
+       or fftsa.busy_max < 2 * n / 512
+    then return false, 'wrong size or leaked resource at N=' .. n end
+    if oldcap ~= fftsa.cap and oldcap.alive then
+      return false, 'old buffer still alive at N=' .. n
+    end
+    fftsa.frame()
+    local kmin, kmax = fftsa.sg_window_bins(n / 2, fftsa.binhz)
+    if fftsa.errrun ~= 0 or fftsa.sg_buf.n ~= kmax - kmin + 1 then
+      return false, 'frame failed at N=' .. n .. ': ' .. tostring(fftsa.lasterr)
+    end
+    local bi, bv = fftsa.find_peaks(n / 2, 1)
+    local dk = fftsa.peak_interp(bi[1], n / 2)
+    if not near((bi[1] - 1 + dk) * fftsa.binhz, SIG.f, 0.1) then
+      return false, 'incorrect peak at N=' .. n
+    end
+  end
+  display.setvalue(fftsa.opt_n, 1)
+  local ok = fftsa.options_apply()
+  fftsa.frame()
+  return ok and fftsa.n == 512 and fftsa.sg_nbins == 256
+         and OBJ[graph0].buffer == fftsa.sg_buf and OBJ[graph0].traces == 1
+         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
+         and fftsa.sg_graph == graph0 and fftsa.sg_scr == screen0
+         and live() == objects0 and livebufs() == buffers0
+end)())
+check('unchanged sample counts reuse acquisition and graph buffers', (function()
+  local cap, graphbuf = fftsa.cap, fftsa.sg_buf
+  return fftsa.options_apply() and fftsa.cap == cap and fftsa.sg_buf == graphbuf
+end)())
+check('a buffer allocation failure halts frames and allows recovery', (function()
+  display.setvalue(fftsa.opt_n, 2)
+  local real = buffer.make
+  buffer.make = function() error('resize-boom', 0) end
+  local ok = fftsa.options_apply()
+  buffer.make = real
+  local halted = fftsa.halted
+  local message = obj_at(fftsa.sg_xunit).text
+  fftsa.frame()
+  display.setvalue(fftsa.opt_n, 1)
+  local recovered = fftsa.options_apply()
+  fftsa.frame()
+  return not ok and halted and string.find(message, 'resize-boom', 1, true) ~= nil
+         and recovered and not fftsa.halted and fftsa.errrun == 0
+         and fftsa.n == 512 and fftsa.sg_nbins == 256
+end)())
+check('sample changes never allocate or replace a graph buffer', (function()
+  local buffers0 = livebufs()
+  local graphbuf = fftsa.sg_buf
+  display.setvalue(fftsa.opt_n, 2)
+  local real, calls = buffer.make, 0
+  buffer.make = function(cap, style)
+    calls = calls + 1
+    if style == buffer.STYLE_WRITABLE_FULL then error('graph buffer replaced', 0) end
+    return real(cap, style)
+  end
+  local ok = fftsa.options_apply()
+  buffer.make = real
+  local allocations = calls
+  display.setvalue(fftsa.opt_n, 1)
+  local recovered = fftsa.options_apply()
+  fftsa.frame()
+  return ok and allocations == 1 and recovered and not fftsa.halted and fftsa.errrun == 0
+         and livebufs() == buffers0 and OBJ[fftsa.sg_graph].buffer == graphbuf
+         and fftsa.sg_buf == graphbuf
+end)())
 -- An inverted span must be repaired: a stop below the start describes no bins,
 -- and every frame then indexes past fft_pwr and dies on a nil comparison.
 display.setvalue(fftsa.opt_flo, 8000)
@@ -1542,6 +1729,7 @@ check('stop() frees every buffer it made', livebufs() == base_bufs,
 check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optscr == nil and fftsa.opt_flo == nil and fftsa.opt_fhi == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
+      and fftsa.opt_n == nil
       and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
       and fftsa.sg_xlab == nil and fftsa.sg_xlab_txt == nil)
 check('stop() twice is harmless', pcall(function() fftsa.stop() end))
@@ -1556,7 +1744,7 @@ print('\ninstalled-App relaunch (real code)')
 fftsa.flo, fftsa.fhi, fftsa.range = 0, 50000, 10
 fftsa.start()
 local live_one, bufs_one = live(), livebufs()
-check('first launch is live', live_one > 0 and live('timer') == 1)
+check('first launch is live', live_one > 0 and live('timer') == 2)
 -- Leave by HOME / another App: EVENT_ENDAPP never fires, nothing is torn down.
 for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
                     'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp'}) do
@@ -1569,7 +1757,7 @@ check('relaunching leaks NO display objects', live() == live_one,
       'live=' .. live() .. ' vs ' .. live_one)
 check('relaunching leaks NO buffers', livebufs() == bufs_one,
       'buffers=' .. livebufs() .. ' vs ' .. bufs_one)
-check('exactly one timer after a relaunch', live('timer') == 1, 'timers=' .. live('timer'))
+check('exactly two timers after a relaunch', live('timer') == 2, 'timers=' .. live('timer'))
 
 -- A refused deletion must be counted, not mistaken for success.
 local realdel = display.delete

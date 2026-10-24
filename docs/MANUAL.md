@@ -10,7 +10,8 @@ screen and buffer the app made.
 
 ![The spectrum screen: two tones at 21.1 and 42.2 kHz, 4.5 and 4.0 V, over a 0 to 50 kHz span with the Hann window](manual-spectrum.png)
 
-+20 to −120 dBV against frequency. 512 samples a frame, 256 bins, about 10 frames a second.
++20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, about 10 frames a second.
+Options offers larger records for finer bin spacing, at a slower update rate.
 
 **Two rows of numbers sit under the plot. Read the lower one.** The graph object's X axis is
 hardwired to time, so the app writes each bin's frequency into the timestamp and the firmware labels
@@ -38,15 +39,40 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
+| FFT Samples | 512 (default), 1024, 2048, 4096, 8192 or 16384. More samples give finer bins but take more time and memory. |
 
-The line under the fields reads back what the instrument settled on. The sample rate snaps to one the
-hardware can produce, so it is rarely the number you asked for.
+The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
+**bin spacing** (`fs / N`) and **acquisition
+duration** (`N / fs`, in milliseconds). It refreshes as you edit the stop frequency or sample count,
+without changing acquisition until you press Apply. Cancel discards the edits. On reopening Options,
+the readout uses the rate measured from the active capture's timestamps. For an unapplied change to
+the sampling rate, it uses the rate the app will request: 100, 200, 500 or 1000 kS/s.
 
-Apply rebuilds the window and its tables — about a third of a second, behind the loading screen.
+At 100 kS/s (stop frequency up to 50 kHz):
+
+| FFT samples | Bin spacing | Acquisition duration |
+|---:|---:|---:|
+| 512 | 195.31 Hz | 5.12 ms |
+| 1024 | 97.66 Hz | 10.24 ms |
+| 2048 | 48.83 Hz | 20.48 ms |
+| 4096 | 24.41 Hz | 40.96 ms |
+| 8192 | 12.21 Hz | 81.92 ms |
+| 16384 | 6.10 Hz | 163.84 ms |
+
+Acquisition duration is the record length, not the complete frame time or the timestamp difference
+between the first and last samples (which is `(N - 1) / fs`). Processing and display add overhead.
+Windowing spreads each tone across several bins, so bin spacing is not a guarantee of tone separation.
+
+Apply rebuilds the window and its tables behind the loading screen, and resizes the acquisition
+buffer if needed. The graph buffer is allocated for the largest count at startup and stays attached
+throughout size changes. At 512 samples Apply takes about a third of a second; larger sizes take longer.
+The larger sizes pass offline tests but still need on-instrument memory and speed validation.
+If Apply fails, an error appears beneath the spectrum and frames stay halted; reopen Options and
+apply a smaller count to retry.
 
 ## Windows
 
-A window tapers the 512 samples to zero at each end. Without one, the ends of the record form a step
+A window tapers the selected record to zero at each end. Without one, the ends of the record form a step
 that smears every tone across the whole spectrum. The shape of the taper sets what you can see, and
 every shape trades the same two things: a **narrow main lobe** resolves two close tones, **low
 sidelobes** reveal a weak tone beside a strong one. None gives both.
@@ -186,13 +212,13 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 
 ## Limits
 
-- **Bin width is the sample rate over 512**, and the sample rate is 100 kS/s for any span up to
-  50 kHz — so bins are 195.3 Hz and **zooming in does not make them finer**. Two tones closer than
-  195.3 Hz merge, and no setting separates them.
+- **Bin width is the sample rate divided by the selected sample count**, and the sample rate is
+  100 kS/s for any span up to 50 kHz. At the default 512 samples bins are 195.3 Hz; at 16384 they are
+  6.10 Hz. **Zooming in alone does not make them finer**; increase FFT Samples instead.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it: 200 kS/s to 100 kHz
-  (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz). 500 kHz is the
+  (390.6 Hz bins at 512 samples), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz). 500 kHz is the
   highest tone the instrument can show.
-- **About 10 frames a second.** The firmware's shortest timer period is 0.05 s and a tick arriving
+- **About 10 frames a second at 512 samples; larger records update more slowly.** The firmware's shortest timer period is 0.05 s and a tick arriving
   mid-frame is dropped, so the rate is quantised to 20, 10, 6.67 and 5 fps.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
@@ -206,6 +232,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 |---|---|
 | Trace pinned at the bottom | Range too high, or no signal. |
 | Peak flat-topped at +20 dBV | Over range. |
+| Peaks update but the trace is missing after changing FFT Samples | Install the rebuilt app that retains the original graph buffer through size changes, then End App and reopen it. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | Peak width changes as you tune | Expected. See above. |

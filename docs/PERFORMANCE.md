@@ -11,6 +11,11 @@ about doing fewer operations, not cheaper ones.
 
 ## The displayed frame rate is quantised, and that is the whole story
 
+The app now offers 512 through 16,384 samples in Options, retaining 512 as the default.
+The measurements and models below describe the original small-record configurations, not benchmarks
+of the larger selectable sizes. Their memory use and update rates still need hardware validation.
+The Options acquisition-duration readout is `N / fs` only; it does not include processing or display.
+
 The rate the app achieves is not the rate the frame can sustain, and the gap is not small.
 
 Two measured facts set it. **The display task shares the application CPU with the Lua interpreter and
