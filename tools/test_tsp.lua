@@ -236,13 +236,26 @@ function buffer.write.format(b, ...) if not b.alive then error('format on dead b
 -- what the real call does. A frame writes 255 points, so a dialog per point makes
 -- the app impossible to exit; that is why this is counted and asserted.
 BADFRAC = 0
+-- The firmware's stated limit, and the mock refuses ABOVE it. fftsa.sg_split_t
+-- carries AT it, one representable step conservative, so the gap between the two is
+-- deliberate -- and invisible from inside sg_update, which is why a check below
+-- asserts the relationship rather than leaving the mock to catch it.
+FRAC_MAX = 0.9999999
+-- "Data must be added in chronological order" -- buffer.write.reading, Details.
+-- Counted rather than raised: what the real call does with an out-of-order
+-- timestamp is not known, and a count is what a test can assert. Without this the
+-- mock stored secs + frac and never compared two of them, so a non-monotonic
+-- sequence would have passed the whole suite in silence.
+NONMONO = 0
 function buffer.write.reading(b, val, extra, secs, frac)
   if not b.alive then error('write to a DELETED buffer', 0) end
-  if frac == nil or frac < 0 or frac > 0.9999999 then BADFRAC = BADFRAC + 1 end
+  if frac == nil or frac < 0 or frac > FRAC_MAX then BADFRAC = BADFRAC + 1 end
   b.n = b.n + 1
   b.readings[b.n] = val
   b.extra[b.n] = extra
-  b.seconds[b.n] = secs + frac
+  local t = secs + frac
+  if b.n > 1 and t <= b.seconds[b.n - 1] then NONMONO = NONMONO + 1 end
+  b.seconds[b.n] = t
 end
 
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
@@ -1113,6 +1126,26 @@ check('and so does a bin width the hardware cannot reach', (function()
 end)())
 check('no frame anywhere in this suite wrote a refused fraction', BADFRAC == 0,
       'total refused: ' .. BADFRAC)
+-- The carry is one representable step tighter than the firmware's limit, which is
+-- the safe direction. Asserted because the mock's predicate is the firmware's, so
+-- it cannot see the guard loosened past it.
+check('the carry threshold sits at or below the fraction the firmware refuses',
+      (function()
+  local worst = 0
+  local i
+  for i = 1, 300 do
+    local w, fr = fftsa.sg_split_t(i * 7 - i * 1e-9)     -- a hair under integers
+    if fr > worst then worst = fr end
+    w, fr = fftsa.sg_split_t(i + FRAC_MAX)
+    if fr > worst then worst = fr end
+    w, fr = fftsa.sg_split_t(i + FRAC_MAX * (1 - 1e-9))
+    if fr > worst then worst = fr end
+  end
+  return worst <= FRAC_MAX, string.format('worst fraction emitted %.12f', worst)
+end)())
+-- Every timestamp this suite wrote was above the one before it, within its fill.
+check('no buffer fill anywhere in this suite went back in time', NONMONO == 0,
+      'out-of-order writes: ' .. NONMONO)
 
 -- the options round trip, including an inverted span
 print('\noptions form (real code)')
@@ -1134,14 +1167,23 @@ check('the readback line clears the last box and the buttons',
                              + fftsa.opt_edit_h
         and fftsa.opt_info_y < fftsa.opt_btn_y,
       'info_y=' .. fftsa.opt_info_y)
-check('even six fields would still clear the button row', (function()
+-- Nine fields, which is five rows: the first count where the clamp changes the
+-- outcome rather than just the pitch. 274 px of usable height over four gaps is 68,
+-- and at the unclamped 100 the last box would end at 454 against a button row at
+-- 360. Six fields -- the old version of this check -- still lay out as three rows at
+-- the same pitch and the same top as five, so it was a second copy of 'the last box
+-- ends above the button row' and never engaged the clamp it was named for.
+check('a field count that overruns is clamped to fit above the button row',
+      (function()
   local keep = fftsa.opt_nf
-  fftsa.opt_nf = 6
+  fftsa.opt_nf = 9
   local r, p, t = fftsa.opt_layout()
   fftsa.opt_nf = keep
   fftsa.opt_layout()
-  return r == 3 and t + (r - 1) * p + fftsa.opt_edit_dy + fftsa.opt_edit_h
-                      <= fftsa.opt_btn_y
+  local bottom = t + (r - 1) * p + fftsa.opt_edit_dy + fftsa.opt_edit_h
+  return r == 5 and p < fftsa.opt_dy and bottom <= fftsa.opt_btn_y,
+         string.format('%d rows, pitch %d of %d asked, bottom %d vs button %d',
+                       r, p, fftsa.opt_dy, bottom, fftsa.opt_btn_y)
 end)())
 check('the first three fields are in column one at opt_x', (function()
   local x = fftsa.opt_x
