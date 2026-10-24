@@ -623,7 +623,7 @@ fftsa.sg_fscale  = 1000    -- Hz per label-second; fftsa.sg_pick_fscale() steps 
 fftsa.sg_gx      = 8
 fftsa.sg_gy      = 0
 fftsa.sg_gw      = 784
-fftsa.sg_gh      = 272
+fftsa.sg_gh      = 292
 
 -- -120 dBV is the floor because the DMM7510's front end sits 12 to 14 dB below the
 -- DMM6500's, and at -100 its noise floor was off the bottom of the plot.
