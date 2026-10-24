@@ -29,7 +29,12 @@ which admits 20, 10, 6.67, 5 fps and nothing between. **Shaving a frame from 81 
 nothing; getting it from 51 to 49 doubles the rate.** Optimising this app means crossing a boundary,
 not reducing a number.
 
-### Measured, N=512, 256 bins, timer frozen, frames back to back
+### Measured, N=512, 256 bins, graph 784x272, timer frozen, frames back to back
+
+The graph is **292** tall as shipped (`sg_gh`, raised after these were taken), so the `sg_update` row
+and the total below are for 7.4 % less paint area than the app now does. It does not cross a
+frame-rate bucket -- 81.8 ms and anything up to 100 ms both display at 10 fps -- and no row other
+than `sg_update` depends on the geometry.
 
 | phase | ms |
 |---|---|
@@ -47,7 +52,8 @@ no host traffic, both consistent with the formula.
 
 The paint inside `sg_update` is proportional to graph **area**, not point count: 784x272 costs
 14.4 ms, 784x200 11.6, 784x136 8.7, 392x136 7.3. Point count does not move it -- 16 and 710 points
-measured the same.
+measured the same. The shipped 784x292 is above the top of that series and has not been measured;
+on the area fit it is about 15.5 ms.
 
 ### The N trade, and why 512 stays the default
 

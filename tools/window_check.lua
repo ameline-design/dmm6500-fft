@@ -10,6 +10,14 @@
 --   SL     peak sidelobe level, measured from the window's own transform
 --   w20    the -20 dB peak width in bins, on a bin centre and half a bin off --
 --          the two numbers behind "the peak at 25 kHz is narrower than at 24"
+--   skirt swing
+--          the level at the SECOND BIN FROM THE PEAK BIN, on a centre against half
+--          a bin off. On a centre that bin is 2.0 bins from the tone; half a bin
+--          off, the nearer of the two is 1.5 bins away -- so the figure is how far
+--          the window's transform rises between 2.0 and 1.5 bins. Hann's is set by
+--          how close its null at 2 bins comes to zero, which is the symmetric-window
+--          residual and scales with N; the other eight do not null there and theirs
+--          do not move with N.
 --
 -- Run from the repo root with Lua 5.0.2:
 --   ~/tmp/base/out/lua502/bin/lua tools/window_check.lua [N]
@@ -92,9 +100,18 @@ end
 -- window transform at its own nulls and the skirt vanishes; half a bin off it
 -- samples the sidelobe envelope instead. The gap between the two is why a tone that
 -- happens to land on a centre draws a visibly narrower peak than its neighbours.
+--
+-- The LARGER of the two bins two out, not bk+2. At d = 0.5 the tone sits between
+-- two bins that are equal to within 7e-12 relative, so the > in run_tone's argmax
+-- decides which is the peak -- and that moved the sample between 1.5 and 2.5 bins
+-- from the tone, 17 dB apart on a skirt. Whichever bin wins the tie, the larger of
+-- bk-2 and bk+2 is the one 1.5 bins out, so the sampled offset is determined.
 local function skirt2(d)
   local bk = run_tone(128 + d, 1.0, 0.3)
-  local pk, s = fftsa.fft_pwr[bk], fftsa.fft_pwr[bk + 2]
+  local pk = fftsa.fft_pwr[bk]
+  local s  = fftsa.fft_pwr[bk - 2]
+  local hi = fftsa.fft_pwr[bk + 2]
+  if s == nil or (hi ~= nil and hi > s) then s = hi end
   if s == nil or s <= 0 then return -200 end
   return 10 * log10(s / pk)
 end

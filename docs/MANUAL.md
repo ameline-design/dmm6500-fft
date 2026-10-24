@@ -53,15 +53,15 @@ sidelobes** reveal a weak tone beside a strong one. None gives both.
 
 | | peak sidelobe | scalloping loss | peak width | skirt swing |
 |---|---|---|---|---|
-| **Hann** (default) | −31.5 dB | −1.42 dB | 3–4 bins | 32.8 dB |
-| **Blackman** | −58.1 | −1.09 | 3–4 | 15.3 |
-| **Blk-Harris** | −92.0 | −0.82 | 4–5 | 8.2 |
-| **Kaiser** β=4 | −30.0 | −2.06 | 2–3 | 7.6 |
-| β=6 | −43.8 | −1.50 | 3–4 | 7.6 |
-| β=9 | −66.3 | −1.06 | 4–5 | 13.3 |
-| β=12 | −90.0 | −0.82 | 4–5 | 8.1 |
-| β=15 | −114.0 | −0.67 | 5–6 | 6.1 |
-| β=18 | −138.6 | −0.56 | 5–6 | 4.9 |
+| **Hann** (default) | −31.5 dB | −1.42 dB | 3–4 bins | 49.8 dB |
+| **Blackman** | −58.1 | −1.09 | 3–4 | 10.8 |
+| **Blk-Harris** | −92.0 | −0.82 | 4–5 | 7.2 |
+| **Kaiser** β=4 | −30.0 | −2.06 | 2–3 | 3.9 |
+| β=6 | −43.8 | −1.50 | 3–4 | 21.9 |
+| β=9 | −66.3 | −1.06 | 4–5 | 10.1 |
+| β=12 | −90.0 | −0.82 | 4–5 | 7.2 |
+| β=15 | −114.0 | −0.67 | 5–6 | 5.6 |
+| β=18 | −138.6 | −0.56 | 5–6 | 4.7 |
 
 **Hann** for general work: it resolves well and its peaks are narrow. **Blackman** or **Blk-Harris**
 to find a weak tone near a strong one. **Kaiser** to choose the sidelobe floor directly — β buys
@@ -82,16 +82,22 @@ on a bin centre therefore puts all its neighbours in those zeros: three bins car
 rest carry nothing. Move the tone half a bin and the neighbours land on the sidelobe envelope
 instead, which is far from zero, and the skirts appear.
 
-With Hann the level two bins out swings **32.8 dB** between the two cases. At 100 kS/s and N=512 the
-bins are 195.3 Hz apart, so 25.000 kHz is bin 128 exactly and draws the spike; 24.9 kHz is not and
-draws the skirts.
+With Hann the second bin from the peak swings **49.8 dB** between the two cases. At 100 kS/s and
+N=512 the bins are 195.3 Hz apart, so 25.000 kHz is bin 128 exactly and draws the spike; 24.9 kHz is
+not and draws the skirts.
 
 **The narrow peak is the truthful one.** The skirts are leakage, not signal. The amplitude in the
 peak table is right in both cases.
 
-If the changing width distracts, use **Kaiser at β=15 or β=18**. Their transforms do not null at
-whole-bin offsets, so the skirt stays put as the tone moves — 5 to 6 dB of swing instead of 33, for
-a peak about twice as wide.
+How large the swing gets depends on where the window's main lobe ends, and not in the direction you
+would guess from the peak-width column. It is the rise between 2.0 and 1.5 bins out, so it is biggest
+when 2 bins lands in a null or on the steep edge of the lobe — Hann nulls there exactly (49.8 dB),
+and Kaiser β=6's lobe ends at 2.16 bins (21.9 dB). It is smallest when 2 bins is still well inside a
+wide lobe (β=18, 4.7 dB) or already out on the sidelobe shelf of a narrow one (β=4, 3.9 dB).
+
+So if the changing width distracts, use **Kaiser at β=15 or β=18**: 5 dB of swing instead of 50, for
+a peak about twice as wide. β=4 is quiet for the opposite reason and buys −30 dB sidelobes with it,
+which is usually the worse trade.
 
 ## Aliasing: a peak can be real and still be at the wrong frequency
 

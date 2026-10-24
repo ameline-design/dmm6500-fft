@@ -31,22 +31,24 @@ content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, d
 
 | | peak sidelobe | scalloping loss | -20 dB peak width | skirt swing |
 |---|---|---|---|---|
-| **Hann** (default) | -31.5 dB | -1.42 dB | 3-4 bins | 32.8 dB |
-| **Blackman** | -58.1 | -1.09 | 3-4 | 15.3 |
-| **Blk-Harris** | -92.0 | -0.82 | 4-5 | 8.2 |
-| **Kaiser** β=4 | -30.0 | -2.06 | 2-3 | 7.6 |
-| β=6 | -43.8 | -1.50 | 3-4 | 7.6 |
-| β=9 | -66.3 | -1.06 | 4-5 | 13.3 |
-| β=12 | -90.0 | -0.82 | 4-5 | 8.1 |
-| β=15 | -114.0 | -0.67 | 5-6 | 6.1 |
-| β=18 | -138.6 | -0.56 | 5-6 | 4.9 |
+| **Hann** (default) | -31.5 dB | -1.42 dB | 3-4 bins | 49.8 dB |
+| **Blackman** | -58.1 | -1.09 | 3-4 | 10.8 |
+| **Blk-Harris** | -92.0 | -0.82 | 4-5 | 7.2 |
+| **Kaiser** β=4 | -30.0 | -2.06 | 2-3 | 3.9 |
+| β=6 | -43.8 | -1.50 | 3-4 | 21.9 |
+| β=9 | -66.3 | -1.06 | 4-5 | 10.1 |
+| β=12 | -90.0 | -0.82 | 4-5 | 7.2 |
+| β=15 | -114.0 | -0.67 | 5-6 | 5.6 |
+| β=18 | -138.6 | -0.56 | 5-6 | 4.7 |
 
 `tools/window_check.lua` measures every figure from the window the instrument builds. **Skirt swing**
-is the one that is not a textbook number: how much the level two bins out changes between a tone on a
-bin centre and one half a bin off. On a centre the DFT samples the window transform at its own nulls
-and the skirts vanish, so the peak draws narrower — Hann swings 33 dB, which is why a tone at exactly
-25 kHz looks sharper than the same tone at 24 kHz. Kaiser at β=15 or 18 cuts that to 5-6 dB and
-doubles the peak width. `docs/MANUAL.md` explains the effect for an operator.
+is the one that is not a textbook number: the level at the second bin from the peak, on a bin centre
+against half a bin off. On a centre that bin sits 2.0 bins from the tone; half a bin off, the nearer
+of the two sits 1.5 bins away — so the figure is how far the window's transform rises between those
+two offsets, and it is what makes a tone at exactly 25 kHz look sharper than the same tone at
+24 kHz. Hann swings 50 dB, because its transform nulls at 2 bins exactly. Kaiser at β=15 or 18 cuts
+that to 5 dB and doubles the peak width; β=6 is the other extreme at 22 dB, its main lobe ending at
+2.16 bins. `docs/MANUAL.md` explains the effect for an operator.
 
 **The peak estimate is exact for every window, in the middle of the spectrum.** `fft_init` samples
 the window's own transform into a 61-point table, inverts the offset-to-ratio curve from it, and reads
