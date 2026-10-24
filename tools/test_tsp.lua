@@ -1380,6 +1380,52 @@ fftsa.errcount = 0
 for _ = 1, 5 do fftsa.frame() end
 check('frames still run after an inverted span', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount .. ' lasterr=' .. tostring(fftsa.lasterr))
+-- Brute force over the values the fields can return, including ones the form cannot
+-- produce: every pair must leave flo < fhi and at least one bin to plot. Ported from
+-- tools/test_algorithms.py, which asserted this against a re-implementation that had
+-- diverged -- it still expected the start to reset to 0, which flomin = 10 made
+-- impossible, and passed. fftsa.apply is replaced by its span half, so the sweep
+-- costs no fft_init and the bin window still follows the repaired pair.
+check('no field pair leaves an empty span or an empty bin window', (function()
+  local V = {'nil', 0, -1, 1, 9, 10, 11, 1999, 2000, 2001, 8000, 49999, 50000,
+             499000, 499999, 500000, 500001, 1e9, 1e300}
+  local nv = table.getn(V)
+  local function setf(h, v)
+    if v == 'nil' then display.setvalue(h, nil) else display.setvalue(h, v) end
+  end
+  local realapply = fftsa.apply
+  fftsa.apply = function() fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi) end
+  local bad, least, leastat, n = nil, 1e9, '', 0
+  local a, b
+  for _, st in ipairs({{10, 50000}, {8000, 16000}, {499000, 500000}}) do
+    for a = 1, nv do
+      for b = 1, nv do
+        fftsa.flo, fftsa.fhi = st[1], st[2]
+        setf(fftsa.opt_flo, V[a])
+        setf(fftsa.opt_fhi, V[b])
+        fftsa.options_apply()
+        local k0, k1 = fftsa.sg_window_bins(fftsa.fft_m, fftsa.binhz)
+        local pts = k1 - k0 + 1
+        n = n + 1
+        if not (fftsa.flo < fftsa.fhi) then
+          bad = string.format('%s/%s from %g..%g gave %g..%g', tostring(V[a]),
+                              tostring(V[b]), st[1], st[2], fftsa.flo, fftsa.fhi)
+        end
+        if pts < least then
+          least = pts
+          leastat = string.format('%g..%g', fftsa.flo, fftsa.fhi)
+        end
+      end
+    end
+  end
+  fftsa.apply = realapply
+  setf(fftsa.opt_flo, 10)
+  setf(fftsa.opt_fhi, 50000)
+  fftsa.options_apply()
+  return bad == nil and least >= 1,
+         string.format('%d pairs, worst %d plotted point(s) at %s%s', n, least,
+                       leastat, bad and (' -- ' .. bad) or '')
+end)())
 
 -- The pool-exhaustion path is the one show_error exists for, and it used to blank
 -- the panel there: display.create returns nil, every child goes to a nil parent and
