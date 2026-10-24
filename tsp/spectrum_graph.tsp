@@ -196,10 +196,26 @@ function fftsa.sg_make_buffer(nbins)
   return fftsa.sg_buf
 end
 
+-- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
+-- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
+-- write with event 1131, which is a MODAL DIALOG on this instrument -- one per
+-- point, every frame, which leaves the app impossible to exit.
+--
+-- math.floor() leaves exactly that whenever the scaled frequency sits a rounding
+-- error below an integer, and it does as soon as the bin width is inexact, which is
+-- the normal case: fftsa.binhz comes from the MEASURED sample rate, not the
+-- commanded one. Carry a fraction that close to one into the whole part instead.
+function fftsa.sg_split_t(t)
+  local w = math.floor(t)
+  local fr = t - w
+  if fr >= 0.9999999 then return w + 1, 0 end
+  return w, fr
+end
+
 -- One point: value dB, extra Hz, timestamp the scaled frequency (the seconds trick).
 function fftsa.sg_write_point(buf, db, f)
-  local t = f / fftsa.sg_fscale
-  buffer.write.reading(buf, db, f, math.floor(t), t - math.floor(t))
+  local w, fr = fftsa.sg_split_t(f / fftsa.sg_fscale)
+  buffer.write.reading(buf, db, f, w, fr)
 end
 
 -- Our own X tick labels in real frequency units. The graph's cannot be relabelled
@@ -331,8 +347,8 @@ function fftsa.sg_update(nbins, binhz)
   local dbmin = fftsa.sg_dbmin
   local dbmax = fftsa.sg_dbmax
   local fscl  = fftsa.sg_fscale
+  local split = fftsa.sg_split_t
   local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
-  local subsecond = ((kmax - 1) * binhz / fscl) < 1
   buf.clear()
   for k = kmin, kmax do
     local v = pwr[k]
@@ -343,13 +359,10 @@ function fftsa.sg_update(nbins, binhz)
     if db < dbmin then db = dbmin end
     if db > dbmax then db = dbmax end
     local f = (k - 1) * binhz
-    local t = f / fscl                       -- scaled frequency into the seconds field
-    if subsecond then
-      wr(buf, db, f, 0, t)
-    else
-      local w = floor(t)
-      wr(buf, db, f, w, t - w)
-    end
+    -- Scaled frequency into the seconds field, split so the fraction cannot reach
+    -- the 0.9999999 the firmware refuses with event 1131.
+    local w, fr = split(f / fscl)
+    wr(buf, db, f, w, fr)
   end
   delay(fftsa.sg_yield)                      -- lets the display task paint the refill
 end

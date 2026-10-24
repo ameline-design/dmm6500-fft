@@ -24,6 +24,11 @@ fftsa.n       = 512
 fftsa.flomin  = 10          -- floor for the start frequency (Hz)
 fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
+-- Nyquist at the fixed 100 kS/s. The floor is not a hardware limit but a useful
+-- one: the span no longer changes the bin width, so 2 kHz is already down to about
+-- ten bins across the plot and anything narrower is a handful of points.
+fftsa.fhi_max = 50000
+fftsa.fhi_min = 2000
 fftsa.range   = 10          -- digitizer input range (V): 0.1 / 1 / 10
 fftsa.fs      = 100000      -- sample rate (picked from fftsa.fhi, then measured)
 fftsa.binhz   = 0           -- true bin width, from measured fs
@@ -55,8 +60,24 @@ if fftsa.handles_inited == nil then
   fftsa.handles_inited = true
 end
 
--- Exact, achievable sample rates only; the hardware cannot produce 102400 S/s.
-fftsa.rates = {1000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000}
+-- Sample rates, floored at 10 kS/s. A narrow span buys finer bins; the floor is
+-- there because 512 samples cost 512/fs of pure waiting -- 5 ms at 100 kS/s, 51 ms
+-- at 10 kS/s, 512 ms at 1 kS/s -- and a press is only dispatched while Lua is idle,
+-- so a frame long enough starves the touch handler and the Options button stops
+-- answering. At 10 kS/s the frame is about 129 ms against a 150 ms timer cadence,
+-- which leaves 21 ms of idle; the operator judged that enough.
+--
+-- 100 kS/s is the ceiling, so Nyquist puts the top of the range at 50 kHz.
+fftsa.rates = {10000, 20000, 50000, 100000}
+
+function fftsa.pick_fs(fhi)
+  local r = fftsa.rates
+  local n = table.getn(r)
+  for i = 1, n do
+    if r[i] / 2 >= fhi then return r[i] end
+  end
+  return r[n]
+end
 
 fftsa.ranges       = {0.1, 1, 10}
 fftsa.range_labels = {"0.1 V", "1 V", "10 V"}
@@ -89,15 +110,6 @@ end
 function fftsa.idx_to_range(v)
   local i = fftsa.opt_index(v, fftsa.range_labels, fftsa.range_to_idx(fftsa.range))
   return fftsa.ranges[i]
-end
-
-function fftsa.pick_fs(fhi)
-  local r = fftsa.rates
-  local n = table.getn(r)
-  for i = 1, n do
-    if r[i] / 2 >= fhi then return r[i] end
-  end
-  return r[n]
 end
 
 function fftsa.measure_fs(buf)
@@ -290,11 +302,11 @@ function fftsa.build_options()
   local x1, y1 = nextpos()
   fftsa.opt_flo = create(fftsa.optscr, display.OBJ_EDIT_NUMBER, x1, y1,
                        "Start Freq", "low edge",
-                       display.NFORMAT_PREFIX, fftsa.flo, fftsa.flomin, 499000, "Hz")
+                       display.NFORMAT_PREFIX, fftsa.flo, fftsa.flomin, fftsa.fhi_max - 1000, "Hz")
   local x2, y2 = nextpos()
   fftsa.opt_fhi = create(fftsa.optscr, display.OBJ_EDIT_NUMBER, x2, y2,
-                       "Stop Freq", "sets sample rate",
-                       display.NFORMAT_PREFIX, fftsa.fhi, 500, 500000, "Hz")
+                       "Stop Freq", "display top",
+                       display.NFORMAT_PREFIX, fftsa.fhi, fftsa.fhi_min, fftsa.fhi_max, "Hz")
   local x3, y3 = nextpos()
   fftsa.opt_rng = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x3, y3,
                        "Input Range", "full-scale",
@@ -393,11 +405,17 @@ function fftsa.options_apply()
   local ri = display.getvalue(fftsa.opt_rng)
   local wi = display.getvalue(fftsa.opt_win)
   local bi = display.getvalue(fftsa.opt_beta)
-  -- Validate the span as a pair: a new stop below the surviving start would leave
-  -- flo > fhi, a window with no bins in it.
+  -- Clamp each end to what the fixed rate can show, then order the pair: a stop at
+  -- or below the start is a window with no bins in it. One repair is enough and
+  -- provably so -- the stop lands in fhi_min..fhi_max and fhi_min is above flomin,
+  -- so dropping the start to its floor always leaves start < stop. Repairing the
+  -- start without re-testing the stop does NOT, which is why the order matters.
   local nlo, nhi = fftsa.flo, fftsa.fhi
   if hi ~= nil and hi > 0 then nhi = hi end
-  if lo ~= nil and lo >= fftsa.flomin then nlo = lo end
+  if lo ~= nil and lo >= 0 then nlo = lo end
+  if nhi > fftsa.fhi_max then nhi = fftsa.fhi_max end
+  if nhi < fftsa.fhi_min then nhi = fftsa.fhi_min end
+  if nlo < fftsa.flomin then nlo = fftsa.flomin end
   if nlo >= nhi then nlo = fftsa.flomin end
   fftsa.flo, fftsa.fhi = nlo, nhi
   fftsa.range   = fftsa.idx_to_range(ri)

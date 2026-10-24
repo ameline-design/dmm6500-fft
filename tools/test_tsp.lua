@@ -229,8 +229,14 @@ function buffer.delete(b)
   b.alive = false
 end
 function buffer.write.format(b, ...) if not b.alive then error('format on dead buffer', 0) end end
+-- Fractional times the firmware would refuse. It posts event 1131 -- a MODAL
+-- DIALOG, once per call -- and RETURNS, so this counts rather than raises, which is
+-- what the real call does. A frame writes 255 points, so a dialog per point makes
+-- the app impossible to exit; that is why this is counted and asserted.
+BADFRAC = 0
 function buffer.write.reading(b, val, extra, secs, frac)
   if not b.alive then error('write to a DELETED buffer', 0) end
+  if frac == nil or frac < 0 or frac > 0.9999999 then BADFRAC = BADFRAC + 1 end
   b.n = b.n + 1
   b.readings[b.n] = val
   b.extra[b.n] = extra
@@ -592,11 +598,32 @@ check('idx_to_range tolerates 1-based', fftsa.idx_to_range(1) == 0.1)
 check('idx_to_range tolerates the label string', fftsa.idx_to_range('10 V') == 10)
 check('idx_to_range tolerates 0-based', fftsa.idx_to_range(0) == 0.1)
 check('idx_to_range clamps out-of-range', fftsa.idx_to_range(99) == 10)
-local nyq = true
-for _, f in ipairs({500, 5000, 25000, 50000, 250000, 500000}) do
-  if fftsa.pick_fs(f) / 2 < f then nyq = false end
+-- Over the range the Stop Freq field can actually produce. Above fhi_max the rate
+-- list deliberately cannot cover Nyquist -- 100 kS/s is the ceiling, so 50 kHz is
+-- the top the app offers, and options_apply clamps to it.
+local nyq, nyqf = true, 0
+for _, f in ipairs({2000, 5000, 10000, 25000, 49000, 50000}) do
+  if fftsa.pick_fs(f) / 2 < f then nyq = false; nyqf = f end
 end
-check('picked fs always covers Nyquist', nyq)
+check('picked fs covers Nyquist across the whole settable span', nyq,
+      'failed at ' .. nyqf)
+-- The floor is what keeps the panel responsive: 512 samples at 10 kS/s is 51 ms of
+-- pure waiting and the Options button stopped answering. Nothing may pick below it.
+local slowest = fftsa.rates[1]
+for i = 1, table.getn(fftsa.rates) do
+  if fftsa.rates[i] < slowest then slowest = fftsa.rates[i] end
+end
+check('no span can pick a rate below the 10 kS/s floor', slowest >= 10000,
+      'slowest = ' .. slowest)
+check('and the worst acquisition leaves the frame inside one timer cadence',
+      fftsa.n / slowest + 0.078 < 0.150,
+      string.format('%.1f ms acquire, %.1f ms frame at %d S/s',
+                    fftsa.n / slowest * 1000, (fftsa.n / slowest + 0.078) * 1000,
+                    slowest))
+check('the stop-frequency ceiling is the fastest rate Nyquist',
+      fftsa.fhi_max * 2 <= fftsa.rates[table.getn(fftsa.rates)],
+      string.format('fhi_max %g, fastest %g', fftsa.fhi_max,
+                    fftsa.rates[table.getn(fftsa.rates)]))
 
 -- ---------- lifecycle: the object-lifetime invariant ----------
 print('\nobject lifetime (real code, mocked display)')
@@ -858,6 +885,47 @@ check('options() creates nothing when the form handle is nil', (function()
   fftsa.optscr = keep
   return r == false and live() == before
 end)())
+
+-- A fractional time at or above 0.9999999 is refused with event 1131, a modal
+-- dialog per point per frame. math.floor() produces exactly that when the scaled
+-- frequency lands a rounding error below an integer, which it does as soon as the
+-- bin width is inexact -- and binhz comes from the MEASURED sample rate, so it
+-- normally is.
+print('\nfractional time (real code)')
+check('sg_split_t carries a near-integer into the whole part', (function()
+  local w, fr = fftsa.sg_split_t(9.9999999999)
+  return w == 10 and fr == 0, string.format('%d + %.12f', w, fr)
+end)())
+check('and the naive floor it replaces WOULD have been refused', (function()
+  local t = 9.9999999999
+  local naive = t - math.floor(t)
+  return naive > 0.9999999, string.format('naive frac %.12f', naive)
+end)())
+check('an exact value is left alone', (function()
+  local w, fr = fftsa.sg_split_t(12.25)
+  return w == 12 and fr == 0.25, string.format('%d + %g', w, fr)
+end)())
+check('a whole frame writes no fraction the firmware would refuse', (function()
+  local before = BADFRAC
+  local lo, hi, sc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = 0, 1e6, 1000
+  -- Every bin lands a hair under a whole label-second: the worst case there is.
+  for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-4 end
+  fftsa.sg_update(fftsa.sg_nbins, 999.9999999999)
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = lo, hi, sc
+  return BADFRAC == before, 'refused writes: ' .. (BADFRAC - before)
+end)())
+check('and that frame really did hit the hazard, so the check has teeth',
+      (function()
+  local bad = 0
+  for k = 1, fftsa.sg_nbins do
+    local t = ((k - 1) * 999.9999999999) / 1000
+    if t - math.floor(t) > 0.9999999 then bad = bad + 1 end
+  end
+  return bad > 0, bad .. ' of ' .. fftsa.sg_nbins .. ' points would have been refused'
+end)())
+check('no frame anywhere in this suite wrote a refused fraction', BADFRAC == 0,
+      'total refused: ' .. BADFRAC)
 
 -- the options round trip, including an inverted span
 print('\noptions form (real code)')
@@ -1265,16 +1333,20 @@ do
         math.abs(fftsa.fft_ksq - 1.53185687861183e-05) <= 1e-19,
         string.format('%.15e', fftsa.fft_ksq))
 
+  -- Regenerated by tools/make_refs.lua, which has its OWN window, its own
+  -- weighted-mean removal and its own O(N^2) DFT -- so these are not the app's
+  -- output pinned against the app. Bin 1 is 1.3e-29 rather than the 1.07e-04 the
+  -- arithmetic mean used to leave there: that zero IS the weighted mean working.
   local REF = {
-    [1]   = 1.070382007807e-04, [2]   = 2.658610401077e-05,
-    [3]   = 8.503625571883e-10, [20]  = 2.976892050182e-03,
-    [21]  = 6.663921764242e-02, [22]  = 6.319272858275e-02,
-    [23]  = 2.332822427426e-03, [63]  = 6.055496103585e-02,
-    [64]  = 4.638311666827e-01, [65]  = 2.105245157564e-01,
-    [66]  = 1.196709564878e-03, [128] = 2.277048179723e-11,
-    [142] = 1.179005997114e-03, [143] = 9.404682971391e-03,
-    [144] = 4.410196791709e-03, [200] = 4.102219056977e-14,
-    [255] = 2.881843089179e-15, [256] = 2.871639894807e-15,
+    [1]   = 1.300361262791e-29, [2]   = 1.021704940227e-09,
+    [3]   = 5.016625104977e-10, [20]  = 2.976886198854e-03,
+    [21]  = 6.663924261446e-02, [22]  = 6.319270653668e-02,
+    [23]  = 2.332826285037e-03, [63]  = 6.055496038219e-02,
+    [64]  = 4.638311684332e-01, [65]  = 2.105245146147e-01,
+    [66]  = 1.196709648263e-03, [128] = 2.275997790175e-11,
+    [142] = 1.179005939318e-03, [143] = 9.404683131771e-03,
+    [144] = 4.410196683798e-03, [200] = 4.112308028054e-14,
+    [255] = 2.881897498689e-15, [256] = 2.871653489567e-15,
   }
   -- Mixed bound, not relative: the sub-1e-14 bins are rounding noise and a pure
   -- relative test fails them at around 1e-7 while telling you nothing.
@@ -1289,7 +1361,7 @@ do
   local tot = 0
   for k = 1, 256 do tot = tot + fftsa.fft_pwr[k] end
   check('the total power matches the reference',
-        math.abs(tot - 8.868655233713e-01) <= 1e-9 * 8.868655233713e-01,
+        math.abs(tot - 8.867318993681e-01) <= 1e-9 * 8.867318993681e-01,
         string.format('%.12e', tot))
 
   -- Second case: a half-bin offset, which is what exercises peak_interp's
@@ -1313,8 +1385,12 @@ do
         string.format('%.6f Hz (d=%.9f)', (64 - 1 + d64) * 195.3125, d64))
   check('interpolation recovers 0.5 V within 0.5%',
         math.abs(a64 - 0.5) <= 0.005 * 0.5, string.format('%.9f V', a64))
-  check('the 1 V pedestal is removed to under 1e-5 power',
-        fftsa.fft_pwr[1] < 1e-5, string.format('%.4e', fftsa.fft_pwr[1]))
+  -- 1e-20, not 1e-5: the weighted mean zeroes windowed DC exactly, so the only
+  -- thing left in bin 1 is rounding. At 1e-5 this passed with the arithmetic mean
+  -- too, which left 6.5e-07 here and 1.07e-04 in the three-tone case -- enough to
+  -- bury a low-frequency tone. The tight bound is what makes it a real guard.
+  check('the pedestal is removed to rounding, not merely to small',
+        fftsa.fft_pwr[1] < 1e-20, string.format('%.4e', fftsa.fft_pwr[1]))
 
   fftsa.fft_init(512)
   dmm.digitize.count = 512

@@ -122,6 +122,7 @@ function fftsa.win_build(N)
   fftsa.fft_win = w
   local wsum = 0
   for i = 1, N do wsum = wsum + w[i] end
+  fftsa.fft_wsum = wsum           -- fftsa.fft_load() divides by it to weight the mean
   fftsa.fft_cg = wsum / N
   -- Volts would be 2/(N*cg); the untangle leaves every bin doubled, so 1/(N*cg),
   -- squared because the output is power.
@@ -311,6 +312,15 @@ end
 -- into the M complex points. Two passes, because the mean must be known before it
 -- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
 -- far more to read than a table entry. Returns the mean (DC level).
+--
+-- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w), and that is not a refinement. What
+-- has to be zero is the DC of the sequence the transform sees, which is
+-- sum(w*(x-m)) = sum(w*x) - m*sum(w); only the weighted mean makes it vanish. The
+-- arithmetic mean leaves a residue that scales with how far the record is from a
+-- whole number of cycles -- measured at -119 for a 203 Hz tone at 100 kS/s -- and it
+-- lands in bin 1 and its neighbours, where it can stand taller than the tone itself.
+-- A wide main lobe then leaves nothing in the lobe that is a local maximum, so
+-- fftsa.find_peaks() reports noise while the trace plainly draws the tone.
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
@@ -320,16 +330,16 @@ function fftsa.fft_load(buf)
   local win = fftsa.fft_win
   local rd  = buf.readings
 
-  local mean = 0
+  local wsx = 0
   for i = 1, N do
     local v = rd[i]
     -- A sparse buffer must not put nils into the arithmetic; fftsa.frame_body()
     -- rejects a short capture before it gets here.
     if v == nil then v = 0 end
     x[i] = v
-    mean = mean + v
+    wsx = wsx + v * win[i]
   end
-  mean = mean / N
+  local mean = wsx / fftsa.fft_wsum
 
   local i = 1
   for k = 1, M do
