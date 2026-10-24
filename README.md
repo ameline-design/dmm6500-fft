@@ -61,8 +61,10 @@ down to 5-6 dB, at the cost of a peak twice as wide.
 window's own transform is sampled at build time into a 61-point table, the offset-to-ratio curve is
 inverted from it, and the scalloping correction is read from the same table — so the estimator is
 derived from the window in use rather than fitted to one window and approximated for the rest.
-Measured worst case over 83 sub-bin offsets: **4.3e-6 bins of frequency error and 0.0035 dB of
-amplitude error**, for all nine settings. `tools/test_tsp.lua` pins both.
+Measured worst case over 83 sub-bin offsets: **4.0e-6 bins of frequency error and 0.0035 dB of
+amplitude error**, both at Kaiser β=4, across all nine settings. `tools/test_tsp.lua` pins both — at
+1e-5 bins and 0.008 dB, so a last-bit change does not fail — and proves the sweep failable by feeding
+one window's data to another window's tables.
 
 Rectangular is deliberately absent: its transform has a null one bin from the peak, which leaves
 three-bin interpolation ill-conditioned, so the peak readings would be wrong in a way the trace does
