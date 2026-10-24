@@ -955,6 +955,58 @@ check('a bin under the floor is plotted AT the floor, not dropped', (function()
   fftsa.fft_pwr = save
   return lo == fftsa.sg_dbmin, 'lowest written = ' .. tostring(lo)
 end)())
+-- Every comparison with a NaN is false, so a `db < dbmin` test lets one through to
+-- buffer.write.reading and a refused parameter is event 1131. Hardening: no
+-- reachable NaN was found, which is why this feeds one in by hand.
+check('a NaN power bin is plotted at the floor, not written as a NaN', (function()
+  local save = fftsa.fft_pwr
+  fftsa.fft_pwr = {}
+  for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-4 end
+  fftsa.fft_pwr[40] = 0 / 0
+  local ok = pcall(function() fftsa.sg_update(fftsa.sg_nbins, 195.3125) end)
+  local bad, seen = 0, nil
+  for i = 1, fftsa.sg_buf.n do
+    local v = fftsa.sg_buf.readings[i]
+    if not (v >= fftsa.sg_dbmin and v <= fftsa.sg_dbmax) then
+      bad = bad + 1
+      seen = v
+    end
+  end
+  fftsa.fft_pwr = save
+  -- The premise: 0/0 really is a NaN in this interpreter, so the input was one.
+  local nan = 0 / 0
+  return ok and bad == 0 and not (nan == nan),
+         string.format('%d written outside the axis (%s), 0/0 is %s', bad,
+                       tostring(seen), tostring(nan))
+end)())
+-- The dB column is floored at the plot's own floor: a bin at 1e-26 power reads
+-- -260 dBV against a -120 dBV axis, which is a number the trace cannot show.
+check('the peak table dB column is floored at the plot floor', (function()
+  local save = fftsa.fft_pwr
+  fftsa.fft_pwr = {}
+  for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-30 end
+  fftsa.fft_pwr[40] = 1e-26
+  fftsa.sg_show_peaks_now({40}, {1e-26}, 1, 195.3125)
+  local txt = obj_at(fftsa.sg_pk_d[1]).text
+  fftsa.fft_pwr = save
+  fftsa.sg_pk_last = nil                 -- let the next frame redraw the block
+  return txt == '-120.0 dBV', tostring(txt)
+end)())
+-- A legal but degenerate span: Start 1999 / Stop 2000 leaves one plotted point, so
+-- the trace is a dot and five peak rows read ---. The legend is the only place that
+-- can say why.
+check('a span with almost no bins in it says so in the legend', (function()
+  local lo, hi, bz = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.binhz
+  fftsa.binhz = 195.3125
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 1999, 2000
+  local narrow = fftsa.sg_xunit_text()
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 10, 50000
+  local wide = fftsa.sg_xunit_text()
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.binhz = lo, hi, bz
+  return string.find(narrow, '1 bin in this span', 1, true) ~= nil
+         and wide == 'X: kHz   Y: dBV',
+         narrow .. ' | wide: ' .. wide
+end)())
 check('the X axis is PINNED to the window, not auto-ranged', (function()
   local lo, hi = display.graph.scalex(fftsa.sg_graph)
   return near(lo, fftsa.sg_flo_hz / fftsa.sg_fscale, 1e-9)

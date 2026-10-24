@@ -176,8 +176,24 @@ end
 
 function fftsa.sg_xunit_text()
   local s = fftsa.sg_fscale
-  if s == 1000 then return "X: kHz   Y: dBV" end
-  return string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
+  local t = "X: kHz   Y: dBV"
+  if s ~= 1000 then
+    t = string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
+  end
+  -- A span narrower than a few bins is a legal pair that leaves nothing to look
+  -- at: Start 1999 / Stop 2000 is one plotted point at 195.3 Hz bins, so the trace
+  -- is a dot, five peak rows read --- and nothing else on the screen says why.
+  local b = fftsa.binhz
+  if b ~= nil and b > 0 then
+    local k0, k1 = fftsa.sg_window_bins(fftsa.sg_nbins, b)
+    local n = k1 - k0 + 1
+    if n < 3 then
+      local plural = "s"
+      if n == 1 then plural = "" end
+      t = t .. string.format("   %d bin%s in this span of %.0f Hz", n, plural, b)
+    end
+  end
+  return t
 end
 
 -- WRITABLE_FULL carries value, extra and timestamp per point: UNIT_VOLT holding dB
@@ -350,7 +366,6 @@ function fftsa.sg_update(nbins, binhz)
   local buf   = fftsa.sg_buf
   local pwr   = fftsa.fft_pwr
   local wr    = buffer.write.reading
-  local floor = math.floor
   local log10 = math.log10
   local vfl   = fftsa.sg_vfloor * fftsa.sg_vfloor   -- squared: the bins are power
   local dbmin = fftsa.sg_dbmin
@@ -363,10 +378,20 @@ function fftsa.sg_update(nbins, binhz)
     local v = pwr[k]
     local db
     -- nil (sparse power array) and anything at or below the floor plot at the
-    -- floor, so log10 is never handed a zero.
-    if v == nil or v <= vfl then db = dbmin else db = 10 * log10(v) end
-    if db < dbmin then db = dbmin end
-    if db > dbmax then db = dbmax end
+    -- floor, so log10 is never handed a zero. The range tests are written as
+    -- positives because every comparison with a NaN is false, so `db < dbmin`
+    -- would pass one straight through to buffer.write.reading and a refused
+    -- parameter is event 1131 again. No reachable NaN was found -- fft_ksq is
+    -- finite for every shipped window, pwr is a sum of squares, and an over-range
+    -- digitizer reading is 9.9e37, which clamps to +20 -- so this is hardening
+    -- rather than a fix for anything observed.
+    if v == nil or v <= vfl then
+      db = dbmin
+    else
+      db = 10 * log10(v)
+      if not (db > dbmin) then db = dbmin
+      elseif not (db < dbmax) then db = dbmax end
+    end
     local f = (k - 1) * binhz
     -- Scaled frequency into the seconds field, split so the fraction cannot reach
     -- the 0.9999999 the firmware refuses with event 1131.
@@ -476,9 +501,14 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
       if v >= 1 then vtxt = string.format("%.4f V", v)
       elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
       else vtxt = string.format("%.0f uV", v * 1e6) end
+      -- Floored at the plot's own floor: a bin at 1e-26 power reads -260 dBV
+      -- against a -120 dBV axis, which is a number the trace cannot show and the
+      -- column has about 93 px for before it reaches the Options button.
+      local dbv = 20 * log10(v)
+      if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
       settext(fftsa.sg_pk_f[p], ftxt)
       settext(fftsa.sg_pk_v[p], vtxt)
-      settext(fftsa.sg_pk_d[p], string.format("%.1f dBV", 20 * log10(v)))
+      settext(fftsa.sg_pk_d[p], string.format("%.1f dBV", dbv))
     else
       settext(fftsa.sg_pk_f[p], string.format("%d  ---", p))
       settext(fftsa.sg_pk_v[p], "")

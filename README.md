@@ -100,7 +100,7 @@ docs/pixel-drawing.pdf   why the graph object beat line objects and setpixel
 ## Building and installing
 
 ```sh
-python3 tools/package_tspa.py                           # -> FFT_Spectrum.tspa, gated
+python3 -I tools/package_tspa.py                        # -> FFT_Spectrum.tspa, gated
 ~/tmp/base/out/lua502/bin/lua tools/test_tsp.lua        # the offline suite
 ~/tmp/base/out/lua502/bin/lua tools/window_check.lua    # per-window accuracy
 python3 -I tools/lint_tsp.py tsp/*.tsp                  # Lua 5.0.2 syntax gate

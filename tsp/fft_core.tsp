@@ -26,7 +26,10 @@ fftsa.fft_twr    = nil    -- flattened butterfly twiddles, stage-major
 fftsa.fft_twi    = nil
 fftsa.fft_utr    = nil    -- untangle twiddles e^(-2*pi*i*k/N), k = 0..M-1
 fftsa.fft_uti    = nil
-fftsa.fft_cg     = 0.5    -- coherent gain (mean window sample)
+-- Coherent gain, the mean window sample. A window identity worth pinning, and
+-- tools/test_tsp.lua and tools/make_refs.lua do; no shipped module reads it. The
+-- amplitude calibration is fftsa.fft_ksq, from the window SUM.
+fftsa.fft_cg     = 0.5
 fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 
 -- ============================ analysis windows ============================
@@ -91,8 +94,8 @@ function fftsa.bessel_i0(x)
 end
 
 -- Build fftsa.fft_win and the amplitude scale from it. Symmetric, so only half the
--- samples are computed; the coherent gain is the mean window sample, and assuming
--- 0.5 for Hann rather than measuring it reads every amplitude 0.2 % low at N = 512.
+-- samples are computed. The scale comes from the window SUM, and assuming N/2 for
+-- Hann rather than summing it reads every amplitude 0.2 % low at N = 512.
 function fftsa.win_build(N)
   local cos, sqrt, floor, pi = math.cos, math.sqrt, math.floor, math.pi
   local w    = {}
