@@ -109,11 +109,39 @@ function display.create(parent, kind, ...)
     end
   end
   local h = newobj(kind, parent)
-  if kind == display.OBJ_EDIT_NUMBER then OBJ[h].value = a[5] end   -- default value
+  -- Which screen was on show at the moment of creation. The only evidence that
+  -- separates a screen built behind the loading cover from one built in view: both
+  -- look identical once finished.
+  OBJ[h].born_on = display.active
+  -- x and y, where the object has them: an OBJ_SCREEN's first argument is its title.
+  if type(a[1]) == 'number' and type(a[2]) == 'number' then
+    OBJ[h].x, OBJ[h].y = a[1], a[2]
+  end
+  -- OBJ_EDIT_NUMBER is (x, y, label, help, format, value, min, max, units), so the
+  -- seeded value is a[6]. a[5] is the format constant, and reading that as the value
+  -- made every field read back as 1 before any setvalue.
+  if kind == display.OBJ_EDIT_NUMBER then OBJ[h].value = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].value = 1 end
   if kind == display.OBJ_TEXT then OBJ[h].text = a[3] end
+  -- Creating a screen makes it the active one. Modelled because it is the whole
+  -- reason the cover has to be raised again after every screen create.
+  if kind == display.OBJ_SCREEN then display.active = h end
   return h
 end
+-- Objects parented to `scr` that were created while `scr` was the screen on show.
+-- Timers are excluded: one draws nothing, so creating it in view is invisible, and
+-- fftsa.arm() is called on a live screen by design.
+function born_in_view(scr)
+  local n = 0
+  for _, o in pairs(OBJ) do
+    if o.parent == scr and o.born_on == scr and o.type ~= display.OBJ_TIMER then
+      n = n + 1
+    end
+  end
+  return n
+end
+-- The mock's record for a handle: kind, parent, x, y, text, value, born_on.
+function obj_at(h) return OBJ[h] end
 function display.delete(h)
   local o = use(h, 'delete')
   o.alive = false
@@ -352,6 +380,159 @@ fftsa.fft_power()
 local dk0, iv0 = fftsa.peak_interp(26, nbi)
 check('an on-bin tone is left alone', math.abs(dk0) < 0.01 and near(iv0, 1.0, 0.005),
       string.format('d=%.5f v=%.5f', dk0, iv0))
+
+-- ---------- selectable windows ----------
+-- The operator's requirement is that the peak reading is accurate for EVERY window,
+-- so every window and every beta is swept here rather than Hann alone. Both halves
+-- are checked against the truth: the tone's frequency and its amplitude are known
+-- because the tone is synthesised, so neither is compared with the other.
+print('\nwindows: peak frequency and amplitude, every window (real code)')
+local WN = 512
+-- Offsets at j/83 of a bin, coprime with the 40-node interpolation grid. On the
+-- nodes every window reads zero error, which measures the grid rather than the code.
+local function win_sweep(centre)
+  local wf, wa = 0, 0
+  for j = -41, 41 do
+    local d  = j / 83
+    local bn = centre + d
+    local xs = {}
+    for i = 1, WN do xs[i] = math.cos(2 * math.pi * bn * (i - 1) / WN + 0.3) end
+    fftsa.fft_load({readings = xs, n = WN})
+    fftsa.fft_run()
+    fftsa.fft_power()
+    local bk, bv = 0, -1
+    for k = 2, fftsa.fft_m - 1 do
+      if fftsa.fft_pwr[k] > bv then bk, bv = k, fftsa.fft_pwr[k] end
+    end
+    local dd, vv = fftsa.peak_interp(bk, fftsa.fft_m)
+    if vv == nil then return 9, 9 end
+    local ef = math.abs((bk - 1 + dd) - bn)
+    local ea = math.abs(20 * math.log10(vv))      -- amplitude is 1.0, so dB vs 0
+    if ef > wf then wf = ef end
+    if ea > wa then wa = ea end
+  end
+  return wf, wa
+end
+-- Bounds from tools/window_check.lua, loosened by about 2x so a harmless last-bit
+-- change does not fail: measured worst cases are 4.3e-6 bins and 0.0035 dB.
+local WIN_DF, WIN_DA = 1e-5, 0.008
+local nwin = table.getn(fftsa.win_names)
+for wi = 1, nwin do
+  fftsa.win_i = wi
+  local nb_ = 1
+  if fftsa.win_cos[wi] == nil then nb_ = table.getn(fftsa.kbetas) end
+  for bi = 1, nb_ do
+    fftsa.kbeta_i = bi
+    fftsa.fft_init(WN)
+    local nm = fftsa.win_label()
+    local wf, wa = win_sweep(128)
+    check(nm .. ': peak frequency within 1e-5 bins', wf <= WIN_DF,
+          string.format('%.2e bins', wf))
+    check(nm .. ': peak amplitude within 0.008 dB', wa <= WIN_DA,
+          string.format('%.1e dB', wa))
+    -- r(d) must rise all the way to half a bin, or the offset is not invertible and
+    -- the window has no business being on the list.
+    check(nm .. ': r(d) is monotonic to half a bin', fftsa.win_mono)
+  end
+end
+-- The sweep must be able to fail, or the bounds above mean nothing.
+check('and the sweep has teeth -- a wrong window in the tables is caught', (function()
+  fftsa.win_i = 1
+  fftsa.fft_init(WN)
+  local hann = fftsa.fft_win
+  fftsa.win_i = 4                             -- build Blackman-Harris tables...
+  fftsa.fft_init(WN)
+  fftsa.fft_win = hann                        -- ...then feed them Hann data
+  local wf, wa = win_sweep(128)
+  return wf > WIN_DF and wa > WIN_DA, string.format('%.2e bins, %.2f dB', wf, wa)
+end)())
+
+print('\nwindow tables (real code)')
+fftsa.win_i = 1
+fftsa.fft_init(WN)
+check('G(0) is exactly 1, so an on-bin tone takes no correction',
+      math.abs(fftsa.win_gain(0) - 1) < 1e-12, string.format('%.15f', fftsa.win_gain(0)))
+check('G is even, so the correction does not depend on which side d is',
+      math.abs(fftsa.win_gain(0.37) - fftsa.win_gain(-0.37)) < 1e-15)
+-- Cross-check of the table against theory, which is the only independent evidence
+-- that win_tables() built the right thing: Hann's kernel is sin(pi*d)/(pi*d*(1-d^2))
+-- in closed form, and the table is a numerical transform of the window samples.
+--
+-- They do not agree exactly, and must not: the closed form is the PERIODIC Hann and
+-- this window is the symmetric one, which differ by O(1/N). So the test is that the
+-- gap is small and that it shrinks like 1/N -- an error in the table would not.
+-- 5.5e-4 at N=512 is the shipped case, and it is error the old closed-form kernel
+-- carried into every amplitude it reported.
+check('the Hann table is the Hann kernel, with the symmetric-window residual',
+      (function()
+  local function worst(n)
+    fftsa.win_i = 1
+    fftsa.fft_init(n)
+    local w = 0
+    for j = 1, 20 do
+      local d = j / 40
+      local want = math.sin(math.pi * d) / (math.pi * d * (1 - d * d))
+      local e = math.abs(fftsa.win_gain(d) - want)
+      if e > w then w = e end
+    end
+    return w
+  end
+  local a, b = worst(512), worst(2048)
+  fftsa.fft_init(WN)
+  return a < 1e-3 and math.abs(a / b - 4) < 0.4,
+         string.format('%.2e at N=512, %.2e at N=2048, ratio %.2f', a, b, a / b)
+end)())
+check('Hann scalloping loss is -1.42 dB half a bin off centre',
+      math.abs(20 * math.log10(fftsa.win_gain(0.5)) + 1.42) < 0.01,
+      string.format('%.3f dB', 20 * math.log10(fftsa.win_gain(0.5))))
+check('r(d) inverts to exactly half a bin at the top of the table',
+      math.abs(fftsa.win_offset(1e6) - 0.5) < 1e-12)
+check('a negative ratio gives a negative offset',
+      fftsa.win_offset(-0.1) == -fftsa.win_offset(0.1))
+check('with no table built, peak_interp says so instead of guessing', (function()
+  local keep = fftsa.fft_dhr
+  fftsa.fft_dhr = 0
+  local a, b = fftsa.peak_interp(64, 256)
+  fftsa.fft_dhr = keep
+  return a == 0 and b == nil
+end)())
+-- The coherent gain is what calibrates amplitude, so it has to follow the window.
+check('coherent gain follows the window', (function()
+  local seen = {}
+  for wi = 1, nwin do
+    fftsa.win_i = wi
+    fftsa.fft_init(WN)
+    local cg = string.format('%.9f', fftsa.fft_cg)
+    if seen[cg] then return false end
+    seen[cg] = true
+  end
+  return true
+end)())
+check('the gain grid reaches 1.5 bins, and says so if it ever stops', (function()
+  local reach = fftsa.fft_gn * fftsa.fft_ghx
+  local keep = fftsa.fft_gn
+  fftsa.fft_gn = keep - 1
+  local ok = pcall(function() fftsa.fft_init(256) end)
+  fftsa.fft_gn = keep
+  fftsa.fft_init(WN)
+  return reach >= 1.5 and not ok, string.format('reach %.3f bins', reach)
+end)())
+check('Kaiser beta 4 keeps its first null outside 1.5 bins', (function()
+  -- The null is at sqrt(1 + (beta/pi)^2) bins; inside 1.5 the interpolation would
+  -- read sidelobe rather than main lobe. This is why the beta list starts at 4.
+  local b = fftsa.kbetas[1]
+  return math.sqrt(1 + (b / math.pi) ^ 2) > 1.5, 'beta=' .. b
+end)())
+check('win_label names beta only where beta applies', (function()
+  fftsa.win_i = 1
+  local a = fftsa.win_label()
+  fftsa.win_i = nwin
+  local b = fftsa.win_label()
+  return string.find(a, 'b=') == nil and string.find(b, 'b=') ~= nil, a .. ' / ' .. b
+end)())
+fftsa.win_i, fftsa.kbeta_i = 1, 4
+fftsa.fft_init(512)
+dmm.digitize.count = 512
 SIG.f, SIG.amp = 12500, 1.0
 
 -- ---------- window clamping ----------
@@ -429,8 +610,8 @@ check('start() succeeds', ok, tostring(err))
 local after1, bufs1 = live(), livebufs()
 check('start() created objects', after1 > 0, 'live=' .. after1 .. ' buffers=' .. bufs1)
 check('exactly one timer is live', live('timer') == 1)
-check('exactly one screen pair is live', live('screen') == 2,
-      'screens=' .. live('screen') .. ' (spectrum + options)')
+check('exactly three screens are live', live('screen') == 3,
+      'screens=' .. live('screen') .. ' (cover + spectrum + options)')
 check('the graph has exactly one trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
@@ -444,7 +625,7 @@ check('rebuilding leaks NO buffers', livebufs() == bufs1,
       'buffers=' .. livebufs() .. ' vs ' .. bufs1)
 check('still exactly one timer after rebuild', live('timer') == 1,
       'timers=' .. live('timer'))
-check('still exactly two screens after rebuild', live('screen') == 2,
+check('still exactly three screens after rebuild', live('screen') == 3,
       'screens=' .. live('screen'))
 
 -- arm() must never stack timers (two would double the frame rate and flood)
@@ -548,6 +729,38 @@ check('the X ticks sit BELOW the graph rectangle, where a repaint cannot erase t
 check('label geometry is inside the usable object area',
       fftsa.sg_xlab_y <= 420 and fftsa.sg_px1 <= 799 and fftsa.sg_px0 >= 0,
       string.format('xlab %d px %d..%d', fftsa.sg_xlab_y, fftsa.sg_px0, fftsa.sg_px1))
+check('the tick row is derived from the graph, so moving the graph moves it',
+      fftsa.sg_xlab_y == fftsa.sg_gy + fftsa.sg_gh + 18,
+      string.format('xlab_y=%d gy=%d gh=%d', fftsa.sg_xlab_y, fftsa.sg_gy,
+                    fftsa.sg_gh))
+check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
+      'gy=' .. fftsa.sg_gy)
+check('the graph and the peak table both fit the panel',
+      fftsa.sg_gy + fftsa.sg_gh < fftsa.sg_pky
+      and fftsa.sg_pky + (fftsa.sg_npeak / 2 - 1) * fftsa.sg_pkdy < fftsa.sg_xunit_y,
+      string.format('graph %d..%d, peaks %d, legend %d', fftsa.sg_gy,
+                    fftsa.sg_gy + fftsa.sg_gh, fftsa.sg_pky, fftsa.sg_xunit_y))
+-- -120 dBV, not -100: the DMM7510's noise floor is 12 to 14 dB below the DMM6500's
+-- and at -100 it sat off the bottom of the plot.
+check('the dB floor reaches the DMM7510 noise floor', fftsa.sg_dbmin == -120,
+      'dbmin=' .. fftsa.sg_dbmin)
+check('the voltage floor is below the dB floor, so log10 never sees a zero',
+      20 * math.log10(fftsa.sg_vfloor) < fftsa.sg_dbmin,
+      string.format('vfloor %g = %.0f dBV', fftsa.sg_vfloor,
+                    20 * math.log10(fftsa.sg_vfloor)))
+check('a bin under the floor is plotted AT the floor, not dropped', (function()
+  local save = fftsa.fft_pwr
+  fftsa.fft_pwr = {}
+  for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-30 end   -- -300 dBV
+  fftsa.sg_update(fftsa.sg_nbins, 195.3125)
+  local lo = nil
+  for i = 1, fftsa.sg_buf.n do
+    local v = fftsa.sg_buf.readings[i]
+    if lo == nil or v < lo then lo = v end
+  end
+  fftsa.fft_pwr = save
+  return lo == fftsa.sg_dbmin, 'lowest written = ' .. tostring(lo)
+end)())
 check('the X axis is PINNED to the window, not auto-ranged', (function()
   local lo, hi = display.graph.scalex(fftsa.sg_graph)
   return near(lo, fftsa.sg_flo_hz / fftsa.sg_fscale, 1e-9)
@@ -600,16 +813,171 @@ check('a rejected short capture is not an error frame', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount)
 SIG.short = false
 
+-- Nothing may be assembled where the operator can watch it happen. The cover is
+-- what prevents it, and the mock's born_on is the only thing that can see it.
+print('\nloading cover (real code)')
+check('nothing on the spectrum screen was created while it was on show',
+      born_in_view(fftsa.sg_scr) == 0, 'in view=' .. born_in_view(fftsa.sg_scr))
+check('nothing on the options form was created while it was on show',
+      born_in_view(fftsa.optscr) == 0, 'in view=' .. born_in_view(fftsa.optscr))
+-- The cover is allocated once and outlives the build, because Apply raises it again
+-- for the 0.3 s the window tables take to rebuild. Creating and deleting one per
+-- raise would cycle two pool objects every time.
+check('the cover is still allocated after start()', fftsa.loadscr ~= nil)
+check('and the spectrum screen is the one on show', display.active == fftsa.sg_scr)
+check('raising the cover creates nothing', (function()
+  local before = live()
+  fftsa.loading_front()
+  local mid = live()
+  fftsa.show_main()
+  return mid == before and live() == before
+end)())
+-- The control: without the cover both screens build in full view. Without this the
+-- two checks above pass whether the cover works or not.
+check('and that check has teeth -- without the cover, both screens build in view',
+      (function()
+  local real = fftsa.loading_front
+  fftsa.loading_front = function() return false end
+  fftsa.stop()
+  fftsa.start()
+  local n = born_in_view(fftsa.sg_scr) + born_in_view(fftsa.optscr)
+  fftsa.loading_front = real
+  fftsa.stop()
+  fftsa.start()
+  return n > 0, 'in view=' .. n
+end)())
+check('and the cover is raised again after the rebuild',
+      born_in_view(fftsa.sg_scr) + born_in_view(fftsa.optscr) == 0)
+-- A press must only ever switch screens: with everything built at launch, a nil
+-- handle means the pool refused and building it now would fail the same way.
+check('options() creates nothing when the form handle is nil', (function()
+  local keep = fftsa.optscr
+  fftsa.optscr = nil
+  local before = live()
+  local r = fftsa.options()
+  fftsa.optscr = keep
+  return r == false and live() == before
+end)())
+
 -- the options round trip, including an inverted span
 print('\noptions form (real code)')
+-- Two columns, five fields, three rows. The pitch is clamped so the last box clears
+-- the button row; a sixth field has to still fit, which is what the clamp is for.
+local nrows, pitch, top = fftsa.opt_layout()
+check('five fields lay out as three rows in two columns', nrows == 3,
+      'nrows=' .. nrows)
+check('the last box ends above the button row',
+      top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h
+        <= fftsa.opt_btn_y,
+      string.format('bottom=%d btn=%d',
+                    top + (nrows - 1) * pitch + fftsa.opt_edit_dy
+                      + fftsa.opt_edit_h, fftsa.opt_btn_y))
+check('the pitch is at least the box height, so boxes cannot overlap',
+      pitch >= fftsa.opt_edit_h, 'pitch=' .. pitch .. ' box=' .. fftsa.opt_edit_h)
+check('the readback line clears the last box and the buttons',
+      fftsa.opt_info_y > top + (nrows - 1) * pitch + fftsa.opt_edit_dy
+                             + fftsa.opt_edit_h
+        and fftsa.opt_info_y < fftsa.opt_btn_y,
+      'info_y=' .. fftsa.opt_info_y)
+check('even six fields would still clear the button row', (function()
+  local keep = fftsa.opt_nf
+  fftsa.opt_nf = 6
+  local r, p, t = fftsa.opt_layout()
+  fftsa.opt_nf = keep
+  fftsa.opt_layout()
+  return r == 3 and t + (r - 1) * p + fftsa.opt_edit_dy + fftsa.opt_edit_h
+                      <= fftsa.opt_btn_y
+end)())
+check('the first three fields are in column one at opt_x', (function()
+  local x = fftsa.opt_x
+  return obj_at(fftsa.opt_flo).x == x and obj_at(fftsa.opt_fhi).x == x
+         and obj_at(fftsa.opt_rng).x == x
+end)(), 'x=' .. tostring(obj_at(fftsa.opt_flo).x))
+check('the window fields are in column two at opt_x_c2', (function()
+  local x = fftsa.opt_x_c2
+  return obj_at(fftsa.opt_win).x == x and obj_at(fftsa.opt_beta).x == x
+end)(), 'x=' .. tostring(obj_at(fftsa.opt_win).x))
+check('each column runs top to bottom at the layout pitch', (function()
+  return obj_at(fftsa.opt_fhi).y - obj_at(fftsa.opt_flo).y == pitch
+         and obj_at(fftsa.opt_rng).y - obj_at(fftsa.opt_fhi).y == pitch
+         and obj_at(fftsa.opt_beta).y - obj_at(fftsa.opt_win).y == pitch
+end)())
+check('the two columns start on the same row',
+      obj_at(fftsa.opt_win).y == obj_at(fftsa.opt_flo).y)
+check('the form carries no instruction text', (function()
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == fftsa.optscr and o.type == display.OBJ_TEXT
+       and o.text ~= nil and string.find(o.text, 'Touch') ~= nil then
+      return false
+    end
+  end
+  return true
+end)())
 fftsa.options()
 check('options() switches to the form', display.active == fftsa.optscr)
+check('the readback line names the window in use',
+      string.find(obj_at(fftsa.opt_info).text, fftsa.win_label(), 1, true) ~= nil,
+      obj_at(fftsa.opt_info).text)
+-- A round trip through the form with nothing touched must change nothing, and must
+-- allocate nothing: Apply raises the cover rather than creating one.
+check('Apply with nothing changed leaves every setting alone, and allocates nothing',
+      (function()
+  local flo, fhi, rng, wi = fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i
+  local before = live()
+  fftsa.options_apply()
+  return fftsa.flo == flo and fftsa.fhi == fhi and fftsa.range == rng
+         and fftsa.win_i == wi and live() == before
+         and display.active == fftsa.sg_scr,
+         string.format('%g..%g %gV %s, live %d -> %d', fftsa.flo, fftsa.fhi,
+                       fftsa.range, fftsa.win_label(), before, live())
+end)())
+fftsa.options()
 display.setvalue(fftsa.opt_flo, 8000)
 display.setvalue(fftsa.opt_fhi, 16000)
 fftsa.options_apply()
 check('a zoom applies', fftsa.flo == 8000 and fftsa.fhi == 16000,
       string.format('%g..%g', fftsa.flo, fftsa.fhi))
 check('apply returns to the spectrum', display.active == fftsa.sg_scr)
+-- The window fields have to reach the transform, not just the setting: every
+-- reading comes out of tables fft_init() rebuilds, so a field that set only
+-- fftsa.win_i would leave the previous window in the data it reports.
+check('the Window field reaches the transform', (function()
+  local cg0 = fftsa.fft_cg
+  display.setvalue(fftsa.opt_win, 3)                    -- Blackman
+  fftsa.options_apply()
+  return fftsa.win_name() == 'Blackman' and math.abs(fftsa.fft_cg - cg0) > 1e-6,
+         fftsa.win_label() .. ' cg=' .. string.format('%.6f', fftsa.fft_cg)
+end)())
+check('the Kaiser Beta field reaches the transform', (function()
+  display.setvalue(fftsa.opt_win, 5)
+  display.setvalue(fftsa.opt_beta, 1)
+  fftsa.options_apply()
+  local cg4 = fftsa.fft_cg
+  local b4  = fftsa.kbeta()
+  display.setvalue(fftsa.opt_beta, 6)
+  fftsa.options_apply()
+  return b4 == 4 and fftsa.kbeta() == 18 and math.abs(fftsa.fft_cg - cg4) > 1e-6,
+         string.format('beta %g cg %.6f -> beta %g cg %.6f', b4, cg4,
+                       fftsa.kbeta(), fftsa.fft_cg)
+end)())
+check('an out-of-range option index clamps instead of fetching a nil window',
+      (function()
+  display.setvalue(fftsa.opt_win, 99)
+  fftsa.options_apply()
+  local hi = fftsa.win_i
+  display.setvalue(fftsa.opt_win, 0)
+  fftsa.options_apply()
+  return hi == table.getn(fftsa.win_names) and fftsa.win_i == 1,
+         'hi=' .. hi .. ' lo=' .. fftsa.win_i
+end)())
+check('an option field read back as its own label still selects it', (function()
+  display.setvalue(fftsa.opt_win, 'Hamming')
+  fftsa.options_apply()
+  return fftsa.win_name() == 'Hamming', fftsa.win_label()
+end)())
+display.setvalue(fftsa.opt_win, 1)
+fftsa.options_apply()
+check('the form returns to Hann', fftsa.win_name() == 'Hann')
 -- An inverted span must be repaired: a stop below the start describes no bins,
 -- and every frame then indexes past fft_pwr and dies on a nil comparison.
 display.setvalue(fftsa.opt_flo, 8000)

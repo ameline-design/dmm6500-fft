@@ -12,10 +12,23 @@ the App runs the concatenated definitions and then fftsa.start().
 import base64
 import os
 import struct
+import subprocess
+import sys
+import tempfile
 import textwrap
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# The instrument's parser is Lua 5.0.2 and a parse error ANYWHERE in the archive
+# leaves fftsa nil, so every later call raises -286 on the panel. Host Lua accepts
+# plenty that it does not (hex literals, '#', string methods), so the only reliable
+# gate is 5.0.2's own compiler, run over the assembled script rather than the modules
+# one at a time -- concatenation is where an unterminated comment would swallow the
+# next module. Set LUA502_LUAC to move it; set FFT_NO_GATE=1 only to package
+# deliberately broken code for a test.
+LUA502_LUAC = os.environ.get('LUA502_LUAC',
+                             os.path.expanduser('~/tmp/base/out/lua502/bin/luac'))
 NAME = 'FFT_Spectrum'          # internal script name (loadscript <NAME>)
 ICON = 'fft_icon'              # icon name (matches -- $Icon and loadimage)
 OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
@@ -141,6 +154,37 @@ def png_icon(W=60, H=60):
     return png
 
 
+def gate(body):
+    """Refuse to write an archive the instrument could not parse. Fails closed: a
+    missing 5.0.2 compiler is a failure, not a skip, because the whole point is that
+    host Lua's verdict does not transfer."""
+    if os.environ.get('FFT_NO_GATE') == '1':
+        print('  GATE SKIPPED (FFT_NO_GATE=1)')
+        return
+    lint = subprocess.run([sys.executable, '-I', os.path.join(ROOT, 'tools/lint_tsp.py')]
+                          + [os.path.join(ROOT, m) for m in MODULES],
+                          capture_output=True, text=True)
+    if lint.returncode != 0:
+        raise SystemExit('lint_tsp.py rejected the modules:\n' + lint.stdout + lint.stderr)
+    if not os.path.exists(LUA502_LUAC):
+        raise SystemExit('no Lua 5.0.2 compiler at %s -- the host Lua on PATH is a '
+                         'later version and accepts code the instrument rejects. Set '
+                         'LUA502_LUAC.' % LUA502_LUAC)
+    fd, path = tempfile.mkstemp(suffix='.lua', prefix='tspa_gate_')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(body)
+        r = subprocess.run([LUA502_LUAC, '-p', path], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise SystemExit('Lua 5.0.2 cannot parse the assembled script:\n'
+                             + r.stdout + r.stderr)
+    finally:
+        os.unlink(path)
+        if os.path.exists('luac.out'):
+            os.unlink('luac.out')
+    print('  gate: lint clean, and Lua 5.0.2 parses the assembled script')
+
+
 def main():
     out = []
     out.append('loadscript ' + NAME)
@@ -158,6 +202,9 @@ def main():
     for ln in ENTRY.strip('\n').split('\n'):
         out.append(ln)
     out.append('endscript')
+
+    # Everything between the two wrapper lines is what the instrument compiles.
+    gate('\n'.join(out[1:-1]) + '\n')
 
     b64 = base64.b64encode(png_icon()).decode('ascii')
     out.append('loadimage %s %s' % (ICON, NAME))

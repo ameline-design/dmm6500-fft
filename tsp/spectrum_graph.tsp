@@ -51,11 +51,13 @@ fftsa.sg_fscale  = 1000    -- Hz per label-second; fftsa.sg_pick_fscale() steps 
 -- Geometry on the 800x480 panel, in object coordinates, which start below the
 -- 49-pixel title bar: a child at y=350 lands on panel row 399.
 fftsa.sg_gx      = 8
-fftsa.sg_gy      = 24
+fftsa.sg_gy      = 0
 fftsa.sg_gw      = 784
 fftsa.sg_gh      = 272
 
-fftsa.sg_dbmin   = -100
+-- -120 dBV is the floor because the DMM7510's front end sits 12 to 14 dB below the
+-- DMM6500's, and at -100 its noise floor was off the bottom of the plot.
+fftsa.sg_dbmin   = -120
 fftsa.sg_dbmax   = 20
 fftsa.sg_vfloor  = 1e-9
 
@@ -65,10 +67,11 @@ fftsa.sg_vfloor  = 1e-9
 fftsa.sg_px0     = 105     -- x of the X axis minimum
 fftsa.sg_px1     = 785     -- x of the X axis maximum
 
--- Our X ticks sit below the graph rectangle (x 8..792, y 24..296): an object inside
--- it is painted over by the per-frame repaint and never appears. Only X gets our
--- labels; the firmware's Y numbers are the dB values themselves, with a "V" suffix.
-fftsa.sg_xlab_y  = 314     -- baseline of our X ticks: below the graph, above the peaks
+-- Our X ticks sit below the graph rectangle: an object inside it is painted over by
+-- the per-frame repaint and never appears. Derived, so moving the graph moves them
+-- with it. Only X gets our labels; the firmware's Y numbers are the dB values
+-- themselves, with a "V" suffix.
+fftsa.sg_xlab_y  = fftsa.sg_gy + fftsa.sg_gh + 18
 -- Labels are JUST_LEFT, so a tick is nudged left by about half a label's width to
 -- sit centred on its gridline; the end ticks are pulled in to stay on the panel.
 fftsa.sg_xlab_hw = 26
@@ -216,8 +219,8 @@ function fftsa.sg_axis_build(create, small)
   fftsa.sg_lab_lo, fftsa.sg_lab_hi = nil, nil   -- force the first text update
 end
 
--- Build the screen once: graph, tick labels, peak table, legend. The frame loop
--- only refills the buffer and updates text.
+-- Build the screen once, at launch: graph, tick labels, peak table, legend. The
+-- frame loop only refills the buffer and updates text.
 function fftsa.sg_build(title, nbins)
   fftsa.sg_destroy()
 
@@ -225,7 +228,16 @@ function fftsa.sg_build(title, nbins)
   local create = display.create
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
-  display.changescreen(fftsa.sg_scr)
+  -- create() returns nil when the pool is exhausted, posting one event and not
+  -- raising, so without this every child is built against a nil parent and
+  -- fftsa.start()'s pcall reports success.
+  if fftsa.sg_scr == nil then
+    error("display object pool exhausted building the spectrum screen -- power "
+          .. "cycle the instrument.", 0)
+  end
+  -- Creating a screen makes it active, so the cover goes back in front before the
+  -- first child: otherwise the operator watches the screen assemble itself.
+  fftsa.loading_front()
 
   -- Fill the buffer before graph.add(): a trace added over an empty buffer binds
   -- nothing and later writes never draw.

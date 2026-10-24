@@ -70,14 +70,18 @@ on the paint, N=512 reaches ~48 ms *with zero fill* -- it cannot comfortably cro
 What follows is therefore the record of an option, not a plan.
 
 It costs **resolution, not accuracy.** Bin width goes 195.3 -> 390.6 Hz, so tones closer than ~391 Hz
-merge. An isolated peak barely moves, because the three-bin interpolation absorbs the coarser grid --
-measured offline under Lua 5.0.2 on a 12345 Hz 0.5 V tone:
+merge. An isolated peak does not move at all, because the three-bin interpolation absorbs the coarser
+grid entirely -- measured offline under Lua 5.0.2 on a 12345 Hz 0.5 V tone:
 
 | N | bin width | interpolated | error | amplitude error |
 |---|---|---|---|---|
-| 512 | 195.3 Hz | 12344.89 Hz | 0.11 Hz | 0.004 % |
-| 256 | 390.6 Hz | 12345.81 Hz | 0.81 Hz | 0.028 % |
-| 128 | 781.3 Hz | 12346.65 Hz | 1.65 Hz | 0.014 % |
+| 512 | 195.3 Hz | 12345.0000 Hz | 0.0000 Hz | 0.0073 % |
+| 256 | 390.6 Hz | 12345.0000 Hz | 0.0000 Hz | 0.0040 % |
+| 128 | 781.3 Hz | 12345.0005 Hz | 0.0005 Hz | 0.0028 % |
+
+(Those figures were 0.11, 0.81 and 1.65 Hz while the estimator used Hann's closed-form kernel against
+a symmetric window. The kernel is now read from the window's own transform, which removed the
+systematic part; the amplitude residual that is left comes from DC removal, not the estimator.)
 
 **If it is ever revisited, the margin is thin and the cliff is binary.** 47.9 ms leaves about 2 ms
 before 50, and crossing back costs half the rate rather than a few per cent. The cheapest headroom is
@@ -91,6 +95,25 @@ frame per tick (never a time loop) gives 13.3 fps displayed for a frame at or un
 frames gives 15 at or under 66 ms. That recovers some of the dropped-tick loss without needing the
 frame under 50 at all, and it keeps 195 Hz bins. It wants measuring before it is trusted: holding the
 interpreter away from its event loop is what the firmware is least forgiving of.
+
+### What a window change costs, and where
+
+Nothing per frame. Selecting a window moves work into `fft_init()`, which runs on Apply and at
+startup, never inside a frame:
+
+| | cost at N = 512, modelled from the table above |
+|---|---|
+| window samples, cosine windows | 256 `cos` calls (symmetry halves it) |
+| window samples, Kaiser | 256 x `I0`, each ~30 series terms -- about 45 ms |
+| gain table, every window | 61 x 256 `cos` calls -- about 120 ms |
+| ratio table and its inverse | arithmetic only, 61 nodes |
+
+So about 130 ms for a cosine window and 180 ms for Kaiser, on top of the capture `apply()` already
+takes. That is why Apply raises the loading cover: the panel is frozen for the duration either way,
+and a cover is the difference between "working" and "wedged".
+
+The frame itself got slightly *cheaper*. `peak_interp` used to call `math.sin` once per peak (a C
+call, ~4 µs); it now does two table lookups and a multiply instead, six times a frame.
 
 ### Not yet verified on hardware
 
@@ -156,13 +179,17 @@ a reading buffer from Lua (established three ways, see the dead ends).
 
 ## What is left to win
 
-### 1. Real-input packing: about 15 ms, and it is exact
+Items 1, 3 and 4 are **taken** -- they shipped on 2026-10-23 and the measured phase table above is
+the result. They are kept here because the reasoning is the record of why the transform has the shape
+it does.
 
-This is the biggest single lever and it is not yet taken. `fft_run` exploits real input in exactly two
-places -- the bit-reversal permutes `re[]` alone, and stage 1 is add/sub with no `im[]` writes -- but
-**stages 2 through 9 are full complex butterflies over all N points.**
+### 1. Real-input packing: about 15 ms, and it is exact -- TAKEN
 
-The standard trick: pack the N real samples as N/2 complex points, `z[k] = x[2k] + i*x[2k+1]`, run an
+The biggest single lever. Before it, `fft_run` exploited real input in exactly two places -- the
+bit-reversal permuted `re[]` alone, and stage 1 was add/sub with no `im[]` writes -- while
+**stages 2 through 9 were full complex butterflies over all N points.**
+
+The trick: pack the N real samples as N/2 complex points, `z[k] = x[2k] + i*x[2k+1]`, run an
 **N/2-point** complex FFT, then untangle with one O(N/2) pass.
 
 Counting the actual loops: inner iterations per stage are `(N/len)*(len/2) = N/2 = 256`, over
@@ -170,8 +197,8 @@ Counting the actual loops: inner iterations per stage are `(N/len)*(len/2) = N/2
 
 | | full complex butterflies | cheap stage-1 | untangle |
 |---|---|---|---|
-| now | 2048 | 256 | -- |
-| packed, M = 256 | **896** | 128 | 128 points |
+| before | 2048 | 256 | -- |
+| packed, M = 256, shipped | **896** | 128 | 128 points |
 
 2.3x fewer full butterflies. Scaling the measured 30.6 ms gives ~13.6 ms for the transform plus
 ~1.8 ms for the untangle, so **about 15 ms back**, which is 12.5 -> ~15.5 fps on its own.
@@ -189,13 +216,13 @@ before storing them back. On a loop where table reads and writes dominate the ar
 1.2 µs, reducing the number of stages is reducing table traffic. N = 512 is not a power of four, so
 this is one radix-2 stage plus four radix-4 stages.
 
-### 3. Drop the sqrt from the magnitude pass: free
+### 3. Drop the sqrt from the magnitude pass: free -- TAKEN
 
-If the display is dB, then `20*log10(sqrt(a*a + b*b))` is `10*log10(a*a + b*b)` -- the sqrt
+`fft_power` outputs power, and `fft_magnitude` is gone. If the display is dB, then `20*log10(sqrt(a*a + b*b))` is `10*log10(a*a + b*b)` -- the sqrt
 disappears entirely. That is 256 C calls at ~4 µs gone, about 1 ms, for one edit and **no loss of
 accuracy at all**.
 
-### 4. Cache `buffer.write.reading` in a local: 1.8 ms
+### 4. Cache `buffer.write.reading` in a local: 1.8 ms -- TAKEN
 
 Measured: 72 µs a call through the table, 65 µs through a local. At 256 points that is 1.8 ms a frame
 for one line.
@@ -205,7 +232,10 @@ for one line.
 Every point not plotted is 65 µs. The graph object is at most 799 px wide, so above about 780 visible
 bins the detail cannot be seen anyway. Halving 256 to 128 is ~8 ms, at half the plotted resolution.
 
-Taken together, 1 + 3 + 4 is about **18 ms off 80**, with no resolution cost: roughly **16 fps**.
+Together 1 + 3 + 4 were worth about **18 ms off 80**, with no resolution cost. The frame is now
+81.8 ms measured against a pre-packing 80 ms estimate that was itself low; what the three bought is
+visible in the phase table, and the displayed rate went 3.2 -> 10 fps because the timer period came
+down with them. What is left is 2 and 5, and neither crosses the 50 ms boundary that would matter.
 
 ## Dead ends, measured -- do not retry these
 
@@ -292,19 +322,24 @@ name rule above.
 The existing `sg_pick_fscale()` steps `s` by ten while `fhi/s >= 59`, so a 500 kHz span lands on
 `s = 10000` and the reader has to multiply the label by ten.
 
-**Fixing `s = 1e6` removes that.** The whole 0-500 kHz span then maps to 0-0.5 label-seconds, so it
-never reaches a minute and base 60 cannot appear, and the graph's own SI prefixes line up with the
-units: `s` is MHz, `ms` is kHz, `us` is Hz. 12.5 kHz labels itself `12.5ms`. One constant instead of a
-multiplier the reader has to apply.
+**Fixing `s = 1e6` was tried on hardware and reverted. Do not retry it.** The idea was that the whole
+0-500 kHz span then maps to 0-0.5 label-seconds, so base 60 cannot appear and the graph's own SI
+prefixes line up with the units. What it actually did was put the firmware's axis row into a regime
+where its own choice of label count oscillates: the operator saw the row alternate between labelling
+every tick and labelling the ticks between, one frame at a time -- "normally 00.01ms, 10.01ms,
+20.01ms; when it flickers it draws 05.01ms, 15.01ms". The decade walk already prevents the base-60
+rollover, so the change bought nothing and cost a visible flicker at 1-2 Hz.
 
 Unverified: whether the graph prefixes sub-second timestamps as `ms`/`us` or prints `0.0125s`. Both
 are decimal and unambiguous; only the first reads directly as kHz. One screenshot settles it.
 
 Related, from the firmware: units are `buffer.UNIT_*`, with `UNIT_HERTZ = 9` and `UNIT_SECOND = 10`.
-`UNIT_SECOND` is the only horizontal-axis unit the firmware demonstrably exercises, and two of the
+`UNIT_SECOND` is the only unit the firmware demonstrably exercises **on an axis**, and two of the
 three unit symbol tables in the image have Hertz pointing at an **empty string** -- which is a
 plausible shape for the frequency-units crash, though the failing call was never captured so the
-mechanism is unproven. Treat every unit other than `UNIT_SECOND` as unvalidated.
+mechanism is unproven. Treat every unit other than `UNIT_SECOND` as unvalidated *as an axis unit*.
+That is not in tension with `sg_make_buffer` formatting the second column as `UNIT_HERTZ`: that
+column is the `extra` value, which the graph never plots and the axis never reads.
 
 ## Reference: the undocumented bit library
 
