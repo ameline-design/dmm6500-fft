@@ -180,9 +180,8 @@ function fftsa.sg_xunit_text()
   if s ~= 1000 then
     t = string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
   end
-  -- A span narrower than a few bins is a legal pair that leaves nothing to look
-  -- at: Start 1999 / Stop 2000 is one plotted point at 195.3 Hz bins, so the trace
-  -- is a dot, five peak rows read --- and nothing else on the screen says why.
+  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins:
+  -- the trace is a dot, five peak rows read ---, and nothing else says why.
   local b = fftsa.binhz
   if b ~= nil and b > 0 then
     local k0, k1 = fftsa.sg_window_bins(fftsa.sg_nbins, b)
@@ -218,18 +217,13 @@ end
 -- dialog per frame at 10 fps is as impossible to exit as one per point.
 --
 -- math.floor() leaves exactly that when the scaled frequency sits a rounding error
--- below an integer. That is rare, not normal: it needs fftsa.binhz/sg_fscale to
--- land within about an ulp below a simple rational, not merely to be inexact.
--- Swept over every reachable configuration -- the measured rate +-0.5 % around each
--- commanded rate in 1e-5 steps, both rate lists, every Stop Freq the form offers --
--- the naive floor refuses at most 3 points of 256 in one frame, and refuses
--- anything at all in 361 of 515052 configurations. The worst is a measured
--- 199999.99999999997 S/s, one ulp below exact, where bin width 390.62499999999994
--- puts bins 64, 128 and 192 a hair under 25, 50 and 75 label-seconds.
---
--- So this guard is cheap insurance, not a response to a measured storm, and the
--- bench symptom it was written for is still unexplained: see
--- fftsa.sg_split_t's test in tools/test_tsp.lua for the one query that settles it.
+-- below an integer. That is rare, not normal: binhz/sg_fscale has to land within an
+-- ulp below a simple rational, not merely be inexact. Swept over every reachable
+-- configuration the naive floor refuses at most 3 points of 256 in one frame, and
+-- nothing at all in 514691 of 515052 -- worst at a measured 199999.99999999997 S/s,
+-- where 390.62499999999994 Hz bins put bins 64, 128 and 192 a hair under 25, 50 and
+-- 75 label-seconds. So this is cheap insurance, and the bench symptom it was written
+-- for is still unexplained: tools/test_tsp.lua carries the query that settles it.
 function fftsa.sg_split_t(t)
   local w = math.floor(t)
   local fr = t - w
@@ -378,13 +372,10 @@ function fftsa.sg_update(nbins, binhz)
     local v = pwr[k]
     local db
     -- nil (sparse power array) and anything at or below the floor plot at the
-    -- floor, so log10 is never handed a zero. The range tests are written as
-    -- positives because every comparison with a NaN is false, so `db < dbmin`
-    -- would pass one straight through to buffer.write.reading and a refused
-    -- parameter is event 1131 again. No reachable NaN was found -- fft_ksq is
-    -- finite for every shipped window, pwr is a sum of squares, and an over-range
-    -- digitizer reading is 9.9e37, which clamps to +20 -- so this is hardening
-    -- rather than a fix for anything observed.
+    -- floor, so log10 is never handed a zero. The range tests are positives because
+    -- every comparison with a NaN is false, so `db < dbmin` would pass one through
+    -- to buffer.write.reading and a refused parameter is event 1131 again. No
+    -- reachable NaN was found, so that half is hardening.
     if v == nil or v <= vfl then
       db = dbmin
     else
@@ -501,9 +492,8 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
       if v >= 1 then vtxt = string.format("%.4f V", v)
       elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
       else vtxt = string.format("%.0f uV", v * 1e6) end
-      -- Floored at the plot's own floor: a bin at 1e-26 power reads -260 dBV
-      -- against a -120 dBV axis, which is a number the trace cannot show and the
-      -- column has about 93 px for before it reaches the Options button.
+      -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against
+      -- a -120 dBV axis, which the trace cannot show and the column has no room for.
       local dbv = 20 * log10(v)
       if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
       settext(fftsa.sg_pk_f[p], ftxt)

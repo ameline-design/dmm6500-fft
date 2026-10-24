@@ -242,10 +242,9 @@ BADFRAC = 0
 -- asserts the relationship rather than leaving the mock to catch it.
 FRAC_MAX = 0.9999999
 -- "Data must be added in chronological order" -- buffer.write.reading, Details.
--- Counted rather than raised: what the real call does with an out-of-order
--- timestamp is not known, and a count is what a test can assert. Without this the
--- mock stored secs + frac and never compared two of them, so a non-monotonic
--- sequence would have passed the whole suite in silence.
+-- Counted rather than raised, since what the real call does with an out-of-order
+-- timestamp is not known. The mock used to store secs + frac without ever comparing
+-- two of them, so a non-monotonic sequence passed in silence.
 NONMONO = 0
 function buffer.write.reading(b, val, extra, secs, frac)
   if not b.alive then error('write to a DELETED buffer', 0) end
@@ -481,14 +480,12 @@ local function dc_reported(centre)
   return n
 end
 -- Worst level anywhere in the DC region with the only tone far away and off a bin
--- centre. This is why fft_load weights the mean: the arithmetic mean removes the
--- true DC, which leaves the window's own DC response behind as a line at bin 1
--- following G(k), and that line is 100 dB above the floor the low-sidelobe windows
--- are chosen for.
+-- centre. This is why fft_load weights the mean: the arithmetic mean leaves the
+-- window's own DC response behind as a line at bin 1 following G(k), 100 dB above
+-- the floor the low-sidelobe windows are chosen for.
 --
--- Eight phases, not one. The residue is A*G_rect(b)*cos(phase) referred to the
--- window centre, so a single phase can land near the zero of that cosine: at phase
--- 0.3 alone the arithmetic mean reads -60 dBc here and this check passed under it.
+-- Eight phases, not one. The residue is A*G_rect(b)*cos(phase) about the window
+-- centre, and at phase 0.3 alone the arithmetic mean reads -60 dBc here and passed.
 local function dc_spur(centre)
   local worst = 0
   for p = 0, 7 do
@@ -537,16 +534,16 @@ for wi = 1, nwin do
           string.format('%.1e dB', wa))
     check(nm .. ': the peak finder reports the tone, every offset', miss == 0,
           miss .. ' of 83 offsets missed')
-    -- The DC region, which fft_load's mean removal owns. One or two bins for every
-    -- shipped window; a wider one would mean the window list changed under this.
+    -- The DC region, which fft_load's mean removal owns: one or two bins for every
+    -- shipped window.
     local kdc = fftsa.fft_kdc
     check(nm .. ': the DC region is one or two bins wide', kdc == 1 or kdc == 2,
           'fft_kdc=' .. tostring(kdc))
     check(nm .. ': a tone inside the DC region is not reported there',
           dc_reported(1) == 0 and dc_reported(0.5) == 0,
           'bin 1: ' .. dc_reported(1) .. ' rows, bin 0.5: ' .. dc_reported(0.5))
-    -- Both axes asserted. The amplitude error here used to be measured, formatted
-    -- into the message and never compared, so it read 2.17 dB and passed.
+    -- Both axes. The amplitude error used to be formatted into the message and
+    -- never compared, so it read 2.17 dB and passed.
     local lf, la, lmiss = win_sweep(kdc + 1, 0)
     check(nm .. ': the lowest reportable bin is found at every offset', lmiss == 0,
           'bin ' .. (kdc + 1) .. ', ' .. lmiss .. ' of 42 missed')
@@ -956,8 +953,8 @@ check('a bin under the floor is plotted AT the floor, not dropped', (function()
   return lo == fftsa.sg_dbmin, 'lowest written = ' .. tostring(lo)
 end)())
 -- Every comparison with a NaN is false, so a `db < dbmin` test lets one through to
--- buffer.write.reading and a refused parameter is event 1131. Hardening only: no
--- reachable NaN was found, which is why this feeds one in by hand.
+-- buffer.write.reading. Hardening only: no reachable NaN was found, so this feeds
+-- one in by hand.
 check('a NaN power bin is plotted at the floor, not written as a NaN', (function()
   local save = fftsa.fft_pwr
   fftsa.fft_pwr = {}
@@ -979,8 +976,8 @@ check('a NaN power bin is plotted at the floor, not written as a NaN', (function
          string.format('%d written outside the axis (%s), 0/0 is %s', bad,
                        tostring(seen), tostring(nan))
 end)())
--- The dB column is floored at the plot's own floor: a bin at 1e-26 power reads
--- -260 dBV against a -120 dBV axis, which is a number the trace cannot show.
+-- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against a
+-- -120 dBV axis, which the trace cannot show.
 check('the peak table dB column is floored at the plot floor', (function()
   local save = fftsa.fft_pwr
   fftsa.fft_pwr = {}
@@ -992,9 +989,8 @@ check('the peak table dB column is floored at the plot floor', (function()
   fftsa.sg_pk_last = nil                 -- let the next frame redraw the block
   return txt == '-120.0 dBV', tostring(txt)
 end)())
--- A legal but degenerate span: Start 1999 / Stop 2000 leaves one plotted point, so
--- the trace is a dot and five peak rows read ---. The legend is the only place that
--- can say why.
+-- Start 1999 / Stop 2000 is legal and leaves one plotted point, so the trace is a
+-- dot and five peak rows read ---. The legend is the only place that can say why.
 check('a span with almost no bins in it says so in the legend', (function()
   local lo, hi, bz = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.binhz
   fftsa.binhz = 195.3125
@@ -1106,22 +1102,20 @@ check('options() creates nothing when the form handle is nil', (function()
 end)())
 
 -- A fractional time above 0.9999999 is refused with event 1131, a modal dialog per
--- refused write. math.floor() produces one when the scaled frequency lands a
+-- refused write, and math.floor() produces one when the scaled frequency lands a
 -- rounding error below an integer.
 --
--- How often: swept over every reachable configuration, the naive floor refuses at
--- most 3 points of 256 in one frame, and refuses nothing at all in 514691 of 515052
--- sampled configurations. The 255-of-256 figure recorded with the fix came from a
--- bin width of 999.9999999999, which needs 512000 S/s -- 2.4 % off the commanded
--- rate, with the nearest achievable widths 976.5625 and 1953.125 -- so it is
--- outside the reachable set rather than at its edge. measure_fs's round trip,
--- 511/(511/fs), is exact or lands ABOVE exact at every rate, never below, so there
--- is no configuration where the hazard repeats every frame for a stated reason.
+-- How often: over every reachable configuration the naive floor refuses at most 3
+-- points of 256 in one frame, and nothing at all in 514691 of 515052. The
+-- 255-of-256 figure recorded with the fix came from a bin width of 999.9999999999,
+-- which needs 512000 S/s -- 2.4 % off the commanded rate -- so it is outside the
+-- reachable set, not at its edge. measure_fs's round trip 511/(511/fs) is exact or
+-- lands above exact at every rate, never below, so the hazard cannot repeat every
+-- frame for a stated reason.
 --
--- The bench symptom is therefore still unexplained. One tagged query on the
--- instrument with the app running settles whether a real frame goes near the limit,
--- counting in place rather than reading binhz back at the 2 dp the readback line
--- shows:
+-- The bench symptom is therefore still unexplained. This query, with the app
+-- running, settles whether a real frame goes near the limit -- counting in place,
+-- since the readback line shows binhz to 2 dp:
 --   do local n=0 for k=2,256 do local t=((k-1)*fftsa.binhz)/fftsa.sg_fscale
 --   if t-math.floor(t) > 0.9999999 then n=n+1 end end
 --   print("BADFRAC="..n.." binhz="..string.format("%.14g",fftsa.binhz)) end
@@ -1140,9 +1134,8 @@ check('an exact value is left alone', (function()
   local w, fr = fftsa.sg_split_t(12.25)
   return w == 12 and fr == 0.25, string.format('%d + %g', w, fr)
 end)())
--- The worst bin width the hardware can actually produce: one ulp below the exact
--- 390.625 that 200 kS/s gives, which puts bins 64, 128 and 192 a hair under 25, 50
--- and 75 label-seconds. Reachable, unlike the 999.9999999999 below.
+-- The worst bin width the hardware can produce: one ulp below the exact 390.625 of
+-- 200 kS/s, putting bins 64, 128 and 192 a hair under 25, 50 and 75 label-seconds.
 local FRAC_WORST = 199999.99999999997 / 512
 local function naive_refusals(binhz, fscale)
   local bad = 0
@@ -1168,9 +1161,8 @@ check('and that frame really did hit the hazard, so the check has teeth',
       naive_refusals(FRAC_WORST, 1000) == 3,
       naive_refusals(FRAC_WORST, 1000) .. ' of ' .. fftsa.sg_nbins
       .. ' points would have been refused by the naive floor')
--- Far outside what the hardware can produce -- 999.9999999999 Hz bins need
--- 512000 S/s -- and kept only as a stress case: every point is then a hair under a
--- whole label-second, which is the shape the guard has to survive at any scale.
+-- A stress case, not a reachable one: 999.9999999999 Hz bins need 512000 S/s, and
+-- every point is then a hair under a whole label-second.
 check('and so does a bin width the hardware cannot reach', (function()
   local bad = naive_refusals(999.9999999999, 1000)
   return frame_refusals(999.9999999999) == 0 and bad == 255,
@@ -1178,9 +1170,9 @@ check('and so does a bin width the hardware cannot reach', (function()
 end)())
 check('no frame anywhere in this suite wrote a refused fraction', BADFRAC == 0,
       'total refused: ' .. BADFRAC)
--- The carry is one representable step tighter than the firmware's limit, which is
--- the safe direction. Asserted because the mock's predicate is the firmware's, so
--- it cannot see the guard loosened past it.
+-- One representable step tighter than the firmware's limit, which is the safe
+-- direction. Asserted because the mock's predicate is the firmware's, so it cannot
+-- see the guard loosened past it.
 check('the carry threshold sits at or below the fraction the firmware refuses',
       (function()
   local worst = 0
@@ -1219,12 +1211,11 @@ check('the readback line clears the last box and the buttons',
                              + fftsa.opt_edit_h
         and fftsa.opt_info_y < fftsa.opt_btn_y,
       'info_y=' .. fftsa.opt_info_y)
--- Nine fields, which is five rows: the first count where the clamp changes the
--- outcome rather than just the pitch. 274 px of usable height over four gaps is 68,
--- and at the unclamped 100 the last box would end at 454 against a button row at
--- 360. Six fields -- the old version of this check -- still lay out as three rows at
--- the same pitch and the same top as five, so it was a second copy of 'the last box
--- ends above the button row' and never engaged the clamp it was named for.
+-- Nine fields, five rows: the first count where the clamp changes the outcome and
+-- not just the pitch. 274 px over four gaps is 68, and unclamped the last box would
+-- end at 454 against a button row at 360. Six fields -- what this check used to use
+-- -- still lay out as three rows at the same pitch and top as five, so it was a
+-- second copy of 'the last box ends above the button row'.
 check('a field count that overruns is clamped to fit above the button row',
       (function()
   local keep = fftsa.opt_nf
@@ -1295,9 +1286,8 @@ check('a failed Apply says so, and a good one restores the legend', (function()
          and good == fftsa.sg_xunit_text(),
          tostring(bad) .. ' | then ' .. tostring(good)
 end)())
--- The check above stubs fftsa.apply out entirely, so it never reaches the real
--- body. This one drives it with a capture that raises -- what a trigger timeout
--- does -- after the sample rate has already been written to the hardware.
+-- The check above stubs fftsa.apply out, so it never reaches the real body. This
+-- one drives it with a capture that raises, after the rate has been written.
 check('a capture that raises leaves binhz describing the rate in force', (function()
   local rate0, bin0 = dmm.digitize.samplerate, fftsa.binhz
   display.setvalue(fftsa.opt_fhi, 200000)              -- pick_fs() -> 500 kS/s
@@ -1313,9 +1303,8 @@ check('a capture that raises leaves binhz describing the rate in force', (functi
                        tostring(ok), rate0, rate1, bin0, fftsa.binhz,
                        rate1 / fftsa.n)
 end)())
--- The operator-visible half. With binhz left at the old rate's value a 12.5 kHz
--- tone read 2500.0 Hz -- the ratio 976.5625/195.3125 -- with errcount 0, the axis
--- labels of the old span, and the table agreeing with the trace.
+-- The operator-visible half: with binhz left at the old rate's value a 12.5 kHz
+-- tone read 2500.0 Hz, the ratio 976.5625/195.3125, with errcount 0.
 check('and the frames after it report the tone at its real frequency', (function()
   fftsa.errcount = 0
   SIG.f, SIG.amp = 12500, 1.0
@@ -1432,12 +1421,11 @@ fftsa.errcount = 0
 for _ = 1, 5 do fftsa.frame() end
 check('frames still run after an inverted span', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount .. ' lasterr=' .. tostring(fftsa.lasterr))
--- Brute force over the values the fields can return, including ones the form cannot
--- produce: every pair must leave flo < fhi and at least one bin to plot. Ported from
--- tools/test_algorithms.py, which asserted this against a re-implementation that had
--- diverged -- it still expected the start to reset to 0, which flomin = 10 made
--- impossible, and passed. fftsa.apply is replaced by its span half, so the sweep
--- costs no fft_init and the bin window still follows the repaired pair.
+-- Every value the fields can return, including ones the form cannot produce: each
+-- pair must leave flo < fhi and a bin to plot. Ported from tools/test_algorithms.py,
+-- which asserted it against a re-implementation that expected the start to reset to
+-- 0, which flomin = 10 made impossible. fftsa.apply is replaced by its span half, so
+-- the sweep costs no fft_init and the bin window still follows the repaired pair.
 check('no field pair leaves an empty span or an empty bin window', (function()
   local V = {'nil', 0, -1, 1, 9, 10, 11, 1999, 2000, 2001, 8000, 49999, 50000,
              499000, 499999, 500000, 500001, 1e9, 1e300}

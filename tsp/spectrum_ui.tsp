@@ -61,13 +61,9 @@ end
 -- arrays: bin indices and power (volts-squared). kmin/kmax restrict the search to
 -- the bins the graph shows, so the table never reports a tone that is absent from
 -- the trace.
---
--- The DC region is never reported, whatever kmin says. Index 1 is DC, and the
--- fftsa.fft_kdc bins above it hold the mean removal's own error rather than the
--- signal: a 1.000 V tone at bin 1 reads 0.589 V under Hann and dances to 1.110 V
--- with the capture phase, and no mean rule does better (fft_core.tsp). Printing a
--- confident wrong number is worse than printing none, so the floor is here; the
--- trace still draws those bins, which is where a low-frequency tone shows up.
+-- Index 1 is DC and the fftsa.fft_kdc bins above it carry the mean removal's own
+-- error rather than signal (fft_core.tsp measures how far that reaches), so neither
+-- is a candidate whatever kmin says. The trace still draws them.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
   local bi, bv = {}, {}

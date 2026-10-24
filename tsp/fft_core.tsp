@@ -227,11 +227,11 @@ function fftsa.win_tables(N)
   end
   fftsa.fft_dtab = dt
 
-  -- How far up from DC fftsa.fft_load()'s mean removal reaches. The weighted mean
-  -- of a record carrying a tone at bin b is D + A*G(b)*cos(phase), so removing it
-  -- takes 2*A*G(b)^2 out of the tone's own bin: at bin 1 a 1.000 V tone reads
-  -- 0.589 V under Hann. The largest b over the scan is taken, not the first,
-  -- because G is not monotonic. fftsa.find_peaks() will not report these bins.
+  -- How far up from DC fftsa.fft_load()'s mean removal reaches, which is where
+  -- fftsa.find_peaks() stops reporting. Removing a weighted mean of
+  -- D + A*G(b)*cos(phase) takes 2*A*G(b)^2 out of the tone's own bin: at bin 1 a
+  -- 1.000 V tone reads 0.589 V under Hann. The largest b, not the first, since G is
+  -- not monotonic.
   local kdc = 0
   for b = 1, fftsa.fft_kdcn do
     local a = twopi_N * b
@@ -341,15 +341,13 @@ end
 -- The mean is window-weighted, sum(w*x)/sum(w). What has to be zero is the DC of
 -- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
 -- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
--- leaving the window's own DC response as a residue that spreads over the first few
--- bins as G(k): measured, a 1.000 V tone at bin 10.5 leaves a spurious -27 dBc line
--- at bin 1 under Hann and -27 under Kaiser b=18, whose sidelobes are at -139. The
--- weighted mean leaves -147.
+-- leaving the window's own DC response spread over the first few bins as G(k):
+-- measured, a 1.000 V tone at bin 10.5 leaves a -27 dBc line at bin 1 under every
+-- window, against -147 here, and Kaiser b=18's sidelobes are at -139.
 --
--- The price is that near DC the estimate is the tone: see fftsa.win_tables(), which
--- measures how far that reaches, and fftsa.find_peaks(), which stops reporting
--- there. Nothing separates a pedestal from a tone within one lobe of DC -- both ways
--- round were measured over every window and nine tone positions.
+-- The price is that near DC the estimate is the tone. fftsa.win_tables() measures
+-- how far that reaches and fftsa.find_peaks() stops reporting there; nothing
+-- separates a pedestal from a tone inside one lobe of DC.
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
