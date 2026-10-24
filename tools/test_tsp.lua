@@ -1040,11 +1040,27 @@ check('options() creates nothing when the form handle is nil', (function()
   return r == false and live() == before
 end)())
 
--- A fractional time at or above 0.9999999 is refused with event 1131, a modal
--- dialog per point per frame. math.floor() produces exactly that when the scaled
--- frequency lands a rounding error below an integer, which it does as soon as the
--- bin width is inexact -- and binhz comes from the MEASURED sample rate, so it
--- normally is.
+-- A fractional time above 0.9999999 is refused with event 1131, a modal dialog per
+-- refused write. math.floor() produces one when the scaled frequency lands a
+-- rounding error below an integer.
+--
+-- HOW OFTEN: swept over every reachable configuration, the naive floor refuses at
+-- most 3 points of 256 in one frame, and refuses nothing at all in 514691 of 515052
+-- sampled configurations. The 255-of-256 figure recorded with the fix came from a
+-- bin width of 999.9999999999, which needs 512000 S/s -- 2.4 % off the commanded
+-- rate, with the nearest achievable widths 976.5625 and 1953.125 -- so it is
+-- outside the reachable set rather than at its edge. measure_fs's round trip,
+-- 511/(511/fs), is exact or lands ABOVE exact at every rate, never below, so there
+-- is no configuration where the hazard repeats every frame for a stated reason.
+--
+-- THE BENCH SYMPTOM IS THEREFORE STILL UNEXPLAINED. One tagged query on the
+-- instrument with the app running settles whether a real frame goes near the limit,
+-- counting in place rather than reading binhz back at the 2 dp the readback line
+-- shows:
+--   do local n=0 for k=2,256 do local t=((k-1)*fftsa.binhz)/fftsa.sg_fscale
+--   if t-math.floor(t) > 0.9999999 then n=n+1 end end
+--   print("BADFRAC="..n.." binhz="..string.format("%.14g",fftsa.binhz)) end
+-- If that prints 0, the 1131 storm had another cause and that cause is still there.
 print('\nfractional time (real code)')
 check('sg_split_t carries a near-integer into the whole part', (function()
   local w, fr = fftsa.sg_split_t(9.9999999999)
@@ -1059,24 +1075,41 @@ check('an exact value is left alone', (function()
   local w, fr = fftsa.sg_split_t(12.25)
   return w == 12 and fr == 0.25, string.format('%d + %g', w, fr)
 end)())
-check('a whole frame writes no fraction the firmware would refuse', (function()
+-- The worst bin width the hardware can actually produce: one ulp below the exact
+-- 390.625 that 200 kS/s gives, which puts bins 64, 128 and 192 a hair under 25, 50
+-- and 75 label-seconds. REACHABLE, unlike the 999.9999999999 below.
+local FRAC_WORST = 199999.99999999997 / 512
+local function naive_refusals(binhz, fscale)
+  local bad = 0
+  for k = 1, fftsa.sg_nbins do
+    local t = ((k - 1) * binhz) / fscale
+    if t - math.floor(t) > 0.9999999 then bad = bad + 1 end
+  end
+  return bad
+end
+local function frame_refusals(binhz)
   local before = BADFRAC
   local lo, hi, sc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = 0, 1e6, 1000
-  -- Every bin lands a hair under a whole label-second: the worst case there is.
   for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-4 end
-  fftsa.sg_update(fftsa.sg_nbins, 999.9999999999)
+  fftsa.sg_update(fftsa.sg_nbins, binhz)
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = lo, hi, sc
-  return BADFRAC == before, 'refused writes: ' .. (BADFRAC - before)
-end)())
+  return BADFRAC - before
+end
+check('the worst REACHABLE bin width writes no fraction the firmware would refuse',
+      frame_refusals(FRAC_WORST) == 0,
+      'refused writes: ' .. frame_refusals(FRAC_WORST))
 check('and that frame really did hit the hazard, so the check has teeth',
-      (function()
-  local bad = 0
-  for k = 1, fftsa.sg_nbins do
-    local t = ((k - 1) * 999.9999999999) / 1000
-    if t - math.floor(t) > 0.9999999 then bad = bad + 1 end
-  end
-  return bad > 0, bad .. ' of ' .. fftsa.sg_nbins .. ' points would have been refused'
+      naive_refusals(FRAC_WORST, 1000) == 3,
+      naive_refusals(FRAC_WORST, 1000) .. ' of ' .. fftsa.sg_nbins
+      .. ' points would have been refused by the naive floor')
+-- Far outside what the hardware can produce -- 999.9999999999 Hz bins need
+-- 512000 S/s -- and kept only as a stress case: every point is then a hair under a
+-- whole label-second, which is the shape the guard has to survive at any scale.
+check('and so does a bin width the hardware cannot reach', (function()
+  local bad = naive_refusals(999.9999999999, 1000)
+  return frame_refusals(999.9999999999) == 0 and bad == 255,
+         bad .. ' of ' .. fftsa.sg_nbins .. ' would have been refused'
 end)())
 check('no frame anywhere in this suite wrote a refused fraction', BADFRAC == 0,
       'total refused: ' .. BADFRAC)

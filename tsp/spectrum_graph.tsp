@@ -198,13 +198,22 @@ end
 
 -- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
 -- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
--- write with event 1131, which is a MODAL DIALOG on this instrument -- one per
--- point, every frame, which leaves the app impossible to exit.
+-- write with event 1131, which is a MODAL DIALOG on this instrument -- and one
+-- dialog per frame at 10 fps is as impossible to exit as one per point.
 --
--- math.floor() leaves exactly that whenever the scaled frequency sits a rounding
--- error below an integer, and it does as soon as the bin width is inexact, which is
--- the normal case: fftsa.binhz comes from the MEASURED sample rate, not the
--- commanded one. Carry a fraction that close to one into the whole part instead.
+-- math.floor() leaves exactly that when the scaled frequency sits a rounding error
+-- below an integer. That is RARE, not normal: it needs fftsa.binhz/sg_fscale to
+-- land within about an ulp below a simple rational, not merely to be inexact.
+-- Swept over every reachable configuration -- the measured rate +-0.5 % around each
+-- commanded rate in 1e-5 steps, both rate lists, every Stop Freq the form offers --
+-- the naive floor refuses at most 3 points of 256 in one frame, and refuses
+-- anything at all in 361 of 515052 configurations. The worst is a measured
+-- 199999.99999999997 S/s, one ulp below exact, where bin width 390.62499999999994
+-- puts bins 64, 128 and 192 a hair under 25, 50 and 75 label-seconds.
+--
+-- So this guard is cheap insurance, not a response to a measured storm, and the
+-- bench symptom it was written for is still unexplained: see
+-- fftsa.sg_split_t's test in tools/test_tsp.lua for the one query that settles it.
 function fftsa.sg_split_t(t)
   local w = math.floor(t)
   local fr = t - w
