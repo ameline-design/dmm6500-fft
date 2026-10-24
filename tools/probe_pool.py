@@ -17,7 +17,7 @@ The probe object is a child of the app's own spectrum screen, so creating it nev
 changes which screen is on show, and it is deleted immediately.
 
 The operator's span, range and window come back unchanged: Apply is pressed with
-whatever the fields already hold. ONE instrument setting is written --
+whatever the fields already hold. One instrument setting is written --
 localnode.showevents, which has to be off for eventlog.next() to return anything at
 all -- and it is restored in the finally block.
 
@@ -30,7 +30,7 @@ this file opens nothing.
 import argparse
 
 # Census tokens that are not handles. Each one is a measurement in its own right,
-# which is why classify() names them instead of filtering them out: 'nil' IS the
+# which is why classify() names them instead of filtering them out: 'nil' is the
 # condition this probe exists to detect.
 DRY = 'nil'              # display.create returned nil -- the pool is exhausted
 NOSCREEN = 'noscreen'    # fftsa.sg_scr is nil -- the app is not built any more
@@ -52,7 +52,7 @@ EVENTS = ('do local n = eventlog.getcount() local s = "" '
 def census_token(reply):
     """The token after H= in a reply, or None if the reply carries none.
 
-    dmmrun.q returns the FIRST line it receives and this instrument volunteers
+    dmmrun.q returns the first line it receives and this instrument volunteers
     event lines, so a census can come back as somebody else's text. That is a lost
     measurement, not a zero.
     """
@@ -81,8 +81,8 @@ def classify(handles):
     presses = n - 1
     for i, h in enumerate(handles):
         if h == DRY:
-            return True, ('display.create returned nil at census %d of %d: THE '
-                          'POOL IS EXHAUSTED. That is the leak, fully realised. '
+            return True, ('display.create returned nil at census %d of %d: the '
+                          'pool is exhausted. That is the leak, fully realised. '
                           'Series: %s' % (i, presses, _fmt(handles)))
     for i, h in enumerate(handles):
         if h == NOSCREEN:
@@ -106,7 +106,7 @@ def classify(handles):
             extra = (' -- and came back to %d, so the slots were consumed and '
                      'returned rather than held' % last)
         return True, ('handle climbed %d -> %d over %d presses, %.2f per press%s. '
-                      'THE APPLY PATH IS CONSUMING POOL OBJECTS%s. Series: %s'
+                      'The Apply path is consuming pool objects%s. Series: %s'
                       % (first, peak, presses, (peak - first) / float(presses),
                          gaptxt, extra, _fmt(handles)))
     if gaps:
@@ -146,7 +146,7 @@ def main():
                              'it posts an event per nil handle. Open the app, then '
                              'run this again.')
         print('  settings before:', d.q('print(fftsa.opt_info_text())'))
-        # With showevents on, eventlog.next() NEVER returns an event: the events are
+        # With showevents on, eventlog.next() never returns an event: the events are
         # read automatically and sent to the interface (Ref manual, eventlog.next,
         # Details). This bench volunteers event lines, so leaving it on would print
         # "0 events" and lose the measurement the probe exists to take.
@@ -159,7 +159,7 @@ def main():
         # its whole 30 s timeout and returns None -- 6.5 minutes over 12 presses,
         # with no way to tell whether the Apply ran.
         d.exec('eventlog.clear()')
-        # Read BEFORE as well as after, or a non-zero count cannot be attributed to
+        # Read before as well as after, or a non-zero count cannot be attributed to
         # the presses rather than to earlier history.
         before = d.q('print(tostring(fftsa.delfails) .. " " '
                      '.. tostring(fftsa.errcount))')

@@ -38,7 +38,7 @@ fftsa.fft_utr    = nil    -- untangle twiddles e^(-2*pi*i*k/N), k = 0..M-1
 fftsa.fft_uti    = nil
 -- Coherent gain, the mean window sample. A window identity worth pinning, and
 -- tools/test_tsp.lua and tools/make_refs.lua do; no shipped module reads it. The
--- amplitude calibration is fftsa.fft_ksq, from the window SUM.
+-- amplitude calibration is fftsa.fft_ksq, from the window sum.
 fftsa.fft_cg     = 0.5
 fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 
@@ -104,7 +104,7 @@ function fftsa.bessel_i0(x)
 end
 
 -- Build fftsa.fft_win and the amplitude scale from it. Symmetric, so only half the
--- samples are computed. The scale comes from the window SUM, and assuming N/2 for
+-- samples are computed. The scale comes from the window sum, and assuming N/2 for
 -- Hann rather than summing it reads every amplitude 0.2 % low at N = 512.
 function fftsa.win_build(N)
   local cos, sqrt, floor, pi = math.cos, math.sqrt, math.floor, math.pi
@@ -348,7 +348,7 @@ end
 -- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
 -- far more to read than a table entry. Returns the mean (DC level).
 --
--- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w). What has to be zero is the DC of
+-- The mean is window-weighted, sum(w*x)/sum(w). What has to be zero is the DC of
 -- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
 -- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
 -- leaving the window's own DC response as a residue that spreads over the first few
@@ -574,7 +574,7 @@ end
 -- the bins the graph shows, so the table never reports a tone that is absent from
 -- the trace.
 --
--- THE DC REGION IS NEVER REPORTED, whatever kmin says. Index 1 is DC, and the
+-- The DC region is never reported, whatever kmin says. Index 1 is DC, and the
 -- fftsa.fft_kdc bins above it hold the mean removal's own error rather than the
 -- signal: a 1.000 V tone at bin 1 reads 0.589 V under Hann and dances to 1.110 V
 -- with the capture phase, and no mean rule does better (fft_core.tsp). Printing a
@@ -831,11 +831,11 @@ end
 
 -- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
 -- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
--- write with event 1131, which is a MODAL DIALOG on this instrument -- and one
+-- write with event 1131, which is a modal dialog on this instrument -- and one
 -- dialog per frame at 10 fps is as impossible to exit as one per point.
 --
 -- math.floor() leaves exactly that when the scaled frequency sits a rounding error
--- below an integer. That is RARE, not normal: it needs fftsa.binhz/sg_fscale to
+-- below an integer. That is rare, not normal: it needs fftsa.binhz/sg_fscale to
 -- land within about an ulp below a simple rational, not merely to be inexact.
 -- Swept over every reachable configuration -- the measured rate +-0.5 % around each
 -- commanded rate in 1e-5 steps, both rate lists, every Stop Freq the form offers --
@@ -1290,7 +1290,7 @@ function fftsa.apply()
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs
-  -- THE BIN WIDTH COMMITS WITH THE RATE, not after the capture. A raise between the
+  -- The bin width commits with the rate, not after the capture. A raise between the
   -- write above and the measurement below -- a trigger timeout is the obvious one --
   -- used to leave the hardware at the new rate and fftsa.binhz describing the old
   -- one, and every later frame then reported the wrong frequency with errcount 0:

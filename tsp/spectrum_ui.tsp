@@ -62,7 +62,7 @@ end
 -- the bins the graph shows, so the table never reports a tone that is absent from
 -- the trace.
 --
--- THE DC REGION IS NEVER REPORTED, whatever kmin says. Index 1 is DC, and the
+-- The DC region is never reported, whatever kmin says. Index 1 is DC, and the
 -- fftsa.fft_kdc bins above it hold the mean removal's own error rather than the
 -- signal: a 1.000 V tone at bin 1 reads 0.589 V under Hann and dances to 1.110 V
 -- with the capture phase, and no mean rule does better (fft_core.tsp). Printing a

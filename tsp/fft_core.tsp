@@ -28,7 +28,7 @@ fftsa.fft_utr    = nil    -- untangle twiddles e^(-2*pi*i*k/N), k = 0..M-1
 fftsa.fft_uti    = nil
 -- Coherent gain, the mean window sample. A window identity worth pinning, and
 -- tools/test_tsp.lua and tools/make_refs.lua do; no shipped module reads it. The
--- amplitude calibration is fftsa.fft_ksq, from the window SUM.
+-- amplitude calibration is fftsa.fft_ksq, from the window sum.
 fftsa.fft_cg     = 0.5
 fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 
@@ -94,7 +94,7 @@ function fftsa.bessel_i0(x)
 end
 
 -- Build fftsa.fft_win and the amplitude scale from it. Symmetric, so only half the
--- samples are computed. The scale comes from the window SUM, and assuming N/2 for
+-- samples are computed. The scale comes from the window sum, and assuming N/2 for
 -- Hann rather than summing it reads every amplitude 0.2 % low at N = 512.
 function fftsa.win_build(N)
   local cos, sqrt, floor, pi = math.cos, math.sqrt, math.floor, math.pi
@@ -338,7 +338,7 @@ end
 -- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
 -- far more to read than a table entry. Returns the mean (DC level).
 --
--- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w). What has to be zero is the DC of
+-- The mean is window-weighted, sum(w*x)/sum(w). What has to be zero is the DC of
 -- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
 -- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
 -- leaving the window's own DC response as a residue that spreads over the first few

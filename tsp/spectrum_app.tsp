@@ -147,7 +147,7 @@ function fftsa.apply()
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs
-  -- THE BIN WIDTH COMMITS WITH THE RATE, not after the capture. A raise between the
+  -- The bin width commits with the rate, not after the capture. A raise between the
   -- write above and the measurement below -- a trigger timeout is the obvious one --
   -- used to leave the hardware at the new rate and fftsa.binhz describing the old
   -- one, and every later frame then reported the wrong frequency with errcount 0:

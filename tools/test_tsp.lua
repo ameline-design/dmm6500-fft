@@ -236,8 +236,8 @@ function buffer.write.format(b, ...) if not b.alive then error('format on dead b
 -- what the real call does. A frame writes 255 points, so a dialog per point makes
 -- the app impossible to exit; that is why this is counted and asserted.
 BADFRAC = 0
--- The firmware's stated limit, and the mock refuses ABOVE it. fftsa.sg_split_t
--- carries AT it, one representable step conservative, so the gap between the two is
+-- The firmware's stated limit, and the mock refuses above it. fftsa.sg_split_t
+-- carries at it, one representable step conservative, so the gap between the two is
 -- deliberate -- and invisible from inside sg_update, which is why a check below
 -- asserts the relationship rather than leaving the mock to catch it.
 FRAC_MAX = 0.9999999
@@ -486,7 +486,7 @@ end
 -- following G(k), and that line is 100 dB above the floor the low-sidelobe windows
 -- are chosen for.
 --
--- EIGHT PHASES, not one. The residue is A*G_rect(b)*cos(phase) referred to the
+-- Eight phases, not one. The residue is A*G_rect(b)*cos(phase) referred to the
 -- window centre, so a single phase can land near the zero of that cosine: at phase
 -- 0.3 alone the arithmetic mean reads -60 dBc here and this check passed under it.
 local function dc_spur(centre)
@@ -508,11 +508,11 @@ local function dc_spur(centre)
 end
 -- Bounds from tools/window_check.lua, loosened by about 2x so a harmless last-bit
 -- change does not fail: measured worst cases are 4.0e-6 bins and 0.0035 dB, both at
--- Kaiser b=4, and both AT MID-SPECTRUM. The low and high ends are four to six orders
+-- Kaiser b=4, and both at mid-spectrum. The low and high ends are four to six orders
 -- worse and have their own bounds below.
 local WIN_DF, WIN_DA = 1e-5, 0.008
 -- The first bin the table may report. Measured worst over every window at and above
--- that bin centre: 0.102 bins and 0.15 dB, at Kaiser b=9. Offsets BELOW the centre
+-- that bin centre: 0.102 bins and 0.15 dB, at Kaiser b=9. Offsets below the centre
 -- are not swept -- the tone is then under the app's own low-frequency limit, and the
 -- masked bin beside it vetoes the one above, so the table is legitimately empty
 -- (1 of 83 under Hann). Loosened like the pair above.
@@ -956,7 +956,7 @@ check('a bin under the floor is plotted AT the floor, not dropped', (function()
   return lo == fftsa.sg_dbmin, 'lowest written = ' .. tostring(lo)
 end)())
 -- Every comparison with a NaN is false, so a `db < dbmin` test lets one through to
--- buffer.write.reading and a refused parameter is event 1131. Hardening: no
+-- buffer.write.reading and a refused parameter is event 1131. Hardening only: no
 -- reachable NaN was found, which is why this feeds one in by hand.
 check('a NaN power bin is plotted at the floor, not written as a NaN', (function()
   local save = fftsa.fft_pwr
@@ -1109,7 +1109,7 @@ end)())
 -- refused write. math.floor() produces one when the scaled frequency lands a
 -- rounding error below an integer.
 --
--- HOW OFTEN: swept over every reachable configuration, the naive floor refuses at
+-- How often: swept over every reachable configuration, the naive floor refuses at
 -- most 3 points of 256 in one frame, and refuses nothing at all in 514691 of 515052
 -- sampled configurations. The 255-of-256 figure recorded with the fix came from a
 -- bin width of 999.9999999999, which needs 512000 S/s -- 2.4 % off the commanded
@@ -1118,7 +1118,7 @@ end)())
 -- 511/(511/fs), is exact or lands ABOVE exact at every rate, never below, so there
 -- is no configuration where the hazard repeats every frame for a stated reason.
 --
--- THE BENCH SYMPTOM IS THEREFORE STILL UNEXPLAINED. One tagged query on the
+-- The bench symptom is therefore still unexplained. One tagged query on the
 -- instrument with the app running settles whether a real frame goes near the limit,
 -- counting in place rather than reading binhz back at the 2 dp the readback line
 -- shows:
@@ -1142,7 +1142,7 @@ check('an exact value is left alone', (function()
 end)())
 -- The worst bin width the hardware can actually produce: one ulp below the exact
 -- 390.625 that 200 kS/s gives, which puts bins 64, 128 and 192 a hair under 25, 50
--- and 75 label-seconds. REACHABLE, unlike the 999.9999999999 below.
+-- and 75 label-seconds. Reachable, unlike the 999.9999999999 below.
 local FRAC_WORST = 199999.99999999997 / 512
 local function naive_refusals(binhz, fscale)
   local bad = 0

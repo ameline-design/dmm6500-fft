@@ -214,11 +214,11 @@ end
 
 -- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
 -- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
--- write with event 1131, which is a MODAL DIALOG on this instrument -- and one
+-- write with event 1131, which is a modal dialog on this instrument -- and one
 -- dialog per frame at 10 fps is as impossible to exit as one per point.
 --
 -- math.floor() leaves exactly that when the scaled frequency sits a rounding error
--- below an integer. That is RARE, not normal: it needs fftsa.binhz/sg_fscale to
+-- below an integer. That is rare, not normal: it needs fftsa.binhz/sg_fscale to
 -- land within about an ulp below a simple rational, not merely to be inexact.
 -- Swept over every reachable configuration -- the measured rate +-0.5 % around each
 -- commanded rate in 1e-5 steps, both rate lists, every Stop Freq the form offers --

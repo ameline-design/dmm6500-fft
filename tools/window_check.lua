@@ -11,7 +11,7 @@
 --   w20    the -20 dB peak width in bins, on a bin centre and half a bin off --
 --          the two numbers behind "the peak at 25 kHz is narrower than at 24"
 --   skirt swing
---          the level at the SECOND BIN FROM THE PEAK BIN, on a centre against half
+--          the level at the second bin from the peak bin, on a centre against half
 --          a bin off. On a centre that bin is 2.0 bins from the tone; half a bin
 --          off, the nearer of the two is 1.5 bins away -- so the figure is how far
 --          the window's transform rises between 2.0 and 1.5 bins. Hann's is set by
@@ -101,7 +101,7 @@ end
 -- samples the sidelobe envelope instead. The gap between the two is why a tone that
 -- happens to land on a centre draws a visibly narrower peak than its neighbours.
 --
--- The LARGER of the two bins two out, not bk+2. At d = 0.5 the tone sits between
+-- The larger of the two bins two out, not bk+2. At d = 0.5 the tone sits between
 -- two bins that are equal to within 7e-12 relative, so the > in run_tone's argmax
 -- decides which is the peak -- and that moved the sample between 1.5 and 2.5 bins
 -- from the tone, 17 dB apart on a skirt. Whichever bin wins the tie, the larger of
