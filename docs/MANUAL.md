@@ -34,7 +34,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 | Field | |
 |---|---|
 | Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. |
-| Stop Freq | Sets the sample rate — the smallest exact rate at or above twice it. A narrower span therefore also gives finer resolution. |
+| Stop Freq | Top of the display, 2 kHz to 500 kHz. Zooming in does not change the sample rate; widening past 50 kHz raises it. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
@@ -93,6 +93,23 @@ If the changing width distracts, use **Kaiser at β=15 or β=18**. Their transfo
 whole-bin offsets, so the skirt stays put as the tone moves — 5 to 6 dB of swing instead of 33, for
 a peak about twice as wide.
 
+## Aliasing: a peak can be real and still be at the wrong frequency
+
+There is no anti-alias filter in front of the digitizer. Anything above half the sample rate folds
+back into the display, at full amplitude, looking exactly like a tone that is there.
+
+Measured: a pure 21.1 kHz sine, with the sample rate chosen from a 0 to 7 kHz span, drew one 4.5135 V
+peak at **1.100 kHz** — 21100 reduced mod 20000. The amplitude was right to four digits. Nothing on
+the screen said the frequency was not.
+
+That is why zooming in no longer lowers the sample rate. The span selects which bins are drawn and
+leaves acquisition alone, so a tone outside the view is excluded rather than folded into it.
+
+**Folding above 50 kHz remains**, because it is the missing filter rather than the rate. At the
+default span a 63 kHz tone appears at 37 kHz and an 84 kHz tone at 16 kHz. Two ways to tell an alias
+from a tone: widen the span, and a real tone stays put while an alias moves; or change the signal and
+watch which peak follows.
+
 ## The peak table is more accurate than the trace
 
 A tone almost never lands on a bin centre, and reading the tallest bin pays for that twice: the
@@ -109,10 +126,12 @@ the window's own transform, so it carries no per-window approximation.
 
 ## Limits
 
-- **Bin width is the sample rate over 512** — 195.3 Hz at 100 kS/s. Two tones closer than that merge;
-  narrow the span to separate them.
-- **Sample rates are a fixed set**: 1 k, 10 k, 20 k, 50 k, 100 k, 200 k, 500 k and 1 MS/s. Stop
-  frequency picks from it, so 500 kHz is the highest tone the instrument can show.
+- **Bin width is the sample rate over 512**, and the sample rate is 100 kS/s for any span up to
+  50 kHz — so bins are 195.3 Hz and **zooming in does not make them finer**. Two tones closer than
+  195.3 Hz merge, and no setting separates them.
+- **A span wider than 50 kHz raises the rate** and coarsens the bins with it: 200 kS/s to 100 kHz
+  (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz). 500 kHz is the
+  highest tone the instrument can show.
 - **About 10 frames a second.** The firmware's shortest timer period is 0.05 s and a tick arriving
   mid-frame is dropped, so the rate is quantised to 20, 10, 6.67 and 5 fps.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the

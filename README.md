@@ -21,8 +21,11 @@ and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 
-The **stop** frequency chooses the sample rate — the smallest exact rate at or above twice it — so a
-narrower span also gives finer resolution. The **start** frequency windows the display.
+The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
+acquisition at 100 kS/s and 195.3 Hz bins, while widening past 50 kHz steps the rate up to 1 MS/s and
+coarsens the bins with it. There is no anti-alias filter, so a rate chosen below the signal's own
+content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, drew a 4.51 V peak at
+1.100 kHz. Raising the rate can only remove aliases; lowering it is what creates them.
 
 ## Choosing a window
 

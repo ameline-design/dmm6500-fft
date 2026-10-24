@@ -598,39 +598,61 @@ check('idx_to_range tolerates 1-based', fftsa.idx_to_range(1) == 0.1)
 check('idx_to_range tolerates the label string', fftsa.idx_to_range('10 V') == 10)
 check('idx_to_range tolerates 0-based', fftsa.idx_to_range(0) == 0.1)
 check('idx_to_range clamps out-of-range', fftsa.idx_to_range(99) == 10)
--- THE SAMPLE RATE IS FIXED, and that is an anti-aliasing requirement rather than a
--- simplification. There is no anti-alias filter, so a rate below the maximum folds
--- everything above its own Nyquist into the display. Measured on hardware: a pure
+-- THE RATE RULE IS DIRECTIONAL, and that is an anti-aliasing requirement rather
+-- than a convenience. There is no anti-alias filter, so a rate whose Nyquist falls
+-- below what is on the wire folds it into the display. Measured on hardware: a pure
 -- 21.1 kHz sine over a 0-7 kHz span at 20 kS/s drew one 4.51 V peak at 1.100 kHz,
--- which is 21100 reduced mod 20000, with nothing on screen to say so.
-check('the sample rate does not depend on the span', (function()
-  local seen = {}
-  for _, f in ipairs({2000, 5000, 10000, 25000, 49000, 50000}) do
-    local keep = fftsa.fhi
-    fftsa.fhi = f
-    fftsa.fs = fftsa.fs_fixed
-    seen[fftsa.fs] = true
-    fftsa.fhi = keep
+-- which is 21100 reduced mod 20000, with nothing on screen to say so. Raising the
+-- rate can only remove aliases; lowering it is what creates them.
+check('zooming in never lowers the sample rate below the floor', (function()
+  local worst, at = 1e12, 0
+  for _, f in ipairs({2000, 3000, 5000, 10000, 20000, 25000, 40000, 50000}) do
+    local fs = fftsa.pick_fs(f)
+    if fs < worst then worst, at = fs, f end
   end
-  local n = 0
-  for _ in pairs(seen) do n = n + 1 end
-  return n == 1 and seen[100000] == true, n .. ' distinct rate(s)'
+  return worst >= fftsa.fs_min,
+         string.format('lowest %g S/s at a %g Hz stop, floor %g', worst, at,
+                       fftsa.fs_min)
 end)())
-check('nothing picks a rate from the span any more',
-      fftsa.pick_fs == nil and fftsa.rates == nil)
-check('the fixed rate is the fastest the hardware offers, so Nyquist is the widest',
-      fftsa.fs_fixed == 100000 and fftsa.fhi_max * 2 <= fftsa.fs_fixed,
-      string.format('fs %g, fhi_max %g', fftsa.fs_fixed, fftsa.fhi_max))
--- The whole span must sit inside Nyquist, or the app offers a setting in which a
--- real in-band tone and an alias are indistinguishable.
-check('no settable span reaches past Nyquist', (function()
-  return fftsa.fhi_max <= fftsa.fs_fixed / 2 and fftsa.fhi_min < fftsa.fhi_max,
-         string.format('%g..%g Hz against Nyquist %g', fftsa.fhi_min,
-                       fftsa.fhi_max, fftsa.fs_fixed / 2)
+check('the rate never decreases as the span widens', (function()
+  local prev, ok = 0, true
+  for f = 2000, 500000, 2000 do
+    local fs = fftsa.pick_fs(f)
+    if fs < prev then ok = false end
+    prev = fs
+  end
+  return ok
 end)())
-check('acquisition is short enough to leave the panel its slice',
-      fftsa.n / fftsa.fs_fixed < 0.010,
-      string.format('%.1f ms', fftsa.n / fftsa.fs_fixed * 1000))
+check('widening past the floor Nyquist does raise the rate',
+      fftsa.pick_fs(50000) == fftsa.fs_min
+      and fftsa.pick_fs(200000) > fftsa.fs_min,
+      string.format('%g at 50 kHz, %g at 200 kHz', fftsa.pick_fs(50000),
+                    fftsa.pick_fs(200000)))
+check('every settable span is covered by its own Nyquist', (function()
+  local bad = 0
+  for f = fftsa.fhi_min, fftsa.fhi_max, 1000 do
+    if fftsa.pick_fs(f) / 2 < f then bad = bad + 1 end
+  end
+  return bad == 0, bad .. ' span(s) past Nyquist'
+end)())
+check('the widest span is the fastest rate Nyquist, so no bandwidth is thrown away',
+      fftsa.fhi_max * 2 == fftsa.rates[table.getn(fftsa.rates)],
+      string.format('fhi_max %g, fastest %g', fftsa.fhi_max,
+                    fftsa.rates[table.getn(fftsa.rates)]))
+check('acquisition is short at every rate, so the panel keeps its slice', (function()
+  local worst = 0
+  for i = 1, table.getn(fftsa.rates) do
+    local a = fftsa.n / fftsa.rates[i]
+    if a > worst then worst = a end
+  end
+  return worst < 0.010, string.format('%.1f ms worst', worst * 1000)
+end)())
+check('the finest bin width is the floor rate, and it is the default span', (function()
+  return fftsa.pick_fs(fftsa.fhi) == fftsa.fs_min
+         and fftsa.fs_min / fftsa.n < 200,
+         string.format('%.2f Hz bins at the default %g Hz stop',
+                       fftsa.pick_fs(fftsa.fhi) / fftsa.n, fftsa.fhi)
+end)())
 
 -- ---------- lifecycle: the object-lifetime invariant ----------
 print('\nobject lifetime (real code, mocked display)')

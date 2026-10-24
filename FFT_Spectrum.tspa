@@ -1091,10 +1091,11 @@ fftsa.n       = 512
 fftsa.flomin  = 10          -- floor for the start frequency (Hz)
 fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
--- Nyquist at the fixed 100 kS/s. The floor is not a hardware limit but a useful
--- one: the span no longer changes the bin width, so 2 kHz is already down to about
--- ten bins across the plot and anything narrower is a handful of points.
-fftsa.fhi_max = 50000
+-- Nyquist at the fastest rate, so this is the widest view the hardware can give.
+-- The low end is not a hardware limit: zooming in does not change the bin width, so
+-- 2 kHz is already down to about ten bins across the plot and narrower is a handful
+-- of points.
+fftsa.fhi_max = 500000
 fftsa.fhi_min = 2000
 fftsa.range   = 10          -- digitizer input range (V): 0.1 / 1 / 10
 fftsa.fs      = 100000      -- sample rate (picked from fftsa.fhi, then measured)
@@ -1127,27 +1128,40 @@ if fftsa.handles_inited == nil then
   fftsa.handles_inited = true
 end
 
--- THE SAMPLE RATE IS FIXED AT 100 kS/s, AND THE REASON IS ALIASING.
+-- SAMPLE RATE: THE SPAN MAY RAISE IT, NEVER LOWER IT BELOW THE FLOOR.
 --
--- There is no anti-alias filter in front of the digitizer. So any rate below the
--- maximum folds everything above its own Nyquist back into the display as peaks
--- that are not there -- measured on the bench 2026-10-23: a 21.1 kHz generator and
--- its harmonics, shown over a 0 to 7 kHz span at 20 kS/s, drew six peaks at 1.100,
--- 2.200, 3.301, 4.398, 5.499 and 6.600 kHz, every one of them a harmonic reduced
--- mod 20 kHz, with amplitudes correct to four digits. Nothing on that screen was
--- real and nothing about it looked wrong.
+-- There is no anti-alias filter in front of the digitizer, so a rate whose Nyquist
+-- falls below what is actually on the wire folds that content into the display as
+-- peaks that are not there. Measured on the bench 2026-10-23: a pure 21.1 kHz sine,
+-- shown over a 0 to 7 kHz span at 20 kS/s, drew one 4.5135 V peak at 1.100 kHz --
+-- 21100 reduced mod 20000 -- amplitude right to four digits, with nothing on the
+-- screen to say the frequency was not.
 --
--- Picking the rate from the span therefore trades a hazard for resolution, and the
--- hazard is invisible. 100 kS/s puts Nyquist at 50 kHz, which is the most the
--- hardware can honestly show; the span now only windows the display, bin width is
--- 195.3 Hz at every setting, and a narrow span simply shows fewer bins.
+-- The direction is what matters. RAISING the rate can only remove aliases; lowering
+-- it is what creates them. So zooming in never drops the rate: the span selects
+-- which bins are drawn, and below the floor it stops affecting acquisition at all.
+-- Widening the span past the floor's Nyquist does raise the rate, because showing
+-- 200 kHz honestly requires sampling for it.
 --
--- It also keeps the panel responsive for free: acquisition is 5 ms rather than the
--- 51 ms that 10 kS/s costs, and a press is only dispatched while Lua is idle.
+-- The floor is 100 kS/s, which gives 195.3 Hz bins -- the finest the app offers,
+-- and the resolution the default 0 to 50 kHz span is built around. Raising the rate
+-- coarsens the bins in proportion, which is the price of the wider view.
 --
--- Harmonics above 50 kHz still fold -- that is the missing filter, not the rate --
--- so a tone reported near the top of the span may be an alias of something higher.
-fftsa.fs_fixed = 100000
+-- Content above the chosen Nyquist still folds. That is the missing filter, not the
+-- rate, and no setting here removes it.
+fftsa.fs_min = 100000
+-- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
+fftsa.rates  = {100000, 200000, 500000, 1000000}
+
+-- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
+function fftsa.pick_fs(fhi)
+  local r = fftsa.rates
+  local n = table.getn(r)
+  for i = 1, n do
+    if r[i] >= fftsa.fs_min and r[i] / 2 >= fhi then return r[i] end
+  end
+  return r[n]
+end
 
 fftsa.ranges       = {0.1, 1, 10}
 fftsa.range_labels = {"0.1 V", "1 V", "10 V"}
@@ -1195,7 +1209,7 @@ end
 -- runtime. fftsa.fft_init() rebuilds the window and its interpolation tables, which
 -- is the slow part of a press -- about 0.3 s for Kaiser -- hence the cover.
 function fftsa.apply()
-  fftsa.fs = fftsa.fs_fixed
+  fftsa.fs = fftsa.pick_fs(fftsa.fhi)
   fftsa.fft_init(fftsa.n)
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
