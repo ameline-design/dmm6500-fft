@@ -1360,9 +1360,9 @@ function fftsa.build_options()
                         56575, display.FONT_SMALL, display.JUST_LEFT)   -- cyan 00DCFF
 
   local b_apply = create(fftsa.optscr, display.OBJ_BUTTON, 470, fftsa.opt_btn_y, "Apply", 140)
-  display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_apply() end")
+  display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_apply) end")
   local b_cancel = create(fftsa.optscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y, "Cancel", 140)
-  display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_cancel() end")
+  display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_cancel) end")
   -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
   -- the visible screen, and leaving from the form must still tear down.
   pcall(function()
@@ -1377,6 +1377,17 @@ function fftsa.opt_info_text()
   return string.format("%.0f - %.0f Hz    fs %d S/s    bin %.2f Hz    %g V    %s",
                        fftsa.flo, fftsa.fhi, fftsa.fs, fftsa.binhz, fftsa.range,
                        fftsa.win_label())
+end
+
+-- Every button press goes through here. A press is dispatched by the firmware
+-- evaluating the command string setevent was given, and an error raised inside that
+-- string arrives as a dialog over the app, not as a return value anyone can read --
+-- so the handler is the last place that can catch it.
+function fftsa.guard(f)
+  if f == nil then return false end
+  local ok, err = pcall(f)
+  if not ok then fftsa.lasterr = "button handler failed: " .. tostring(err) end
+  return ok
 end
 
 -- Back to the spectrum screen, which is also what lets the frame timer run again.
@@ -1443,7 +1454,7 @@ function fftsa.build()
   -- stale handle, do not delete it.
   fftsa.optbtn = nil
   fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
-  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options() end")
+  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options) end")
   fftsa.build_options()
   return fftsa.sg_scr
 end

@@ -904,6 +904,39 @@ check('each column runs top to bottom at the layout pitch', (function()
 end)())
 check('the two columns start on the same row',
       obj_at(fftsa.opt_win).y == obj_at(fftsa.opt_flo).y)
+-- opt_layout() derives the pitch from opt_nf, so a count that disagrees with the
+-- fields actually created lays the form out for a field that is not there.
+check('opt_nf matches the number of fields actually created', (function()
+  local n = 0
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == fftsa.optscr
+       and (o.type == display.OBJ_EDIT_NUMBER or o.type == display.OBJ_EDIT_OPTION) then
+      n = n + 1
+    end
+  end
+  return n == fftsa.opt_nf, 'created ' .. n .. ', opt_nf ' .. fftsa.opt_nf
+end)())
+-- A press is dispatched by the firmware evaluating a command string, so an error
+-- raised in a handler becomes a dialog over the app rather than a return value.
+check('a handler that raises is caught instead of reaching the panel', (function()
+  local before = fftsa.lasterr
+  local ok = fftsa.guard(function() error('boom', 0) end)
+  local caught = fftsa.lasterr ~= before and
+                 string.find(tostring(fftsa.lasterr), 'boom', 1, true) ~= nil
+  fftsa.lasterr = before
+  return ok == false and caught, tostring(fftsa.lasterr)
+end)())
+check('every button press goes through the guard', (function()
+  local bad = nil
+  for h, evs in pairs(display.events) do
+    local c, o = evs[display.EVENT_PRESS], OBJ[h]
+    if c ~= nil and o ~= nil and o.type == display.OBJ_BUTTON
+       and string.find(c, 'fftsa.guard(', 1, true) == nil then
+      bad = c
+    end
+  end
+  return bad == nil, tostring(bad)
+end)())
 check('the form carries no instruction text', (function()
   for _, o in pairs(OBJ) do
     if o.alive and o.parent == fftsa.optscr and o.type == display.OBJ_TEXT
