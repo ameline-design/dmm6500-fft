@@ -53,7 +53,10 @@ MANIFEST = [
     ('Description', 'On-instrument FFT spectrum analyser: digitize mode + FFT '
                     'with a live graph, top-6 peaks, and a touch options form '
                     '(start/stop frequency, input range).'),
-    ('Version', '1'),
+    # The repo versions by git tag (v1.1, v1.2, ...) and this field had never
+    # moved from the initial '1'. Tracks the tag from here on, so the version in
+    # MENU > Manage Apps identifies which tree is installed.
+    ('Version', '1.3'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was

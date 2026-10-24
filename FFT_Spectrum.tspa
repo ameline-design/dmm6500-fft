@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 1
+-- $Version: 1.3
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -36,7 +36,10 @@ fftsa.fft_twr    = nil    -- flattened butterfly twiddles, stage-major
 fftsa.fft_twi    = nil
 fftsa.fft_utr    = nil    -- untangle twiddles e^(-2*pi*i*k/N), k = 0..M-1
 fftsa.fft_uti    = nil
-fftsa.fft_cg     = 0.5    -- coherent gain (mean window sample)
+-- Coherent gain, the mean window sample. A window identity worth pinning, and
+-- tools/test_tsp.lua and tools/make_refs.lua do; no shipped module reads it. The
+-- amplitude calibration is fftsa.fft_ksq, from the window SUM.
+fftsa.fft_cg     = 0.5
 fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 
 -- ============================ analysis windows ============================
@@ -101,8 +104,8 @@ function fftsa.bessel_i0(x)
 end
 
 -- Build fftsa.fft_win and the amplitude scale from it. Symmetric, so only half the
--- samples are computed; the coherent gain is the mean window sample, and assuming
--- 0.5 for Hann rather than measuring it reads every amplitude 0.2 % low at N = 512.
+-- samples are computed. The scale comes from the window SUM, and assuming N/2 for
+-- Hann rather than summing it reads every amplitude 0.2 % low at N = 512.
 function fftsa.win_build(N)
   local cos, sqrt, floor, pi = math.cos, math.sqrt, math.floor, math.pi
   local w    = {}
@@ -159,6 +162,13 @@ fftsa.fft_gtab = nil
 fftsa.fft_dtab = nil
 fftsa.fft_dhr  = 0        -- dtab step in r; 0 means there is no usable table
 fftsa.win_mono = false    -- r(d) rose all the way to half a bin
+
+-- Bins above DC that the mean removal in fftsa.fft_load() makes unreportable, and
+-- the amplitude error that decides which they are. Set by fftsa.win_tables(), read
+-- by fftsa.find_peaks(). 0 before the first fftsa.fft_init().
+fftsa.fft_dctol = 0.05    -- 5 % of amplitude, 0.45 dB
+fftsa.fft_kdc   = 0
+fftsa.fft_kdcn  = 6       -- bins scanned; covers Kaiser b=18's 5.83-bin main lobe
 
 -- Costs (fft_gn+1)*N/2 cosines at init and nothing per frame.
 function fftsa.win_tables(N)
@@ -226,6 +236,21 @@ function fftsa.win_tables(N)
     fftsa.fft_dhr = 0
   end
   fftsa.fft_dtab = dt
+
+  -- How far up from DC fftsa.fft_load()'s mean removal reaches. The weighted mean
+  -- of a record carrying a tone at bin b is D + A*G(b)*cos(phase), so removing it
+  -- takes 2*A*G(b)^2 out of the tone's own bin: at bin 1 a 1.000 V tone reads
+  -- 0.589 V under Hann. The largest b over the scan is taken, not the first,
+  -- because G is not monotonic. fftsa.find_peaks() will not report these bins.
+  local kdc = 0
+  for b = 1, fftsa.fft_kdcn do
+    local a = twopi_N * b
+    local s = 0
+    for i = 1, M2 do s = s + w[i] * cos(a * (i - ctr)) end
+    s = 2 * s / wsum
+    if 2 * s * s > fftsa.fft_dctol then kdc = b end
+  end
+  fftsa.fft_kdc = kdc
   return g, dt
 end
 
@@ -323,14 +348,18 @@ end
 -- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
 -- far more to read than a table entry. Returns the mean (DC level).
 --
--- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w), and that is not a refinement. What
--- has to be zero is the DC of the sequence the transform sees, which is
--- sum(w*(x-m)) = sum(w*x) - m*sum(w); only the weighted mean makes it vanish. The
--- arithmetic mean leaves a residue that scales with how far the record is from a
--- whole number of cycles -- measured at -119 for a 203 Hz tone at 100 kS/s -- and it
--- lands in bin 1 and its neighbours, where it can stand taller than the tone itself.
--- A wide main lobe then leaves nothing in the lobe that is a local maximum, so
--- fftsa.find_peaks() reports noise while the trace plainly draws the tone.
+-- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w). What has to be zero is the DC of
+-- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
+-- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
+-- leaving the window's own DC response as a residue that spreads over the first few
+-- bins as G(k): measured, a 1.000 V tone at bin 10.5 leaves a spurious -27 dBc line
+-- at bin 1 under Hann and -27 under Kaiser b=18, whose sidelobes are at -139. The
+-- weighted mean leaves -147.
+--
+-- The price is that near DC the estimate is the tone: see fftsa.win_tables(), which
+-- measures how far that reaches, and fftsa.find_peaks(), which stops reporting
+-- there. Nothing separates a pedestal from a tone within one lobe of DC -- both ways
+-- round were measured over every window and nine tone positions.
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
@@ -541,14 +570,22 @@ end
 -- ---------- peak finder ----------
 
 -- Top `count` local maxima of fftsa.fft_pwr, strongest first, as two 1..count
--- arrays: bin indices and power (volts-squared). kmin/kmax (default 2..nbins)
--- restrict the search to the bins the graph shows, so the table never reports a
--- tone that is absent from the trace. Bin 1 is DC and is never a candidate.
+-- arrays: bin indices and power (volts-squared). kmin/kmax restrict the search to
+-- the bins the graph shows, so the table never reports a tone that is absent from
+-- the trace.
+--
+-- THE DC REGION IS NEVER REPORTED, whatever kmin says. Index 1 is DC, and the
+-- fftsa.fft_kdc bins above it hold the mean removal's own error rather than the
+-- signal: a 1.000 V tone at bin 1 reads 0.589 V under Hann and dances to 1.110 V
+-- with the capture phase, and no mean rule does better (fft_core.tsp). Printing a
+-- confident wrong number is worse than printing none, so the floor is here; the
+-- trace still draws those bins, which is where a low-frequency tone shows up.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
   local bi, bv = {}, {}
   for s = 1, count do bi[s] = 0; bv[s] = -1 end
-  if kmin == nil or kmin < 2 then kmin = 2 end
+  local k0 = 2 + (fftsa.fft_kdc or 0)
+  if kmin == nil or kmin < k0 then kmin = k0 end
   if kmax == nil or kmax > nbins then kmax = nbins end
   for k = kmin, kmax do
     local m = pwr[k]
@@ -756,8 +793,24 @@ end
 
 function fftsa.sg_xunit_text()
   local s = fftsa.sg_fscale
-  if s == 1000 then return "X: kHz   Y: dBV" end
-  return string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
+  local t = "X: kHz   Y: dBV"
+  if s ~= 1000 then
+    t = string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
+  end
+  -- A span narrower than a few bins is a legal pair that leaves nothing to look
+  -- at: Start 1999 / Stop 2000 is one plotted point at 195.3 Hz bins, so the trace
+  -- is a dot, five peak rows read --- and nothing else on the screen says why.
+  local b = fftsa.binhz
+  if b ~= nil and b > 0 then
+    local k0, k1 = fftsa.sg_window_bins(fftsa.sg_nbins, b)
+    local n = k1 - k0 + 1
+    if n < 3 then
+      local plural = "s"
+      if n == 1 then plural = "" end
+      t = t .. string.format("   %d bin%s in this span of %.0f Hz", n, plural, b)
+    end
+  end
+  return t
 end
 
 -- WRITABLE_FULL carries value, extra and timestamp per point: UNIT_VOLT holding dB
@@ -778,13 +831,22 @@ end
 
 -- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
 -- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
--- write with event 1131, which is a MODAL DIALOG on this instrument -- one per
--- point, every frame, which leaves the app impossible to exit.
+-- write with event 1131, which is a MODAL DIALOG on this instrument -- and one
+-- dialog per frame at 10 fps is as impossible to exit as one per point.
 --
--- math.floor() leaves exactly that whenever the scaled frequency sits a rounding
--- error below an integer, and it does as soon as the bin width is inexact, which is
--- the normal case: fftsa.binhz comes from the MEASURED sample rate, not the
--- commanded one. Carry a fraction that close to one into the whole part instead.
+-- math.floor() leaves exactly that when the scaled frequency sits a rounding error
+-- below an integer. That is RARE, not normal: it needs fftsa.binhz/sg_fscale to
+-- land within about an ulp below a simple rational, not merely to be inexact.
+-- Swept over every reachable configuration -- the measured rate +-0.5 % around each
+-- commanded rate in 1e-5 steps, both rate lists, every Stop Freq the form offers --
+-- the naive floor refuses at most 3 points of 256 in one frame, and refuses
+-- anything at all in 361 of 515052 configurations. The worst is a measured
+-- 199999.99999999997 S/s, one ulp below exact, where bin width 390.62499999999994
+-- puts bins 64, 128 and 192 a hair under 25, 50 and 75 label-seconds.
+--
+-- So this guard is cheap insurance, not a response to a measured storm, and the
+-- bench symptom it was written for is still unexplained: see
+-- fftsa.sg_split_t's test in tools/test_tsp.lua for the one query that settles it.
 function fftsa.sg_split_t(t)
   local w = math.floor(t)
   local fr = t - w
@@ -921,7 +983,6 @@ function fftsa.sg_update(nbins, binhz)
   local buf   = fftsa.sg_buf
   local pwr   = fftsa.fft_pwr
   local wr    = buffer.write.reading
-  local floor = math.floor
   local log10 = math.log10
   local vfl   = fftsa.sg_vfloor * fftsa.sg_vfloor   -- squared: the bins are power
   local dbmin = fftsa.sg_dbmin
@@ -934,10 +995,20 @@ function fftsa.sg_update(nbins, binhz)
     local v = pwr[k]
     local db
     -- nil (sparse power array) and anything at or below the floor plot at the
-    -- floor, so log10 is never handed a zero.
-    if v == nil or v <= vfl then db = dbmin else db = 10 * log10(v) end
-    if db < dbmin then db = dbmin end
-    if db > dbmax then db = dbmax end
+    -- floor, so log10 is never handed a zero. The range tests are written as
+    -- positives because every comparison with a NaN is false, so `db < dbmin`
+    -- would pass one straight through to buffer.write.reading and a refused
+    -- parameter is event 1131 again. No reachable NaN was found -- fft_ksq is
+    -- finite for every shipped window, pwr is a sum of squares, and an over-range
+    -- digitizer reading is 9.9e37, which clamps to +20 -- so this is hardening
+    -- rather than a fix for anything observed.
+    if v == nil or v <= vfl then
+      db = dbmin
+    else
+      db = 10 * log10(v)
+      if not (db > dbmin) then db = dbmin
+      elseif not (db < dbmax) then db = dbmax end
+    end
     local f = (k - 1) * binhz
     -- Scaled frequency into the seconds field, split so the fraction cannot reach
     -- the 0.9999999 the firmware refuses with event 1131.
@@ -1047,9 +1118,14 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
       if v >= 1 then vtxt = string.format("%.4f V", v)
       elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
       else vtxt = string.format("%.0f uV", v * 1e6) end
+      -- Floored at the plot's own floor: a bin at 1e-26 power reads -260 dBV
+      -- against a -120 dBV axis, which is a number the trace cannot show and the
+      -- column has about 93 px for before it reaches the Options button.
+      local dbv = 20 * log10(v)
+      if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
       settext(fftsa.sg_pk_f[p], ftxt)
       settext(fftsa.sg_pk_v[p], vtxt)
-      settext(fftsa.sg_pk_d[p], string.format("%.1f dBV", 20 * log10(v)))
+      settext(fftsa.sg_pk_d[p], string.format("%.1f dBV", dbv))
     else
       settext(fftsa.sg_pk_f[p], string.format("%d  ---", p))
       settext(fftsa.sg_pk_v[p], "")
@@ -1214,6 +1290,17 @@ function fftsa.apply()
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs
+  -- THE BIN WIDTH COMMITS WITH THE RATE, not after the capture. A raise between the
+  -- write above and the measurement below -- a trigger timeout is the obvious one --
+  -- used to leave the hardware at the new rate and fftsa.binhz describing the old
+  -- one, and every later frame then reported the wrong frequency with errcount 0:
+  -- a 12.5 kHz tone read 2500.0 Hz, axis and table agreeing and both wrong. The
+  -- measurement below refines this by about 0.01 %, so a failure costs that much
+  -- rather than a factor of five.
+  fftsa.binhz = fftsa.fs / fftsa.n
+  -- Same reason: the span comes from fftsa.flo/fhi, which options_apply() has
+  -- already committed, so pinning the axis to them does not depend on the capture.
+  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   dmm.digitize.aperture   = 1e-6
   dmm.digitize.count      = fftsa.n
   if fftsa.cap ~= nil and fftsa.cap_n ~= fftsa.n then
@@ -1228,7 +1315,6 @@ function fftsa.apply()
   dmm.digitize.read(fftsa.cap)
   fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
   fftsa.binhz = fftsa.fs / fftsa.n
-  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   fftsa.sg_rebind()
 end
 
