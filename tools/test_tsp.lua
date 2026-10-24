@@ -129,8 +129,10 @@ function display.create(parent, kind, ...)
   return h
 end
 -- Objects parented to `scr` that were created while `scr` was the screen on show.
--- Timers are excluded: one draws nothing, so creating it in view is invisible, and
--- fftsa.arm() is called on a live screen by design.
+-- Timers are excluded because one draws nothing, so creating it in view cannot be
+-- seen. The app does not need the exemption -- fftsa.start() arms under the cover --
+-- but this suite re-arms three times further down to prove timers do not stack, and
+-- those creates land on a visible screen.
 function born_in_view(scr)
   local n = 0
   for _, o in pairs(OBJ) do
@@ -396,8 +398,15 @@ print('\nwindows: peak frequency and amplitude, every window (real code)')
 local WN = 512
 -- Offsets at j/83 of a bin, coprime with the 40-node interpolation grid. On the
 -- nodes every window reads zero error, which measures the grid rather than the code.
+-- Routed through fftsa.find_peaks, the way a frame reaches peak_interp, NOT through
+-- a local argmax. An argmax always lands on the tone, so it cannot see the failure
+-- that mattered: find_peaks requires pwr[k] > pwr[k-1], and for a tone near DC the
+-- DC bin is the k-1 it is compared against. While fft_load removed the unweighted
+-- mean, that bin stood taller than the tone under every wide window, no bin in the
+-- main lobe was a local maximum, and the table reported noise 110 dB down while the
+-- trace drew the tone. `misses` is what counts that, and it is why this returns it.
 local function win_sweep(centre)
-  local wf, wa = 0, 0
+  local wf, wa, misses = 0, 0, 0
   for j = -41, 41 do
     local d  = j / 83
     local bn = centre + d
@@ -406,18 +415,24 @@ local function win_sweep(centre)
     fftsa.fft_load({readings = xs, n = WN})
     fftsa.fft_run()
     fftsa.fft_power()
-    local bk, bv = 0, -1
-    for k = 2, fftsa.fft_m - 1 do
-      if fftsa.fft_pwr[k] > bv then bk, bv = k, fftsa.fft_pwr[k] end
+    local bi_ = fftsa.find_peaks(fftsa.fft_m, 6, 2, fftsa.fft_m)
+    local bk = bi_[1]
+    -- The strongest peak must BE the tone, within a bin of where it was put.
+    if bk == nil or bk < 1 or math.abs((bk - 1) - bn) > 1.5 then
+      misses = misses + 1
+    else
+      local dd, vv = fftsa.peak_interp(bk, fftsa.fft_m)
+      if vv == nil then
+        misses = misses + 1
+      else
+        local ef = math.abs((bk - 1 + dd) - bn)
+        local ea = math.abs(20 * math.log10(vv))   -- amplitude is 1.0, so dB vs 0
+        if ef > wf then wf = ef end
+        if ea > wa then wa = ea end
+      end
     end
-    local dd, vv = fftsa.peak_interp(bk, fftsa.fft_m)
-    if vv == nil then return 9, 9 end
-    local ef = math.abs((bk - 1 + dd) - bn)
-    local ea = math.abs(20 * math.log10(vv))      -- amplitude is 1.0, so dB vs 0
-    if ef > wf then wf = ef end
-    if ea > wa then wa = ea end
   end
-  return wf, wa
+  return wf, wa, misses
 end
 -- Bounds from tools/window_check.lua, loosened by about 2x so a harmless last-bit
 -- change does not fail: measured worst cases are 4.3e-6 bins and 0.0035 dB.
@@ -431,11 +446,21 @@ for wi = 1, nwin do
     fftsa.kbeta_i = bi
     fftsa.fft_init(WN)
     local nm = fftsa.win_label()
-    local wf, wa = win_sweep(128)
+    local wf, wa, miss = win_sweep(128)
     check(nm .. ': peak frequency within 1e-5 bins', wf <= WIN_DF,
           string.format('%.2e bins', wf))
     check(nm .. ': peak amplitude within 0.008 dB', wa <= WIN_DA,
           string.format('%.1e dB', wa))
+    check(nm .. ': the peak finder reports the tone, every offset', miss == 0,
+          miss .. ' of 83 offsets missed')
+    -- Near DC the tone's own mirror image overlaps its skirts, so the ESTIMATE
+    -- degrades -- that is physics. What must not degrade is whether the tone is
+    -- found at all, which is what the DC bin used to prevent.
+    local lf, la, lmiss = win_sweep(3)
+    check(nm .. ': a tone three bins up is still found', lmiss == 0,
+          lmiss .. ' of 83 offsets missed')
+    check(nm .. ': and is placed within a tenth of a bin', lf < 0.1,
+          string.format('%.4f bins, %.2f dB', lf, la))
     -- r(d) must rise all the way to half a bin, or the offset is not invertible and
     -- the window has no business being on the list.
     check(nm .. ': r(d) is monotonic to half a bin', fftsa.win_mono)
@@ -495,12 +520,24 @@ check('r(d) inverts to exactly half a bin at the top of the table',
       math.abs(fftsa.win_offset(1e6) - 0.5) < 1e-12)
 check('a negative ratio gives a negative offset',
       fftsa.win_offset(-0.1) == -fftsa.win_offset(0.1))
+-- fft_pwr has to be POPULATED for this to reach win_offset at all: with an empty
+-- power array peak_interp returns 0, nil from the sparse guard and the test passes
+-- whatever the table is doing. That is how it was written, and it could not fail.
 check('with no table built, peak_interp says so instead of guessing', (function()
+  local xs = {}
+  for i = 1, WN do xs[i] = math.cos(2 * math.pi * 64.3 * (i - 1) / WN) end
+  fftsa.fft_load({readings = xs, n = WN})
+  fftsa.fft_run()
+  fftsa.fft_power()
+  -- Control first: with the table intact this same call MUST give an estimate, or
+  -- the assertion below is measuring the sparse guard again.
+  local c, cv = fftsa.peak_interp(65, 256)
   local keep = fftsa.fft_dhr
   fftsa.fft_dhr = 0
-  local a, b = fftsa.peak_interp(64, 256)
+  local a, b = fftsa.peak_interp(65, 256)
   fftsa.fft_dhr = keep
-  return a == 0 and b == nil
+  return cv ~= nil and a == 0 and b == nil,
+         string.format('with table: %s; without: %s', tostring(cv), tostring(b))
 end)())
 -- The coherent gain is what calibrates amplitude, so it has to follow the window.
 check('coherent gain follows the window', (function()
@@ -1144,6 +1181,39 @@ fftsa.errcount = 0
 for _ = 1, 5 do fftsa.frame() end
 check('frames still run after an inverted span', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount .. ' lasterr=' .. tostring(fftsa.lasterr))
+
+-- The pool-exhaustion path is the one show_error exists for, and it used to blank
+-- the panel there: display.create returns nil, every child goes to a nil parent and
+-- changescreen(nil) raises inside the pcall.
+print('\nstartup failure (real code)')
+check('show_error survives an exhausted pool and does not blank the panel',
+      (function()
+  local real = display.create
+  display.create = function() return nil end
+  local ok, err = pcall(function() fftsa.show_error('synthetic failure') end)
+  display.create = real
+  return ok and fftsa.errscr == nil and display.active == display.SCREEN_HOME,
+         string.format('raised=%s errscr=%s active=%s', tostring(not ok),
+                       tostring(fftsa.errscr), tostring(display.active))
+end)())
+check('and with a working pool it builds a screen and shows it', (function()
+  local h = fftsa.show_error('synthetic failure, readable')
+  local on = (display.active == h)
+  local txt = false
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT
+       and o.text ~= nil and string.find(o.text, 'readable', 1, true) ~= nil then
+      txt = true
+    end
+  end
+  return h ~= nil and on and txt, 'screen ' .. tostring(h) .. ', message shown: '
+         .. tostring(txt)
+end)())
+check('and stop() reclaims it', (function()
+  fftsa.stop()
+  return fftsa.errscr == nil and live() == 0, 'live=' .. live()
+end)())
+fftsa.start()
 
 -- teardown must leave nothing behind
 print('\nteardown (real code)')

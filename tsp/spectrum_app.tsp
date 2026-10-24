@@ -572,13 +572,25 @@ end
 
 -- Startup failure on the panel. End App is hooked here too, and the handle is kept
 -- so fftsa.stop() can delete the screen.
+-- The commonest reason startup fails is an exhausted object pool, and then
+-- display.create returns nil here too: without the guard below every child is built
+-- against a nil parent and changescreen(nil) raises, so the operator gets a BLANK
+-- PANEL in precisely the case this screen exists for. Nothing can be drawn with at
+-- that point, so it says so on the console and leaves the home screen up.
+--
+-- These children are created on a visible screen, which nothing else in the app
+-- does. Accepted: it runs once, after startup has already failed, and the cover is
+-- gone by then because fftsa.stop() took it.
 function fftsa.show_error(msg)
-  pcall(function()
+  local shown = pcall(function()
     if fftsa.errscr ~= nil then
       fftsa.del_obj(fftsa.errscr)
       fftsa.errscr = nil
     end
     fftsa.errscr = display.create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER ERROR")
+    if fftsa.errscr == nil then
+      error("object pool exhausted; no error screen", 0)
+    end
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
                    "The analyser could not start.", 16736352,   -- red FF6060
                    display.FONT_MEDIUM, display.JUST_LEFT)
@@ -597,5 +609,10 @@ function fftsa.show_error(msg)
     display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
     display.changescreen(fftsa.errscr)
   end)
+  if not shown or fftsa.errscr == nil then
+    fftsa.errscr = nil
+    pcall(function() display.changescreen(display.SCREEN_HOME) end)
+    print("fftsa: could not build the error screen either -- " .. tostring(msg))
+  end
   return fftsa.errscr
 end

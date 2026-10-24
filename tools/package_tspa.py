@@ -180,8 +180,6 @@ def gate(body):
                              + r.stdout + r.stderr)
     finally:
         os.unlink(path)
-        if os.path.exists('luac.out'):
-            os.unlink('luac.out')
     print('  gate: lint clean, and Lua 5.0.2 parses the assembled script')
 
 
