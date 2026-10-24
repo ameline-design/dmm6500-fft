@@ -58,14 +58,22 @@ end
 -- ---------- peak finder ----------
 
 -- Top `count` local maxima of fftsa.fft_pwr, strongest first, as two 1..count
--- arrays: bin indices and power (volts-squared). kmin/kmax (default 2..nbins)
--- restrict the search to the bins the graph shows, so the table never reports a
--- tone that is absent from the trace. Bin 1 is DC and is never a candidate.
+-- arrays: bin indices and power (volts-squared). kmin/kmax restrict the search to
+-- the bins the graph shows, so the table never reports a tone that is absent from
+-- the trace.
+--
+-- THE DC REGION IS NEVER REPORTED, whatever kmin says. Index 1 is DC, and the
+-- fftsa.fft_kdc bins above it hold the mean removal's own error rather than the
+-- signal: a 1.000 V tone at bin 1 reads 0.589 V under Hann and dances to 1.110 V
+-- with the capture phase, and no mean rule does better (fft_core.tsp). Printing a
+-- confident wrong number is worse than printing none, so the floor is here; the
+-- trace still draws those bins, which is where a low-frequency tone shows up.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
   local bi, bv = {}, {}
   for s = 1, count do bi[s] = 0; bv[s] = -1 end
-  if kmin == nil or kmin < 2 then kmin = 2 end
+  local k0 = 2 + (fftsa.fft_kdc or 0)
+  if kmin == nil or kmin < k0 then kmin = k0 end
   if kmax == nil or kmax > nbins then kmax = nbins end
   for k = kmin, kmax do
     local m = pwr[k]

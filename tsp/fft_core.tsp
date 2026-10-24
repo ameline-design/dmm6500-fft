@@ -150,6 +150,13 @@ fftsa.fft_dtab = nil
 fftsa.fft_dhr  = 0        -- dtab step in r; 0 means there is no usable table
 fftsa.win_mono = false    -- r(d) rose all the way to half a bin
 
+-- Bins above DC that the mean removal in fftsa.fft_load() makes unreportable, and
+-- the amplitude error that decides which they are. Set by fftsa.win_tables(), read
+-- by fftsa.find_peaks(). 0 before the first fftsa.fft_init().
+fftsa.fft_dctol = 0.05    -- 5 % of amplitude, 0.45 dB
+fftsa.fft_kdc   = 0
+fftsa.fft_kdcn  = 6       -- bins scanned; covers Kaiser b=18's 5.83-bin main lobe
+
 -- Costs (fft_gn+1)*N/2 cosines at init and nothing per frame.
 function fftsa.win_tables(N)
   local cos, floor = math.cos, math.floor
@@ -216,6 +223,21 @@ function fftsa.win_tables(N)
     fftsa.fft_dhr = 0
   end
   fftsa.fft_dtab = dt
+
+  -- How far up from DC fftsa.fft_load()'s mean removal reaches. The weighted mean
+  -- of a record carrying a tone at bin b is D + A*G(b)*cos(phase), so removing it
+  -- takes 2*A*G(b)^2 out of the tone's own bin: at bin 1 a 1.000 V tone reads
+  -- 0.589 V under Hann. The largest b over the scan is taken, not the first,
+  -- because G is not monotonic. fftsa.find_peaks() will not report these bins.
+  local kdc = 0
+  for b = 1, fftsa.fft_kdcn do
+    local a = twopi_N * b
+    local s = 0
+    for i = 1, M2 do s = s + w[i] * cos(a * (i - ctr)) end
+    s = 2 * s / wsum
+    if 2 * s * s > fftsa.fft_dctol then kdc = b end
+  end
+  fftsa.fft_kdc = kdc
   return g, dt
 end
 
@@ -313,14 +335,18 @@ end
 -- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
 -- far more to read than a table entry. Returns the mean (DC level).
 --
--- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w), and that is not a refinement. What
--- has to be zero is the DC of the sequence the transform sees, which is
--- sum(w*(x-m)) = sum(w*x) - m*sum(w); only the weighted mean makes it vanish. The
--- arithmetic mean leaves a residue that scales with how far the record is from a
--- whole number of cycles -- measured at -119 for a 203 Hz tone at 100 kS/s -- and it
--- lands in bin 1 and its neighbours, where it can stand taller than the tone itself.
--- A wide main lobe then leaves nothing in the lobe that is a local maximum, so
--- fftsa.find_peaks() reports noise while the trace plainly draws the tone.
+-- The mean is WINDOW-WEIGHTED, sum(w*x)/sum(w). What has to be zero is the DC of
+-- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
+-- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
+-- leaving the window's own DC response as a residue that spreads over the first few
+-- bins as G(k): measured, a 1.000 V tone at bin 10.5 leaves a spurious -27 dBc line
+-- at bin 1 under Hann and -27 under Kaiser b=18, whose sidelobes are at -139. The
+-- weighted mean leaves -147.
+--
+-- The price is that near DC the estimate is the tone: see fftsa.win_tables(), which
+-- measures how far that reaches, and fftsa.find_peaks(), which stops reporting
+-- there. Nothing separates a pedestal from a tone within one lobe of DC -- both ways
+-- round were measured over every window and nine tone positions.
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m

@@ -33,7 +33,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 
 | Field | |
 |---|---|
-| Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. |
+| Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. The peak table has its own floor two or three bins up — see *The lowest frequency the table reports*. |
 | Stop Freq | Top of the display, 2 kHz to 500 kHz. Zooming in does not change the sample rate; widening past 50 kHz raises it. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
@@ -121,8 +121,47 @@ The table recovers both from the tallest bin and its two neighbours. On hardware
 table.
 
 So the apex of the trace can sit 1.4 dB below the number printed under it. The number is right. Over
-83 sub-bin offsets and every window the worst case is 4.0e-6 bins and 0.0035 dB; the estimator reads
-the window's own transform, so it carries no per-window approximation.
+83 sub-bin offsets and every window the worst case **in the middle of the spectrum** is 4.0e-6 bins
+and 0.0035 dB; the estimator reads the window's own transform, so it carries no per-window
+approximation. Both ends of the spectrum are worse, and by a long way:
+
+| where | frequency | amplitude |
+|---|---|---|
+| middle of the span | 4.0e-6 bins | 0.0035 dB |
+| lowest bin the table reports | 0.102 bins | 0.15 dB |
+| top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
+
+The top bin has no neighbour above it, so there is nothing to interpolate against and the table falls
+back to the bin itself: 49.805 kHz at the default span, read up to 98 Hz low with the full scalloping
+loss. Widen the span by one step if a tone sits in it.
+
+## The lowest frequency the table reports
+
+The transform removes the DC level before it runs, or a 2.5 V offset would stand 2.5 V tall at the
+left edge and bury everything near it. The estimate of that level is the window-weighted mean, and
+for a tone within one main lobe of DC **the estimate is partly the tone**: removing it takes
+`2·G(b)²` of the tone out of the tone's own bin. Measured on bin 1, a 1.000 V tone at 195.3 Hz reads
+0.589 V under Hann and swings to 1.110 V as the capture phase drifts.
+
+Nothing fixes that. A record 512 samples long cannot tell a steady offset from a tone one bin away
+from it — they are the same resolution cell. Removing the plain arithmetic mean instead puts a
+spurious line of up to −27 dBc at bin 1 for any off-centre tone **anywhere** in the spectrum, which
+is 110 dB above the floor Kaiser β=18 is chosen for. Both were measured over every window and nine
+tone positions.
+
+So the app declines to put a number on those bins. The trace still draws them, which is where a tone
+below the limit shows up:
+
+| window | bins not reported | lowest reported, 195.3 Hz bins |
+|---|---|---|
+| Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | 390.6 Hz |
+| Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | 585.9 Hz |
+
+The limit is in **bins**, so it moves with the sample rate: at a 500 kHz span the bins are 1953 Hz
+and two of them is 3.9 kHz. A narrower window main lobe reaches closer to DC, which is the one thing
+Kaiser β=4 is better at than β=18.
+
+**A bump at the left edge of the trace with nothing in the table is a tone below this limit.**
 
 ## Limits
 
@@ -136,6 +175,8 @@ the window's own transform, so it carries no per-window approximation.
   mid-frame is dropped, so the rate is quantised to 20, 10, 6.67 and 5 fps.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
+- **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin
+  estimate. See above for both.
 - **No averaging and no peak hold.** Each frame is one capture.
 
 ## Troubleshooting
@@ -147,3 +188,4 @@ the window's own transform, so it carries no per-window approximation.
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | Peak width changes as you tune | Expected. See above. |
+| A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |

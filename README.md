@@ -48,13 +48,30 @@ and the skirts vanish, so the peak draws narrower — Hann swings 33 dB, which i
 25 kHz looks sharper than the same tone at 24 kHz. Kaiser at β=15 or 18 cuts that to 5-6 dB and
 doubles the peak width. `docs/MANUAL.md` explains the effect for an operator.
 
-**The peak estimate is exact for every window.** `fft_init` samples the window's own transform into a
-61-point table, inverts the offset-to-ratio curve from it, and reads the scalloping correction from
-the same table, so the estimator is derived from the window in use rather than fitted to one and
-approximated for the rest. Worst case over 83 sub-bin offsets and all nine settings: **4.0e-6 bins of
-frequency error and 0.0035 dB of amplitude error**, both at Kaiser β=4. `tools/test_tsp.lua` pins
-them at 1e-5 bins and 0.008 dB, and proves the sweep failable by feeding one window's data to
-another's tables.
+**The peak estimate is exact for every window, in the middle of the spectrum.** `fft_init` samples
+the window's own transform into a 61-point table, inverts the offset-to-ratio curve from it, and reads
+the scalloping correction from the same table, so the estimator is derived from the window in use
+rather than fitted to one and approximated for the rest. Worst case over 83 sub-bin offsets and all
+nine settings: **4.0e-6 bins of frequency error and 0.0035 dB of amplitude error**, both at Kaiser
+β=4. `tools/test_tsp.lua` pins them at 1e-5 bins and 0.008 dB, and proves the sweep failable by
+feeding one window's data to another's tables.
+
+Both ends of the spectrum are four to six orders worse, and the suite now bounds them separately.
+
+| | frequency | amplitude |
+|---|---|---|
+| middle of the span | 4.0e-6 bins | 0.0035 dB |
+| lowest bin the table reports | 0.102 bins | 0.15 dB |
+| top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
+
+The top bin has no neighbour above it, so `peak_interp` declines and the caller reads the raw bin. At
+the low end the DC removal owns the first bin or two: the weighted mean of a record with a tone inside
+the window's main lobe of DC *is partly the tone*, so removing it takes `2·G(b)²` out of the tone's
+own bin — a 1.000 V tone on bin 1 reads 0.589 V under Hann and moves with the capture phase. No mean
+rule does better; the arithmetic mean instead leaves a −27 dBc line at bin 1 for any off-centre tone
+anywhere in the spectrum. `fft_init` measures how far the damage reaches (`fft_kdc`, one bin for Hann
+and two for Blackman-Harris) and `find_peaks` will not report those bins. The trace still draws them.
+`docs/MANUAL.md` states the resulting lowest reported frequency.
 
 Rectangular and Hamming are absent. Rectangular's transform nulls one bin from the peak, which leaves
 the three-bin estimate ill-conditioned; Kaiser β=6 covers Hamming to within a dB.

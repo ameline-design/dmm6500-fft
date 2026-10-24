@@ -318,12 +318,23 @@ check('strongest peak is the tone', bi[1] == bestk)
 local sorted = true
 for p = 1, 5 do if bv[p] < bv[p + 1] then sorted = false end end
 check('sorted strongest first', sorted)
--- Bin 1 is DC, so bin 2 is the first real frequency bin and must be reportable.
+-- Index 1 is DC and the fftsa.fft_kdc indices above it are the mean removal's own
+-- error, so the first reportable index is fft_kdc + 2. Both halves are asserted:
+-- the bin past the region is reported and the region itself never is.
+local kdc = fftsa.fft_kdc
+check('Hann puts one bin above DC inside the region', kdc == 1,
+      'fft_kdc=' .. tostring(kdc))
 fftsa.fft_pwr = {}
 for k = 1, nb do fftsa.fft_pwr[k] = 1e-12 end
-fftsa.fft_pwr[2] = 0.25
+fftsa.fft_pwr[kdc + 2] = 0.25
 local b2 = fftsa.find_peaks(nb, 6)
-check('a tone in bin 2 is reportable', b2[1] == 2, 'bi[1]=' .. tostring(b2[1]))
+check('the first bin past the DC region is reportable', b2[1] == kdc + 2,
+      'bi[1]=' .. tostring(b2[1]) .. ', want ' .. (kdc + 2))
+fftsa.fft_pwr[kdc + 2] = 1e-12
+fftsa.fft_pwr[2] = 1.0            -- a full-scale peak, inside the region
+local bdc = fftsa.find_peaks(nb, 6)
+check('a peak inside the DC region is refused however tall it stands', bdc[1] == 0,
+      'bi[1]=' .. tostring(bdc[1]))
 -- windowing keeps an out-of-window tone out of the table
 for k = 1, nb do fftsa.fft_pwr[k] = 1e-12 end
 fftsa.fft_pwr[62] = 0.04      -- ~12 kHz, inside 8-16 kHz
@@ -399,15 +410,16 @@ local WN = 512
 -- Offsets at j/83 of a bin, coprime with the 40-node interpolation grid. On the
 -- nodes every window reads zero error, which measures the grid rather than the code.
 -- Routed through fftsa.find_peaks, the way a frame reaches peak_interp, NOT through
--- a local argmax. An argmax always lands on the tone, so it cannot see the failure
--- that mattered: find_peaks requires pwr[k] > pwr[k-1], and for a tone near DC the
--- DC bin is the k-1 it is compared against. While fft_load removed the unweighted
--- mean, that bin stood taller than the tone under every wide window, no bin in the
--- main lobe was a local maximum, and the table reported noise 110 dB down while the
--- trace drew the tone. `misses` is what counts that, and it is why this returns it.
-local function win_sweep(centre)
-  local wf, wa, misses = 0, 0, 0
-  for j = -41, 41 do
+-- a local argmax: an argmax always lands on the tone, so it cannot see a tone that
+-- is present in the spectrum and absent from the table. `misses` counts that.
+--
+-- `fb` counts offsets where peak_interp declined and the raw bin was used, which is
+-- what fftsa.sg_show_peaks() does, so the error columns describe the number the
+-- operator reads rather than the number peak_interp returned.
+local function win_sweep(centre, from_j)
+  local wf, wa, misses, fb = 0, 0, 0, 0
+  if from_j == nil then from_j = -41 end
+  for j = from_j, 41 do
     local d  = j / 83
     local bn = centre + d
     local xs = {}
@@ -423,20 +435,79 @@ local function win_sweep(centre)
     else
       local dd, vv = fftsa.peak_interp(bk, fftsa.fft_m)
       if vv == nil then
-        misses = misses + 1
-      else
-        local ef = math.abs((bk - 1 + dd) - bn)
-        local ea = math.abs(20 * math.log10(vv))   -- amplitude is 1.0, so dB vs 0
-        if ef > wf then wf = ef end
-        if ea > wa then wa = ea end
+        fb = fb + 1
+        dd, vv = 0, math.sqrt(fftsa.fft_pwr[bk])
+      end
+      local ef = math.abs((bk - 1 + dd) - bn)
+      local ea = math.abs(20 * math.log10(vv))     -- amplitude is 1.0, so dB vs 0
+      if ef > wf then wf = ef end
+      if ea > wa then wa = ea end
+    end
+  end
+  return wf, wa, misses, fb
+end
+-- Rows of the table reported inside the DC region with the tone placed there. The
+-- whole region must stay empty: those bins carry fft_load's own error, so a number
+-- printed from them is wrong by up to 11.6 dB and moves with the capture phase.
+local function dc_reported(centre)
+  local n = 0
+  for j = -41, 41 do
+    local bn = centre + j / 83
+    local xs = {}
+    for i = 1, WN do xs[i] = math.cos(2 * math.pi * bn * (i - 1) / WN + 0.3) end
+    fftsa.fft_load({readings = xs, n = WN})
+    fftsa.fft_run()
+    fftsa.fft_power()
+    local bi_ = fftsa.find_peaks(fftsa.fft_m, 6, 2, fftsa.fft_m)
+    for p = 1, 6 do
+      if bi_[p] ~= nil and bi_[p] > 0 and bi_[p] <= fftsa.fft_kdc + 1 then
+        n = n + 1
       end
     end
   end
-  return wf, wa, misses
+  return n
+end
+-- Worst level anywhere in the DC region with the only tone far away and off a bin
+-- centre. This is why fft_load weights the mean: the arithmetic mean removes the
+-- true DC, which leaves the window's own DC response behind as a line at bin 1
+-- following G(k), and that line is 100 dB above the floor the low-sidelobe windows
+-- are chosen for.
+--
+-- EIGHT PHASES, not one. The residue is A*G_rect(b)*cos(phase) referred to the
+-- window centre, so a single phase can land near the zero of that cosine: at phase
+-- 0.3 alone the arithmetic mean reads -60 dBc here and this check passed under it.
+local function dc_spur(centre)
+  local worst = 0
+  for p = 0, 7 do
+    local ph = p * math.pi / 8
+    local xs = {}
+    for i = 1, WN do xs[i] = math.cos(2 * math.pi * centre * (i - 1) / WN + ph) end
+    fftsa.fft_load({readings = xs, n = WN})
+    fftsa.fft_run()
+    fftsa.fft_power()
+    for k = 1, fftsa.fft_kdc + 2 do
+      local v = fftsa.fft_pwr[k]
+      if v ~= nil and v > worst then worst = v end
+    end
+  end
+  if worst <= 0 then return -300 end
+  return 10 * math.log10(worst)
 end
 -- Bounds from tools/window_check.lua, loosened by about 2x so a harmless last-bit
--- change does not fail: measured worst cases are 4.3e-6 bins and 0.0035 dB.
+-- change does not fail: measured worst cases are 4.0e-6 bins and 0.0035 dB, both at
+-- Kaiser b=4, and both AT MID-SPECTRUM. The low and high ends are four to six orders
+-- worse and have their own bounds below.
 local WIN_DF, WIN_DA = 1e-5, 0.008
+-- The first bin the table may report. Measured worst over every window at and above
+-- that bin centre: 0.102 bins and 0.15 dB, at Kaiser b=9. Offsets BELOW the centre
+-- are not swept -- the tone is then under the app's own low-frequency limit, and the
+-- masked bin beside it vetoes the one above, so the table is legitimately empty
+-- (1 of 83 under Hann). Loosened like the pair above.
+local LOW_DF, LOW_DA = 0.15, 0.3
+-- The top bin of the spectrum has no right-hand neighbour, so peak_interp declines
+-- for every window and the raw bin is read: half a bin of frequency and 2.3 to
+-- 7.1 dB of scalloping, which is the high end of the accuracy claim in the docs.
+local TOP_DF, TOP_DA = 0.5, 8.0
 local nwin = table.getn(fftsa.win_names)
 for wi = 1, nwin do
   fftsa.win_i = wi
@@ -453,14 +524,31 @@ for wi = 1, nwin do
           string.format('%.1e dB', wa))
     check(nm .. ': the peak finder reports the tone, every offset', miss == 0,
           miss .. ' of 83 offsets missed')
-    -- Near DC the tone's own mirror image overlaps its skirts, so the ESTIMATE
-    -- degrades -- that is physics. What must not degrade is whether the tone is
-    -- found at all, which is what the DC bin used to prevent.
-    local lf, la, lmiss = win_sweep(3)
-    check(nm .. ': a tone three bins up is still found', lmiss == 0,
-          lmiss .. ' of 83 offsets missed')
-    check(nm .. ': and is placed within a tenth of a bin', lf < 0.1,
+    -- The DC region, which fft_load's mean removal owns. One or two bins for every
+    -- shipped window; a wider one would mean the window list changed under this.
+    local kdc = fftsa.fft_kdc
+    check(nm .. ': the DC region is one or two bins wide', kdc == 1 or kdc == 2,
+          'fft_kdc=' .. tostring(kdc))
+    check(nm .. ': a tone inside the DC region is not reported there',
+          dc_reported(1) == 0 and dc_reported(0.5) == 0,
+          'bin 1: ' .. dc_reported(1) .. ' rows, bin 0.5: ' .. dc_reported(0.5))
+    -- Both axes asserted. The amplitude error here used to be measured, formatted
+    -- into the message and never compared, so it read 2.17 dB and passed.
+    local lf, la, lmiss = win_sweep(kdc + 1, 0)
+    check(nm .. ': the lowest reportable bin is found at every offset', lmiss == 0,
+          'bin ' .. (kdc + 1) .. ', ' .. lmiss .. ' of 42 missed')
+    check(nm .. ': ... within 0.15 bins and 0.3 dB',
+          lf < LOW_DF and la < LOW_DA,
           string.format('%.4f bins, %.2f dB', lf, la))
+    -- The arithmetic mean reads -42 to -46 dBc here for every window; the weighted
+    -- mean reads -54 (Kaiser b=4, its own sidelobes) to -167 (Kaiser b=18).
+    local spur = dc_spur(64.5)
+    check(nm .. ': a distant off-centre tone leaves the DC region clean',
+          spur < -50, string.format('%.1f dBc', spur))
+    local hf, ha, hmiss, hfb = win_sweep(fftsa.fft_m - 1)
+    check(nm .. ': the top bin falls back to the raw bin, and reads half a bin out',
+          hmiss == 0 and hfb > 0 and hf < TOP_DF and ha < TOP_DA,
+          string.format('%d of 83 fell back, %.3f bins, %.2f dB', hfb, hf, ha))
     -- r(d) must rise all the way to half a bin, or the offset is not invertible and
     -- the window has no business being on the list.
     check(nm .. ': r(d) is monotonic to half a bin', fftsa.win_mono)
