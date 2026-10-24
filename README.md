@@ -4,7 +4,7 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen: a 12 kHz tone at 1 V, 0 to 50 kHz span, Hann window](docs/manual-spectrum.png)
+![The spectrum screen: a 21.1 kHz tone at 4.5 V with its second harmonic at 42.2 kHz, 0 to 50 kHz span, Hann window](docs/manual-spectrum.png)
 
 A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
 and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.

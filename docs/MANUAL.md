@@ -16,16 +16,24 @@ Leave with **End App**. That frees every screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12 kHz tone at 1 V, 0 to 50 kHz span, Hann window](manual-spectrum.png)
+![The spectrum screen: a 21.1 kHz tone at 4.5 V with its second harmonic at 42.2 kHz, 0 to 50 kHz span, Hann window](manual-spectrum.png)
 
-The trace runs 0 to −120 dBV against frequency. Tick labels below the plot read in Hz or kHz. The
-firmware's own numbers along the left edge are the dB values; ignore the `V` it suffixes them with.
+The trace runs +20 to −120 dBV against frequency.
+
+**Two rows of numbers sit under the plot. Read the lower one.** The graph object's X axis is
+hardwired to time, so the app writes each bin's frequency into the timestamp and the firmware labels
+it in seconds — the `00.01s 05.01s 10.01s` row. One label-second is one kilohertz. The app prints its
+own row in real units below it, and that is the one to read. The dB numbers down the left edge are
+the firmware's, correct as written; ignore the `V` it suffixes them with.
 
 Six peaks sit below the trace in two columns, strongest first, each as frequency, amplitude and level:
 
 ```
-1  12.000 kHz   1.0016 V   0.0 dBV
+1  21.100 kHz   4.5122 V   13.1 dBV
 ```
+
+In the capture above, peak 1 is the generator's fundamental and peak 2 its second harmonic, 1.0 dB
+down. Peaks 3 to 6 are noise, 70 dB below the tones.
 
 **Options** opens the settings form. **End App** exits.
 
