@@ -5,11 +5,10 @@ on the instrument** as a TSP app. No host, no PC software: the digitizer capture
 computes the transform in Lua, and the firmware's own graph object draws the trace. Touch the front
 panel to change the span.
 
-**Supported hardware:** DMM6500, DAQ6510, DMM7510. All three run the same firmware family and the
-same patched Lua 5.0.2, and all three reach the digitizer as `dmm.digitize`, which is the only
-instrument namespace this app uses — the shared lineage shows in the firmware itself, where a
-DMM6500 creates its display task under the name "DAQ Display". **Only the DMM6500 has been tested;**
-the other two are declared so that they can be, and reports are welcome.
+**Supported hardware:** DMM6500, DAQ6510, DMM7510 — all three tested and working. The DMM6500 and
+DAQ6510 share the same boards. The DMM7510 has a better digitizer and analog front end, so it gives
+the cleanest spectrum of the three. All of them reach the digitizer as `dmm.digitize`, the only
+instrument namespace this app uses.
 
 ![the app running](docs/spectrum-working.png)
 

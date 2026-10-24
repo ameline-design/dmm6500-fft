@@ -1,82 +1,42 @@
 -- spectrum_app.tsp -- interactive standalone spectrum analyser for the DMM6500
 --
--- Uses the other modules:
---   fft_core.tsp       real-input FFT
---   spectrum_ui.tsp    fftsa.find_peaks()
---   spectrum_graph.tsp fftsa.sg_build / fftsa.sg_update / fftsa.sg_bind_min / fftsa.sg_show_peaks / etc.
+-- The touch options form and the on-instrument run loop, over fft_core.tsp (the
+-- transform), spectrum_ui.tsp (fftsa.find_peaks) and spectrum_graph.tsp (fftsa.sg_*).
+-- The stop frequency sets the sample rate (smallest exact rate >= 2*stop, so a
+-- narrower span also gives finer resolution), the start frequency only windows the
+-- display, and the input range is dmm.digitize.range.
 --
--- Provides a touch OPTIONS FORM (a screen of editable fields, not a chain of
--- modal prompts) and an on-instrument run loop, so the app runs by itself.
---
--- OPTIONS SEMANTICS (like a real spectrum analyser):
---   Stop frequency  -> sets the sample rate: fs = smallest EXACT rate >= 2*stop.
---                      A narrower span therefore also gives finer resolution.
---                      Only exact decimal rates are used (102400 is NOT exact).
---   Start frequency -> restricts the displayed span to [start, stop]; the graph
---                      shows only the bins in that window (see fftsa.sg_set_xrange).
---   Input range     -> dmm.digitize.range, one of 0.1 / 1 / 10 V (fixed).
---
--- OBJECT LIFETIME: every display object and buffer is deleted and its handle set
--- to nil before a replacement is created (fftsa.sg_destroy / fftsa.destroy_options /
--- fftsa.arm / fftsa.apply). Creating over a live handle would overwrite the only
--- reference to the old object, stranding it in the firmware with no way to delete
--- it until the next power cycle -- and it is accumulated display churn, not any
--- single call, that walks this instrument toward a panic.
+-- Every display object and buffer is deleted and its handle cleared before a
+-- replacement is created. Creating over a live handle drops the only reference to
+-- the old object, which stays alive in the firmware until a power cycle.
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- FFT size, a power of two. 256 bins, 195.3 Hz each at 100 kS/s.
---
--- This is the frame-rate knob and the only one large enough to matter, because
--- the DISPLAYED rate is quantised: a timer tick landing while a frame is still
--- running is dropped rather than queued, and the firmware's shortest period is
--- 0.05 s, so the achievable rates are 1/(0.05*k) -- 20, 10, 6.67, 5 fps and
--- nothing between. At N=512 the frame is 81.6 ms measured: capable of 12.3 fps,
--- displaying 10. At N=256 it models to ~48 ms, which crosses the 50 ms boundary
--- and displays 20.
---
--- 512 IS A DELIBERATE CHOICE, not an unexamined default. The operator decided
--- on 2026-10-23 that 10 fps is fast enough and resolution is not to be traded
--- for speed. Halving N would halve resolution -- 390.6 Hz bins, so two tones
--- closer than ~391 Hz merge -- and that is what the instrument is for.
---
--- What halving does NOT cost is accuracy on an isolated peak, which is worth
--- knowing if the decision is ever revisited: the three-bin interpolation
--- absorbs the coarser grid, and measured offline under 5.0.2 on a 12345 Hz
--- 0.5 V tone, N=512 reads 12344.89 Hz against N=256's 12345.81 Hz -- 0.81 Hz,
--- or 0.007 %, with 0.03 % amplitude error. So the trade is resolution for
--- frame rate, never precision for frame rate.
---
--- Changing it needs nothing else: every table, window and twiddle is sized from
--- this one value. docs/PERFORMANCE.md has the full model and the alternatives.
+-- FFT size, a power of two; every table, window and twiddle is sized from it. 512
+-- gives 256 bins of 195.3 Hz at 100 kS/s. Halving it trades bin width for frame
+-- rate; resolution was chosen. docs/PERFORMANCE.md has the frame-rate model.
 fftsa.n       = 512
 
--- Lowest start frequency the app will accept or display. Bin 1 is DC, and
--- fftsa.fft_load() subtracts the mean, so bin 1 carries only the residual the
--- window leaks -- never a signal. Including it puts a meaningless spike at the
--- left edge of every trace and lets it into the peak table, so the span starts
--- above DC. 10 Hz is below the lowest bin width the app can produce, so it costs
--- no real signal at any sample rate.
+-- Floor for the start frequency. A start of 0 would admit bin 1, which is DC and,
+-- with the mean removed by fftsa.fft_load(), holds only window leakage.
 fftsa.flomin  = 10          -- floor for the start frequency (Hz)
 fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
 fftsa.range   = 10          -- digitizer input range (V): 0.1 / 1 / 10
-fftsa.fs      = 100000      -- sample rate (derived from fftsa.fhi)
+fftsa.fs      = 100000      -- sample rate (picked from fftsa.fhi, then measured)
 fftsa.binhz   = 0           -- true bin width, from measured fs
 fftsa.busy    = false       -- reentrancy guard (never preserved across a reload)
 fftsa.stop_pending = false  -- a teardown deferred until the running frame ends
 fftsa.halted  = false       -- frames suppressed after repeated failures
-fftsa.lasterr = nil         -- last frame error (nil if none) -- diagnosis
+fftsa.lasterr = nil         -- last frame error, nil if none
 fftsa.errcount = 0          -- count of dropped frames
-fftsa.errrun  = 0           -- CONSECUTIVE dropped frames
-fftsa.errmax  = 20          -- give up (and say so) after this many in a row: 6 s
+fftsa.errrun  = 0           -- consecutive dropped frames
+fftsa.errmax  = 20          -- give up (and say so) after this many in a row
 fftsa.shortreads = 0        -- captures rejected for returning fewer than n samples
 
--- FIRMWARE HANDLES -- initialised ONLY on the first load (see the same block in
--- spectrum_graph.tsp for the full reasoning). Opening the App a second time in one
--- power session re-runs this body; clearing a live handle here would strand the
--- previous launch's timer, screens and buffer in the firmware until a power cycle.
--- Keeping them lets fftsa.start()'s opening fftsa.stop() reclaim them properly.
+-- Firmware handles, initialised only on the first load: opening the App again in
+-- one power session re-runs this body, and clearing a live handle would strand the
+-- previous launch's objects. fftsa.start()'s opening fftsa.stop() reclaims them.
 if fftsa.handles_inited == nil then
   fftsa.cap      = nil      -- acquisition buffer
   fftsa.optbtn   = nil      -- Options button on the spectrum screen
@@ -93,9 +53,8 @@ end
 -- Exact, achievable sample rates only; the hardware cannot produce 102400 S/s.
 fftsa.rates = {1000, 10000, 20000, 50000, 100000, 200000, 500000, 1000000}
 
--- 1-based index <-> range for the OBJ_EDIT_OPTION field. getvalue() may hand back
--- a numeric index (0- OR 1-based, firmware-dependent) or the option label string,
--- so fftsa.idx_to_range() tolerates all three.
+-- getvalue() on the OBJ_EDIT_OPTION field may return a 0- or 1-based index or the
+-- option label, so fftsa.idx_to_range() accepts all three.
 fftsa.ranges       = {0.1, 1, 10}
 fftsa.range_labels = {"0.1 V", "1 V", "10 V"}
 
@@ -122,7 +81,6 @@ function fftsa.idx_to_range(v)
   return fftsa.ranges[v]
 end
 
--- Smallest exact rate whose Nyquist (fs/2) covers the requested stop frequency.
 function fftsa.pick_fs(fhi)
   local r = fftsa.rates
   local n = table.getn(r)
@@ -140,8 +98,7 @@ function fftsa.measure_fs(buf)
   return (n - 1) / (tN - t1)
 end
 
--- Apply the current fftsa settings to the hardware and the graph. Safe to call
--- repeatedly (that is what the Options Apply button does).
+-- Apply the current settings to the hardware and the graph. Safe to repeat.
 function fftsa.apply()
   fftsa.fs = fftsa.pick_fs(fftsa.fhi)
   fftsa.fft_init(fftsa.n)
@@ -150,10 +107,6 @@ function fftsa.apply()
   dmm.digitize.samplerate = fftsa.fs
   dmm.digitize.aperture   = 1e-6
   dmm.digitize.count      = fftsa.n
-  -- Acquisition buffer: delete the old one and clear the handle BEFORE making a
-  -- new one, so re-applying can never strand a buffer behind an overwritten
-  -- reference (and a changed fftsa.n always gets a correctly sized buffer).
-  -- Apply is user-paced, so this costs nothing per frame.
   if fftsa.cap ~= nil then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
@@ -162,79 +115,44 @@ function fftsa.apply()
   dmm.digitize.read(fftsa.cap)
   fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
   fftsa.binhz = fftsa.fs / fftsa.n
-  -- Restrict the displayed span to [start, stop]. fftsa.sg_update() then plots only the
-  -- bins in that window, so the graph auto-ranges to it.
   fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   fftsa.sg_rebind()
 end
 
--- The per-frame work (one acquisition + FFT + display), split out so fftsa.frame()
--- can run it under pcall.
---
--- Measured frame budget at 256 bins, in ms: fft_run 30.6, sg_update 24.7,
--- fft_load 15.3, digitize.read 6.2, find_peaks 1.9, fft_magnitude 1.5
--- sg_show_peaks 0.9, cap.clear 0.2 -- 81.4 total, so 12.3 Hz. The transform and
--- the buffer refill now dominate; the display path is no longer the limit.
---
--- The display figures above are for the detach-first order sg_update() now
--- uses. It used to refill the buffer first and call sg_bind_min() after, which
--- paid two avoidable costs: the writes went through a live subscription at
--- 76 us a point instead of 54, and removeall then waited on the paint of the
--- frame it was in rather than the one before. sg_bind_min() is kept for callers
--- that genuinely need a re-attach, but nothing per-frame calls it.
---
--- Do not "optimise" the removeall away. It is the only thing in the frame that
--- blocks for the display task, and that task is not scheduled while Lua runs --
--- see the measurements in fftsa.sg_update.
+-- One frame: acquire, transform, plot. Runs under pcall from fftsa.frame().
+-- docs/PERFORMANCE.md has the measured phase costs.
 function fftsa.frame_body()
-  -- Everything a frame touches must still exist. A frame can be dispatched while
-  -- the app is half-built (a failed startup) or half-torn-down (End App, a host
-  -- reload), and indexing a nil buffer or a nil peak-field table would raise on
-  -- every tick, so bail out quietly instead.
+  -- A frame can be dispatched while the app is half-built (a failed startup) or
+  -- half-torn-down (End App, a host reload); bail out rather than index a nil.
   if fftsa.cap == nil or fftsa.sg_buf == nil or fftsa.sg_graph == nil
      or fftsa.sg_pk_f == nil then
     return
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
-  -- Reject a short capture rather than transform it. fftsa.fft_load() would
-  -- zero-pad the missing tail, and the step from real samples into zeros is
-  -- broadband: the result is a convincing but completely FALSE spectrum. Holding
-  -- the previous frame is honest; drawing a fabricated one is not.
+  -- A short capture is rejected, not transformed: zero-padding the tail would give
+  -- a convincing but false broadband spectrum. The previous frame stays on screen.
   if fftsa.cap.n < fftsa.n then
     fftsa.shortreads = (fftsa.shortreads or 0) + 1
     return
   end
   fftsa.fft_load(fftsa.cap)
   fftsa.fft_run()
-  -- Power, not magnitude: the untangle pass that unpacks the N/2 complex
-  -- transform back to N/2 real bins produces |X|^2 for free, so taking the
-  -- square root here would be 256 sqrt calls a frame thrown away immediately
-  -- by the dB conversion, which is 10*log10 of power.
   fftsa.fft_power()
   local nb = fftsa.fft_m
-  -- Search for peaks in exactly the window the graph plots, so the table always
-  -- describes the visible trace instead of reporting off-screen tones.
+  -- Peaks are searched in the window the graph plots, so the table matches the trace.
   local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
   local bi, bv = fftsa.find_peaks(nb, fftsa.sg_npeak, kmin, kmax)
   fftsa.sg_update(nb, fftsa.binhz)
   fftsa.sg_show_peaks(bi, bv, fftsa.sg_npeak, fftsa.binhz)
 end
 
--- Reentrancy-guarded frame. The body runs under pcall so an error can never skip
--- the fftsa.busy reset: were the guard left latched, every later frame would return
--- at the top and the display would freeze. A failed frame is simply dropped, and
--- fftsa.lasterr / fftsa.errcount record it for diagnosis.
---
--- The pcall does not cover being killed from OUTSIDE. Observed 2026-10-23: a
--- host sent ABORT (event 1409) while a frame was running, the frame never
--- reached the reset below, and from then on every frame returned at the top --
--- a frozen trace, and fftsa.stop() could never complete because it waits for
--- the frame to finish. The age check below is the way out of that: a guard held
--- longer than any real frame can take did not come from a frame that is still
--- running, so it is cleared and the drop is counted.
+-- Reentrancy-guarded frame. The body runs under pcall so an error cannot leave
+-- fftsa.busy set, which would make every later frame return at the top. A host
+-- abort (event 1409) mid-frame is not covered by the pcall and does leave it set,
+-- so a guard held longer than fftsa.busy_max is broken and the break counted.
 fftsa.busy_since = nil
-fftsa.busy_max   = 2.0      -- seconds; a frame is ~0.08 s, so this is 25x slack
+fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged stuck
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
 function fftsa.frame()
@@ -248,20 +166,15 @@ function fftsa.frame()
   fftsa.busy = true
   local ok, err = pcall(fftsa.frame_body)
   if not ok then
-    -- fftsa.sg_update() detaches the trace before refilling and re-attaches it
-    -- at the end, so an error raised in between leaves the graph with no trace
-    -- at all -- which looks exactly like a dead signal. This is the net: a
-    -- failed frame always ends with the trace attached.
+    -- Re-bind the trace after a failure so the graph is never left without one.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil then
       pcall(function() fftsa.sg_rebind() end)
     end
     fftsa.lasterr  = tostring(err)
     fftsa.errcount = (fftsa.errcount or 0) + 1
     fftsa.errrun   = (fftsa.errrun or 0) + 1
-    -- A trace that stopped updating looks exactly like a working analyser looking
-    -- at a dead signal, so after a run of failures stop retrying and SAY so on
-    -- screen. The timer keeps ticking into a no-op, which is cheaper and safer
-    -- than deleting a timer from inside its own callback.
+    -- After a run of failures stop retrying and say so on screen: a trace that
+    -- stopped updating looks like a working analyser on a dead signal.
     if fftsa.errrun >= (fftsa.errmax or 20) then
       fftsa.halted = true
       pcall(function()
@@ -281,9 +194,7 @@ function fftsa.frame()
   end
 end
 
--- Delete the options form and clear EVERY handle into it. The fields are children
--- of the screen, so the firmware frees them with it, but the Lua handles would
--- otherwise dangle at deleted objects and a later fftsa.options() would poke them.
+-- The firmware frees the fields with their screen; the Lua handles still need clearing.
 function fftsa.destroy_options()
   if fftsa.optscr ~= nil then
     -- Never delete the screen currently on show: leave it first.
@@ -298,24 +209,19 @@ function fftsa.destroy_options()
     nil, nil, nil, nil, nil
 end
 
--- Build the OPTIONS form: a screen of editable fields the user touches to edit,
--- plus Apply / Cancel. Created once, hidden until the Options button is pressed.
 function fftsa.build_options()
-  -- Destroy first, ALWAYS: a second create would overwrite fftsa.optscr and leave
-  -- the first screen alive in the firmware with nothing able to reach it.
   fftsa.destroy_options()
 
   local create = display.create
-  -- Screen title must be <= 31 chars or the firmware truncates it (error 1707).
+  -- A screen title over 31 characters is truncated by the firmware (event 1707).
   fftsa.optscr = create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER OPTIONS")
 
   create(fftsa.optscr, display.OBJ_TEXT, 30, 62,
-         "Touch a field to edit it, then Apply.", 11579568, display.FONT_MEDIUM,   -- 0xB0B0B0
+         "Touch a field to edit it, then Apply.", 11579568, display.FONT_MEDIUM,   -- grey B0B0B0
          display.JUST_LEFT)
 
-  -- Edit objects render their label+description to the LEFT of the value box, so
-  -- the box x must leave room for them; at x=270 the labels sit fully on-screen.
-  -- Descriptions are kept short so they don't overrun the left edge.
+  -- Edit objects draw their label and description to the left of the value box;
+  -- x=270 leaves room for them.
   fftsa.opt_flo = create(fftsa.optscr, display.OBJ_EDIT_NUMBER, 270, 108,
                        "Start Frequency", "low edge (Hz)",
                        display.NFORMAT_PREFIX, fftsa.flo, fftsa.flomin, 499000, "Hz")
@@ -327,24 +233,20 @@ function fftsa.build_options()
                        "0.1 V", "1 V", "10 V")
 
   fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 30, 322, "",
-                        56575, display.FONT_SMALL, display.JUST_LEFT)   -- 0x00DCFF
+                        56575, display.FONT_SMALL, display.JUST_LEFT)   -- cyan 00DCFF
 
   local b_apply = create(fftsa.optscr, display.OBJ_BUTTON, 470, 362, "Apply", 140)
   display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_apply() end")
   local b_cancel = create(fftsa.optscr, display.OBJ_BUTTON, 630, 362, "Cancel", 140)
   display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options_cancel() end")
-  -- Hook End App on THIS screen too. If the firmware delivers EVENT_ENDAPP to the
-  -- screen that is currently visible, a user who exits from the options form would
-  -- otherwise leave with no teardown at all -- both screens, the graph, the timer
-  -- and both buffers stranded until the next power cycle.
+  -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
+  -- the visible screen, and leaving from the form must still tear down.
   pcall(function()
     display.setevent(fftsa.optscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
   end)
   return fftsa.optscr
 end
 
--- Options button handler: seed the fields with the current settings, show a
--- read-back line, and switch to the form.
 function fftsa.options()
   if fftsa.optscr == nil then fftsa.build_options() end
   pcall(function() display.setvalue(fftsa.opt_flo, fftsa.flo) end)
@@ -358,19 +260,15 @@ function fftsa.options()
   display.changescreen(fftsa.optscr)
 end
 
--- Apply the form: read every field, validate, then reconfigure and return.
 function fftsa.options_apply()
   local lo = display.getvalue(fftsa.opt_flo)
   local hi = display.getvalue(fftsa.opt_fhi)
   local ri = display.getvalue(fftsa.opt_rng)
-  -- Validate the span as a PAIR. Applying the two fields independently lets a new
-  -- stop frequency land BELOW the surviving start (zoom to 8-16 kHz, then set stop
-  -- to 5 kHz): the new start is rejected, the surviving one stays, and flo > fhi
-  -- leaves an EMPTY window -- a span that describes no bins at all.
+  -- Validate the span as a pair: a new stop below the surviving start would leave
+  -- flo > fhi, a window with no bins in it.
   local nlo, nhi = fftsa.flo, fftsa.fhi
   if hi ~= nil and hi > 0 then nhi = hi end
   if lo ~= nil and lo >= fftsa.flomin then nlo = lo end
-  -- Inconsistent pair: widen back to the full span rather than leave an empty one.
   if nlo >= nhi then nlo = fftsa.flomin end
   fftsa.flo, fftsa.fhi = nlo, nhi
   if ri ~= nil then fftsa.range = fftsa.idx_to_range(ri) end
@@ -382,47 +280,26 @@ function fftsa.options_cancel()
   display.changescreen(fftsa.sg_scr)
 end
 
--- Build the spectrum screen, add the Options button, and pre-build the form.
 function fftsa.build()
-  -- fftsa.sg_build() destroys any previous spectrum screen, its children and its
-  -- buffer, and nils every handle, before creating the new one.
   fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2)
-  -- Options button: far bottom-right, clear of the right-hand peak column. The
-  -- button is a child of the screen fftsa.sg_build() just destroyed, so clear the
-  -- stale handle before creating its replacement.
+  -- The button died with the screen fftsa.sg_build() just destroyed: clear the
+  -- stale handle, do not delete it.
   fftsa.optbtn = nil
   fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
   display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.options() end")
   fftsa.build_options()
-  -- Creating fftsa.optscr leaves it as the active screen, which would hide the
-  -- spectrum and (since the frame timer only runs while its parent screen is
-  -- visible) stop the display updating. Switch back to the spectrum explicitly.
+  -- The frame timer is active only while its parent screen is visible.
   display.changescreen(fftsa.sg_scr)
   return fftsa.sg_scr
 end
 
--- Arm the periodic frame timer (fires only while the spectrum screen is visible).
---
--- 0.05 s is the firmware's floor: arm(0.045) is refused with event 1131,
--- "Parameter, period, expected value from 0.05 to 120". Measured 2026-10-23.
---
--- The period matters more than it looks, because a tick that lands while a
--- frame is still running is DROPPED, not queued, so the displayed rate is
--- quantised: displayed = 1 / (P * ceil(frame / P)). With an 81.8 ms frame that
--- is 10 fps at P=0.05 and 8.55 fps measured at P=0.1 -- never the 12.3 fps the
--- frame itself can sustain. The reachable rates at the floor are 20, 10, 6.67,
--- 5 fps and nothing in between, so the only way past 12 is to bring the frame
--- under 50 ms, which lands on 20. Tuning the period cannot do it.
---
--- Do NOT batch frames inside the callback to beat this. Running frames
--- back-to-back for most of a period holds the interpreter away from its event
--- loop, and a peer session testing exactly that pattern lost the instrument
--- (cause unproven, but the risk is not worth the fps).
+-- Arm the frame timer; it is active only while its parent screen is visible.
+-- 0.05 s is the firmware's floor (arm(0.045) is refused with event 1131), and a
+-- tick that lands during a frame is dropped, so the displayed rate is quantised;
+-- docs/PERFORMANCE.md has the model. One frame per tick: back-to-back frames keep
+-- the interpreter out of its event loop.
 function fftsa.arm(period_s)
   if period_s == nil then period_s = 0.05 end
-  -- NEVER stack timers. Two live timers would both fire fftsa.frame(), doubling
-  -- the frame rate, and that extra display traffic is exactly what floods the
-  -- display processor and hangs the instrument.
   if fftsa.timer ~= nil then
     fftsa.del_obj(fftsa.timer)
     fftsa.timer = nil
@@ -433,17 +310,12 @@ function fftsa.arm(period_s)
   return fftsa.timer
 end
 
--- End App (the system button) fires EVENT_ENDAPP -> tear everything down so the
--- instrument is handed back clean.
 function fftsa.cleanup()
   pcall(function() fftsa.stop() end)
 end
 
--- Hook End App as soon as the spectrum screen exists, so that even a failure
--- later in startup leaves the user a working way out that cleans up.
--- pcall'd, because a wrong EVENT_ENDAPP constant must not abort startup -- but
--- the failure is RECORDED and reported: silently swallowing it would leave the
--- app with no teardown path and nothing to say so.
+-- Hooked as soon as the spectrum screen exists, so a later startup failure still
+-- leaves a way out that cleans up.
 function fftsa.install_cleanup()
   if fftsa.sg_scr == nil then return false end
   local ok, err = pcall(function()
@@ -453,18 +325,11 @@ function fftsa.install_cleanup()
   return ok
 end
 
--- One-call startup: build the screens, hook End App, apply settings, arm the
--- frame timer. Guarded end to end -- an unprotected failure part-way through
--- would abort the script with screens, a graph binding and buffers already
--- created and no teardown wired up, and those orphaned display objects then
--- survive until the next power cycle.
+-- Startup, guarded end to end so a failure part-way leaves nothing without a
+-- teardown. The opening fftsa.stop() reclaims a previous launch's handles: as an
+-- installed App the script re-runs on every open, and an exit that skipped
+-- EVENT_ENDAPP (the Home screen, another App) leaves them behind.
 function fftsa.start()
-  -- Reclaim anything a previous launch left behind, IN DEPENDENCY ORDER (timer,
-  -- then screens, then buffers), before building. Installed as an App this is the
-  -- normal case, not an edge case: opening the App re-runs the whole script, and
-  -- if the last exit skipped EVENT_ENDAPP (HOME, another App) the handles from
-  -- that launch are still here -- which is exactly why the declarations above no
-  -- longer wipe them.
   pcall(function() fftsa.stop() end)
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
 
@@ -479,17 +344,12 @@ function fftsa.start()
     fftsa.lasterr = tostring(err)
     pcall(function() fftsa.stop() end)
     print("fftsa start FAILED (cleaned up): " .. tostring(err))
-    -- Running as an installed App there is no console: a print goes nowhere the
-    -- user can see, and stop() has just removed the half-built screen, so without
-    -- this they are dropped back to HOME with no idea whether the App is broken
-    -- or the installation is.
+    -- No console as an installed App, so the failure goes on the panel.
     fftsa.show_error(tostring(err))
     return false
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
-    -- Same reasoning: say it on the panel, since this one costs the user a power
-    -- cycle's worth of stranded objects every time they leave the App.
     pcall(function()
       display.settext(fftsa.sg_xunit, "WARNING: End App will not clean up")
     end)
@@ -498,14 +358,10 @@ function fftsa.start()
   return true
 end
 
--- Tear down everything (timer, screens, buffers) and clear every handle. Called
--- on app exit via EVENT_ENDAPP, from the host when reloading, and by
--- fftsa.start() itself if startup fails part-way through.
 function fftsa.stop()
-  -- Never tear down underneath a frame that is mid-flight: it would be left
-  -- writing into a deleted buffer or a deleted graph. Defer ONCE -- frame() runs
-  -- the pending stop the moment it finishes -- and then proceed regardless, so a
-  -- guard stuck set can never make the app impossible to shut down.
+  -- Not underneath a running frame, which would be left writing into a deleted
+  -- buffer: defer once (fftsa.frame() runs the pending stop as it finishes), then
+  -- proceed regardless, so a stuck guard cannot make the app impossible to stop.
   if fftsa.busy and not fftsa.stop_pending then
     fftsa.stop_pending = true
     return false
@@ -525,15 +381,12 @@ function fftsa.stop()
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
   end
-  -- Leave no latched state behind for the next start().
   fftsa.busy, fftsa.halted, fftsa.errrun = false, false, 0
   return true
 end
 
--- Report a startup failure ON THE PANEL. Uses only calls this app already relies
--- on elsewhere (screen + text + changescreen), rather than an untested modal
--- dialog, and keeps the handle so fftsa.stop() can delete it like anything else.
--- End App is hooked here too, so the user's way out still cleans up.
+-- Startup failure on the panel. End App is hooked here too, and the handle is kept
+-- so fftsa.stop() can delete the screen.
 function fftsa.show_error(msg)
   pcall(function()
     if fftsa.errscr ~= nil then
@@ -542,20 +395,19 @@ function fftsa.show_error(msg)
     end
     fftsa.errscr = display.create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER ERROR")
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
-                   "The analyser could not start.", 16736352,   -- 0xFF6060
+                   "The analyser could not start.", 16736352,   -- red FF6060
                    display.FONT_MEDIUM, display.JUST_LEFT)
-    -- One long line runs off an 800 px panel, so break the message into chunks.
     local m = tostring(msg)
     local y = 140
     local i = 1
     while i <= string.len(m) and y <= 400 do
       display.create(fftsa.errscr, display.OBJ_TEXT, 20, y, string.sub(m, i, i + 79),
-                     14737632, display.FONT_SMALL, display.JUST_LEFT)   -- 0xE0E0E0
+                     14737632, display.FONT_SMALL, display.JUST_LEFT)   -- light grey E0E0E0
       i = i + 80
       y = y + 22
     end
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 420,
-                   "Press End App to exit.", 9474192,   -- 0x909090
+                   "Press End App to exit.", 9474192,   -- grey 909090
                    display.FONT_SMALL, display.JUST_LEFT)
     display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
     display.changescreen(fftsa.errscr)
