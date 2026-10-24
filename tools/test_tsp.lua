@@ -598,32 +598,39 @@ check('idx_to_range tolerates 1-based', fftsa.idx_to_range(1) == 0.1)
 check('idx_to_range tolerates the label string', fftsa.idx_to_range('10 V') == 10)
 check('idx_to_range tolerates 0-based', fftsa.idx_to_range(0) == 0.1)
 check('idx_to_range clamps out-of-range', fftsa.idx_to_range(99) == 10)
--- Over the range the Stop Freq field can actually produce. Above fhi_max the rate
--- list deliberately cannot cover Nyquist -- 100 kS/s is the ceiling, so 50 kHz is
--- the top the app offers, and options_apply clamps to it.
-local nyq, nyqf = true, 0
-for _, f in ipairs({2000, 5000, 10000, 25000, 49000, 50000}) do
-  if fftsa.pick_fs(f) / 2 < f then nyq = false; nyqf = f end
-end
-check('picked fs covers Nyquist across the whole settable span', nyq,
-      'failed at ' .. nyqf)
--- The floor is what keeps the panel responsive: 512 samples at 10 kS/s is 51 ms of
--- pure waiting and the Options button stopped answering. Nothing may pick below it.
-local slowest = fftsa.rates[1]
-for i = 1, table.getn(fftsa.rates) do
-  if fftsa.rates[i] < slowest then slowest = fftsa.rates[i] end
-end
-check('no span can pick a rate below the 10 kS/s floor', slowest >= 10000,
-      'slowest = ' .. slowest)
-check('and the worst acquisition leaves the frame inside one timer cadence',
-      fftsa.n / slowest + 0.078 < 0.150,
-      string.format('%.1f ms acquire, %.1f ms frame at %d S/s',
-                    fftsa.n / slowest * 1000, (fftsa.n / slowest + 0.078) * 1000,
-                    slowest))
-check('the stop-frequency ceiling is the fastest rate Nyquist',
-      fftsa.fhi_max * 2 <= fftsa.rates[table.getn(fftsa.rates)],
-      string.format('fhi_max %g, fastest %g', fftsa.fhi_max,
-                    fftsa.rates[table.getn(fftsa.rates)]))
+-- THE SAMPLE RATE IS FIXED, and that is an anti-aliasing requirement rather than a
+-- simplification. There is no anti-alias filter, so a rate below the maximum folds
+-- everything above its own Nyquist into the display. Measured on hardware: a pure
+-- 21.1 kHz sine over a 0-7 kHz span at 20 kS/s drew one 4.51 V peak at 1.100 kHz,
+-- which is 21100 reduced mod 20000, with nothing on screen to say so.
+check('the sample rate does not depend on the span', (function()
+  local seen = {}
+  for _, f in ipairs({2000, 5000, 10000, 25000, 49000, 50000}) do
+    local keep = fftsa.fhi
+    fftsa.fhi = f
+    fftsa.fs = fftsa.fs_fixed
+    seen[fftsa.fs] = true
+    fftsa.fhi = keep
+  end
+  local n = 0
+  for _ in pairs(seen) do n = n + 1 end
+  return n == 1 and seen[100000] == true, n .. ' distinct rate(s)'
+end)())
+check('nothing picks a rate from the span any more',
+      fftsa.pick_fs == nil and fftsa.rates == nil)
+check('the fixed rate is the fastest the hardware offers, so Nyquist is the widest',
+      fftsa.fs_fixed == 100000 and fftsa.fhi_max * 2 <= fftsa.fs_fixed,
+      string.format('fs %g, fhi_max %g', fftsa.fs_fixed, fftsa.fhi_max))
+-- The whole span must sit inside Nyquist, or the app offers a setting in which a
+-- real in-band tone and an alias are indistinguishable.
+check('no settable span reaches past Nyquist', (function()
+  return fftsa.fhi_max <= fftsa.fs_fixed / 2 and fftsa.fhi_min < fftsa.fhi_max,
+         string.format('%g..%g Hz against Nyquist %g', fftsa.fhi_min,
+                       fftsa.fhi_max, fftsa.fs_fixed / 2)
+end)())
+check('acquisition is short enough to leave the panel its slice',
+      fftsa.n / fftsa.fs_fixed < 0.010,
+      string.format('%.1f ms', fftsa.n / fftsa.fs_fixed * 1000))
 
 -- ---------- lifecycle: the object-lifetime invariant ----------
 print('\nobject lifetime (real code, mocked display)')
