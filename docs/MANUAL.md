@@ -134,7 +134,9 @@ approximation. Both ends of the spectrum are worse, and by a long way:
 | where | frequency | amplitude |
 |---|---|---|
 | middle of the span | 4.0e-6 bins | 0.0035 dB |
-| lowest bin the table reports | 0.102 bins | 0.15 dB |
+| three bins up from DC and above | 0.07 bins | 0.11 dB |
+| lowest bin the table reports | 0.11 bins | 0.19 dB |
+| below that bin, where it reports at all | 0.28 bins | 1.7 dB |
 | top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
 
 The top bin has no neighbour above it, so there is nothing to interpolate against and the table falls
@@ -158,14 +160,27 @@ tone positions.
 So the app declines to put a number on those bins. The trace still draws them, which is where a tone
 below the limit shows up:
 
-| window | bins not reported | lowest reported, 195.3 Hz bins |
+| window | bins not reported | lowest frequency the table reports, at 195.3 Hz bins |
 |---|---|---|
-| Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | 390.6 Hz |
-| Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | 585.9 Hz |
+| Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | **390.6 Hz** |
+| Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | **585.9 Hz** |
 
 The limit is in **bins**, so it moves with the sample rate: at a 500 kHz span the bins are 1953 Hz
 and two of them is 3.9 kHz. A narrower window main lobe reaches closer to DC, which is the one thing
 Kaiser β=4 is better at than β=18.
+
+What you get either side of it, measured over a 1.000 V tone swept in 0.01-bin steps at four phases:
+
+| tone sits | the table |
+|---|---|
+| at or above the lowest reported bin | always reports it, within **0.11 bins and 0.19 dB** |
+| between about 60 Hz and that bin | usually empty; where it does report, within **0.28 bins and 1.7 dB** |
+| below about 60 Hz (0.3 bins) | never reports it |
+
+A peak the app cannot place is refused rather than guessed: the estimator saturates when the three
+bins around a candidate are not one tone centred there, and a candidate whose own estimate lands a
+quarter bin below the lowest reported bin is dropped. Before that guard, Blackman and Kaiser β=9
+reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 
 **A bump at the left edge of the trace with nothing in the table is a tone below this limit.**
 

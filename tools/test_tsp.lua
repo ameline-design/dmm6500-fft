@@ -479,6 +479,35 @@ local function dc_reported(centre)
   end
   return n
 end
+-- Rows the table shows for a tone BELOW the lowest reportable bin. Such a tone
+-- leaks into that bin and makes it a local maximum, and it was then reported a
+-- whole bin and 16 dB out under Blackman and Kaiser b=9. find_peaks refuses it on
+-- the estimate, so nothing may come back at all.
+local function dc_leak()
+  local n = 0
+  local bn = 0.3
+  while bn <= 0.99 + 1e-9 do
+    for p = 0, 3 do
+      local xs = {}
+      for i = 1, WN do
+        xs[i] = math.cos(2 * math.pi * bn * (i - 1) / WN + p * math.pi / 4)
+      end
+      fftsa.fft_load({readings = xs, n = WN})
+      fftsa.fft_run()
+      fftsa.fft_power()
+      local bi_ = fftsa.find_peaks(fftsa.fft_m, 6, 2, fftsa.fft_m)
+      -- Rows at the mask edge only. The other five legitimately carry whatever
+      -- noise-level maxima exist further up the spectrum.
+      for s = 1, 6 do
+        if bi_[s] ~= nil and bi_[s] > 0 and bi_[s] <= 2 + fftsa.fft_kdc then
+          n = n + 1
+        end
+      end
+    end
+    bn = bn + 0.01
+  end
+  return n
+end
 -- Worst level anywhere in the DC region with the only tone far away and off a bin
 -- centre. This is why fft_load weights the mean: the arithmetic mean leaves the
 -- window's own DC response behind as a line at bin 1 following G(k), 100 dB above
@@ -542,6 +571,10 @@ for wi = 1, nwin do
     check(nm .. ': a tone inside the DC region is not reported there',
           dc_reported(1) == 0 and dc_reported(0.5) == 0,
           'bin 1: ' .. dc_reported(1) .. ' rows, bin 0.5: ' .. dc_reported(0.5))
+    -- And not reported anywhere else either: the first reportable bin must not
+    -- pick it up as leakage.
+    check(nm .. ': a tone below the limit puts no row in the table at all',
+          dc_leak() == 0, dc_leak() .. ' rows at the mask edge over 280 positions')
     -- Both axes. The amplitude error used to be formatted into the message and
     -- never compared, so it read 2.17 dB and passed.
     local lf, la, lmiss = win_sweep(kdc + 1, 0)

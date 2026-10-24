@@ -63,7 +63,9 @@ Both ends of the spectrum are four to six orders worse, and the suite now bounds
 | | frequency | amplitude |
 |---|---|---|
 | middle of the span | 4.0e-6 bins | 0.0035 dB |
-| lowest bin the table reports | 0.102 bins | 0.15 dB |
+| three bins up from DC and above | 0.07 bins | 0.11 dB |
+| lowest bin the table reports | 0.11 bins | 0.19 dB |
+| below that bin, where it reports at all | 0.28 bins | 1.7 dB |
 | top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
 
 The top bin has no neighbour above it, so `peak_interp` declines and the caller reads the raw bin. At
@@ -72,8 +74,11 @@ the window's main lobe of DC *is partly the tone*, so removing it takes `2·G(b)
 own bin — a 1.000 V tone on bin 1 reads 0.589 V under Hann and moves with the capture phase. No mean
 rule does better; the arithmetic mean instead leaves a −27 dBc line at bin 1 for any off-centre tone
 anywhere in the spectrum. `fft_init` measures how far the damage reaches (`fft_kdc`, one bin for Hann
-and two for Blackman-Harris) and `find_peaks` will not report those bins. The trace still draws them.
-`docs/MANUAL.md` states the resulting lowest reported frequency.
+and two for Blackman-Harris) and `find_peaks` will not report those bins, nor accept a candidate
+whose own interpolated centre lands a quarter bin below them -- that is leakage from a tone inside
+the region, and it used to be reported a whole bin and 16 dB out. The trace still draws those bins.
+`docs/MANUAL.md` states the resulting lowest reported frequency: **390.6 Hz** at the default span,
+585.9 Hz for the wide windows.
 
 Rectangular and Hamming are absent. Rectangular's transform nulls one bin from the peak, which leaves
 the three-bin estimate ill-conditioned; Kaiser β=6 covers Hamming to within a dB.

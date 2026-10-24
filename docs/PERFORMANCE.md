@@ -278,8 +278,9 @@ Worth stating because the arithmetic is counter-intuitive on an interpreted VM:
 
 **Flattening is worse than 2D**: two table reads beat a multiply, an add and one read, because index
 arithmetic costs more than the extra indirection. **Do not put a shift in a table** -- the multiply is
-cheaper than the read. And a 256x256 binary table is ~65,536 TValues, about **1 MB** of Lua heap plus
-~0.2 s to build, for a 32 % saving over `bit.bitand`: a poor trade unless the operation is hot.
+cheaper than the read. And a 256x256 binary table is ~65,536 TValues at 16 bytes each, **1 MiB**
+(1.05 MB) of Lua heap plus ~0.2 s to build, for a 32 % saving over `bit.bitand`: a poor trade
+unless the operation is hot.
 
 Where LUTs win decisively is **fused unary sequences** -- one read replacing reverse-then-mask, or
 scale-then-clamp-then-pack, at 1.4 µs against 4-8 µs for the steps. This app has no such step; the

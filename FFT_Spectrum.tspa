@@ -594,7 +594,21 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
       if ml == nil then ml = -1 end
       if mr == nil then mr = -1 end
       if m > ml and m >= mr then
-        if m > bv[count] then
+        -- A tone inside the DC region leaks enough into the first reportable bin
+        -- to make it a local maximum, and that bin then reports the tone a whole
+        -- bin and 16 dB out. The estimator already knows: it saturates at -0.5,
+        -- the end of its table, which says the three bins are not one tone
+        -- centred here. So refuse a peak whose own estimate lands a quarter bin
+        -- or more below the lowest reportable bin. Measured, a genuine tone there
+        -- estimates within 0.017 bins of it, against the leak's 0.500, so the
+        -- quarter-bin margin sits in the middle of the gap. Only k0 can trigger
+        -- it, since the offset cannot reach half a bin.
+        local keep = true
+        if k == k0 then
+          local d = fftsa.peak_interp(k, nbins)
+          if (k - 1) + d < (k0 - 1) - 0.25 then keep = false end
+        end
+        if keep and m > bv[count] then
           local s = count
           while s > 1 and m > bv[s-1] do
             bv[s] = bv[s-1]; bi[s] = bi[s-1]; s = s - 1
