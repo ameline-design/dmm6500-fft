@@ -147,6 +147,17 @@ function fftsa.apply()
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs
+  -- THE BIN WIDTH COMMITS WITH THE RATE, not after the capture. A raise between the
+  -- write above and the measurement below -- a trigger timeout is the obvious one --
+  -- used to leave the hardware at the new rate and fftsa.binhz describing the old
+  -- one, and every later frame then reported the wrong frequency with errcount 0:
+  -- a 12.5 kHz tone read 2500.0 Hz, axis and table agreeing and both wrong. The
+  -- measurement below refines this by about 0.01 %, so a failure costs that much
+  -- rather than a factor of five.
+  fftsa.binhz = fftsa.fs / fftsa.n
+  -- Same reason: the span comes from fftsa.flo/fhi, which options_apply() has
+  -- already committed, so pinning the axis to them does not depend on the capture.
+  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   dmm.digitize.aperture   = 1e-6
   dmm.digitize.count      = fftsa.n
   if fftsa.cap ~= nil and fftsa.cap_n ~= fftsa.n then
@@ -161,7 +172,6 @@ function fftsa.apply()
   dmm.digitize.read(fftsa.cap)
   fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
   fftsa.binhz = fftsa.fs / fftsa.n
-  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   fftsa.sg_rebind()
 end
 

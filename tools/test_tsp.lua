@@ -1168,6 +1168,42 @@ check('a failed Apply says so, and a good one restores the legend', (function()
          and good == fftsa.sg_xunit_text(),
          tostring(bad) .. ' | then ' .. tostring(good)
 end)())
+-- The check above stubs fftsa.apply out entirely, so it never reaches the real
+-- body. This one drives it with a capture that raises -- what a trigger timeout
+-- does -- after the sample rate has already been written to the hardware.
+check('a capture that raises leaves binhz describing the rate in force', (function()
+  local rate0, bin0 = dmm.digitize.samplerate, fftsa.binhz
+  display.setvalue(fftsa.opt_fhi, 200000)              -- pick_fs() -> 500 kS/s
+  local realread = dmm.digitize.read
+  dmm.digitize.read = function() error('trigger timeout', 0) end
+  local ok = fftsa.options_apply()
+  dmm.digitize.read = realread
+  local rate1 = dmm.digitize.samplerate
+  -- The premises first: the Apply really failed, and the rate really did move.
+  return (not ok) and rate1 ~= rate0
+         and math.abs(fftsa.binhz - rate1 / fftsa.n) < 1e-9,
+         string.format('ok=%s, rate %g -> %g, binhz %.4f -> %.4f (want %.4f)',
+                       tostring(ok), rate0, rate1, bin0, fftsa.binhz,
+                       rate1 / fftsa.n)
+end)())
+-- The operator-visible half. With binhz left at the old rate's value a 12.5 kHz
+-- tone read 2500.0 Hz -- the ratio 976.5625/195.3125 -- with errcount 0, the axis
+-- labels of the old span, and the table agreeing with the trace.
+check('and the frames after it report the tone at its real frequency', (function()
+  fftsa.errcount = 0
+  SIG.f, SIG.amp = 12500, 1.0
+  fftsa.frame()
+  local bi_ = fftsa.find_peaks(fftsa.fft_m, 6,
+                               fftsa.sg_window_bins(fftsa.fft_m, fftsa.binhz))
+  local k  = bi_[1]
+  local dk = fftsa.peak_interp(k, fftsa.fft_m)
+  local f  = (k - 1 + dk) * fftsa.binhz
+  return fftsa.errcount == 0 and math.abs(f - 12500) < 50,
+         string.format('%.1f Hz, errcount %d, binhz %.4f', f, fftsa.errcount,
+                       fftsa.binhz)
+end)())
+display.setvalue(fftsa.opt_fhi, 50000)                 -- back to the default span
+fftsa.options_apply()
 check('every button press goes through the guard', (function()
   local bad = nil
   for h, evs in pairs(display.events) do
