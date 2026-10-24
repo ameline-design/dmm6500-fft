@@ -131,11 +131,14 @@ function fftsa.idx_to_range(v)
   return fftsa.ranges[i]
 end
 
+-- Falls back rather than raising. A count off the list can only arrive from a host
+-- assignment, and raising here took Options and Apply down together with no way back
+-- but End App: both paths call this before they can show anything.
 function fftsa.sample_to_idx(n)
   for i = 1, table.getn(fftsa.sample_counts) do
     if fftsa.sample_counts[i] == n then return i end
   end
-  error("unsupported FFT sample count: " .. tostring(n), 0)
+  return 1
 end
 
 function fftsa.options_samples()
@@ -242,8 +245,13 @@ function fftsa.frame()
   fftsa.busy = true
   local ok, err = pcall(fftsa.frame_body)
   if not ok then
-    -- Re-bind the trace after a failure so the graph is never left without one.
-    if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil then
+    -- Re-bind the trace after a failure so the graph is never left without one -- but
+    -- only while the buffer still holds points. sg_update() clears it before the
+    -- refill, so a raise in there would have this remove the trace and then add one
+    -- over an empty buffer, which binds nothing and never draws again. Skipping it
+    -- there needs no recovery: the trace was never removed, and the next refill draws
+    -- through the binding it still has.
+    if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
       pcall(function() fftsa.sg_rebind() end)
     end
     fftsa.lasterr  = tostring(err)
@@ -405,11 +413,11 @@ function fftsa.sample_rate_text(fs)
 end
 
 -- Acquisition duration is N/fs, not the first-to-last timestamp interval (N-1)/fs.
-function fftsa.opt_info_text(fs, n)
+function fftsa.opt_info_text(fs, n, wi, bi)
   fs, n = fs or fftsa.fs, n or fftsa.n
   return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
                        fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
-                       fftsa.win_label())
+                       fftsa.win_label(wi, bi))
 end
 
 function fftsa.options_preview()
@@ -417,7 +425,12 @@ function fftsa.options_preview()
   local fs = fftsa.pick_fs(hi)
   -- Reuse the timestamp-measured rate when previewing the active acquisition rate.
   if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs end
-  local text = fftsa.opt_info_text(fs, fftsa.options_samples())
+  -- The window comes from the fields too, or three quarters of the line would track
+  -- the edit and the fourth would silently show the applied window.
+  local wi = fftsa.opt_index(display.getvalue(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
+  local bi = fftsa.opt_index(display.getvalue(fftsa.opt_beta), fftsa.kbeta_labels,
+                             fftsa.kbeta_i)
+  local text = fftsa.opt_info_text(fs, fftsa.options_samples(), wi, bi)
   if text ~= fftsa.opt_info_last then
     display.settext(fftsa.opt_info, text)
     fftsa.opt_info_last = text
@@ -470,7 +483,10 @@ function fftsa.options()
   pcall(function() display.setvalue(fftsa.opt_win, fftsa.win_i) end)
   pcall(function() display.setvalue(fftsa.opt_beta, fftsa.kbeta_i) end)
   pcall(function() display.setvalue(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n)) end)
-  fftsa.options_preview()
+  -- Guarded like its neighbours: four getvalue/settext calls on handles the pool may
+  -- have refused, and changescreen is the next line. Unguarded, a refusal at the end
+  -- of the create list leaves the Options button dead for the life of the app.
+  pcall(function() fftsa.options_preview() end)
   display.changescreen(fftsa.optscr)
   return true
 end
@@ -494,12 +510,18 @@ function fftsa.options_span()
 end
 
 function fftsa.options_apply()
+  -- Every field is read before anything is committed: a raise in here leaves the
+  -- applied state untouched, where a raise after the first commit would leave the
+  -- span changed with the axis, the cover and the message all still describing the
+  -- old one -- and say() writes the spectrum screen, which is not on show yet.
   local ri = display.getvalue(fftsa.opt_rng)
   local wi = display.getvalue(fftsa.opt_win)
   local bi = display.getvalue(fftsa.opt_beta)
-  fftsa.flo, fftsa.fhi = fftsa.options_span()
+  local nnew = fftsa.options_samples()
+  local nlo, nhi = fftsa.options_span()
+  fftsa.flo, fftsa.fhi = nlo, nhi
   local nold    = fftsa.n
-  fftsa.n       = fftsa.options_samples()
+  fftsa.n       = nnew
   fftsa.range   = fftsa.idx_to_range(ri)
   fftsa.win_i   = fftsa.opt_index(wi, fftsa.win_names, fftsa.win_i)
   fftsa.kbeta_i = fftsa.opt_index(bi, fftsa.kbeta_labels, fftsa.kbeta_i)

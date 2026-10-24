@@ -63,20 +63,24 @@ fftsa.kbeta_labels = {"4  -30dB", "6  -44dB", "9  -66dB",
                       "12  -90dB", "15  -114dB", "18  -139dB"}
 fftsa.kbeta_i      = 4      -- index into fftsa.kbetas
 
-function fftsa.kbeta()
-  local b = fftsa.kbetas[fftsa.kbeta_i]
+function fftsa.kbeta(bi)
+  local b = fftsa.kbetas[bi or fftsa.kbeta_i]
   if b == nil then b = fftsa.kbetas[1] end
   return b
 end
 
-function fftsa.win_name()
-  return fftsa.win_names[fftsa.win_i] or fftsa.win_names[1]
+function fftsa.win_name(wi)
+  wi = wi or fftsa.win_i
+  return fftsa.win_names[wi] or fftsa.win_names[1]
 end
 
 -- Window name for a readback line, with beta where beta applies.
-function fftsa.win_label()
-  if fftsa.win_cos[fftsa.win_i] ~= nil then return fftsa.win_name() end
-  return fftsa.win_name() .. " b=" .. tostring(fftsa.kbeta())
+-- Defaults to the applied window; the options preview passes the field values so the
+-- whole line describes one state rather than two.
+function fftsa.win_label(wi, bi)
+  wi = wi or fftsa.win_i
+  if fftsa.win_cos[wi] ~= nil then return fftsa.win_name(wi) end
+  return fftsa.win_name(wi) .. " b=" .. tostring(fftsa.kbeta(bi))
 end
 
 -- I0 by its power series, sum of ((x/2)^k / k!)^2. The term ratio is (x/2)^2/k^2, so

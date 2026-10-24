@@ -1630,6 +1630,134 @@ check('sample changes never allocate or replace a graph buffer', (function()
          and livebufs() == buffers0 and OBJ[fftsa.sg_graph].buffer == graphbuf
          and fftsa.sg_buf == graphbuf
 end)())
+
+-- ---------- the merge's own regressions, each failable by reverting one line ----------
+
+-- F1. The pool refuses from the end of the create list, and opt_n / opt_info / the
+-- preview timer are the last three objects build_options() makes. Unguarded, the raise
+-- lands before changescreen and the Options button is dead for the life of the app.
+check('a refused options handle does not kill the Options button', (function()
+  local keepinfo, keepn = fftsa.opt_info, fftsa.opt_n
+  local scr0 = display.active
+  local r1 = fftsa.options()
+  fftsa.show_main()
+  fftsa.opt_info = nil                       -- settext raise site
+  local r2 = fftsa.options()
+  local after2 = display.active
+  fftsa.show_main()
+  fftsa.opt_info, fftsa.opt_n = keepinfo, nil   -- getvalue raise site
+  local r3 = fftsa.options()
+  local after3 = display.active
+  fftsa.opt_n = keepn
+  fftsa.show_main()
+  return r1 and r2 and r3 and after2 == fftsa.optscr and after3 == fftsa.optscr,
+         string.format('ok %s/%s/%s, screens %s/%s', tostring(r1), tostring(r2),
+                       tostring(r3), tostring(after2 == fftsa.optscr),
+                       tostring(after3 == fftsa.optscr))
+end)())
+
+-- F4. An off-list count can only arrive from a host assignment, but raising on it took
+-- Options and Apply down together with no way back but End App.
+check('an off-list sample count leaves Options and Apply working', (function()
+  local keep = fftsa.n
+  fftsa.n = 3000
+  local opened = fftsa.options()
+  local onscr = display.active == fftsa.optscr
+  display.setvalue(fftsa.opt_n, 1)
+  local applied = fftsa.options_apply()
+  local landed = fftsa.n
+  fftsa.n = keep
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  return opened and onscr and applied and landed == 512,
+         string.format('opened=%s applied=%s n=%s', tostring(opened),
+                       tostring(applied), tostring(landed))
+end)())
+
+-- F3. A raise between the span commit and show_main() left flo/fhi describing a span
+-- the axis, the cover and the message all still disagreed with.
+check('a raise while reading the form commits no part of the span', (function()
+  local flo0, fhi0 = fftsa.flo, fftsa.fhi
+  local keepn = fftsa.opt_n
+  display.setvalue(fftsa.opt_flo, 2000)
+  display.setvalue(fftsa.opt_fhi, 30000)
+  fftsa.opt_n = nil                          -- getvalue(opt_n) raises
+  local ok = fftsa.guard(fftsa.options_apply)
+  fftsa.opt_n = keepn
+  local held = fftsa.flo == flo0 and fftsa.fhi == fhi0
+  display.setvalue(fftsa.opt_flo, flo0)
+  display.setvalue(fftsa.opt_fhi, fhi0)
+  fftsa.options_apply()
+  return (not ok) and held,
+         string.format('ok=%s flo %g->%g fhi %g->%g', tostring(ok), flo0, fftsa.flo,
+                       fhi0, fftsa.fhi)
+end)())
+
+-- F2. sg_update() clears the buffer before refilling it, so a raise in there left
+-- frame()'s rebind adding a trace over an empty buffer -- which binds nothing and
+-- never draws again, silently, with the peak table still updating.
+check('a refill that raises leaves the trace recoverable, not blank for good',
+      (function()
+  fftsa.errrun, fftsa.errcount = 0, 0
+  local g = fftsa.sg_graph
+  local realwr = buffer.write.reading
+  buffer.write.reading = function() error('refill-boom', 0) end
+  fftsa.frame()
+  buffer.write.reading = realwr
+  -- The premise: the refill really did clear the buffer and then fail in it.
+  local emptied = fftsa.sg_buf.n == 0 and fftsa.errrun > 0
+  fftsa.frame()                              -- the first refill that can bind
+  local bound = (OBJ[g].traces or 0) > 0 and OBJ[g].buffer == fftsa.sg_buf
+  fftsa.errrun, fftsa.errcount = 0, 0
+  return emptied and bound and fftsa.sg_buf.n > 0,
+         string.format('emptied=%s bound=%s traces=%s n=%d', tostring(emptied),
+                       tostring(bound), tostring(OBJ[g].traces), fftsa.sg_buf.n)
+end)())
+
+-- F8. Three quarters of the preview tracked the edit and the window label did not.
+check('the preview line previews the window too, not the applied one', (function()
+  local wi0 = fftsa.win_i
+  local other = 1
+  if wi0 == 1 then other = 2 end
+  display.setvalue(fftsa.opt_win, fftsa.win_names[other])
+  fftsa.options_preview()
+  local shown = obj_at(fftsa.opt_info).text
+  display.setvalue(fftsa.opt_win, fftsa.win_names[wi0])
+  fftsa.options_preview()
+  local wanted = fftsa.win_names[other]
+  return string.find(shown, wanted, 1, true) ~= nil,
+         'field=' .. wanted .. ' line=' .. tostring(shown)
+end)())
+
+-- T1. The hoist: sg_nbins has to describe the new size before the sg_set_xrange() at
+-- the top of apply(), because the legend reports how many bins land in the span.
+check('the legend bin count follows a resize in the same Apply', (function()
+  display.setvalue(fftsa.opt_flo, 1999)
+  display.setvalue(fftsa.opt_fhi, 2000)
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  local at512 = fftsa.sg_xunit_text()
+  display.setvalue(fftsa.opt_n, 6)           -- 16384
+  fftsa.options_apply()
+  local at16k = fftsa.sg_xunit_text()
+  local nb = fftsa.sg_nbins
+  display.setvalue(fftsa.opt_n, 1)
+  display.setvalue(fftsa.opt_flo, 1000)
+  display.setvalue(fftsa.opt_fhi, 50000)
+  fftsa.options_apply()
+  return nb == 8192 and string.find(at512, 'bin', 1, true) ~= nil
+         and string.find(at16k, 'bin', 1, true) ~= nil and at512 ~= at16k,
+         '512: ' .. tostring(at512) .. ' | 16384: ' .. tostring(at16k)
+end)())
+
+-- F13. Three constants that have to agree and nothing said so.
+check('sample_counts, sample_labels and opt_nf agree',
+      table.getn(fftsa.sample_counts) == table.getn(fftsa.sample_labels)
+        and fftsa.opt_nf == 6,
+      string.format('counts=%d labels=%d opt_nf=%d',
+                    table.getn(fftsa.sample_counts),
+                    table.getn(fftsa.sample_labels), fftsa.opt_nf))
+
 -- An inverted span must be repaired: a stop below the start describes no bins,
 -- and every frame then indexes past fft_pwr and dies on a nil comparison.
 display.setvalue(fftsa.opt_flo, 8000)
