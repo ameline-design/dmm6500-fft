@@ -3,7 +3,7 @@
 -- The touch options form and the on-instrument run loop, over fft_core.tsp (the
 -- transform and the windows), spectrum_ui.tsp (the loading cover, fftsa.find_peaks)
 -- and spectrum_graph.tsp (fftsa.sg_*). The stop frequency sets the sample rate
--- (smallest exact rate >= 2*stop, so a narrower span also gives finer resolution),
+-- (smallest exact rate >= 2*stop, with a 100 kS/s floor),
 -- the start frequency only windows the display, the input range is
 -- dmm.digitize.range, and the window and its beta pick the analysis window.
 --
@@ -14,10 +14,11 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- FFT size, a power of two; every table, window and twiddle is sized from it. 512
--- gives 256 bins of 195.3 Hz at 100 kS/s. Halving it trades bin width for frame
--- rate; resolution was chosen. docs/PERFORMANCE.md has the frame-rate model.
+-- Every table, window and twiddle is sized from the selected power-of-two count.
+-- 512 remains the default; larger records trade update speed for finer bins.
 fftsa.n       = 512
+fftsa.sample_counts = {512, 1024, 2048, 4096, 8192, 16384}
+fftsa.sample_labels = {"512", "1024", "2048", "4096", "8192", "16384"}
 
 -- Floor for the start frequency. A start of 0 would admit bin 1, which is DC and,
 -- with the mean removed by fftsa.fft_load(), holds only window leakage.
@@ -57,6 +58,7 @@ if fftsa.handles_inited == nil then
   fftsa.opt_rng  = nil      -- Input Range edit-option field
   fftsa.opt_win  = nil      -- Window edit-option field
   fftsa.opt_beta = nil      -- Kaiser Beta edit-option field
+  fftsa.opt_n    = nil      -- FFT sample-count edit-option field
   fftsa.opt_info = nil      -- read-back info line on the options screen
   fftsa.handles_inited = true
 end
@@ -76,8 +78,8 @@ end
 -- Widening the span past the floor's Nyquist does raise the rate, because showing
 -- 200 kHz honestly requires sampling for it.
 --
--- The floor is 100 kS/s, which gives 195.3 Hz bins -- the finest the app offers,
--- and the resolution the default 0 to 50 kHz span is built around. Raising the rate
+-- The floor is 100 kS/s, which gives 195.3 Hz bins at the default 512 samples.
+-- Increasing the sample count makes bins finer. Raising the rate
 -- coarsens the bins in proportion, which is the price of the wider view.
 --
 -- Content above the chosen Nyquist still folds. That is the missing filter, not the
@@ -129,6 +131,19 @@ function fftsa.idx_to_range(v)
   return fftsa.ranges[i]
 end
 
+function fftsa.sample_to_idx(n)
+  for i = 1, table.getn(fftsa.sample_counts) do
+    if fftsa.sample_counts[i] == n then return i end
+  end
+  error("unsupported FFT sample count: " .. tostring(n), 0)
+end
+
+function fftsa.options_samples()
+  local i = fftsa.opt_index(display.getvalue(fftsa.opt_n), fftsa.sample_labels,
+                           fftsa.sample_to_idx(fftsa.n))
+  return fftsa.sample_counts[i]
+end
+
 function fftsa.measure_fs(buf)
   local n = buf.n
   if n < 4 then return fftsa.fs end
@@ -138,8 +153,8 @@ function fftsa.measure_fs(buf)
 end
 
 -- Apply the current settings to the hardware and the graph. Safe to repeat: the
--- capture buffer is reused, since only fftsa.n sizes it and that does not change at
--- runtime. fftsa.fft_init() rebuilds the window and its interpolation tables, which
+-- capture buffer is resized when needed; the graph keeps its original buffer.
+-- fftsa.fft_init() rebuilds the window and its interpolation tables, which
 -- is the slow part of a press -- about 0.3 s for Kaiser -- hence the cover.
 function fftsa.apply()
   fftsa.fs = fftsa.pick_fs(fftsa.fhi)
@@ -161,8 +176,11 @@ function fftsa.apply()
   dmm.digitize.read(fftsa.cap)
   fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
   fftsa.binhz = fftsa.fs / fftsa.n
+  -- Large transforms can legitimately take longer than the default stuck guard.
+  fftsa.busy_max = math.max(2.0, 2.0 * fftsa.n / 512)
+  fftsa.sg_nbins = fftsa.n / 2
+  fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
-  fftsa.sg_rebind()
 end
 
 -- One frame: acquire, transform, plot. Runs under pcall from fftsa.frame().
@@ -249,14 +267,15 @@ function fftsa.destroy_options()
   end
   fftsa.optscr, fftsa.opt_flo, fftsa.opt_fhi, fftsa.opt_rng, fftsa.opt_info =
     nil, nil, nil, nil, nil
-  fftsa.opt_win, fftsa.opt_beta = nil, nil
+  fftsa.opt_win, fftsa.opt_beta, fftsa.opt_n = nil, nil, nil
+  fftsa.opt_info_last = nil
 end
 
--- Form geometry, two columns like the decode app's: five fields become three rows,
+-- Form geometry, two columns like the decode app's: six fields become three rows,
 -- and the gap that buys is what makes each box a touch target. display.create takes
 -- no width for an OBJ_EDIT_*, so the second column's x is the one number to check on
 -- the glass. Labels are right-aligned and end at the column x.
-fftsa.opt_nf      = 5
+fftsa.opt_nf      = 6
 fftsa.opt_cols    = 2
 fftsa.opt_x       = 185
 fftsa.opt_x_c2    = 552
@@ -267,7 +286,7 @@ fftsa.opt_edit_dy = 4       -- offset of the box inside the object
 fftsa.opt_y_adj   = -8      -- nudge of the centred block, negative being up
 fftsa.opt_btn_y   = 360
 fftsa.opt_btn_gap = 24      -- air kept between the last box and the button row
-fftsa.opt_info_y  = 318
+fftsa.opt_info_y  = 323
 
 -- Rows, pitch and top for the field block. The pitch asks for every pixel available
 -- and the clamp decides what it gets: the last box has to end above the button row.
@@ -342,9 +361,18 @@ function fftsa.build_options()
                        "Kaiser Beta", "sidelobe level",
                        fftsa.kbeta_labels[1], fftsa.kbeta_labels[2], fftsa.kbeta_labels[3],
                        fftsa.kbeta_labels[4], fftsa.kbeta_labels[5], fftsa.kbeta_labels[6])
+  local x6, y6 = nextpos()
+  fftsa.opt_n = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x6, y6,
+                       "FFT Samples", "resolution vs speed",
+                       fftsa.sample_labels[1], fftsa.sample_labels[2], fftsa.sample_labels[3],
+                       fftsa.sample_labels[4], fftsa.sample_labels[5], fftsa.sample_labels[6])
 
-  fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 30, fftsa.opt_info_y, "",
-                        56575, display.FONT_SMALL, display.JUST_LEFT)   -- cyan 00DCFF
+  fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 400, fftsa.opt_info_y, "",
+                        56575, display.FONT_SMALL, display.JUST_CENTER)   -- cyan 00DCFF
+  -- A timer on the options screen previews edits without configuring acquisition.
+  local preview = create(fftsa.optscr, display.OBJ_TIMER, 0.2, display.TIMER_FOREVER)
+  display.setevent(preview, display.EVENT_PRESS,
+                  "if fftsa ~= nil then fftsa.guard(fftsa.options_preview) end")
 
   local b_apply = create(fftsa.optscr, display.OBJ_BUTTON, 470, fftsa.opt_btn_y, "Apply", 140)
   display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_apply) end")
@@ -358,12 +386,30 @@ function fftsa.build_options()
   return fftsa.optscr
 end
 
--- The settings as they ended up, which is not always as they were asked for: the
--- sample rate snaps to an achievable one and the bin width follows the measured rate.
-function fftsa.opt_info_text()
-  return string.format("%.0f - %.0f Hz    fs %d S/s    bin %.2f Hz    %g V    %s",
-                       fftsa.flo, fftsa.fhi, fftsa.fs, fftsa.binhz, fftsa.range,
+function fftsa.sample_rate_text(fs)
+  if fs >= 1000000 then return string.format("%g MS/s", fs / 1000000) end
+  if fs >= 1000 then return string.format("%g kS/s", fs / 1000) end
+  return string.format("%g S/s", fs)
+end
+
+-- Acquisition duration is N/fs, not the first-to-last timestamp interval (N-1)/fs.
+function fftsa.opt_info_text(fs, n)
+  fs, n = fs or fftsa.fs, n or fftsa.n
+  return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
+                       fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
                        fftsa.win_label())
+end
+
+function fftsa.options_preview()
+  local lo, hi = fftsa.options_span()
+  local fs = fftsa.pick_fs(hi)
+  -- Reuse the timestamp-measured rate when previewing the active acquisition rate.
+  if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs end
+  local text = fftsa.opt_info_text(fs, fftsa.options_samples())
+  if text ~= fftsa.opt_info_last then
+    display.settext(fftsa.opt_info, text)
+    fftsa.opt_info_last = text
+  end
 end
 
 -- Every button press goes through here. A press is dispatched by the firmware
@@ -411,17 +457,15 @@ function fftsa.options()
   pcall(function() display.setvalue(fftsa.opt_rng, fftsa.range_to_idx(fftsa.range)) end)
   pcall(function() display.setvalue(fftsa.opt_win, fftsa.win_i) end)
   pcall(function() display.setvalue(fftsa.opt_beta, fftsa.kbeta_i) end)
-  pcall(function() display.settext(fftsa.opt_info, fftsa.opt_info_text()) end)
+  display.setvalue(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
+  fftsa.options_preview()
   display.changescreen(fftsa.optscr)
   return true
 end
 
-function fftsa.options_apply()
+function fftsa.options_span()
   local lo = display.getvalue(fftsa.opt_flo)
   local hi = display.getvalue(fftsa.opt_fhi)
-  local ri = display.getvalue(fftsa.opt_rng)
-  local wi = display.getvalue(fftsa.opt_win)
-  local bi = display.getvalue(fftsa.opt_beta)
   -- Clamp each end to what the fixed rate can show, then order the pair: a stop at
   -- or below the start is a window with no bins in it. One repair is enough and
   -- provably so -- the stop lands in fhi_min..fhi_max and fhi_min is above flomin,
@@ -434,7 +478,15 @@ function fftsa.options_apply()
   if nhi < fftsa.fhi_min then nhi = fftsa.fhi_min end
   if nlo < fftsa.flomin then nlo = fftsa.flomin end
   if nlo >= nhi then nlo = fftsa.flomin end
-  fftsa.flo, fftsa.fhi = nlo, nhi
+  return nlo, nhi
+end
+
+function fftsa.options_apply()
+  local ri = display.getvalue(fftsa.opt_rng)
+  local wi = display.getvalue(fftsa.opt_win)
+  local bi = display.getvalue(fftsa.opt_beta)
+  fftsa.flo, fftsa.fhi = fftsa.options_span()
+  fftsa.n       = fftsa.options_samples()
   fftsa.range   = fftsa.idx_to_range(ri)
   fftsa.win_i   = fftsa.opt_index(wi, fftsa.win_names, fftsa.win_i)
   fftsa.kbeta_i = fftsa.opt_index(bi, fftsa.kbeta_labels, fftsa.kbeta_i)
@@ -442,12 +494,15 @@ function fftsa.options_apply()
   -- and the frame timer does not run while its screen is off show, so no frame can
   -- meet half-rebuilt tables.
   fftsa.loading_front()
+  -- A failed resize must not resume frames with mismatched FFT and buffer sizes.
+  fftsa.halted = true
   local ok, err = pcall(function() fftsa.apply() end)
   fftsa.show_main()
   if not ok then
     fftsa.lasterr = tostring(err)
     fftsa.say("APPLY FAILED: " .. tostring(err))
   else
+    fftsa.halted, fftsa.errrun = false, 0
     pcall(function() display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text()) end)
   end
   return ok
@@ -462,7 +517,9 @@ end
 function fftsa.build()
   fftsa.loading_build()
   fftsa.loading_front()
-  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2)
+  -- Keep the graph and its backing buffer bound for the whole app lifetime.
+  local maxn = fftsa.sample_counts[table.getn(fftsa.sample_counts)]
+  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, maxn / 2)
   -- The button died with the screen fftsa.sg_build() just destroyed: clear the
   -- stale handle, do not delete it.
   fftsa.optbtn = nil
