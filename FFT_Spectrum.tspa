@@ -1388,8 +1388,23 @@ end
 function fftsa.guard(f)
   if f == nil then return false end
   local ok, err = pcall(f)
-  if not ok then fftsa.lasterr = "button handler failed: " .. tostring(err) end
+  if not ok then
+    fftsa.lasterr = "button handler failed: " .. tostring(err)
+    fftsa.say(fftsa.lasterr)
+  end
   return ok
+end
+
+-- Put a line on the glass where the axis legend goes. Failures that are only
+-- recorded in fftsa.lasterr are invisible to the operator, who sees a press that
+-- did nothing and a previous spectrum still running. The legend is rewritten by the
+-- next fftsa.sg_set_xrange(), so this is not sticky.
+function fftsa.say(msg)
+  pcall(function()
+    if fftsa.sg_xunit ~= nil then
+      display.settext(fftsa.sg_xunit, string.sub(tostring(msg), 1, 70))
+    end
+  end)
 end
 
 -- Back to the spectrum screen, which is also what lets the frame timer run again.
@@ -1437,8 +1452,13 @@ function fftsa.options_apply()
   -- meet half-rebuilt tables.
   fftsa.loading_front()
   local ok, err = pcall(function() fftsa.apply() end)
-  if not ok then fftsa.lasterr = tostring(err) end
   fftsa.show_main()
+  if not ok then
+    fftsa.lasterr = tostring(err)
+    fftsa.say("APPLY FAILED: " .. tostring(err))
+  else
+    pcall(function() display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text()) end)
+  end
   return ok
 end
 

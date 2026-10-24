@@ -926,6 +926,26 @@ check('a handler that raises is caught instead of reaching the panel', (function
   fftsa.lasterr = before
   return ok == false and caught, tostring(fftsa.lasterr)
 end)())
+-- A failure that is only recorded is invisible: the operator sees a press that did
+-- nothing and the previous spectrum still running.
+check('a caught handler failure is also said on the glass', (function()
+  fftsa.guard(function() error('visible-boom', 0) end)
+  local said = obj_at(fftsa.sg_xunit).text
+  pcall(function() display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text()) end)
+  return string.find(tostring(said), 'visible-boom', 1, true) ~= nil, tostring(said)
+end)())
+check('a failed Apply says so, and a good one restores the legend', (function()
+  local real = fftsa.apply
+  fftsa.apply = function() error('apply-boom', 0) end
+  fftsa.options_apply()
+  local bad = obj_at(fftsa.sg_xunit).text
+  fftsa.apply = real
+  fftsa.options_apply()
+  local good = obj_at(fftsa.sg_xunit).text
+  return string.find(tostring(bad), 'apply-boom', 1, true) ~= nil
+         and good == fftsa.sg_xunit_text(),
+         tostring(bad) .. ' | then ' .. tostring(good)
+end)())
 check('every button press goes through the guard', (function()
   local bad = nil
   for h, evs in pairs(display.events) do
