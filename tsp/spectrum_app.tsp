@@ -305,7 +305,7 @@ function fftsa.build_options()
   fftsa.opt_win = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x4, y4,
                        "Window", "lobe vs sidelobe",
                        fftsa.win_names[1], fftsa.win_names[2], fftsa.win_names[3],
-                       fftsa.win_names[4], fftsa.win_names[5])
+                       fftsa.win_names[4])
   -- Always built, not only when Kaiser is selected: a field created on a press is a
   -- create on a visible screen, and this one is inert for the other four windows.
   local x5, y5 = nextpos()

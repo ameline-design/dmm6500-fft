@@ -124,10 +124,21 @@ local function sweep(centre)
   return worst_f, worst_a, at_f, at_a
 end
 
-local cfgs = {}
+-- Derived from the window list, so adding or removing one needs no edit here.
+local cfgs, nc = {}, 0
 local i
-for i = 1, 4 do cfgs[i] = {wi = i, bi = nil} end
-for i = 1, 6 do cfgs[4 + i] = {wi = 5, bi = i} end
+for i = 1, table.getn(fftsa.win_names) do
+  if fftsa.win_cos[i] ~= nil then
+    nc = nc + 1
+    cfgs[nc] = {wi = i, bi = nil}
+  else
+    local b
+    for b = 1, table.getn(fftsa.kbetas) do
+      nc = nc + 1
+      cfgs[nc] = {wi = i, bi = b}
+    end
+  end
+end
 
 print(string.format('N = %d, tone at bin 128, 83 offsets across -0.5..0.5 (coprime '
                     .. 'with the table grid), 3 phase/amplitude combinations each', N))

@@ -40,7 +40,6 @@ resolution), and the **start** frequency restricts what is displayed.
 | | peak sidelobe | scalloping loss | -20 dB peak width | skirt swing |
 |---|---|---|---|---|
 | **Hann** (default) | -31.5 dB | -1.42 dB | 3-4 bins | 32.8 dB |
-| **Hamming** | -42.7 | -1.75 | 3-4 | 11.7 |
 | **Blackman** | -58.1 | -1.09 | 3-4 | 15.3 |
 | **Blk-Harris** | -92.0 | -0.82 | 4-5 | 8.2 |
 | **Kaiser** β=4 | -30.0 | -2.06 | 2-3 | 7.6 |
@@ -63,11 +62,13 @@ window's own transform is sampled at build time into a 61-point table, the offse
 inverted from it, and the scalloping correction is read from the same table — so the estimator is
 derived from the window in use rather than fitted to one window and approximated for the rest.
 Measured worst case over 83 sub-bin offsets: **4.3e-6 bins of frequency error and 0.0035 dB of
-amplitude error**, for all ten settings. `tools/test_tsp.lua` pins both.
+amplitude error**, for all nine settings. `tools/test_tsp.lua` pins both.
 
 Rectangular is deliberately absent: its transform has a null one bin from the peak, which leaves
 three-bin interpolation ill-conditioned, so the peak readings would be wrong in a way the trace does
-not show.
+not show. **Hamming** was offered briefly and withdrawn — it exited the app on the instrument on
+2026-10-23, with no offline reproduction and no mechanism found. Kaiser at β=5 is the same window to
+within a fraction of a dB if it is ever wanted back.
 
 Mixed signals are where the choice earns its keep. A weak tone 40 dB down and 5 bins from a strong
 one reads -38.5 dBV under Hann (its own sidelobes add in) and -39.8 under Blackman-Harris; Kaiser at
@@ -92,7 +93,7 @@ docs/pixel-drawing.pdf   the three render paths that were benchmarked, and why t
 
 ```sh
 python3 tools/package_tspa.py          # -> FFT_Spectrum.tspa, gated (see below)
-~/tmp/base/out/lua502/bin/lua tools/test_tsp.lua        # the offline suite, 186 tests
+~/tmp/base/out/lua502/bin/lua tools/test_tsp.lua        # the offline suite
 ~/tmp/base/out/lua502/bin/lua tools/window_check.lua    # per-window accuracy
 python3 tools/lint_tsp.py tsp/*.tsp    # Lua 5.0.2 syntax gate
 ```

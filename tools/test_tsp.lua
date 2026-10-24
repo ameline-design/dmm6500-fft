@@ -976,13 +976,18 @@ check('apply returns to the spectrum', display.active == fftsa.sg_scr)
 -- fftsa.win_i would leave the previous window in the data it reports.
 check('the Window field reaches the transform', (function()
   local cg0 = fftsa.fft_cg
-  display.setvalue(fftsa.opt_win, 3)                    -- Blackman
+  -- Looked up rather than hardcoded: the list has lost an entry once already.
+  local want = 'Blackman'
+  local j
+  for j = 1, table.getn(fftsa.win_names) do
+    if fftsa.win_names[j] == want then display.setvalue(fftsa.opt_win, j) end
+  end
   fftsa.options_apply()
-  return fftsa.win_name() == 'Blackman' and math.abs(fftsa.fft_cg - cg0) > 1e-6,
+  return fftsa.win_name() == want and math.abs(fftsa.fft_cg - cg0) > 1e-6,
          fftsa.win_label() .. ' cg=' .. string.format('%.6f', fftsa.fft_cg)
 end)())
 check('the Kaiser Beta field reaches the transform', (function()
-  display.setvalue(fftsa.opt_win, 5)
+  display.setvalue(fftsa.opt_win, table.getn(fftsa.win_names))   -- Kaiser is last
   display.setvalue(fftsa.opt_beta, 1)
   fftsa.options_apply()
   local cg4 = fftsa.fft_cg
@@ -1004,9 +1009,9 @@ check('an out-of-range option index clamps instead of fetching a nil window',
          'hi=' .. hi .. ' lo=' .. fftsa.win_i
 end)())
 check('an option field read back as its own label still selects it', (function()
-  display.setvalue(fftsa.opt_win, 'Hamming')
+  display.setvalue(fftsa.opt_win, 'Blk-Harris')
   fftsa.options_apply()
-  return fftsa.win_name() == 'Hamming', fftsa.win_label()
+  return fftsa.win_name() == 'Blk-Harris', fftsa.win_label()
 end)())
 display.setvalue(fftsa.opt_win, 1)
 fftsa.options_apply()
