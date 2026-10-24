@@ -279,8 +279,9 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   | frame | 0.095 s | 0.161 s | 0.258 s | 0.456 s | 0.855 s | 1.681 s |
   | displayed | 10 fps | 5 fps | 3.3 fps | 2 fps | 1.1 fps | **0.6 fps** |
 
-  At 16384 the trace repaints about every 1.7 s, and the glass is unresponsive for most of it: the
-  display task only runs while Lua is blocked.
+  At 16384 the trace repaints about every **2 s** -- 0.5 Hz, measured on the installed app -- and the
+  glass is unresponsive for most of each frame: the display task only runs while Lua is blocked. The
+  frame figures above exclude that paint, so they run a tick or two optimistic.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
 - **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin

@@ -35,8 +35,8 @@ More samples give finer bins without reducing bandwidth: 16,384 samples at 100 k
 6.10 Hz spacing and a 163.84 ms record. Acquisition duration is `N / fs`, not the full frame time;
 processing and display add overhead. Larger sizes cost update rate, and measurably so: the frame goes
 from 0.095 s at 512 samples to 1.681 s at 16,384, and Apply from 0.11 s to 2.91 s. The trace repaints
-about every 1.7 s at the top size and the glass is unresponsive for most of each frame, because the
-display task only runs while Lua is blocked. `docs/PERFORMANCE.md` has every size measured.
+about every 2 s at the top size -- 0.5 Hz observed -- and the glass is unresponsive for most of each
+frame, because the display task only runs while Lua is blocked. `docs/PERFORMANCE.md` has every size measured.
 
 ## Choosing a window
 

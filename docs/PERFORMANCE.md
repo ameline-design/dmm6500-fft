@@ -144,10 +144,17 @@ Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, a 12.5 kHz 1.000 V
 | 2048 | 0.393 s | 0.258 s | 3.3 fps | 441 | 48.83 Hz |
 | 4096 | 0.755 s | 0.456 s | 2 fps | 475 | 24.41 Hz |
 | 8192 | 1.488 s | 0.855 s | 1.1 fps | 496 | 12.21 Hz |
-| 16384 | 2.906 s | 1.681 s | 0.6 fps | 502 | 6.10 Hz |
+| 16384 | 2.906 s | 1.681 s | 0.6 fps modelled, **0.5 Hz observed** | 502 | 6.10 Hz |
 
 The 0.095 s frame at 512 against the 81.8 ms of the phase table above is the same configuration
 measured a different way, through `options_apply` rather than per phase.
+
+**These frame times are a floor, not what the operator sees.** They were taken with the frame timer
+parked and `saved_frame()` called synchronously, which leaves out the display task's own paint -- in
+the running app that work lands between frames and costs another tick or two. Measured on the
+installed app at 16384 the update is about **0.5 Hz**, a 2.0 s period, against the 0.59 fps the 1.681 s
+figure predicts: the real frame is nearer 1.95 s. Treat the table as per-phase cost and the 0.5 Hz as
+the rate.
 
 ### Where a frame goes, per sample and per bin
 
