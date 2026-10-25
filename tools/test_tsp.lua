@@ -149,8 +149,12 @@ function display.create(parent, kind, ...)
   if kind == display.OBJ_TEXT then OBJ[h].justify = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].help = a[4] end
   -- Creating a screen makes it the active one. Modelled because it is the whole
-  -- reason the cover has to be raised again after every screen create.
-  if kind == display.OBJ_SCREEN then display.active = h end
+  -- reason the cover has to be raised again after every screen create. The title is
+  -- kept because the firmware truncates one over 31 characters with event 1707.
+  if kind == display.OBJ_SCREEN then
+    display.active = h
+    OBJ[h].title = a[1]
+  end
   return h
 end
 -- Objects parented to `scr` that were created while `scr` was the screen on show.
@@ -954,6 +958,26 @@ check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
 
 print('\nthe about screen (real code)')
+-- Every screen title, with its length: the firmware truncates one over 31 characters and
+-- posts 1707, and a truncated title is the sort of thing that reaches the glass unnoticed.
+check('every screen title is what it should be, and short enough', (function()
+  local want = {[fftsa.sg_scr] = 'FFT SPECTRUM ANALYSER',
+                [fftsa.optscr] = 'FFT ANALYSER OPTIONS',
+                [fftsa.aboutscr] = 'FFT Analyser - About',
+                [fftsa.loadscr] = 'FFT SPECTRUM ANALYSER'}
+  local h, t
+  for h, t in pairs(want) do
+    local got = obj_at(h).title
+    if got ~= t then
+      return false, string.format('%q against %q', tostring(got), t)
+    end
+    if string.len(t) > 31 then
+      return false, string.format('%q is %d characters', t, string.len(t))
+    end
+  end
+  return true, string.format('about: %q, %d characters', want[fftsa.aboutscr],
+                             string.len(want[fftsa.aboutscr]))
+end)())
 -- The licence has to be the repo's, not a paraphrase of it, so it is compared against
 -- LICENSE itself. Trailing blank lines are dropped: the file ends with a newline and the
 -- screen carries no row for it.

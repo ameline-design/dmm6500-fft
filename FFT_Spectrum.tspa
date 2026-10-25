@@ -1794,7 +1794,7 @@ end
 function fftsa.build_about()
   fftsa.destroy_about()
   local create = display.create
-  fftsa.aboutscr = create(display.ROOT, display.OBJ_SCREEN, "ABOUT")
+  fftsa.aboutscr = create(display.ROOT, display.OBJ_SCREEN, "FFT Analyser - About")
   if fftsa.aboutscr == nil then
     fftsa.lasterr = "display object pool exhausted building the about screen -- "
                     .. "power cycle the instrument."
