@@ -271,10 +271,27 @@ end
 buffer = {
   STYLE_WRITABLE_FULL = 'wf', STYLE_STANDARD = 'std',
   UNIT_VOLT = 'V', UNIT_HERTZ = 'Hz', DIGITS_4_5 = 45, DIGITS_6_5 = 65,
-  -- The firmware's values, read off the instrument 2026-10-24.
+  -- The firmware's values, read off its registration table. UNIT_DECIBEL is 4 and is
+  -- NOT used: it panics the instrument during build. A custom unit is the safe route to
+  -- a dB suffix.
+  UNIT_DECIBEL = 4, UNIT_CUSTOM1 = 14, UNIT_DBM = 20, UNIT_NONE = 23,
   FILL_ONCE = 0, FILL_CONTINUOUS = 1,
   write = {},
 }
+-- buffer.unit(unit, label) names a custom unit. The firmware uses only the first TWO
+-- characters and posts 4933, "Reading buffer custom unit truncated to two characters",
+-- when handed more -- so the mock stores what the instrument would keep, not what it was
+-- given. A harness that stored the whole string would let a three-character label look
+-- fine here and arrive truncated on the glass.
+CUSTOM_UNITS, CUSTOM_TRUNCATED = {}, 0
+function buffer.unit(u, label)
+  local t = tostring(label)
+  if string.len(t) > 2 then
+    t = string.sub(t, 1, 2)
+    CUSTOM_TRUNCATED = CUSTOM_TRUNCATED + 1
+  end
+  CUSTOM_UNITS[u] = t
+end
 function buffer.make(cap, style) return newbuf(cap) end
 function buffer.delete(b)
   if type(b) ~= 'table' or not b.alive then error('buffer.delete on a dead buffer', 0) end
@@ -283,7 +300,10 @@ function buffer.delete(b)
   end
   b.alive = false
 end
-function buffer.write.format(b, ...) if not b.alive then error('format on dead buffer', 0) end end
+function buffer.write.format(b, ...)
+  if not b.alive then error('format on dead buffer', 0) end
+  b.yunit, b.xunit = arg[1], arg[3]
+end
 -- Fractional times the firmware would refuse. It posts event 1131 -- a MODAL
 -- DIALOG, once per call -- and RETURNS, so this counts rather than raises, which is
 -- what the real call does. A frame writes 255 points, so a dialog per point makes
@@ -831,32 +851,6 @@ check('binhz of zero degrades safely', (function()
   return a == 1 and b == nb
 end)())
 
--- ---------- axis scale ----------
-print('\nseconds-trick axis scale (real code)')
-check('a 50 kHz span labels directly in kHz', fftsa.sg_pick_fscale(50000) == 1000)
-check('a wider span steps by a decade rather than rolling over',
-      fftsa.sg_pick_fscale(500000) == 10000,
-      tostring(fftsa.sg_pick_fscale(500000)))
-local rollover = false
-for _, f in ipairs({500, 5000, 50000, 58999, 60000, 100000, 500000, 1000000}) do
-  if f / fftsa.sg_pick_fscale(f) >= 59 then rollover = true end
-end
-check('no span up to 1 MHz hits the MM:SS rollover', not rollover)
--- The label count the firmware chooses has to be stable, which is what fixing
--- the scale at 1e6 broke: it put a 50 kHz span at 50 ms, where the row drew six
--- labels on most frames and eleven on some. A decade scale keeps every span in
--- a range whose divisions are wide and distinct.
-check('a 50 kHz span sits in tens of label-seconds, not hundredths',
-      50000 / fftsa.sg_pick_fscale(50000) == 50,
-      tostring(50000 / fftsa.sg_pick_fscale(50000)))
-fftsa.sg_fscale = fftsa.sg_pick_fscale(50000)
-check('legend names both units at the default scale',
-      fftsa.sg_xunit_text() == 'X: kHz   Y: dBV', fftsa.sg_xunit_text())
-fftsa.sg_fscale = fftsa.sg_pick_fscale(500000)
-check('legend states the multiplier once the decade has stepped',
-      fftsa.sg_xunit_text() == 'X: kHz   Y: dBV   (graph x10)', fftsa.sg_xunit_text())
--- Back to the real default: later checks divide by this.
-fftsa.sg_fscale = 1000
 
 -- ---------- range mapping / sample rate ----------
 print('\nrange + sample rate (real code)')
@@ -1232,96 +1226,13 @@ check('options() creates nothing when the form handle is nil', (function()
   return r == false and live() == before
 end)())
 
--- A fractional time above 0.9999999 is refused with event 1131, a modal dialog per
--- refused write, and math.floor() produces one when the scaled frequency lands a
--- rounding error below an integer.
---
--- How often: at N = 512 the naive floor refuses at most 3 points of 256 in one frame,
--- and nothing at all in 514691 of 515052. The 255-of-256 figure recorded with the fix
--- came from a bin width of 999.9999999999, which needs 512000 S/s -- 2.4 % off the
--- commanded rate -- so it is outside the reachable set at any count, not at its edge.
---
--- The round trip (n-1)/((n-1)/fs) is exact or above exact at N = 512, which is what
--- the 'cannot repeat every frame' claim rested on. That claim does NOT generalise:
--- at N = 2048 and N = 16384 the round trip lands one ulp BELOW exact at 500 kS/s and
--- 1 MS/s, and the naive floor then refuses one point on EVERY frame -- bin 513 at
--- 2048/1 MS/s, bin 4097 at 16384/1 MS/s. sg_split_t carries both, so there is no live
--- defect, but the sweep below is scoped to 512 and does not see them.
---
--- The bench symptom is therefore still unexplained. This query, with the app
--- running, settles whether a real frame goes near the limit -- counting in place,
--- since the readback line shows binhz to 2 dp:
---   do local n=0 for k=2,256 do local t=((k-1)*fftsa.binhz)/fftsa.sg_fscale
---   if t-math.floor(t) > 0.9999999 then n=n+1 end end
---   print("BADFRAC="..n.." binhz="..string.format("%.14g",fftsa.binhz)) end
--- If that prints 0, the 1131 storm had another cause and that cause is still there.
-print('\nfractional time (real code)')
-check('sg_split_t carries a near-integer into the whole part', (function()
-  local w, fr = fftsa.sg_split_t(9.9999999999)
-  return w == 10 and fr == 0, string.format('%d + %.12f', w, fr)
-end)())
-check('and the naive floor it replaces WOULD have been refused', (function()
-  local t = 9.9999999999
-  local naive = t - math.floor(t)
-  return naive > 0.9999999, string.format('naive frac %.12f', naive)
-end)())
-check('an exact value is left alone', (function()
-  local w, fr = fftsa.sg_split_t(12.25)
-  return w == 12 and fr == 0.25, string.format('%d + %g', w, fr)
-end)())
--- The worst bin width the hardware can produce: one ulp below the exact 390.625 of
--- 200 kS/s, putting bins 64, 128 and 192 a hair under 25, 50 and 75 label-seconds.
-local FRAC_WORST = 199999.99999999997 / 512
-local function naive_refusals(binhz, fscale)
-  local bad = 0
-  for k = 1, fftsa.sg_nbins do
-    local t = ((k - 1) * binhz) / fscale
-    if t - math.floor(t) > 0.9999999 then bad = bad + 1 end
-  end
-  return bad
-end
-local function frame_refusals(binhz)
-  local before = BADFRAC
-  local lo, hi, sc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale
-  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = 0, 1e6, 1000
-  for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-4 end
-  fftsa.sg_update(fftsa.sg_nbins, binhz)
-  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.sg_fscale = lo, hi, sc
-  return BADFRAC - before
-end
-check('the worst REACHABLE bin width writes no fraction the firmware would refuse',
-      frame_refusals(FRAC_WORST) == 0,
-      'refused writes: ' .. frame_refusals(FRAC_WORST))
-check('and that frame really did hit the hazard, so the check has teeth',
-      naive_refusals(FRAC_WORST, 1000) == 3,
-      naive_refusals(FRAC_WORST, 1000) .. ' of ' .. fftsa.sg_nbins
-      .. ' points would have been refused by the naive floor')
--- A stress case, not a reachable one: 999.9999999999 Hz bins need 512000 S/s, and
--- every point is then a hair under a whole label-second.
-check('and so does a bin width the hardware cannot reach', (function()
-  local bad = naive_refusals(999.9999999999, 1000)
-  return frame_refusals(999.9999999999) == 0 and bad == 255,
-         bad .. ' of ' .. fftsa.sg_nbins .. ' would have been refused'
-end)())
-check('no frame anywhere in this suite wrote a refused fraction', BADFRAC == 0,
-      'total refused: ' .. BADFRAC)
--- One representable step tighter than the firmware's limit, which is the safe
--- direction. Asserted because the mock's predicate is the firmware's, so it cannot
--- see the guard loosened past it.
-check('the carry threshold sits at or below the fraction the firmware refuses',
-      (function()
-  local worst = 0
-  local i
-  for i = 1, 300 do
-    local w, fr = fftsa.sg_split_t(i * 7 - i * 1e-9)     -- a hair under integers
-    if fr > worst then worst = fr end
-    w, fr = fftsa.sg_split_t(i + FRAC_MAX)
-    if fr > worst then worst = fr end
-    w, fr = fftsa.sg_split_t(i + FRAC_MAX * (1 - 1e-9))
-    if fr > worst then worst = fr end
-  end
-  return worst <= FRAC_MAX, string.format('worst fraction emitted %.12f', worst)
-end)())
+-- The scaled-timestamp encoding is gone with the time axis, and with it the event-1131
+-- hazard its carry existed for: the fractional-seconds field is refused above 0.9999999,
+-- and a frequency landing an ulp below an integer after the divide produced exactly that.
+-- The timestamp is now the slot number, an integer, so the fraction is always 0. The
+-- mock still counts a refused fraction, and the check below is what would catch a
+-- fractional timestamp creeping back in.
+
 -- Every timestamp this suite wrote was above the one before it, within its fill.
 check('no buffer fill anywhere in this suite went back in time', NONMONO == 0,
       'out-of-order writes: ' .. NONMONO)
@@ -1969,23 +1880,27 @@ check('an off-list sample count leaves Options and Apply working', (function()
                        tostring(applied), tostring(landed))
 end)())
 
--- F3. A raise between the span commit and show_main() left flo/fhi describing a span
--- the axis, the cover and the message all still disagreed with.
-check('a raise while reading the form commits no part of the span', (function()
+-- F3 as originally written: a raise between the span commit and show_main() left flo/fhi
+-- describing a span the axis, the cover and the message all disagreed with. The raise it
+-- induced -- getvalue on a nil field handle -- cannot happen any more, because the reads
+-- test for nil and fall back instead. The property that mattered is still asserted: a
+-- field whose handle was never built costs that field and nothing else.
+check('a missing field costs that field alone, and the span still commits', (function()
   local flo0, fhi0 = fftsa.flo, fftsa.fhi
-  local keepn = fftsa.opt_n
+  local keepn, n0 = fftsa.opt_n, fftsa.n
   display.setvalue(fftsa.opt_flo, 2000)
   display.setvalue(fftsa.opt_fhi, 30000)
-  fftsa.opt_n = nil                          -- getvalue(opt_n) raises
-  local ok = fftsa.guard(fftsa.options_apply)
+  fftsa.opt_n = nil                          -- the handle the pool could not give us
+  local ok = fftsa.options_apply()
   fftsa.opt_n = keepn
-  local held = fftsa.flo == flo0 and fftsa.fhi == fhi0
+  local kept = fftsa.n == n0
+  local moved = fftsa.flo == 2000 and fftsa.fhi == 30000
   display.setvalue(fftsa.opt_flo, flo0)
   display.setvalue(fftsa.opt_fhi, fhi0)
   fftsa.options_apply()
-  return (not ok) and held,
-         string.format('ok=%s flo %g->%g fhi %g->%g', tostring(ok), flo0, fftsa.flo,
-                       fhi0, fftsa.fhi)
+  return ok and kept and moved,
+         string.format('ok=%s n %s->%s, span %g..%g', tostring(ok), tostring(n0),
+                       tostring(fftsa.n), 2000, 30000)
 end)())
 
 -- F2. The refill clears the bound buffer before rewriting it, so a raise inside it does

@@ -75,7 +75,6 @@ fftsa.delfails = fftsa.delfails or 0
 -- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
 fftsa.sg_flo_hz  = 0
 fftsa.sg_fhi_hz  = 1e9
-fftsa.sg_fscale  = 1000    -- Hz per label-second; fftsa.sg_pick_fscale() steps it by decades
 
 -- EXPERIMENT, both settable over the socket while the app runs.
 --
@@ -188,21 +187,8 @@ function fftsa.sg_pin_x()
   return true
 end
 
--- Largest decade that keeps the span under 59 label-seconds; above that the
--- firmware's time axis rolls into base-60 MM:SS.
-function fftsa.sg_pick_fscale(fhi_hz)
-  local s = 1000                      -- the label then reads directly as kHz
-  if fhi_hz == nil or fhi_hz <= 0 then return s end
-  while fhi_hz / s >= 59 do s = s * 10 end
-  return s
-end
-
 function fftsa.sg_xunit_text()
-  local s = fftsa.sg_fscale
   local t = "X: kHz   Y: dBV"
-  if s ~= 1000 then
-    t = string.format("X: kHz   Y: dBV   (graph x%g)", s / 1000)
-  end
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins:
   -- the trace is a dot, five peak rows read ---, and nothing else says why.
   local b = fftsa.binhz
@@ -284,11 +270,9 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- same, so growing a table mid-frame would allocate inside the window it exists to
   -- shrink. Seeded so every slot is a store rather than a rehash on the first frame.
   fftsa.sg_st_db, fftsa.sg_st_hz = {}, {}
-  fftsa.sg_st_w,  fftsa.sg_st_fr = {}, {}
   local j
   for j = 1, want do
     fftsa.sg_st_db[j], fftsa.sg_st_hz[j] = fftsa.sg_dbmin, 0
-    fftsa.sg_st_w[j],  fftsa.sg_st_fr[j] = 0, 0
   end
   return fftsa.sg_buf
 end
@@ -301,44 +285,34 @@ function fftsa.sg_mkbuf(want)
   local b = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
   -- Left at FILL_ONCE deliberately. See sg_make_buffer: FILL_CONTINUOUS works exactly
   -- as documented and still draws a line from the newest point to the oldest.
-  -- Not buffer.UNIT_DECIBEL: it panics the instrument during build.
-  buffer.write.format(b, buffer.UNIT_VOLT,  buffer.DIGITS_4_5,
-                         buffer.UNIT_HERTZ, buffer.DIGITS_6_5)
+  --
+  -- The Y values are decibels, and a custom unit is how the axis gets to say so. NOT
+  -- buffer.UNIT_DECIBEL, which panics the instrument during build -- the custom units
+  -- are a different path, and the firmware truncates their label to two characters
+  -- (event 4933), which is exactly "dB". Without this the axis labels read "+020.0V" on
+  -- numbers that are not volts.
+  buffer.unit(buffer.UNIT_CUSTOM1, "dB")
+  buffer.write.format(b, buffer.UNIT_CUSTOM1, buffer.DIGITS_4_5,
+                         buffer.UNIT_HERTZ,   buffer.DIGITS_6_5)
   local k
   for k = 1, want do
-    fftsa.sg_write_point(b, fftsa.sg_dbmin, (k - 1) * 1.0)
+    fftsa.sg_write_point(b, fftsa.sg_dbmin, (k - 1) * 1.0, k)
   end
   return b
 end
 
--- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
--- takes. The fraction must be 0 to 0.9999999; past that the firmware refuses the
--- write with event 1131, which is a modal dialog on this instrument -- and one
--- dialog per frame at 10 fps is as impossible to exit as one per point.
+-- One point: value dB, extra the bin's frequency in Hz, timestamp a plain counter.
 --
--- math.floor() leaves exactly that when the scaled frequency sits a rounding error
--- below an integer. That is rare, not normal: binhz/sg_fscale has to land within an
--- ulp below a simple rational, not merely be inexact. Swept over every reachable
--- configuration the naive floor refuses at most 3 points of 256 in one frame, and
--- nothing at all in 514691 of 515052 -- worst at a measured 199999.99999999997 S/s,
--- where 390.62499999999994 Hz bins put bins 64, 128 and 192 a hair under 25, 50 and
--- 75 label-seconds. Those figures, and the round-trip argument above, are N = 512.
--- At 2048 and 16384 the round trip lands one ulp BELOW exact at 500 kS/s and 1 MS/s,
--- and the naive floor would then refuse one point every frame rather than once --
--- measured, bin 513 and bin 4097 respectively. So this is not merely cheap insurance
--- at the larger counts, and the bench symptom it was written for is still
--- unexplained: tools/test_tsp.lua carries the query that settles it.
-function fftsa.sg_split_t(t)
-  local w = math.floor(t)
-  local fr = t - w
-  if fr >= 0.9999999 then return w + 1, 0 end
-  return w, fr
-end
-
--- One point: value dB, extra Hz, timestamp the scaled frequency (the seconds trick).
-function fftsa.sg_write_point(buf, db, f)
-  local w, fr = fftsa.sg_split_t(f / fftsa.sg_fscale)
-  buffer.write.reading(buf, db, f, w, fr)
+-- THE TIMESTAMP IS NO LONGER THE X AXIS, so it carries no information -- X is bound to
+-- the extra field. It still has to be supplied and still has to increase, because
+-- buffer.write.reading documents chronological order, so the slot number serves. What
+-- that retires is the scaled-frequency encoding and its hazard: the fractional seconds
+-- field is refused above 0.9999999 with event 1131, a modal dialog per offending point,
+-- and a frequency landing an ulp below an integer after the divide produced exactly
+-- that. An integer count cannot.
+function fftsa.sg_write_point(buf, db, f, slot)
+  if slot == nil then slot = 1 end
+  buffer.write.reading(buf, db, f, slot, 0)
 end
 
 
@@ -446,8 +420,6 @@ function fftsa.sg_update(nbins, binhz)
   local vfl   = fftsa.sg_vfloor * fftsa.sg_vfloor   -- squared: the bins are power
   local dbmin = fftsa.sg_dbmin
   local dbmax = fftsa.sg_dbmax
-  local fscl  = fftsa.sg_fscale
-  local split = fftsa.sg_split_t
   local floor = math.floor
   local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
   local npts = kmax - kmin + 1
@@ -475,16 +447,10 @@ function fftsa.sg_update(nbins, binhz)
   -- 13 at 255 points. The staging costs four table stores and four loads a point, some
   -- 11 us, so the frame as a whole gets about 3 ms longer -- paid outside the window.
   local st_db, st_hz = fftsa.sg_st_db, fftsa.sg_st_hz
-  local st_w,  st_fr = fftsa.sg_st_w,  fftsa.sg_st_fr
   -- Hoisted out of the loop: the column's frequency advances by a constant, so the
-  -- per-point divide and two multiplies become one add. The split is inlined for the
-  -- same reason -- a Lua call per point was measurable against the 51.6 us write.
+  -- per-point divide and two multiplies become one add.
   local fstep = (npts / ncol) * binhz
   local f0    = (kmin - 1) * binhz
-  local tstep = fstep / fscl
-  local t     = f0 / fscl
-  local FMAX  = 0.9999999        -- the same limit sg_split_t enforces
-  local floor2 = floor
   local c
   for c = 0, ncol - 1 do
     -- The column's bin range. One bin wide at the default, where capacity equals the
@@ -510,20 +476,12 @@ function fftsa.sg_update(nbins, binhz)
       elseif not (db < dbmax) then db = dbmax end
     end
     -- The COLUMN's frequency, not the winning bin's. Columns can be narrower than a
-    -- bin -- 255 bins over 384 columns at the default -- and several of them would then
-    -- share a bin, giving equal timestamps. This is strictly increasing by
-    -- construction. The cost is that a peak is drawn at its column rather than its bin,
-    -- within 130 Hz at any size, which is 2 px of a 784 px graph; the peak table still
-    -- carries the interpolated frequency.
-    -- Scaled frequency into the seconds field, split so the fraction cannot reach the
-    -- 0.9999999 the firmware refuses with event 1131. Inlined from sg_split_t.
-    local w = floor2(t)
-    local fr = t - w
-    if fr >= FMAX then w = w + 1; fr = 0 end
+    -- bin, and several would then share one, so a column's own frequency is strictly
+    -- increasing by construction where the winning bin's is not. The cost is that a peak
+    -- is drawn at its column rather than its bin, within 130 Hz at any size, which is
+    -- 2 px of a 784 px graph; the peak table still carries the interpolated frequency.
     nwrote = nwrote + 1
     st_db[nwrote], st_hz[nwrote] = db, f0 + c * fstep
-    st_w[nwrote], st_fr[nwrote] = w, fr
-    t = t + tstep
   end
   fftsa.sg_nwrote = nwrote                   -- segments the widget was actually handed
   -- THE WINDOW. Everything above this line ran against the previous frame's trace, which
@@ -534,7 +492,7 @@ function fftsa.sg_update(nbins, binhz)
   local i
   buf.clear()
   for i = 1, nwrote do
-    wr(buf, st_db[i], st_hz[i], st_w[i], st_fr[i])
+    wr(buf, st_db[i], st_hz[i], i, 0)
   end
   -- No graph call. The clear above is the notify, and the trace stays bound to the
   -- same buffer for the life of the app -- so nothing here can repaint the axes.
@@ -547,7 +505,6 @@ end
 function fftsa.sg_set_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
-  fftsa.sg_fscale = fftsa.sg_pick_fscale(fhi_hz)
   if fftsa.sg_xunit ~= nil then
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end

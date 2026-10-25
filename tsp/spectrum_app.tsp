@@ -142,7 +142,7 @@ function fftsa.sample_to_idx(n)
 end
 
 function fftsa.options_samples()
-  local i = fftsa.opt_index(display.getvalue(fftsa.opt_n), fftsa.sample_labels,
+  local i = fftsa.opt_index(fftsa.getval(fftsa.opt_n), fftsa.sample_labels,
                            fftsa.sample_to_idx(fftsa.n))
   return fftsa.sample_counts[i]
 end
@@ -325,7 +325,7 @@ function fftsa.frame()
     -- bound, and the only buffer that can be left part filled is one nothing draws
     -- from -- the next frame clears it before writing anyway.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
-      pcall(function() fftsa.sg_rebind() end)
+      fftsa.sg_rebind()
     end
     fftsa.lasterr  = tostring(err)
     fftsa.errcount = (fftsa.errcount or 0) + 1
@@ -334,11 +334,9 @@ function fftsa.frame()
     -- stopped updating looks like a working analyser on a dead signal.
     if fftsa.errrun >= (fftsa.errmax or 20) then
       fftsa.halted = true
-      pcall(function()
-        display.settext(fftsa.sg_xunit,
-          "HALTED after " .. fftsa.errrun .. " failed frames: " ..
-          string.sub(tostring(fftsa.lasterr), 1, 60))
-      end)
+      display.settext(fftsa.sg_xunit,
+        "HALTED after " .. fftsa.errrun .. " failed frames: " ..
+        string.sub(tostring(fftsa.lasterr), 1, 60))
     end
   else
     fftsa.errrun = 0
@@ -347,7 +345,7 @@ function fftsa.frame()
   -- A teardown that arrived mid-frame waits here, where nothing is in flight.
   if fftsa.stop_pending then
     fftsa.stop_pending = false
-    pcall(function() fftsa.stop() end)
+    fftsa.stop()
   end
 end
 
@@ -355,7 +353,7 @@ end
 function fftsa.destroy_options()
   if fftsa.optscr ~= nil then
     -- Never delete the screen currently on show: leave it first.
-    pcall(function() fftsa.show_main() end)
+    fftsa.show_main()
     fftsa.del_obj(fftsa.optscr)
   end
   fftsa.optscr, fftsa.opt_flo, fftsa.opt_fhi, fftsa.opt_rng, fftsa.opt_info =
@@ -473,9 +471,8 @@ function fftsa.build_options()
   display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_cancel) end")
   -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
   -- the visible screen, and leaving from the form must still tear down.
-  pcall(function()
-    display.setevent(fftsa.optscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
-  end)
+  display.setevent(fftsa.optscr, display.EVENT_ENDAPP,
+                   "if fftsa ~= nil then fftsa.cleanup() end")
   return fftsa.optscr
 end
 
@@ -493,6 +490,31 @@ function fftsa.opt_info_text(fs, n, wi, bi)
                        fftsa.win_label(wi, bi))
 end
 
+-- Read a field, or answer the fallback if the handle was never built. The firmware
+-- returns nil from display.create when the object pool is exhausted, so a field handle
+-- can legitimately be nil, and getvalue on nil is a raise in OUR code -- not a firmware
+-- refusal. Testing for nil here is what keeps a missing field from taking Options and
+-- Apply down with it, which is what the pcalls around these calls used to do at the cost
+-- of a closure each and of hiding the reason.
+function fftsa.getval(h, fallback)
+  if h == nil then return fallback end
+  return display.getvalue(h)
+end
+
+-- Set a field, or do nothing if the handle was never built. See fftsa.options().
+function fftsa.setval(h, v)
+  if h == nil then return false end
+  display.setvalue(h, v)
+  return true
+end
+
+-- Set a text, or do nothing if the handle was never built.
+function fftsa.settxt(h, t)
+  if h == nil then return false end
+  display.settext(h, t)
+  return true
+end
+
 function fftsa.options_preview()
   local lo, hi = fftsa.options_span()
   local fs = fftsa.pick_fs(hi)
@@ -500,8 +522,8 @@ function fftsa.options_preview()
   if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs end
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
-  local wi = fftsa.opt_index(display.getvalue(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
-  local bi = fftsa.opt_index(display.getvalue(fftsa.opt_beta), fftsa.kbeta_labels,
+  local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
+  local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
   local text = fftsa.opt_info_text(fs, fftsa.options_samples(), wi, bi)
   if text ~= fftsa.opt_info_last then
@@ -529,11 +551,9 @@ end
 -- did nothing and a previous spectrum still running. The legend is rewritten by the
 -- next fftsa.sg_set_xrange(), so this is not sticky.
 function fftsa.say(msg)
-  pcall(function()
-    if fftsa.sg_xunit ~= nil then
-      display.settext(fftsa.sg_xunit, string.sub(tostring(msg), 1, 70))
-    end
-  end)
+  if fftsa.sg_xunit ~= nil then
+    display.settext(fftsa.sg_xunit, string.sub(tostring(msg), 1, 70))
+  end
 end
 
 -- Back to the spectrum screen, which is also what lets the frame timer run again.
@@ -542,7 +562,7 @@ function fftsa.show_main()
     display.changescreen(fftsa.sg_scr)
     return true
   end
-  pcall(function() display.changescreen(display.SCREEN_HOME) end)
+  display.changescreen(display.SCREEN_HOME)
   return false
 end
 
@@ -550,23 +570,28 @@ end
 -- means the object pool refused and building it now would fail the same way.
 function fftsa.options()
   if fftsa.optscr == nil then return false end
-  pcall(function() display.setvalue(fftsa.opt_flo, fftsa.flo) end)
-  pcall(function() display.setvalue(fftsa.opt_fhi, fftsa.fhi) end)
-  pcall(function() display.setvalue(fftsa.opt_rng, fftsa.range_to_idx(fftsa.range)) end)
-  pcall(function() display.setvalue(fftsa.opt_win, fftsa.win_i) end)
-  pcall(function() display.setvalue(fftsa.opt_beta, fftsa.kbeta_i) end)
-  pcall(function() display.setvalue(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n)) end)
+  -- Guarded, NOT pcall'd. The firmware does not raise -- display.create RETURNS NIL when
+  -- the object pool is exhausted, and it is setvalue on that nil handle that raises, in
+  -- our own code. A nil test removes the raise instead of catching it, which is the same
+  -- protection without a closure per field: an exhausted pool then costs the fields it
+  -- could not build rather than the Options button and Apply together.
+  fftsa.setval(fftsa.opt_flo, fftsa.flo)
+  fftsa.setval(fftsa.opt_fhi, fftsa.fhi)
+  fftsa.setval(fftsa.opt_rng, fftsa.range_to_idx(fftsa.range))
+  fftsa.setval(fftsa.opt_win, fftsa.win_i)
+  fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
+  fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
   -- Guarded like its neighbours: four getvalue/settext calls on handles the pool may
   -- have refused, and changescreen is the next line. Unguarded, a refusal at the end
   -- of the create list leaves the Options button dead for the life of the app.
-  pcall(function() fftsa.options_preview() end)
+  fftsa.options_preview()
   display.changescreen(fftsa.optscr)
   return true
 end
 
 function fftsa.options_span()
-  local lo = display.getvalue(fftsa.opt_flo)
-  local hi = display.getvalue(fftsa.opt_fhi)
+  local lo = fftsa.getval(fftsa.opt_flo, fftsa.flo)
+  local hi = fftsa.getval(fftsa.opt_fhi, fftsa.fhi)
   -- Clamp each end to what the fixed rate can show, then order the pair: a stop at
   -- or below the start is a window with no bins in it. One repair is enough and
   -- provably so -- the stop lands in fhi_min..fhi_max and fhi_min is above flomin,
@@ -587,9 +612,9 @@ function fftsa.options_apply()
   -- applied state untouched, where a raise after the first commit would leave the
   -- span changed with the axis, the cover and the message all still describing the
   -- old one -- and say() writes the spectrum screen, which is not on show yet.
-  local ri = display.getvalue(fftsa.opt_rng)
-  local wi = display.getvalue(fftsa.opt_win)
-  local bi = display.getvalue(fftsa.opt_beta)
+  local ri = fftsa.getval(fftsa.opt_rng)
+  local wi = fftsa.getval(fftsa.opt_win)
+  local bi = fftsa.getval(fftsa.opt_beta)
   local nnew = fftsa.options_samples()
   local nlo, nhi = fftsa.options_span()
   fftsa.flo, fftsa.fhi = nlo, nhi
@@ -614,7 +639,7 @@ function fftsa.options_apply()
     fftsa.say("APPLY FAILED: " .. tostring(err))
   else
     fftsa.halted, fftsa.errrun = false, 0
-    pcall(function() display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text()) end)
+    display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
   return ok
 end
@@ -702,7 +727,7 @@ function fftsa.arm(period_s)
 end
 
 function fftsa.cleanup()
-  pcall(function() fftsa.stop() end)
+  fftsa.stop()
 end
 
 -- Hooked as soon as the spectrum screen exists, so a later startup failure still
@@ -721,7 +746,7 @@ end
 -- installed App the script re-runs on every open, and an exit that skipped
 -- EVENT_ENDAPP (the Home screen, another App) leaves them behind.
 function fftsa.start()
-  pcall(function() fftsa.stop() end)
+  fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
 
   local hooked = false
@@ -738,7 +763,7 @@ function fftsa.start()
   end)
   if not ok then
     fftsa.lasterr = tostring(err)
-    pcall(function() fftsa.stop() end)
+    fftsa.stop()
     print("fftsa start FAILED (cleaned up): " .. tostring(err))
     -- No console as an installed App, so the failure goes on the panel.
     fftsa.show_error(tostring(err))
@@ -746,9 +771,7 @@ function fftsa.start()
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
-    pcall(function()
-      display.settext(fftsa.sg_xunit, "WARNING: End App will not clean up")
-    end)
+    display.settext(fftsa.sg_xunit, "WARNING: End App will not clean up")
   end
   print("fftsa started fs=" .. fftsa.fs .. " bin=" .. fftsa.binhz ..
         " range=" .. fftsa.range .. " window=" .. fftsa.win_label())
@@ -774,7 +797,7 @@ function fftsa.stop()
   fftsa.optbtn = nil                          -- child of the spectrum screen
   pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
   fftsa.destroy_options()
-  pcall(function() fftsa.loading_destroy(display.SCREEN_HOME) end)
+  fftsa.loading_destroy(display.SCREEN_HOME)
   if fftsa.errscr ~= nil then
     fftsa.del_obj(fftsa.errscr)
     fftsa.errscr = nil
@@ -828,7 +851,7 @@ function fftsa.show_error(msg)
   end)
   if not shown or fftsa.errscr == nil then
     fftsa.errscr = nil
-    pcall(function() display.changescreen(display.SCREEN_HOME) end)
+    display.changescreen(display.SCREEN_HOME)
     print("fftsa: could not build the error screen either -- " .. tostring(msg))
   end
   return fftsa.errscr

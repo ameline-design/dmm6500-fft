@@ -30,10 +30,8 @@ function fftsa.loading_build()
                                  "Loading, please wait...", 16777215, display.FONT_MEDIUM)
   -- End App is hooked here too: the firmware may deliver EVENT_ENDAPP only to the
   -- visible screen, and this is the visible one while Apply rebuilds the tables.
-  pcall(function()
-    display.setevent(fftsa.loadscr, display.EVENT_ENDAPP,
-                     "if fftsa ~= nil then fftsa.cleanup() end")
-  end)
+  display.setevent(fftsa.loadscr, display.EVENT_ENDAPP,
+                   "if fftsa ~= nil then fftsa.cleanup() end")
   return fftsa.loadscr
 end
 
@@ -47,7 +45,7 @@ end
 -- second: deleting the screen on show leaves the panel black.
 function fftsa.loading_destroy(showscr)
   if showscr == nil then showscr = display.SCREEN_HOME end
-  pcall(function() display.changescreen(showscr) end)
+  display.changescreen(showscr)
   if fftsa.loadscr == nil then return false end
   fftsa.del_obj(fftsa.loadtxt)
   fftsa.del_obj(fftsa.loadscr)
