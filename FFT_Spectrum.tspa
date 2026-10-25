@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 1.9
+-- $Version: 2.0
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -397,20 +397,63 @@ fftsa.bp_m     = 512
 -- this feature is for. The decimation is capped to keep M under it, which is why a large
 -- sample count leaves no room to decimate at all.
 fftsa.bp_maxm  = 8192
-fftsa.bp_tapd  = 4        -- taps per unit of decimation, before the cap
+-- TAPS COME FROM THE TRANSITION WIDTH, not from the decimation. A Hamming-windowed FIR
+-- needs about 3.3/transition taps for its stopband, where the transition is measured as a
+-- fraction of the sample rate -- and getting this wrong is not a subtle fault: at a 20 kHz
+-- span and /3 the old "4 taps per unit of decimation" gave 13 taps where the transition
+-- needed 50, and the result read 3.5 dB LOW at 16.6 kHz and 1.9 dB low at 12.5 kHz,
+-- measured against the same stimulus with the filter off.
+fftsa.bp_tapk  = 3.3      -- Hamming's transition constant
 fftsa.bp_lmax  = 65       -- tap ceiling: N*L multiply-accumulates land in the frame
 
 -- Largest decimation that leaves the stop frequency inside the decimated Nyquist with
 -- room for the filter's transition, capped by what the read can afford. 2.56 is the usual
 -- margin over 2: at D exactly fs/(2*fhi) the transition band would have zero width.
+-- The transition a given decimation leaves, as a fraction of the sample rate: from the
+-- stop frequency up to the decimated Nyquist. Negative or zero means the span does not
+-- fit under that decimation at all.
+function fftsa.bp_transition(fs, fhi, d)
+  return 1 / (2 * d) - fhi / fs
+end
+
+-- Taps that transition needs, odd, and nil when it needs more than the ceiling.
+function fftsa.bp_taps_for(fs, fhi, d)
+  local w = fftsa.bp_transition(fs, fhi, d)
+  if w <= 0 then return nil end
+  local l = math.ceil(fftsa.bp_tapk / w)
+  if math.mod(l, 2) == 0 then l = l + 1 end
+  if l > fftsa.bp_lmax then return nil end
+  if l < 3 then l = 3 end
+  return l
+end
+
+-- The decimation is limited by TWO things, and the filter is usually the tighter of them:
+-- the read budget, and whether a filter short enough to run can hold the transition that
+-- decimation leaves. Stepping down until both fit is what keeps the passband flat across
+-- the displayed span -- decimating harder than the taps can support is how the amplitudes
+-- came out low.
 function fftsa.bp_pick_d(fs, fhi, n)
   if fs == nil or fhi == nil or n == nil or fhi <= 0 or n < 2 then return 1 end
-  local d = math.floor(fs / (2.56 * fhi))
-  -- M = (n-1)*d + l, and l grows with d, so the cap is solved against the worst l.
   local dmax = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (n - 1))
+  local d = math.floor(fs / (2.56 * fhi))
   if d > dmax then d = dmax end
+  while d > 1 and fftsa.bp_taps_for(fs, fhi, d) == nil do d = d - 1 end
   if d < 1 then d = 1 end
   return d
+end
+
+-- WHY a decimation of 1 came out, for the readback line. Three different reasons land on
+-- the same answer and the operator cannot tell them apart otherwise: at a 4096-sample
+-- count the read budget leaves no room whatever the span, which reads as nothing to do
+-- with the span at all.
+function fftsa.bp_why(fs, fhi, n)
+  if fs == nil or fhi == nil or n == nil then return "off" end
+  if math.floor(fs / (2.56 * fhi)) < 2 then return "span too wide" end
+  if math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (n - 1)) < 2 then
+    return "too many samples"
+  end
+  if fftsa.bp_taps_for(fs, fhi, 2) == nil then return "filter will not fit" end
+  return "no room"
 end
 
 -- Windowed-sinc low-pass, cutoff at the stop frequency, Hamming-windowed and normalised
@@ -422,10 +465,13 @@ function fftsa.bp_build(fs, fhi, n, d)
     fftsa.bp_l, fftsa.bp_h, fftsa.bp_m = 0, nil, n
     return 1
   end
-  local l = fftsa.bp_tapd * d + 1
-  if l > fftsa.bp_lmax then l = fftsa.bp_lmax end
-  if math.mod(l, 2) == 0 then l = l + 1 end
-  local fc = fhi / fs                 -- cutoff as a fraction of the sample rate
+  local l = fftsa.bp_taps_for(fs, fhi, d)
+  if l == nil then l = fftsa.bp_lmax end
+  -- THE CUTOFF SITS BETWEEN THE SPAN TOP AND THE DECIMATED NYQUIST, not on the span top:
+  -- a filter's roll-off starts before its cutoff, so a cutoff at fhi puts the whole
+  -- displayed band inside the roll-off and reads every peak low. Halfway leaves the
+  -- passband flat to fhi and the stopband begun by the Nyquist.
+  local fc = 0.5 * (fhi / fs + 0.5 / d)
   if fc > 0.5 / d then fc = 0.5 / d end
   local c = (l - 1) / 2
   local h, sum = {}, 0
@@ -814,7 +860,13 @@ fftsa.sg_ncol    = 255
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
 fftsa.sg_markers = false
-fftsa.sg_mk_size = 4       -- marker radius; 1 is the built-in glyph, 2..5 are circles
+-- NEEDLES, NOT DOTS. drawstyle is per GRAPH, so asking for markers on the peak trace puts
+-- one on all 255 points of the spectrum as well -- line-and-points mode, which is not
+-- wanted. So the peak trace is drawn as a line too, carrying three points a peak: the
+-- floor, the peak, the floor again, a pixel of plot either side. That draws a vertical
+-- needle from the bottom rule up to each peak, with the run between needles hidden along
+-- the rule.
+fftsa.sg_mk_per  = 3       -- points a needle: floor, peak, floor
 -- The firmware's floor on a reading buffer: "capacity must be between 10 and 5311488
 -- readings", event 4920. Six peaks is under it, and buffer.make then RETURNS NIL -- so the
 -- marker buffer was never created, every call on it took a 1138, and the marker trace drew
@@ -1020,7 +1072,7 @@ function fftsa.sg_make_buffer(nbins, npoints)
     fftsa.del_buf(fftsa.sg_mk)
     fftsa.sg_mk = nil
   end
-  local mkcap = fftsa.sg_npeak
+  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
   fftsa.sg_mk = fftsa.sg_mkbuf(mkcap)
   -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
@@ -1276,10 +1328,7 @@ end
 -- Bind the traces: the spectrum always, the markers when they are switched on. The one
 -- place that decides, so the build and a rebind cannot disagree about what is bound.
 --
--- removeall() first, or add() stacks a duplicate trace. drawstyle is per GRAPH, so markers
--- on means STYLE_BOTH for both traces -- the spectrum keeps size 1, which is the built-in
--- glyph and is lost under its own line, while the marker trace gets sg_mk_size. markersize
--- applies to the ACTIVE trace, and select() takes the buffer rather than an index.
+-- removeall() first, or add() stacks a duplicate trace.
 function fftsa.sg_bind()
   local g = fftsa.sg_graph
   if g == nil then return false end
@@ -1289,28 +1338,18 @@ function fftsa.sg_bind()
   if fftsa.sg_markers and fftsa.sg_mk ~= nil then
     display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
                       fftsa.sg_mk, display.ELEMENT_EXTRA)
-    display.graph.drawstyle(g, display.STYLE_BOTH)
-    -- BOTH AXES ARE PER SELECTED TRACE once there is more than one trace: the API
-    -- reference says so of scalex and scaley alike, "positions apply to selected trace
-    -- only for multitrace". Pinning once leaves the second trace auto-scaling on both
-    -- axes, and a handful of points scaled against themselves land nowhere near the
-    -- spectrum -- which is a marker trace that draws nothing visible and logs nothing.
-    --
-    -- So each trace is selected and then given its own limits and marker size. The
-    -- spectrum is selected last, so anything later lands on it.
-    display.graph.select(g, fftsa.sg_mk, display.ELEMENT_DATA)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
-    display.graph.markersize(g, fftsa.sg_mk_size)
-    display.graph.select(g, fftsa.sg_buf, display.ELEMENT_DATA)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
-    display.graph.markersize(g, 1)
-  else
-    display.graph.drawstyle(g, display.STYLE_LINE)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
+    -- ONE SCALE FOR EVERY TRACE. A custom graph starts at TRACE_ACTIVE, where a scale
+    -- call reaches only the selected trace -- so the second trace keeps auto-scaling and
+    -- its points are stretched across the whole plot, landing nowhere near the spectrum.
+    -- TRACE_ALL syncs them: "as scale settings for X and Y change they will get applied
+    -- to all traces". Documented to work only on a custom-created graph, which this is.
+    display.graph.scaletrace(g, display.TRACE_ALL)
   end
+  -- Always a line. See sg_mk_per: markers are per graph, so the peak trace draws needles
+  -- rather than asking for a marker the spectrum would get too.
+  display.graph.drawstyle(g, display.STYLE_LINE)
+  fftsa.sg_pin_y(g)
+  fftsa.sg_pin_x()
   return true
 end
 
@@ -1392,13 +1431,32 @@ function fftsa.sg_update_markers(bi, bv, count, binhz)
     end
   end
   if n == 0 then return 0 end
+  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a
+  -- pixel above. The x values have to stay increasing or the line doubles back, so each
+  -- foot is held at or above the previous needle's -- two peaks within two pixels then
+  -- read as one slightly wider needle, which is what they look like anyway.
+  local span = fftsa.sg_fhi_hz - fftsa.sg_flo_hz
+  local dx = span / fftsa.sg_plotpx
+  if not (dx > 0) then dx = binhz end
+  local floordb = fftsa.sg_dbmin
   local wr = buffer.write.reading
-  local i
+  local cap = mk.capacity
+  local i, slot, prev = nil, 0, nil
   mk.clear()
   for i = 1, n do
-    wr(mk, db[i], hz[i], i, 0)
+    local f = hz[i]
+    local l, r = f - dx, f + dx
+    if prev ~= nil and l < prev then l = prev end
+    if f < l then f = l end
+    if r < f then r = f end
+    if slot + fftsa.sg_mk_per <= cap then
+      slot = slot + 1; wr(mk, floordb, l, slot, 0)
+      slot = slot + 1; wr(mk, db[i],   f, slot, 0)
+      slot = slot + 1; wr(mk, floordb, r, slot, 0)
+      prev = r
+    end
   end
-  return n
+  return slot
 end
 
 -- Gated at fftsa.sg_pk_period and skipped when no peak moved beyond the tolerances,
@@ -1607,11 +1665,25 @@ end
 -- and keeps the resolution.
 function fftsa.bp_plan(fhi, n)
   local base = fftsa.pick_fs(fhi)
-  local d0   = fftsa.bp_pick_d(base, fhi, n)
-  local up   = fftsa.bp_rate(base)
-  local d1   = fftsa.bp_pick_d(up, fhi, n)
-  if up > base and (up / d1) <= (base / d0) then return up, d1 end
-  return base, d0
+  local r = fftsa.rates
+  local bestfs, bestd = nil, nil
+  local i
+  for i = 1, table.getn(r) do
+    local fs = r[i]
+    -- Only rates that cover the span at all, and only those the hardware has.
+    if fs >= base then
+      local d = fftsa.bp_pick_d(fs, fhi, n)
+      -- A decimation of 1 means the filter is bypassed, which is the thing to avoid: at a
+      -- 50 kHz span no decimation fits under 100 kS/s, and the rate has to go up before
+      -- the filter can run at all. Among the rates where it CAN run, the finest bin wins.
+      if d > 1 and (bestfs == nil or (fs / d) < (bestfs / bestd)) then
+        bestfs, bestd = fs, d
+      end
+    end
+  end
+  -- Nothing could decimate: run at the rate the span needs and leave the filter out.
+  if bestfs == nil then return base, 1 end
+  return bestfs, bestd
 end
 
 -- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
@@ -2224,13 +2296,19 @@ function fftsa.bp_text(d, on)
   if on == nil then on = fftsa.bp_on end
   if not on then return "BP:Off" end
   if d ~= nil and d > 1 then return string.format("BP:On /%d", d) end
-  return "BP:On (span too wide)"
+  return "BP:On (" .. fftsa.bp_why(fftsa.fs_acq, fftsa.fhi, fftsa.n) .. ")"
 end
 
-function fftsa.opt_info_text(fs, n, wi, bi)
+-- fs IS THE DIGITIZER'S RATE, never the decimated one. The decimated rate is a derived
+-- figure -- 200 kS/s over /3 is 66.667 -- and printing that as "fs" reads as the hardware
+-- running below its own 100 kS/s floor, which it never does. The bin and the record
+-- length are computed from the decimated rate, where they belong: the bin is fs_eff/N, and
+-- N/fs_eff is the same record duration as N*D/fs_acq.
+function fftsa.opt_info_text(fs, n, wi, bi, acq)
   fs, n = fs or fftsa.fs, n or fftsa.n
+  if acq == nil then acq = fftsa.fs_acq or fs end
   return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
-                       fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
+                       fftsa.sample_rate_text(acq), fs / n, 1000 * n / fs,
                        fftsa.win_label(wi, bi))
 end
 
@@ -2274,13 +2352,14 @@ function fftsa.options_preview()
     -- produce: the rate and the decimation are chosen together.
     fs, d = fftsa.bp_plan(hi, n)
   end
+  local acq = fs
   fs = fs / d
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
-  local text = fftsa.opt_info_text(fs, n, wi, bi) .. "   " .. fftsa.bp_text(d, bp)
+  local text = fftsa.opt_info_text(fs, n, wi, bi, acq) .. "   " .. fftsa.bp_text(d, bp)
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text

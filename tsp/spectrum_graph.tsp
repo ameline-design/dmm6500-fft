@@ -47,7 +47,13 @@ fftsa.sg_ncol    = 255
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
 fftsa.sg_markers = false
-fftsa.sg_mk_size = 4       -- marker radius; 1 is the built-in glyph, 2..5 are circles
+-- NEEDLES, NOT DOTS. drawstyle is per GRAPH, so asking for markers on the peak trace puts
+-- one on all 255 points of the spectrum as well -- line-and-points mode, which is not
+-- wanted. So the peak trace is drawn as a line too, carrying three points a peak: the
+-- floor, the peak, the floor again, a pixel of plot either side. That draws a vertical
+-- needle from the bottom rule up to each peak, with the run between needles hidden along
+-- the rule.
+fftsa.sg_mk_per  = 3       -- points a needle: floor, peak, floor
 -- The firmware's floor on a reading buffer: "capacity must be between 10 and 5311488
 -- readings", event 4920. Six peaks is under it, and buffer.make then RETURNS NIL -- so the
 -- marker buffer was never created, every call on it took a 1138, and the marker trace drew
@@ -253,7 +259,7 @@ function fftsa.sg_make_buffer(nbins, npoints)
     fftsa.del_buf(fftsa.sg_mk)
     fftsa.sg_mk = nil
   end
-  local mkcap = fftsa.sg_npeak
+  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
   fftsa.sg_mk = fftsa.sg_mkbuf(mkcap)
   -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
@@ -509,10 +515,7 @@ end
 -- Bind the traces: the spectrum always, the markers when they are switched on. The one
 -- place that decides, so the build and a rebind cannot disagree about what is bound.
 --
--- removeall() first, or add() stacks a duplicate trace. drawstyle is per GRAPH, so markers
--- on means STYLE_BOTH for both traces -- the spectrum keeps size 1, which is the built-in
--- glyph and is lost under its own line, while the marker trace gets sg_mk_size. markersize
--- applies to the ACTIVE trace, and select() takes the buffer rather than an index.
+-- removeall() first, or add() stacks a duplicate trace.
 function fftsa.sg_bind()
   local g = fftsa.sg_graph
   if g == nil then return false end
@@ -522,28 +525,18 @@ function fftsa.sg_bind()
   if fftsa.sg_markers and fftsa.sg_mk ~= nil then
     display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
                       fftsa.sg_mk, display.ELEMENT_EXTRA)
-    display.graph.drawstyle(g, display.STYLE_BOTH)
-    -- BOTH AXES ARE PER SELECTED TRACE once there is more than one trace: the API
-    -- reference says so of scalex and scaley alike, "positions apply to selected trace
-    -- only for multitrace". Pinning once leaves the second trace auto-scaling on both
-    -- axes, and a handful of points scaled against themselves land nowhere near the
-    -- spectrum -- which is a marker trace that draws nothing visible and logs nothing.
-    --
-    -- So each trace is selected and then given its own limits and marker size. The
-    -- spectrum is selected last, so anything later lands on it.
-    display.graph.select(g, fftsa.sg_mk, display.ELEMENT_DATA)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
-    display.graph.markersize(g, fftsa.sg_mk_size)
-    display.graph.select(g, fftsa.sg_buf, display.ELEMENT_DATA)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
-    display.graph.markersize(g, 1)
-  else
-    display.graph.drawstyle(g, display.STYLE_LINE)
-    fftsa.sg_pin_y(g)
-    fftsa.sg_pin_x()
+    -- ONE SCALE FOR EVERY TRACE. A custom graph starts at TRACE_ACTIVE, where a scale
+    -- call reaches only the selected trace -- so the second trace keeps auto-scaling and
+    -- its points are stretched across the whole plot, landing nowhere near the spectrum.
+    -- TRACE_ALL syncs them: "as scale settings for X and Y change they will get applied
+    -- to all traces". Documented to work only on a custom-created graph, which this is.
+    display.graph.scaletrace(g, display.TRACE_ALL)
   end
+  -- Always a line. See sg_mk_per: markers are per graph, so the peak trace draws needles
+  -- rather than asking for a marker the spectrum would get too.
+  display.graph.drawstyle(g, display.STYLE_LINE)
+  fftsa.sg_pin_y(g)
+  fftsa.sg_pin_x()
   return true
 end
 
@@ -625,13 +618,32 @@ function fftsa.sg_update_markers(bi, bv, count, binhz)
     end
   end
   if n == 0 then return 0 end
+  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a
+  -- pixel above. The x values have to stay increasing or the line doubles back, so each
+  -- foot is held at or above the previous needle's -- two peaks within two pixels then
+  -- read as one slightly wider needle, which is what they look like anyway.
+  local span = fftsa.sg_fhi_hz - fftsa.sg_flo_hz
+  local dx = span / fftsa.sg_plotpx
+  if not (dx > 0) then dx = binhz end
+  local floordb = fftsa.sg_dbmin
   local wr = buffer.write.reading
-  local i
+  local cap = mk.capacity
+  local i, slot, prev = nil, 0, nil
   mk.clear()
   for i = 1, n do
-    wr(mk, db[i], hz[i], i, 0)
+    local f = hz[i]
+    local l, r = f - dx, f + dx
+    if prev ~= nil and l < prev then l = prev end
+    if f < l then f = l end
+    if r < f then r = f end
+    if slot + fftsa.sg_mk_per <= cap then
+      slot = slot + 1; wr(mk, floordb, l, slot, 0)
+      slot = slot + 1; wr(mk, db[i],   f, slot, 0)
+      slot = slot + 1; wr(mk, floordb, r, slot, 0)
+      prev = r
+    end
   end
-  return n
+  return slot
 end
 
 -- Gated at fftsa.sg_pk_period and skipped when no peak moved beyond the tolerances,

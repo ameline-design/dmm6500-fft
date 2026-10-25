@@ -268,6 +268,7 @@ function display.graph.removeall(g)
   use(g, 'graph.removeall')
   OBJ[g].buffer, OBJ[g].buffers = nil, nil
   OBJ[g].selected, OBJ[g].xpin, OBJ[g].ypin = nil, nil, nil
+  OBJ[g].scaletrace_mode = nil          -- a fresh graph is back to TRACE_ACTIVE
   OBJ[g].traces = 0
   OBJ[g].removes = (OBJ[g].removes or 0) + 1
 end
@@ -279,12 +280,24 @@ end
 -- PER SELECTED TRACE, which is what the API reference says of both axes: "positions
 -- apply to selected trace only for multitrace". Modelled, because a graph-wide model is
 -- kinder than the firmware and let a second trace go unpinned and invisible.
+-- WHICH TRACES A SCALE CALL REACHES. A custom graph starts at TRACE_ACTIVE, where the
+-- positions "apply to selected trace only for multitrace"; scaletrace(TRACE_ALL) syncs
+-- them, and from then on a scale call lands on every bound trace. Modelled because a
+-- graph-wide model is kinder than the firmware and let a second trace go unpinned.
+local function pin_targets(g)
+  if OBJ[g].scaletrace_mode == display.TRACE_ALL and OBJ[g].buffers ~= nil then
+    return OBJ[g].buffers
+  end
+  return {OBJ[g].selected or OBJ[g].buffer}
+end
 function display.graph.scaley(g, ...)
   use(g, 'graph.scaley')
   local a = arg
   if OBJ[g].ypin == nil then OBJ[g].ypin = {} end
   if a[3] ~= nil then
-    OBJ[g].ypin[OBJ[g].selected or OBJ[g].buffer] = {a[3], a[4]}
+    local t = pin_targets(g)
+    local i
+    for i = 1, table.getn(t) do OBJ[g].ypin[t[i]] = {a[3], a[4]} end
     OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
   end
 end
@@ -299,8 +312,10 @@ function display.graph.scalex(g, ...)
   if OBJ[g].xpin == nil then OBJ[g].xpin = {} end
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
-    -- Per selected trace, like scaley: the reference gives both axes the same note.
-    OBJ[g].xpin[OBJ[g].selected or OBJ[g].buffer] = {a[3], a[4]}
+    -- Per selected trace, like scaley, and per ALL of them after scaletrace(TRACE_ALL).
+    local t = pin_targets(g)
+    local i
+    for i = 1, table.getn(t) do OBJ[g].xpin[t[i]] = {a[3], a[4]} end
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
   end
   return OBJ[g].xmin, OBJ[g].xmax
@@ -1030,20 +1045,54 @@ check('the band-pass steps the acquisition rate up one, and stops at 1 MS/s', (f
          string.format('100k->%g 200k->%g 500k->%g 1M->%g', got[1], got[2], got[3],
                        got[4])
 end)())
-check('a band-pass Apply runs the digitizer at the stepped rate', (function()
+-- The digitizer runs at the rate the plan chose -- not necessarily the stepped one, since
+-- the filter length limits the decimation and the base rate can give the finer bin. What
+-- has to hold is that the rate is one the hardware has, is never under the floor, and is
+-- what was actually programmed.
+check('a band-pass Apply runs the digitizer at the rate it planned', (function()
   display.setvalue(fftsa.opt_flo, 10)
   display.setvalue(fftsa.opt_fhi, 10000)
   display.setvalue(fftsa.opt_n, 1)
   display.setvalue(fftsa.opt_bp, 2)
   if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local rate, acq = dmm.digitize.samplerate, fftsa.fs_acq
+  local rate, acq, d = dmm.digitize.samplerate, fftsa.fs_acq, fftsa.bp_d
   display.setvalue(fftsa.opt_bp, 1)
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   local plain = dmm.digitize.samplerate
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
-  return rate == 200000 and plain == 100000 and acq == 200000,
-         string.format('band-pass at %g, plain at %g', rate, plain)
+  local exact = false
+  local i
+  for i = 1, table.getn(fftsa.rates) do
+    if fftsa.rates[i] == acq then exact = true end
+  end
+  return rate == acq and exact and acq >= fftsa.fs_min and plain == 100000 and d > 1,
+         string.format('band-pass at %g /%d, plain at %g', rate, d, plain)
+end)())
+-- The rate on the readback line is the DIGITIZER's. With the band-pass decimating, the
+-- rate the transform sees is lower -- 200 kS/s over /3 is 66.667 -- and printing that as
+-- "fs" reads as the hardware running under its own 100 kS/s floor. A 20 kHz span is the
+-- case that produced it.
+check('the readback line reports the digitizer rate, not the decimated one', (function()
+  display.setvalue(fftsa.opt_flo, 10)
+  display.setvalue(fftsa.opt_fhi, 20000)
+  display.setvalue(fftsa.opt_n, 1)
+  display.setvalue(fftsa.opt_bp, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local line = fftsa.sg_xunit_text()
+  local acq, eff, d = fftsa.fs_acq, fftsa.fs, fftsa.bp_d
+  display.setvalue(fftsa.opt_bp, 1)
+  display.setvalue(fftsa.opt_fhi, 50000)
+  fftsa.options_apply()
+  if d < 2 then return false, 'no decimation at a 20 kHz span, nothing to tell apart' end
+  -- The acquisition rate is in the line and the decimated one is NOT, while the bin
+  -- width is computed from the decimated rate.
+  local shown = string.find(line, fftsa.sample_rate_text(acq), 1, true) ~= nil
+  local hidden = string.find(line, fftsa.sample_rate_text(eff), 1, true) == nil
+  local bin = string.find(line, string.format('bin %.2f Hz', eff / 512), 1, true) ~= nil
+  return shown and hidden and bin and acq >= fftsa.fs_min,
+         string.format('%s | acq %s eff %s /%d', line, fftsa.sample_rate_text(acq),
+                       fftsa.sample_rate_text(eff), d)
 end)())
 check('the taps sum to one, are odd in number and symmetric', (function()
   fftsa.bp_build(100000, 10000, 512, 4)
@@ -1088,17 +1137,64 @@ check('an out-of-band tone is stopped before it can fold in', (function()
          string.format('2 kHz through at %.3f, 20 kHz down to %.4f (%.1f dB)',
                        inband, alias, 20 * math.log10(alias / inband))
 end)())
+-- THE TWO NUMBERS THAT WERE WRONG. The filter has to be flat across the displayed span
+-- and down by the time the decimated Nyquist arrives. The old design was neither: its
+-- cutoff sat on the span top so the band was inside the roll-off, and 13 taps where 51
+-- were needed left the near stopband barely attenuated. Measured on the glass against the
+-- same stimulus, that read 3.5 dB low at 16.6 kHz of a 20 kHz span.
+--
+-- Driven through the real taps at the real plan for a 20 kHz span, which is the case that
+-- showed it.
+check('the filter is flat across the span and down past the Nyquist', (function()
+  local fs, fhi, n = 200000, 20000, 512
+  local d = fftsa.bp_pick_d(fs, fhi, n)
+  if d < 2 then return false, 'no decimation to test at /1' end
+  fftsa.bp_build(fs, fhi, n, d)
+  local nyq = fs / (2 * d)
+  local function gain(hz)
+    local rd, i = {}, nil
+    for i = 1, fftsa.bp_m do rd[i] = math.sin(2 * math.pi * hz * (i - 1) / fs) end
+    local out = fftsa.bp_filter(rd)
+    local mx = 0
+    for i = math.ceil(fftsa.bp_l / d) + 1, n do
+      local v = math.abs(out[i])
+      if v > mx then mx = v end
+    end
+    return mx
+  end
+  local dc    = gain(100)
+  local mid   = gain(fhi / 2)
+  local edge  = gain(fhi * 0.98)
+  local above = gain(nyq * 1.15)
+  local function db(x) return 20 * math.log10(x / dc) end
+  -- Flat to half a dB across the span, and 30 dB down above the Nyquist.
+  return math.abs(db(mid)) < 0.5 and math.abs(db(edge)) < 0.5 and db(above) < -30,
+         string.format('%d taps at /%d: mid %.2f dB, span edge %.2f dB, %.0f Hz %.1f dB',
+                       fftsa.bp_l, d, db(mid), db(edge), nyq * 1.15, db(above))
+end)())
 -- The decimation is chosen, not fixed: a narrow span can afford more of it, and a large
 -- sample count cannot afford any because the read is what it costs.
-check('the decimation follows the span and is capped by the read cost', (function()
+-- TWO CAPS, and the filter is usually the tighter: a decimation leaves a transition from
+-- the span top to the decimated Nyquist, and the taps that transition needs grow fast as
+-- it narrows. Every chosen decimation must have a filter that fits the ceiling.
+check('the decimation is capped by the filter length as well as the read cost', (function()
   local wide   = fftsa.bp_pick_d(100000, 50000, 512)
-  local narrow = fftsa.bp_pick_d(100000, 2000, 512)
   local mid    = fftsa.bp_pick_d(100000, 10000, 512)
+  local narrow = fftsa.bp_pick_d(100000, 2000, 512)
   local big    = fftsa.bp_pick_d(100000, 2000, 16384)
-  local cap    = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (512 - 1))
-  return wide == 1 and mid == 3 and narrow == cap and big == 1,
-         string.format('50k->%d 10k->%d 2k->%d (cap %d), 2k at 16384->%d',
-                       wide, mid, narrow, cap, big)
+  local read   = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (512 - 1))
+  -- every one of them has a filter that fits
+  local hi
+  for hi = 2000, 50000, 500 do
+    local d = fftsa.bp_pick_d(100000, hi, 512)
+    if d > 1 and fftsa.bp_taps_for(100000, hi, d) == nil then
+      return false, string.format('stop %d Hz chose /%d, which needs more than %d taps',
+                                  hi, d, fftsa.bp_lmax)
+    end
+  end
+  return wide == 1 and mid == 3 and narrow > 1 and narrow < read and big == 1,
+         string.format('50k->%d 10k->%d 2k->%d (read cap %d), 2k at 16384->%d',
+                       wide, mid, narrow, read, big)
 end)())
 -- Every decimation has to keep the stop frequency inside the decimated Nyquist, or the
 -- span the operator asked for would be partly folded -- which is the failure this whole
@@ -1181,7 +1277,7 @@ end)())
 -- make is refused with event 4920 and answers nil, which is a marker trace that cannot
 -- exist and five 1138s from the calls that follow.
 check('the marker buffer exists and clears the firmware capacity floor', (function()
-  local want = fftsa.sg_npeak
+  local want = fftsa.sg_npeak * fftsa.sg_mk_per
   if want < fftsa.sg_bufmin then want = fftsa.sg_bufmin end
   return fftsa.sg_mk ~= nil and fftsa.sg_mk.alive
          and fftsa.sg_mk.capacity == want and want >= BUF_MIN
@@ -1204,25 +1300,23 @@ end)())
 -- On: two traces, STYLE_BOTH because drawstyle is per graph, and the sizes attributed to
 -- the right buffer -- the spectrum at 1, where the glyph is lost under its own line, and
 -- the markers at sg_mk_size.
-check('markers on bind a second trace and size the marker one', (function()
+-- On: two traces, both drawn as LINES -- no markers anywhere, because drawstyle is per
+-- graph and a marker for the peak trace is a marker on all 255 spectrum points too -- and
+-- the scales synced with TRACE_ALL, which is what reaches the second trace at all.
+check('markers on bind a second line trace with the scales synced', (function()
   fftsa.sg_markers = true
   fftsa.sg_bind()
   local o = OBJ[fftsa.sg_graph]
   local two = o.buffers ~= nil and table.getn(o.buffers) == 2
   local order = two and o.buffers[1] == fftsa.sg_buf and o.buffers[2] == fftsa.sg_mk
-  local sized = o.marksize ~= nil and o.marksize[fftsa.sg_mk] == fftsa.sg_mk_size
-                and o.marksize[fftsa.sg_buf] == 1
   return fftsa.sg_markers == true and two and order
-         and o.drawstyle == display.STYLE_BOTH and sized,
-         string.format('traces=%s spectrum-first=%s style=%s marker size=%s spectrum=%s',
+         and o.drawstyle == display.STYLE_LINE
+         and o.scaletrace_mode == display.TRACE_ALL,
+         string.format('traces=%s spectrum-first=%s style=%s scaletrace=%s',
                        tostring(two), tostring(order), tostring(o.drawstyle),
-                       tostring(o.marksize and o.marksize[fftsa.sg_mk]),
-                       tostring(o.marksize and o.marksize[fftsa.sg_buf]))
+                       tostring(o.scaletrace_mode))
 end)())
--- The markers carry the INTERPOLATED frequency and amplitude, which is the whole point:
--- the trace draws a peak at its column, up to half a bin out, and the table's own numbers
--- are the corrected ones. Sorted by frequency, because drawstyle is per graph and the
--- marker trace is drawn with a line through it too.
+
 -- THE BUG THAT MADE MARKERS INVISIBLE. Both axes apply their limits to the SELECTED
 -- trace only once a graph has more than one, so pinning once after adding both left the
 -- marker trace auto-scaling: its handful of points were scaled against themselves and
@@ -1255,40 +1349,37 @@ check('every bound trace is pinned to the same dB range and span', (function()
   return true, string.format('both traces at %g..%g dB and 0..%g Hz',
                              fftsa.sg_dbmin, fftsa.sg_dbmax, fftsa.sg_fhi_hz)
 end)())
-check('the marker points are the peak table values, in frequency order', (function()
+check('each peak gets a needle: floor, peak, floor, in frequency order', (function()
   fftsa.frame()
   local mk = fftsa.sg_mk
-  -- One point a peak the finder actually reported, which is not always six: a clean tone
-  -- leaves most of the list empty, and an empty slot must not become a marker at 0 Hz.
-  local found = 0
-  local i
+  local found, i = 0, nil
   for i = 1, fftsa.sg_npeak do
     local k = fftsa.pk_bi[i]
     if k ~= nil and k > 0 and fftsa.pk_bv[i] > 0 then found = found + 1 end
   end
-  if mk.n ~= found then
-    return false, string.format('%d marker points for %d peaks', mk.n, found)
+  if found < 1 then return false, 'no peaks to mark' end
+  if mk.n ~= found * fftsa.sg_mk_per then
+    return false, string.format('%d points for %d peaks at %d a needle', mk.n, found,
+                                fftsa.sg_mk_per)
   end
-  if mk.n < 1 then return false, 'no peaks to mark' end
-  for i = 2, mk.n do
-    if not (mk.extravalues[i] > mk.extravalues[i - 1]) then
-      return false, string.format('point %d at %g Hz is not above %g', i,
-                                  mk.extravalues[i], mk.extravalues[i - 1])
+  -- Each triple is floor, above the floor, floor again, and x never goes backwards.
+  for i = 1, found do
+    local b = (i - 1) * 3
+    if mk.readings[b + 1] ~= fftsa.sg_dbmin or mk.readings[b + 3] ~= fftsa.sg_dbmin then
+      return false, string.format('needle %d does not start and end at the floor', i)
+    end
+    if not (mk.readings[b + 2] > fftsa.sg_dbmin) then
+      return false, string.format('needle %d has no height', i)
     end
   end
-  -- The strongest peak's own frequency has to be among them, to within a bin.
-  local k = fftsa.pk_bi[1]
-  local dk = fftsa.peak_interp(k, fftsa.sg_nbins)
-  local want = (k - 1 + (dk or 0)) * fftsa.binhz
-  local best, bestd = nil, nil
-  for i = 1, mk.n do
-    local d = math.abs(mk.extravalues[i] - want)
-    if bestd == nil or d < bestd then best, bestd = mk.extravalues[i], d end
+  for i = 2, mk.n do
+    if mk.extravalues[i] < mk.extravalues[i - 1] then
+      return false, string.format('x goes backwards at point %d', i)
+    end
   end
-  return bestd < fftsa.binhz,
-         string.format('%d points for %d peaks, strongest wanted %.1f Hz, nearest %.1f',
-                       mk.n, found, want, best)
+  return true, string.format('%d needles, %d points', found, mk.n)
 end)())
+
 -- The sort, driven directly. The end-to-end check above cannot reach it: the mock's
 -- capture is one tone, so the finder reports a single peak and a one-point buffer is
 -- sorted whatever the code does. These three arrive strongest-first with their
@@ -1305,12 +1396,15 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
   local n = fftsa.sg_update_markers(bi, bv, 3, 100)
   local mk = fftsa.sg_mk
   fftsa.peak_interp = real
-  if n ~= 3 or mk.n ~= 3 then
-    return false, string.format('wrote %d, buffer holds %d', n, mk.n)
+  if n ~= 9 or mk.n ~= 9 then
+    return false, string.format('wrote %d, buffer holds %d, wanted 9', n, mk.n)
   end
+  -- The peak of each needle is the middle point of its triple.
   local hz, db = {}, {}
   local i
-  for i = 1, mk.n do hz[i], db[i] = mk.extravalues[i], mk.readings[i] end
+  for i = 1, 3 do
+    hz[i], db[i] = mk.extravalues[(i - 1) * 3 + 2], mk.readings[(i - 1) * 3 + 2]
+  end
   -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. Each has to carry its OWN amplitude
   -- through the sort, which here means dB rising with frequency.
   local want = {{400, 20 * math.log10(0.005)},

@@ -127,11 +127,25 @@ end
 -- and keeps the resolution.
 function fftsa.bp_plan(fhi, n)
   local base = fftsa.pick_fs(fhi)
-  local d0   = fftsa.bp_pick_d(base, fhi, n)
-  local up   = fftsa.bp_rate(base)
-  local d1   = fftsa.bp_pick_d(up, fhi, n)
-  if up > base and (up / d1) <= (base / d0) then return up, d1 end
-  return base, d0
+  local r = fftsa.rates
+  local bestfs, bestd = nil, nil
+  local i
+  for i = 1, table.getn(r) do
+    local fs = r[i]
+    -- Only rates that cover the span at all, and only those the hardware has.
+    if fs >= base then
+      local d = fftsa.bp_pick_d(fs, fhi, n)
+      -- A decimation of 1 means the filter is bypassed, which is the thing to avoid: at a
+      -- 50 kHz span no decimation fits under 100 kS/s, and the rate has to go up before
+      -- the filter can run at all. Among the rates where it CAN run, the finest bin wins.
+      if d > 1 and (bestfs == nil or (fs / d) < (bestfs / bestd)) then
+        bestfs, bestd = fs, d
+      end
+    end
+  end
+  -- Nothing could decimate: run at the rate the span needs and leave the filter out.
+  if bestfs == nil then return base, 1 end
+  return bestfs, bestd
 end
 
 -- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
@@ -744,13 +758,19 @@ function fftsa.bp_text(d, on)
   if on == nil then on = fftsa.bp_on end
   if not on then return "BP:Off" end
   if d ~= nil and d > 1 then return string.format("BP:On /%d", d) end
-  return "BP:On (span too wide)"
+  return "BP:On (" .. fftsa.bp_why(fftsa.fs_acq, fftsa.fhi, fftsa.n) .. ")"
 end
 
-function fftsa.opt_info_text(fs, n, wi, bi)
+-- fs IS THE DIGITIZER'S RATE, never the decimated one. The decimated rate is a derived
+-- figure -- 200 kS/s over /3 is 66.667 -- and printing that as "fs" reads as the hardware
+-- running below its own 100 kS/s floor, which it never does. The bin and the record
+-- length are computed from the decimated rate, where they belong: the bin is fs_eff/N, and
+-- N/fs_eff is the same record duration as N*D/fs_acq.
+function fftsa.opt_info_text(fs, n, wi, bi, acq)
   fs, n = fs or fftsa.fs, n or fftsa.n
+  if acq == nil then acq = fftsa.fs_acq or fs end
   return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
-                       fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
+                       fftsa.sample_rate_text(acq), fs / n, 1000 * n / fs,
                        fftsa.win_label(wi, bi))
 end
 
@@ -794,13 +814,14 @@ function fftsa.options_preview()
     -- produce: the rate and the decimation are chosen together.
     fs, d = fftsa.bp_plan(hi, n)
   end
+  local acq = fs
   fs = fs / d
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
-  local text = fftsa.opt_info_text(fs, n, wi, bi) .. "   " .. fftsa.bp_text(d, bp)
+  local text = fftsa.opt_info_text(fs, n, wi, bi, acq) .. "   " .. fftsa.bp_text(d, bp)
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text

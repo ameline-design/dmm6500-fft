@@ -387,20 +387,63 @@ fftsa.bp_m     = 512
 -- this feature is for. The decimation is capped to keep M under it, which is why a large
 -- sample count leaves no room to decimate at all.
 fftsa.bp_maxm  = 8192
-fftsa.bp_tapd  = 4        -- taps per unit of decimation, before the cap
+-- TAPS COME FROM THE TRANSITION WIDTH, not from the decimation. A Hamming-windowed FIR
+-- needs about 3.3/transition taps for its stopband, where the transition is measured as a
+-- fraction of the sample rate -- and getting this wrong is not a subtle fault: at a 20 kHz
+-- span and /3 the old "4 taps per unit of decimation" gave 13 taps where the transition
+-- needed 50, and the result read 3.5 dB LOW at 16.6 kHz and 1.9 dB low at 12.5 kHz,
+-- measured against the same stimulus with the filter off.
+fftsa.bp_tapk  = 3.3      -- Hamming's transition constant
 fftsa.bp_lmax  = 65       -- tap ceiling: N*L multiply-accumulates land in the frame
 
 -- Largest decimation that leaves the stop frequency inside the decimated Nyquist with
 -- room for the filter's transition, capped by what the read can afford. 2.56 is the usual
 -- margin over 2: at D exactly fs/(2*fhi) the transition band would have zero width.
+-- The transition a given decimation leaves, as a fraction of the sample rate: from the
+-- stop frequency up to the decimated Nyquist. Negative or zero means the span does not
+-- fit under that decimation at all.
+function fftsa.bp_transition(fs, fhi, d)
+  return 1 / (2 * d) - fhi / fs
+end
+
+-- Taps that transition needs, odd, and nil when it needs more than the ceiling.
+function fftsa.bp_taps_for(fs, fhi, d)
+  local w = fftsa.bp_transition(fs, fhi, d)
+  if w <= 0 then return nil end
+  local l = math.ceil(fftsa.bp_tapk / w)
+  if math.mod(l, 2) == 0 then l = l + 1 end
+  if l > fftsa.bp_lmax then return nil end
+  if l < 3 then l = 3 end
+  return l
+end
+
+-- The decimation is limited by TWO things, and the filter is usually the tighter of them:
+-- the read budget, and whether a filter short enough to run can hold the transition that
+-- decimation leaves. Stepping down until both fit is what keeps the passband flat across
+-- the displayed span -- decimating harder than the taps can support is how the amplitudes
+-- came out low.
 function fftsa.bp_pick_d(fs, fhi, n)
   if fs == nil or fhi == nil or n == nil or fhi <= 0 or n < 2 then return 1 end
-  local d = math.floor(fs / (2.56 * fhi))
-  -- M = (n-1)*d + l, and l grows with d, so the cap is solved against the worst l.
   local dmax = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (n - 1))
+  local d = math.floor(fs / (2.56 * fhi))
   if d > dmax then d = dmax end
+  while d > 1 and fftsa.bp_taps_for(fs, fhi, d) == nil do d = d - 1 end
   if d < 1 then d = 1 end
   return d
+end
+
+-- WHY a decimation of 1 came out, for the readback line. Three different reasons land on
+-- the same answer and the operator cannot tell them apart otherwise: at a 4096-sample
+-- count the read budget leaves no room whatever the span, which reads as nothing to do
+-- with the span at all.
+function fftsa.bp_why(fs, fhi, n)
+  if fs == nil or fhi == nil or n == nil then return "off" end
+  if math.floor(fs / (2.56 * fhi)) < 2 then return "span too wide" end
+  if math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (n - 1)) < 2 then
+    return "too many samples"
+  end
+  if fftsa.bp_taps_for(fs, fhi, 2) == nil then return "filter will not fit" end
+  return "no room"
 end
 
 -- Windowed-sinc low-pass, cutoff at the stop frequency, Hamming-windowed and normalised
@@ -412,10 +455,13 @@ function fftsa.bp_build(fs, fhi, n, d)
     fftsa.bp_l, fftsa.bp_h, fftsa.bp_m = 0, nil, n
     return 1
   end
-  local l = fftsa.bp_tapd * d + 1
-  if l > fftsa.bp_lmax then l = fftsa.bp_lmax end
-  if math.mod(l, 2) == 0 then l = l + 1 end
-  local fc = fhi / fs                 -- cutoff as a fraction of the sample rate
+  local l = fftsa.bp_taps_for(fs, fhi, d)
+  if l == nil then l = fftsa.bp_lmax end
+  -- THE CUTOFF SITS BETWEEN THE SPAN TOP AND THE DECIMATED NYQUIST, not on the span top:
+  -- a filter's roll-off starts before its cutoff, so a cutoff at fhi puts the whole
+  -- displayed band inside the roll-off and reads every peak low. Halfway leaves the
+  -- passband flat to fhi and the stopband begun by the Nyquist.
+  local fc = 0.5 * (fhi / fs + 0.5 / d)
   if fc > 0.5 / d then fc = 0.5 / d end
   local c = (l - 1) / 2
   local h, sum = {}, 0
