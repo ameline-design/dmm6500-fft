@@ -352,6 +352,21 @@ end
 -- The price is that near DC the estimate is the tone. fftsa.win_tables() measures
 -- how far that reaches and fftsa.find_peaks() stops reporting there; nothing
 -- separates a pedestal from a tone inside one lobe of DC.
+-- The display task shares this core with the interpreter and runs only while Lua is
+-- blocked, so a stretch of Lua with no delay() in it is a stretch in which a touch
+-- cannot be dispatched. At 16384 samples fft_load and fft_run are 0.5 s and 0.8 s of
+-- unbroken arithmetic, and the app's only delay was the 25 ms at the end of a refill:
+-- the Options button then took several presses over several seconds to answer.
+--
+-- The cure is more yield points rather than a longer one. Each costs fft_yield seconds
+-- plus a call, and they are placed where the enclosing loop is cheap -- per chunk in
+-- fft_load, per stage in fft_run -- so the per-sample inner loops are untouched. Both
+-- gates are sized so the default 512 samples reaches neither and its frame rate is
+-- unchanged.
+fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
+fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
+fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length
+
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
@@ -362,13 +377,24 @@ function fftsa.fft_load(buf)
   local rd  = buf.readings
 
   local wsx = 0
-  for i = 1, N do
-    local v = rd[i]
-    -- A sparse buffer must not put nils into the arithmetic; fftsa.frame_body()
-    -- rejects a short capture before it gets here.
-    if v == nil then v = 0 end
-    x[i] = v
-    wsx = wsx + v * win[i]
+  -- Chunked so the yield is per chunk, not per sample: a test inside this loop would
+  -- cost more than the yields save. One chunk means no yield, which is the 512 case.
+  local chunk = fftsa.fft_yield_n
+  local lo = 1
+  while lo <= N do
+    local hi = lo + chunk - 1
+    if hi > N then hi = N end
+    local i
+    for i = lo, hi do
+      local v = rd[i]
+      -- A sparse buffer must not put nils into the arithmetic; fftsa.frame_body()
+      -- rejects a short capture before it gets here.
+      if v == nil then v = 0 end
+      x[i] = v
+      wsx = wsx + v * win[i]
+    end
+    lo = hi + 1
+    if lo <= N then delay(fftsa.fft_yield) end
   end
   local mean = wsx / fftsa.fft_wsum
 
@@ -429,6 +455,7 @@ function fftsa.fft_run()
     end
     base = base + half
     len  = len * 2
+    if M > fftsa.fft_yield_m then delay(fftsa.fft_yield) end
   end
 end
 

@@ -362,6 +362,21 @@ end
 -- The price is that near DC the estimate is the tone. fftsa.win_tables() measures
 -- how far that reaches and fftsa.find_peaks() stops reporting there; nothing
 -- separates a pedestal from a tone inside one lobe of DC.
+-- The display task shares this core with the interpreter and runs only while Lua is
+-- blocked, so a stretch of Lua with no delay() in it is a stretch in which a touch
+-- cannot be dispatched. At 16384 samples fft_load and fft_run are 0.5 s and 0.8 s of
+-- unbroken arithmetic, and the app's only delay was the 25 ms at the end of a refill:
+-- the Options button then took several presses over several seconds to answer.
+--
+-- The cure is more yield points rather than a longer one. Each costs fft_yield seconds
+-- plus a call, and they are placed where the enclosing loop is cheap -- per chunk in
+-- fft_load, per stage in fft_run -- so the per-sample inner loops are untouched. Both
+-- gates are sized so the default 512 samples reaches neither and its frame rate is
+-- unchanged.
+fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
+fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
+fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length
+
 function fftsa.fft_load(buf)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
@@ -372,13 +387,24 @@ function fftsa.fft_load(buf)
   local rd  = buf.readings
 
   local wsx = 0
-  for i = 1, N do
-    local v = rd[i]
-    -- A sparse buffer must not put nils into the arithmetic; fftsa.frame_body()
-    -- rejects a short capture before it gets here.
-    if v == nil then v = 0 end
-    x[i] = v
-    wsx = wsx + v * win[i]
+  -- Chunked so the yield is per chunk, not per sample: a test inside this loop would
+  -- cost more than the yields save. One chunk means no yield, which is the 512 case.
+  local chunk = fftsa.fft_yield_n
+  local lo = 1
+  while lo <= N do
+    local hi = lo + chunk - 1
+    if hi > N then hi = N end
+    local i
+    for i = lo, hi do
+      local v = rd[i]
+      -- A sparse buffer must not put nils into the arithmetic; fftsa.frame_body()
+      -- rejects a short capture before it gets here.
+      if v == nil then v = 0 end
+      x[i] = v
+      wsx = wsx + v * win[i]
+    end
+    lo = hi + 1
+    if lo <= N then delay(fftsa.fft_yield) end
   end
   local mean = wsx / fftsa.fft_wsum
 
@@ -439,6 +465,7 @@ function fftsa.fft_run()
     end
     base = base + half
     len  = len * 2
+    if M > fftsa.fft_yield_m then delay(fftsa.fft_yield) end
   end
 end
 
@@ -580,7 +607,10 @@ end
 -- is a candidate whatever kmin says. The trace still draws them.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
-  local bi, bv = {}, {}
+  -- Reused, not rebuilt: two tables a frame was the only allocation left in the frame
+  -- path, and the house rule is to allocate once. Callers read them immediately.
+  if fftsa.pk_bi == nil then fftsa.pk_bi, fftsa.pk_bv = {}, {} end
+  local bi, bv = fftsa.pk_bi, fftsa.pk_bv
   for s = 1, count do bi[s] = 0; bv[s] = -1 end
   local k0 = 2 + (fftsa.fft_kdc or 0)
   if kmin == nil or kmin < k0 then kmin = k0 end
@@ -651,12 +681,29 @@ fftsa = fftsa or {}   -- the single global this app exposes
 fftsa.sg_nbins   = 256
 fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 
--- Trace columns. The graph is 784 px wide, so plotting more bins than this asks the
--- firmware to decimate by a rule we do not control and which can drop the bin a tone
--- lives in. 256 is what the app has always drawn at the default 512 samples, and two
--- points a column (min and max) is 512 writes whatever the sample count is.
-fftsa.sg_ncol    = 256
-fftsa.sg_maxpts  = 2 * 256
+-- Trace columns, and the only number that sets the graph widget's work per frame.
+--
+-- The plotted area is 680 px wide, measured off a panel capture: the vertical grid
+-- rules land at x = 100, 168, ... 780, eleven of them 68 px apart, with the Y-axis
+-- labels to the left of x = 100. So one point per pixel is 680 and one per two is 340.
+--
+-- One point a column carrying the column's MAXIMUM. Writing the minimum as well was
+-- tried, for a noise floor that read as a band rather than its upper envelope, and
+-- withdrawn: it doubled the point count as the sample count rose and made every second
+-- segment span the whole band, about 45 px, where a single-valued trace moves a few px
+-- between neighbours. Rasterising costs per segment length. Max alone reads the floor
+-- about 6 dB high.
+--
+-- Fixed, not sized to the span: a frame then always writes exactly this many points and
+-- the widget's load is constant and predictable whatever the sample count or span.
+--
+-- 255 points, with the pair ALLOCATED AT 680 and freed only when the app ends. One
+-- point per pixel was tried and withdrawn on cost: it made the fill 77 ms against about
+-- 28 ms here, and the frame is what the operator feels. sg_ncol is settable while the
+-- app runs, up to sg_maxpts, because the buffers are FILL_ONCE and cleared -- n follows
+-- the writes, so a smaller count simply draws fewer points and reallocates nothing.
+fftsa.sg_ncol    = 255
+fftsa.sg_maxpts  = 680
 
 -- Firmware handles, initialised only on the first load: opening the App again
 -- re-runs this body and `fftsa = fftsa or {}` keeps the table, so nil-ing a live
@@ -683,6 +730,38 @@ fftsa.delfails = fftsa.delfails or 0
 fftsa.sg_flo_hz  = 0
 fftsa.sg_fhi_hz  = 1e9
 fftsa.sg_fscale  = 1000    -- Hz per label-second; fftsa.sg_pick_fscale() steps it by decades
+
+-- EXPERIMENT, both settable over the socket while the app runs.
+--
+-- The display task keeps its own copy of the readings (FIRMWARE_API.md:246), so
+-- overwriting a bound buffer in place is invisible to it and something has to make it
+-- re-read. These two choose what.
+--
+-- sg_xmethod is the X scale method sg_pin_x() asks for. XSCALE_OFF is a fixed window --
+-- the one method that needs nothing from the buffer, which may be exactly why our
+-- in-place writes never appear. The instrument's own reading graph redraws live from a
+-- continuously filled buffer, and on the front panel it is set to Show Group. The
+-- measured internals (FIRMWARE_API.md:821): ALL reads the whole buffer decimated to 710
+-- points, so our sg_ncol fit undecimated; LATEST reads a 648-point window ending at the
+-- newest reading; GROUP is internal mode 7. If one of them follows the buffer by itself
+-- then a frame needs no graph call at all, which is the cheapest outcome available.
+-- XSCALE_OFF, the pinned window, MEASURED AS THE ONLY STABLE CHOICE. XSCALE_ALL was
+-- tried first, on the reasoning that it reads the whole buffer and so has to notice new
+-- writes -- it does, and the trace redrew, but it also derives the X range from the
+-- buffer's own timestamps. The buffer is a ring, so startindex sweeps across it as the
+-- fill advances and a paint landing mid-fill computes the range from whichever slot the
+-- write position had reached. The axis then walks frame to frame, which on the glass
+-- reads as the trace sliding left and right as though the point count were changing.
+-- The axis does not need to follow anything: the span is known, and pinning it leaves
+-- the redraw to the notify below.
+fftsa.sg_xmethod = display.XSCALE_OFF
+-- Notify candidates that were tried and are NOT used, so none of them is tried again
+-- on the same reasoning: select, scaletrace(TRACE_ACTIVE), drawstyle and re-asserting
+-- scalex all make the task re-read a buffer it is already bound to, and scalex was
+-- confirmed doing it on the glass. Every one of them needs the bound buffer overwritten
+-- in place, which needs FILL_CONTINUOUS, which draws the wrap line. The hand-over is
+-- the only notify compatible with FILL_ONCE.
+
 
 -- Geometry on the 800x480 panel, in object coordinates, which start below the
 -- 49-pixel title bar: a child at y=350 lands on panel row 399.
@@ -765,12 +844,14 @@ function fftsa.sg_pin_x()
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if hi > fftsa.sg_fmax_real or hi <= lo then return false end
   local s = fftsa.sg_fscale
-  pcall(function()
-    display.graph.scalex(fftsa.sg_graph, display.XSCALE_OFF, display.AXIS_NORMAL,
-                         lo / s, hi / s)
-  end)
+  local m = fftsa.sg_xmethod
+  if m == nil then m = display.XSCALE_OFF end
+  -- No pcall: the call does not raise, it posts an event, so a wrapper buys nothing and
+  -- costs a closure and a frame per call -- and this one runs every frame.
+  display.graph.scalex(fftsa.sg_graph, m, display.AXIS_NORMAL, lo / s, hi / s)
   return true
 end
+
 
 -- The span sets the precision: two adjacent ticks reading the same number are
 -- worse than none. Each tick carries its own unit, since the firmware's row says "s".
@@ -796,7 +877,7 @@ function fftsa.sg_axis_update(force)
     end
     fftsa.sg_xlab_txt[i] = txt
     local h = fftsa.sg_xlab[i]
-    pcall(function() display.settext(h, txt) end)
+    display.settext(h, txt)
   end
   return true
 end
@@ -831,29 +912,97 @@ function fftsa.sg_xunit_text()
   return t
 end
 
--- WRITABLE_FULL carries value, extra and timestamp per point: UNIT_VOLT holding dB
--- numbers, extra UNIT_HERTZ. The caller must have detached the graph first
--- (fftsa.sg_destroy() does).
-function fftsa.sg_make_buffer(nbins)
+-- The two trace buffers the frame alternates between. WRITABLE_FULL carries value, extra
+-- and timestamp per point: UNIT_VOLT holding dB numbers, extra UNIT_HERTZ.
+--
+-- MADE ONCE, WHEN THE APP STARTS, AND FREED ONLY BY fftsa.sg_destroy() WHEN IT ENDS.
+-- Capacity is sg_maxpts -- the ceiling, not the current sg_ncol -- whatever the sample
+-- count, so neither a size change nor a change of point count needs a new buffer: this
+-- writes sg_nbins and returns. Nothing allocates or frees while frames are running.
+--
+-- WHY TWO, AND WHY FILL_ONCE. Both were established on the instrument, and each rules
+-- out the obvious cheaper design.
+--
+-- One buffer, overwritten in place, is invisible. The display task keeps its own copy of
+-- the readings (FIRMWARE_API.md:246): all 340 points were moved to -20 dBV with the
+-- frame parked and the plot area came back byte-identical. Being handed a buffer is what
+-- makes the task re-read one, so a frame has to hand one over.
+--
+-- FILL_CONTINUOUS removes the need to clear, and every mechanical claim about it held --
+-- the mode reads back, writing past capacity wraps with no event, n pins at capacity,
+-- and after exactly capacity writes startindex is 1 again. It is still unusable here:
+-- the widget draws a continuous-fill buffer as a WRAPPING trace and joins its newest
+-- point back to its oldest, which on the glass is a straight line across the whole plot.
+-- Measured against the alternative explanation -- the bound buffer was read four times
+-- while that line was on screen and was perfectly aligned every time, startindex 1,
+-- endindex 680, timestamps monotonic -- so the line is the fill mode, not a rotation.
+--
+-- So: FILL_ONCE, and a frame clears and fills the one the graph is NOT showing before
+-- handing it over. The clear is what the firmware needs and it happens where nothing can
+-- see it; the bound buffer is always a complete trace and is never written at all.
+function fftsa.sg_make_buffer(nbins, npoints)
   fftsa.sg_nbins = nbins
+  local want = npoints or fftsa.sg_maxpts
+  -- Already built at the right size: keep them, and write nothing but sg_nbins.
+  --
+  -- An invariant, not a fix: sg_build() is the only caller and start() the only caller
+  -- of that, so today this never returns early. It is here because it is the one place
+  -- the rule is expressed in code rather than left implicit in the call graph -- proved
+  -- by putting an allocation into apply(), which then allocates nothing with this
+  -- present and fourteen buffers with it removed.
+  if fftsa.sg_buf ~= nil and fftsa.sg_back ~= nil
+     and fftsa.sg_buf.capacity == want and fftsa.sg_back.capacity == want then
+    return fftsa.sg_buf
+  end
+  -- DETACH BEFORE DELETING. The firmware refuses to delete a buffer that is still
+  -- bound to a graph, so remaking one while attached leaves the old buffer alive AND
+  -- STILL BOUND: the widget then draws both, which on the glass is a second trace
+  -- overlaid on the first at the old resolution. Reached only by a relaunch, where
+  -- fftsa.sg_build() has already called sg_destroy(), but the graph handle survives a
+  -- reload and the cost of being wrong here is a stranded buffer.
+  if fftsa.sg_graph ~= nil then
+    display.graph.removeall(fftsa.sg_graph)
+  end
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
     fftsa.sg_buf = nil
   end
-  -- One size for every sample count, because sg_update() never writes more than
-  -- sg_maxpts. Nothing here has to grow when the count does.
-  fftsa.sg_buf = buffer.make(fftsa.sg_maxpts + 16, buffer.STYLE_WRITABLE_FULL)
-  -- Not buffer.UNIT_DECIBEL: it panics the instrument during build.
-  buffer.write.format(fftsa.sg_buf, buffer.UNIT_VOLT,  buffer.DIGITS_4_5,
-                              buffer.UNIT_HERTZ, buffer.DIGITS_6_5)
-  -- An empty buffer binds no trace, and later writes never draw. Seed here so
-  -- the initial graph binding has data to attach.
-  local nseed = nbins
-  if nseed > fftsa.sg_ncol then nseed = fftsa.sg_ncol end
-  for k = 1, nseed do
-    fftsa.sg_write_point(fftsa.sg_buf, fftsa.sg_dbmin, (k - 1) * 1.0)
+  if fftsa.sg_back ~= nil then
+    fftsa.del_buf(fftsa.sg_back)
+    fftsa.sg_back = nil
+  end
+  fftsa.sg_buf  = fftsa.sg_mkbuf(want)
+  fftsa.sg_back = nil
+  -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
+  -- at the ceiling and never resized: a frame writes slots 1..sg_ncol and reads back the
+  -- same, so growing a table mid-frame would allocate inside the window it exists to
+  -- shrink. Seeded so every slot is a store rather than a rehash on the first frame.
+  fftsa.sg_st_db, fftsa.sg_st_hz = {}, {}
+  fftsa.sg_st_w,  fftsa.sg_st_fr = {}, {}
+  local j
+  for j = 1, want do
+    fftsa.sg_st_db[j], fftsa.sg_st_hz[j] = fftsa.sg_dbmin, 0
+    fftsa.sg_st_w[j],  fftsa.sg_st_fr[j] = 0, 0
   end
   return fftsa.sg_buf
+end
+
+-- One trace buffer: FILL_ONCE, formatted, seeded full. Capacity is exactly the write
+-- count, so a cleared buffer takes a whole frame and no more -- one past it is event
+-- 4915. Seeded because an empty buffer binds no trace at all, and sg_build() binds this
+-- before the first frame has run.
+function fftsa.sg_mkbuf(want)
+  local b = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
+  -- Left at FILL_ONCE deliberately. See sg_make_buffer: FILL_CONTINUOUS works exactly
+  -- as documented and still draws a line from the newest point to the oldest.
+  -- Not buffer.UNIT_DECIBEL: it panics the instrument during build.
+  buffer.write.format(b, buffer.UNIT_VOLT,  buffer.DIGITS_4_5,
+                         buffer.UNIT_HERTZ, buffer.DIGITS_6_5)
+  local k
+  for k = 1, want do
+    fftsa.sg_write_point(b, fftsa.sg_dbmin, (k - 1) * 1.0)
+  end
+  return b
 end
 
 -- Split a scaled frequency into the (seconds, fraction) pair buffer.write.reading
@@ -905,10 +1054,10 @@ end
 
 -- Build the screen once, at launch: graph, tick labels, peak table, legend. The
 -- frame loop only refills the buffer and updates text.
-function fftsa.sg_build(title, nbins)
+function fftsa.sg_build(title, nbins, npoints)
   fftsa.sg_destroy()
 
-  fftsa.sg_make_buffer(nbins)
+  fftsa.sg_make_buffer(nbins, npoints)
   local create = display.create
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
@@ -927,10 +1076,8 @@ function fftsa.sg_build(title, nbins)
   -- X is ELEMENT_TIME (our scaled-frequency timestamps); Y is ELEMENT_DATA (dB).
   display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA, fftsa.sg_buf, display.ELEMENT_TIME)
   display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
-  pcall(function()
-    display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
-                         fftsa.sg_dbmin, fftsa.sg_dbmax)
-  end)
+  display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
+                       fftsa.sg_dbmin, fftsa.sg_dbmax)
   fftsa.sg_pin_x()
   fftsa.sg_axis_build(create, small)
   fftsa.sg_axis_update(true)
@@ -958,22 +1105,28 @@ end
 -- children, then free the buffer the trace referenced. Nils every handle.
 function fftsa.sg_destroy()
   if fftsa.sg_graph ~= nil then
-    pcall(function() display.graph.removeall(fftsa.sg_graph) end)
+    display.graph.removeall(fftsa.sg_graph)
   end
   if fftsa.sg_scr ~= nil then
-    pcall(function() display.changescreen(display.SCREEN_HOME) end)
+    display.changescreen(display.SCREEN_HOME)
     fftsa.del_obj(fftsa.sg_scr)
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat = nil, nil, nil, nil, nil, nil, nil
   fftsa.sg_xlab = nil
   fftsa.sg_lab_lo, fftsa.sg_lab_hi, fftsa.sg_xlab_txt = nil, nil, nil
+  -- Both: a buffer whose handle is dropped is stranded and still counts against the
+  -- instrument's capacity.
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
   end
-  fftsa.sg_buf = nil
+  if fftsa.sg_back ~= nil then
+    fftsa.del_buf(fftsa.sg_back)
+  end
+  fftsa.sg_buf, fftsa.sg_back = nil, nil
   collectgarbage()
 end
+
 
 -- Bin index range covering the visible window, clamped into 1..nbins. Shared by
 -- the plot and the peak search, so the table describes what is on screen.
@@ -991,15 +1144,16 @@ function fftsa.sg_window_bins(nbins, binhz)
   return kmin, kmax
 end
 
--- Refill the trace from fftsa.fft_pwr in place, with the trace attached: a detach
--- and re-add (removeall+add) repaints the whole widget, an attached refill does
--- not. The display task shares this core with the interpreter and runs only while
--- Lua is blocked, so the delay at the end is what gets the refill painted; too
--- short and the firmware posts 1706, "Message dropped from display queue".
+-- Refill the trace from fftsa.fft_pwr into the buffer the graph is NOT showing, then
+-- hand that buffer over. The clear and the whole fill therefore happen where no paint
+-- can see them, and the bound buffer is replaced only by a complete one.
+--
+-- The display task shares this core with the interpreter and runs only while Lua is
+-- blocked, so the delay at the end is what gets the new trace painted; too short and the
+-- firmware posts 1706, "Message dropped from display queue".
 function fftsa.sg_update(nbins, binhz)
   if binhz == nil or binhz <= 0 then return end   -- no usable frequency scale yet
   local g     = fftsa.sg_graph
-  local buf   = fftsa.sg_buf
   local pwr   = fftsa.fft_pwr
   local wr    = buffer.write.reading
   local log10 = math.log10
@@ -1011,78 +1165,96 @@ function fftsa.sg_update(nbins, binhz)
   local floor = math.floor
   local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
   local npts = kmax - kmin + 1
+  local buf = fftsa.sg_buf
+  if buf == nil then return end
+  -- Points this frame writes, CLAMPED TO CAPACITY: one write past it is event 4915, a
+  -- modal dialog, and sg_ncol is settable while the app runs. Writing fewer than
+  -- capacity is fine now that the buffers are FILL_ONCE and cleared -- n follows the
+  -- writes, so the trace simply has that many points. That is what makes sg_ncol a live
+  -- knob without reallocating anything: the pair stays at the 680 they were made with.
   local ncol = fftsa.sg_ncol
-  buf.clear()
-  if npts <= ncol then
-    -- One point per bin. The default span at 512 samples is about 250 points, so this
-    -- is the shipped path and it is unchanged.
-    for k = kmin, kmax do
+  local cap  = buf.capacity
+  if cap ~= nil and ncol > cap then ncol = cap end
+  if ncol == nil or ncol < 2 then ncol = 2 end
+  local nwrote = 0
+  -- STAGE EVERYTHING FIRST, THEN CLEAR AND WRITE. The buffer is at n = 0 from the clear
+  -- until the last write, and a paint landing in that window draws a blank or partial
+  -- trace -- that is the flicker. So the window is made as narrow as the firmware allows:
+  -- every value is computed into these four preallocated arrays while the buffer still
+  -- holds the PREVIOUS complete trace, and the only thing between the clear and a full
+  -- buffer is a tight loop of buffer.write.reading.
+  --
+  -- A point costs about 109 us to produce and 51.6 of that is the write itself, so this
+  -- moves rather more than half the work out of the window: about 30 ms down to about
+  -- 13 at 255 points. The staging costs four table stores and four loads a point, some
+  -- 11 us, so the frame as a whole gets about 3 ms longer -- paid outside the window.
+  local st_db, st_hz = fftsa.sg_st_db, fftsa.sg_st_hz
+  local st_w,  st_fr = fftsa.sg_st_w,  fftsa.sg_st_fr
+  -- Hoisted out of the loop: the column's frequency advances by a constant, so the
+  -- per-point divide and two multiplies become one add. The split is inlined for the
+  -- same reason -- a Lua call per point was measurable against the 51.6 us write.
+  local fstep = (npts / ncol) * binhz
+  local f0    = (kmin - 1) * binhz
+  local tstep = fstep / fscl
+  local t     = f0 / fscl
+  local FMAX  = 0.9999999        -- the same limit sg_split_t enforces
+  local floor2 = floor
+  local c
+  for c = 0, ncol - 1 do
+    -- The column's bin range. One bin wide at the default, where capacity equals the
+    -- bins in the span; wider when the span holds more bins than the cap allows.
+    local a = kmin + floor(c * npts / ncol)
+    local b = kmin + floor((c + 1) * npts / ncol) - 1
+    if b < a then b = a end
+    if b > kmax then b = kmax end
+    local hi, hik = nil, a
+    local k
+    for k = a, b do
       local v = pwr[k]
-      local db
-      -- nil (sparse power array) and anything at or below the floor plot at the
-      -- floor, so log10 is never handed a zero. The range tests are positives because
-      -- every comparison with a NaN is false, so `db < dbmin` would pass one through
-      -- to buffer.write.reading and a refused parameter is event 1131 again. No
-      -- reachable NaN was found, so that half is hardening.
-      if v == nil or v <= vfl then
-        db = dbmin
-      else
-        db = 10 * log10(v)
-        if not (db > dbmin) then db = dbmin
-        elseif not (db < dbmax) then db = dbmax end
-      end
-      local f = (k - 1) * binhz
-      -- Scaled frequency into the seconds field, split so the fraction cannot reach
-      -- the 0.9999999 the firmware refuses with event 1131.
-      local w, fr = split(f / fscl)
-      wr(buf, db, f, w, fr)
+      if v ~= nil and (hi == nil or v > hi) then hi = v; hik = k end
     end
-  else
-    -- More bins than columns. Writing them all costs 51.6 us a point for the firmware
-    -- to then decimate by its own rule, which can discard the bin a tone sits in. Take
-    -- the min and the max of each column instead: a narrow tone always reaches the
-    -- trace, and the floor still reads as a band rather than as its upper envelope,
-    -- which max alone would lift by about 6 dB at 64 bins a column.
-    local c
-    for c = 0, ncol - 1 do
-      local a = kmin + floor(c * npts / ncol)
-      local b = kmin + floor((c + 1) * npts / ncol) - 1
-      if b < a then b = a end
-      local lo, hi, hik = nil, nil, a
-      local k
-      for k = a, b do
-        local v = pwr[k]
-        if v == nil then v = 0 end
-        if lo == nil or v < lo then lo = v end
-        if hi == nil or v > hi then hi = v; hik = k end
-      end
-      -- The min carries the column's own start frequency and the max the frequency of
-      -- the bin that won it, so x never decreases and a peak lands where it really is.
-      -- When the winner is the first bin the two would share an x, and a duplicate
-      -- timestamp is not worth the risk, so the min is dropped for that column.
-      if hik > a then
-        local db = dbmin
-        if lo ~= nil and lo > vfl then
-          db = 10 * log10(lo)
-          if not (db > dbmin) then db = dbmin
-          elseif not (db < dbmax) then db = dbmax end
-        end
-        local fa = (a - 1) * binhz
-        local w, fr = split(fa / fscl)
-        wr(buf, db, fa, w, fr)
-      end
-      local db = dbmin
-      if hi ~= nil and hi > vfl then
-        db = 10 * log10(hi)
-        if not (db > dbmin) then db = dbmin
-        elseif not (db < dbmax) then db = dbmax end
-      end
-      local fh = (hik - 1) * binhz
-      local w, fr = split(fh / fscl)
-      wr(buf, db, fh, w, fr)
+    -- nil (sparse power array) and anything at or below the floor plot at the floor,
+    -- so log10 is never handed a zero. The range tests are positives because every
+    -- comparison with a NaN is false, so `db < dbmin` would pass one through to
+    -- buffer.write.reading and a refused parameter is event 1131 again.
+    local db = dbmin
+    if hi ~= nil and hi > vfl then
+      db = 10 * log10(hi)
+      if not (db > dbmin) then db = dbmin
+      elseif not (db < dbmax) then db = dbmax end
     end
+    -- The COLUMN's frequency, not the winning bin's. Columns can be narrower than a
+    -- bin -- 255 bins over 384 columns at the default -- and several of them would then
+    -- share a bin, giving equal timestamps. This is strictly increasing by
+    -- construction. The cost is that a peak is drawn at its column rather than its bin,
+    -- within 130 Hz at any size, which is 2 px of a 784 px graph; the peak table still
+    -- carries the interpolated frequency.
+    -- Scaled frequency into the seconds field, split so the fraction cannot reach the
+    -- 0.9999999 the firmware refuses with event 1131. Inlined from sg_split_t.
+    local w = floor2(t)
+    local fr = t - w
+    if fr >= FMAX then w = w + 1; fr = 0 end
+    nwrote = nwrote + 1
+    st_db[nwrote], st_hz[nwrote] = db, f0 + c * fstep
+    st_w[nwrote], st_fr[nwrote] = w, fr
+    t = t + tstep
   end
-  delay(fftsa.sg_yield)                      -- lets the display task paint the refill
+  fftsa.sg_nwrote = nwrote                   -- segments the widget was actually handed
+  -- THE WINDOW. Everything above this line ran against the previous frame's trace, which
+  -- was complete and on screen the whole time. From here the buffer is empty until the
+  -- loop ends, so there is nothing in it but the writes.
+  -- Declared out here on purpose: nothing but the clear and the writes belongs inside
+  -- the window, not even a local slot.
+  local i
+  buf.clear()
+  for i = 1, nwrote do
+    wr(buf, st_db[i], st_hz[i], st_w[i], st_fr[i])
+  end
+  -- No graph call. The clear above is the notify, and the trace stays bound to the
+  -- same buffer for the life of the app -- so nothing here can repaint the axes.
+  -- The paint. The bound buffer is complete and the next fill has not begun, so this is
+  -- the window in which a copy is correct by construction.
+  delay(fftsa.sg_yield)
 end
 
 -- The one place a zoom touches: the tick pixels are fixed and only the numbers move.
@@ -1091,7 +1263,7 @@ function fftsa.sg_set_xrange(flo_hz, fhi_hz)
   fftsa.sg_fhi_hz = fhi_hz
   fftsa.sg_fscale = fftsa.sg_pick_fscale(fhi_hz)
   if fftsa.sg_xunit ~= nil then
-    pcall(function() display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text()) end)
+    display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
   fftsa.sg_pin_x()
   fftsa.sg_axis_update()
@@ -1099,22 +1271,20 @@ end
 
 -- Re-bind the trace; removeall() first, or add() stacks a duplicate trace.
 function fftsa.sg_rebind()
-  pcall(function() display.graph.removeall(fftsa.sg_graph) end)
-  pcall(function() display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
-                                     fftsa.sg_buf, display.ELEMENT_TIME) end)
-  pcall(function() display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE) end)
-  pcall(function()
-    display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
-                         fftsa.sg_dbmin, fftsa.sg_dbmax)
-  end)
+  display.graph.removeall(fftsa.sg_graph)
+  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
+                    fftsa.sg_buf, display.ELEMENT_TIME)
+  display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
+  display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
+                       fftsa.sg_dbmin, fftsa.sg_dbmax)
   fftsa.sg_pin_x()
 end
 
 -- Detach and re-add the trace. Not called by the app; tools/test_tsp.lua exercises it.
 function fftsa.sg_bind_min()
-  pcall(function() display.graph.removeall(fftsa.sg_graph) end)
-  pcall(function() display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
-                                     fftsa.sg_buf, display.ELEMENT_TIME) end)
+  display.graph.removeall(fftsa.sg_graph)
+  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
+                    fftsa.sg_buf, display.ELEMENT_TIME)
 end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint
@@ -1402,6 +1572,30 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
+  -- A SMALL FIXED YIELD, because the frame no longer owns the display task's whole
+  -- budget. It used to: work equalled the inter-frame interval at every count, so the
+  -- only time the task got was this delay, and a fixed 25 ms meant 250 ms a second at
+  -- 512 samples against 15 at 16384 -- the same constant, thirty times less time. It was
+  -- scaled to a fifth of the frame for that reason.
+  --
+  -- The timer period now leaves 20 % of every frame idle, and Lua is blocked on the
+  -- timer throughout that idle, so the task is scheduled there in proportion to the
+  -- frame as well. Measured at 2048 samples: dropping the yield from 43 ms to 10 and
+  -- then 5 raised idle from 46 % to 54 % and posted no 1706 at either, so the delay is
+  -- no longer what feeds the task -- it is only insurance against a frame whose work
+  -- happens to fill its whole period.
+  fftsa.sg_yield = 0.010
+  -- Re-armed here, not at startup: the period depends on the sample count, and this is
+  -- the one place the count changes. The timer object is replaced, which is a create
+  -- and a delete -- acceptable on a settings change, never in a frame.
+  --
+  -- This arm is from the model. frame() replaces it with one measured from real frames
+  -- as soon as it has eight of them, so the peak is cleared here with the count.
+  fftsa.work_peak, fftsa.work_seen = nil, 0
+  if fftsa.timer ~= nil then
+    fftsa.period = fftsa.frame_period(fftsa.n)
+    fftsa.arm(fftsa.period)
+  end
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   -- Again with the measured rate, which refines binhz and so the bin count the
   -- legend reports for a narrow span.
@@ -1443,6 +1637,7 @@ end
 fftsa.busy_since = nil
 fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged stuck
 
+
 -- Seconds one frame costs at a given sample count, from costs measured on the
 -- instrument on 2026-10-24 (docs/PERFORMANCE.md): 10.9 us a sample to acquire, 32.0
 -- to load and window, 3.593e-6 per butterfly-equivalent for the transform and its
@@ -1468,14 +1663,46 @@ function fftsa.frame()
   end
   fftsa.busy_since = os.clock()
   fftsa.busy = true
+  -- Timed, because the timer period is set from what a frame actually costs.
+  local entry = os.clock()
   local ok, err = pcall(fftsa.frame_body)
+  fftsa.frame_work = os.clock() - entry
+  -- RE-ARM FROM MEASURED WORK. frame_estimate() is a model fitted at one point count and
+  -- one draw path, and it was setting the frame rate on its own: at 512 it predicted
+  -- 80.4 ms, which divided by the 0.8 occupancy is 100.5 ms -- half a millisecond past
+  -- the 0.10 s tick, so the period came out 0.15 and the rate 6.7 fps where the frame
+  -- needed 0.10 and 10. At 2048 it errs the other way, 216 ms against 240 measured.
+  --
+  -- The peak over a window of frames, not the mean: the period has to cover the slowest
+  -- frame or ticks are dropped and the rate halves. It is only ever raised by a whole
+  -- tick and only re-armed when the tick count actually changes, so a frame that runs
+  -- long once does not re-arm the timer every frame afterwards.
+  if ok then
+    if fftsa.work_peak == nil or fftsa.frame_work > fftsa.work_peak then
+      fftsa.work_peak = fftsa.frame_work
+    end
+    fftsa.work_seen = (fftsa.work_seen or 0) + 1
+    if fftsa.work_seen >= 8 and fftsa.timer ~= nil then
+      local want = fftsa.tick_period(fftsa.work_peak)
+      if want ~= fftsa.period then
+        fftsa.period = want
+        fftsa.arm(want)
+      end
+      -- Decay the peak so a size change downwards is noticed: it is re-earned over the
+      -- next window rather than remembered for the life of the app.
+      fftsa.work_peak = fftsa.frame_work
+      fftsa.work_seen = 0
+    end
+  end
   if not ok then
-    -- Re-bind the trace after a failure so the graph is never left without one -- but
-    -- only while the buffer still holds points. sg_update() clears it before the
-    -- refill, so a raise in there would have this remove the trace and then add one
-    -- over an empty buffer, which binds nothing and never draws again. Skipping it
-    -- there needs no recovery: the trace was never removed, and the next refill draws
-    -- through the binding it still has.
+    -- Re-bind the trace after a failure so the graph is never left without one, and only
+    -- while the bound buffer still holds points: adding over an empty one binds nothing
+    -- and never draws again.
+    --
+    -- The guard is cheap insurance rather than a live case now. sg_update() clears and
+    -- fills the SPARE, so a raise in there leaves the bound buffer whole and still
+    -- bound, and the only buffer that can be left part filled is one nothing draws
+    -- from -- the next frame clears it before writing anyway.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
       pcall(function() fftsa.sg_rebind() end)
     end
@@ -1780,9 +2007,10 @@ end
 function fftsa.build()
   fftsa.loading_build()
   fftsa.loading_front()
-  -- Keep the graph and its backing buffer bound for the whole app lifetime. One
-  -- fixed size serves every sample count, since the trace is capped at sg_maxpts.
-  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2)
+  -- Two trace buffers at sg_maxpts, for the life of the app: allocated at the CEILING
+  -- rather than at sg_ncol so the point count stays adjustable upwards while running
+  -- without anything being resized or reallocated.
+  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
   -- The button died with the screen fftsa.sg_build() just destroyed: clear the
   -- stale handle, do not delete it.
   fftsa.optbtn = nil
@@ -1797,6 +2025,40 @@ end
 -- tick that lands during a frame is dropped, so the displayed rate is quantised;
 -- docs/PERFORMANCE.md has the model. One frame per tick: back-to-back frames keep
 -- the interpreter out of its event loop.
+-- The period a frame needs, with interpreter idle left over.
+--
+-- delay() lets the display task PAINT -- that is C -- but dispatching a touch means
+-- evaluating Lua, and the interpreter is inside the delay. So a press is only handled
+-- in the gap between a frame finishing and the next tick, and with the period left at
+-- the 0.05 s floor that gap is whatever the quantisation happens to leave: 45 ms of
+-- 150 at 512 samples, and 12 ms of 500 at 4096, which made Options unreachable there
+-- while 512 was fine. It was luck, not design.
+--
+-- Asking for the work to be 80 % of the period puts the idle at about 20 % at every
+-- count.
+--
+-- frame_estimate() ALREADY INCLUDES THE YIELD. It was fitted against measured frame
+-- times -- 0.080 s predicted against 81.8 ms measured at 512 -- and a measured frame is
+-- the whole frame, delay() and all. Adding sg_yield to it again counted the yield twice
+-- and pushed 512 from 105 ms of apparent busy to 131 ms after the 80 % divide, which is
+-- past the 0.10 s tick: the period came out 0.15 and the rate 6.7 fps where the frame
+-- itself only needed 0.10 and 10 fps. A tick of quantisation lost to double counting.
+-- Seconds of timer period that leave a frame of this length about 20 % idle, rounded up
+-- to the firmware's 0.05 s tick. The one place the occupancy rule lives, so the modelled
+-- first arm and the measured re-arms cannot disagree about it.
+function fftsa.tick_period(busy)
+  if busy == nil or busy <= 0 then return 0.05 end
+  local ticks = math.ceil((busy / 0.8) / 0.05)
+  if ticks < 1 then ticks = 1 end
+  return ticks * 0.05
+end
+
+-- The FIRST arm, before any frame has been timed. From here on frame() re-arms from the
+-- work it actually measures.
+function fftsa.frame_period(n)
+  return fftsa.tick_period(fftsa.frame_estimate(n))
+end
+
 function fftsa.arm(period_s)
   if period_s == nil then period_s = 0.05 end
   if fftsa.timer ~= nil then
@@ -1837,7 +2099,12 @@ function fftsa.start()
     fftsa.build()
     hooked = fftsa.install_cleanup()
     fftsa.apply()
-    fftsa.arm()
+    -- With the computed period, not the 0.05 s floor: apply() re-arms on a size change
+    -- but cannot do it here, because the timer is created after the first apply() runs.
+    -- Left at the floor, the default size kept whatever idle the quantisation happened
+    -- to leave -- which is the whole fault this period exists to remove.
+    fftsa.period = fftsa.frame_period(fftsa.n)
+    fftsa.arm(fftsa.period)
   end)
   if not ok then
     fftsa.lasterr = tostring(err)

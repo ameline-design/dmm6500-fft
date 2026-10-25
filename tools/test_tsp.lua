@@ -62,12 +62,18 @@ local function use(h, what)
 end
 
 local BUFS = {}       -- buffer objects, so we can count live ones
+-- `capacity` is the firmware's name for it; `cap` was the mock's own and is kept so the
+-- existing checks still read. A mock that lacks a field the firmware has hides nothing
+-- on the instrument and breaks only here, which is the wrong way round.
 local function newbuf(cap)
-  local b = {alive = true, cap = cap, n = 0, readings = {},
-             relativetimestamps = {}, extra = {}, seconds = {}}
+  local b = {alive = true, cap = cap, capacity = cap, n = 0, readings = {},
+             relativetimestamps = {}, extra = {}, seconds = {},
+             fillmode = buffer.FILL_ONCE, startindex = 1, endindex = 0, wpos = 1}
   function b.clear()
+    CLEAR_AT_WRITES, LOG10_AT_CLEAR = WRITES, LOG10S
     b.n = 0
-    b.readings, b.relativetimestamps, b.extra = {}, {}, {}
+    b.wpos, b.startindex, b.endindex = 1, 1, 0
+    b.readings, b.relativetimestamps, b.extra, b.seconds = {}, {}, {}, {}
   end
   BUFS[table.getn(BUFS) + 1] = b
   return b
@@ -88,8 +94,16 @@ display = {
   FONT_SMALL = 1, FONT_MEDIUM = 2,
   JUST_LEFT = 0, JUST_CENTER = 1, JUST_RIGHT = 2,
   NFORMAT_PREFIX = 1, TIMER_FOREVER = -1,
-  YSCALE_OFF = 0, XSCALE_OFF = 0, AXIS_NORMAL = 0, STYLE_LINE = 1,
-  ELEMENT_DATA = 'data', ELEMENT_TIME = 'time',
+  -- The firmware's own values, read out of its registration table, because the app
+  -- now chooses between them: a mock that called them all 0 could not tell an auto
+  -- method from a fixed one.
+  XSCALE_SMART = 0, XSCALE_LATEST = 1, XSCALE_GROUP = 2, XSCALE_ALL = 3,
+  XSCALE_AUTOBIN = 4, XSCALE_SWIM = 5, XSCALE_SHARED = 6, XSCALE_OFF = 7,
+  YSCALE_SMART = 0, YSCALE_PER_TRACE = 1, YSCALE_PER_TRACE_ONCE = 2,
+  YSCALE_SWIM = 3, YSCALE_SHARED = 4, YSCALE_OFF = 5,
+  AXIS_NORMAL = 0, AXIS_LOG = 1, STYLE_LINE = 0, STYLE_MARKER = 1, STYLE_BOTH = 2,
+  TRACE_ACTIVE = 0, TRACE_ALL = 1, MARKER_LAST_TRACE = 0, MARKER_LAST_CUSTOM = 1,
+  ELEMENT_DATA = 'data', ELEMENT_TIME = 'time', ELEMENT_EXTRA = 2,
   -- Object states. Only these two are modelled, because they are the two the
   -- app uses: STATE_DISABLE and STATE_READONLY are refused on a Graph with
   -- event 1717 on the real firmware, so modelling them would model a bug.
@@ -199,6 +213,10 @@ display.graph = {}
 function display.graph.add(g, ...)
   use(g, 'graph.add')
   OBJ[g].adds = (OBJ[g].adds or 0) + 1
+  -- The ordering witness. The display task copies the buffer when it processes the
+  -- hand-over, so the hand-over has to happen BEFORE the frame's yield: that is the
+  -- window where the bound buffer is complete and the next fill has not started.
+  OBJ[g].adddelays = DELAYS
   -- Firmware binds nothing for an empty buffer, even if later frames fill it.
   if arg[1].n == 0 then return end
   OBJ[g].buffer = arg[1]
@@ -219,16 +237,36 @@ function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h
 function display.graph.scalex(g, ...)
   use(g, 'graph.scalex')
   local a = arg
+  OBJ[g].xmethod = a[1]                    -- which scale method was asked for
+  -- The ordering witness. The display task copies the buffer when it processes the
+  -- notify, so the notify has to be issued BEFORE the frame's yield, not after: with
+  -- the yield first the copy lands during the next frame's fill and reads the ring part
+  -- way round. Nothing else can see that order, so the delay count is recorded here.
+  OBJ[g].xdelays = DELAYS
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
   end
   return OBJ[g].xmin, OBJ[g].xmax
 end
+-- The two notify candidates that are not already modelled. Counted, not acted on: what
+-- the firmware does with them is the open question the instrument has to answer.
+function display.graph.select(g, b, elem)
+  use(g, 'graph.select')
+  OBJ[g].selects = (OBJ[g].selects or 0) + 1
+  OBJ[g].selected = b
+end
+function display.graph.scaletrace(g, mode)
+  use(g, 'graph.scaletrace')
+  OBJ[g].scaletraces = (OBJ[g].scaletraces or 0) + 1
+  OBJ[g].scaletrace_mode = mode
+end
 
 buffer = {
   STYLE_WRITABLE_FULL = 'wf', STYLE_STANDARD = 'std',
   UNIT_VOLT = 'V', UNIT_HERTZ = 'Hz', DIGITS_4_5 = 45, DIGITS_6_5 = 65,
+  -- The firmware's values, read off the instrument 2026-10-24.
+  FILL_ONCE = 0, FILL_CONTINUOUS = 1,
   write = {},
 }
 function buffer.make(cap, style) return newbuf(cap) end
@@ -255,15 +293,62 @@ FRAC_MAX = 0.9999999
 -- timestamp is not known. The mock used to store secs + frac without ever comparing
 -- two of them, so a non-monotonic sequence passed in silence.
 NONMONO = 0
+NONMONODUMP = true
+-- WRITES counts every point written anywhere; CLEAR_AT_WRITES is the value it had when
+-- a buffer was last cleared. Together they say what happened INSIDE the window where the
+-- trace buffer is empty: the refill stages every value into preallocated arrays first,
+-- so the only thing between the clear and a full buffer should be writes.
+WRITES, CLEAR_AT_WRITES = 0, 0
+-- LOG10S counts the per-point dB conversions, LOG10_AT_CLEAR its value at the last
+-- clear. These are what tell a STAGED refill from an interleaved one: counting writes
+-- cannot, because the old design also wrote only after the clear -- it just did the
+-- arithmetic for each point in between.
+LOG10S, LOG10_AT_CLEAR = 0, 0
+local REAL_LOG10 = math.log10
+function math.log10(x)
+  LOG10S = LOG10S + 1
+  return REAL_LOG10(x)
+end
 function buffer.write.reading(b, val, extra, secs, frac)
   if not b.alive then error('write to a DELETED buffer', 0) end
+  WRITES = WRITES + 1
   if frac == nil or frac < 0 or frac > FRAC_MAX then BADFRAC = BADFRAC + 1 end
+  local i = b.wpos or (b.n + 1)
+  if b.fillmode == buffer.FILL_CONTINUOUS then
+    -- Wraps with no event posted; n pins at capacity. Measured 2026-10-24.
+    -- Only within a logical run. Slot 1 against slot capacity is the ring's wrap seam,
+    -- and after exactly capacity writes startindex is back at 1, so the firmware reads
+    -- 1..capacity in order and that seam is not a discontinuity it ever sees.
+    local t = secs + frac
+    if i > 1 and b.seconds[i - 1] ~= nil and t <= b.seconds[i - 1] then
+      NONMONO = NONMONO + 1
+      if NONMONODUMP then
+        print(string.format('   NONMONO at slot %d: prev %.9f this %.9f (secs %.9f'
+                            .. ' frac %.9f) extra %.4f', i, b.seconds[i - 1], t,
+                            secs, frac, extra))
+      end
+    end
+    b.readings[i], b.extra[i], b.seconds[i] = val, extra, t
+    b.wpos = i + 1
+    if b.wpos > b.capacity then b.wpos = 1 end
+    if b.n < b.capacity then b.n = b.n + 1 end
+    b.startindex = b.wpos
+    if b.n < b.capacity then b.startindex = 1 end
+    b.endindex = b.n
+    return
+  end
+  if b.n >= b.capacity then
+    -- FILL_ONCE past the end is event 4915, not a wrap.
+    error('buffer full: 4915', 0)
+  end
   b.n = b.n + 1
   b.readings[b.n] = val
   b.extra[b.n] = extra
   local t = secs + frac
   if b.n > 1 and t <= b.seconds[b.n - 1] then NONMONO = NONMONO + 1 end
   b.seconds[b.n] = t
+  b.wpos = b.n + 1
+  b.endindex = b.n
 end
 
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
@@ -911,7 +996,13 @@ print('\nper-frame repaint is in place, with a yield (real code)')
 local gh = fftsa.sg_graph
 local ad0, rm0 = (OBJ[gh].adds or 0), (OBJ[gh].removes or 0)
 local dl0 = DELAYS
+local pin0 = (OBJ[gh].pins or 0)
 fftsa.frame_body()
+-- One detach and one re-attach a frame, which is the buffer swap: the refill fills the
+-- spare and then points the graph at it, so no paint ever catches a partial trace. It
+-- used to be zero of each -- an attached in-place refill -- and the 43 ms the swap
+-- costs the display task is the price of that. More than one of either would be a
+-- regression into per-point churn, which is what these numbers really guard.
 check('the frame does not detach the trace', (OBJ[gh].removes or 0) == rm0,
       'removes=' .. tostring(OBJ[gh].removes) .. ' was ' .. tostring(rm0))
 check('nor re-attach it', (OBJ[gh].adds or 0) == ad0,
@@ -922,6 +1013,21 @@ check('the trace stays attached throughout', OBJ[gh].traces == 1,
       'traces=' .. tostring(OBJ[gh].traces))
 check('and the frame yields exactly once for the paint', DELAYS == dl0 + 1,
       'delays=' .. DELAYS .. ' was ' .. dl0)
+
+-- NO GRAPH CALL AT ALL. The clear is the notify, so a frame touches nothing on the
+-- widget -- and that is what keeps the axes still. Every synchronous graph call in a
+-- frame repaints the whole widget including its own axis label text, which was watched
+-- happening on the glass with a removeall and add per frame: 8.5 ms of time and a
+-- visible flicker. Counted per call rather than by live trace count, because a
+-- removeall+add pair leaves the count at 1 exactly as never touching it does.
+check('and the frame makes no graph call whatsoever', (function()
+  local o = OBJ[gh]
+  return (o.pins or 0) == pin0 and (o.selects or 0) == 0
+         and (o.scaletraces or 0) == 0,
+         string.format('pins %s was %s, selects %s, scaletraces %s',
+                       tostring(o.pins), tostring(pin0), tostring(o.selects),
+                       tostring(o.scaletraces))
+end)())
 
 -- The yield is the only thing feeding the display task, so a zero or missing
 -- one is a silent regression into the jumpy behaviour. Assert the value too.
@@ -1550,6 +1656,10 @@ check('the graph mock rejects empty bindings until explicitly rebound', (functio
   buffer.delete(b)
   return rejected and rebound
 end)())
+-- The bound buffer ALTERNATES between the two now, so identity is not the invariant it
+-- used to be. What has to hold is that the pair never changes, both stay alive, the
+-- graph always shows one of them, and exactly one trace is bound -- adds and removes
+-- both advance by one a frame, so only their difference is stable.
 check('all size transitions keep the original trace bound and plot without leaks',
       (function()
   display.setvalue(fftsa.opt_flo, 10)
@@ -1562,32 +1672,46 @@ check('all size transitions keep the original trace bound and plot without leaks
     local oldcap = fftsa.cap
     local n = fftsa.sample_counts[i]
     display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])
-    if not fftsa.options_apply() then return false, fftsa.lasterr end
+    if not fftsa.options_apply() then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
+      return false, fftsa.lasterr
+    end
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
        or dmm.digitize.count ~= n or fftsa.cap.cap ~= n * 4
-       or fftsa.sg_buf.cap ~= fftsa.sg_maxpts + 16 or OBJ[graph0].buffer ~= graphbuf0
+       or fftsa.sg_buf.capacity ~= fftsa.sg_maxpts
+       or fftsa.sg_back ~= nil
+       or OBJ[graph0].buffer ~= graphbuf0
        or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
        or OBJ[graph0].adds ~= adds0 or OBJ[graph0].removes ~= removes0
        or live() ~= objects0 or livebufs() ~= buffers0
        or fftsa.busy_max < 2.0
        or fftsa.busy_max < 3.0 * fftsa.frame_estimate(n) - 1e-9
-    then return false, 'wrong size or leaked resource at N=' .. n end
+    then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
+      return false, string.format('N=%d: same buffer=%s spare=%s adds %s/%s'
+                                  .. ' objs %d/%d bufs %d/%d', n,
+                                  tostring(fftsa.sg_buf == graphbuf0),
+                                  tostring(fftsa.sg_back),
+                                  tostring(OBJ[graph0].adds), tostring(adds0),
+                                  live(), objects0, livebufs(), buffers0)
+    end
     if oldcap ~= fftsa.cap and oldcap.alive then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
       return false, 'old buffer still alive at N=' .. n
     end
     fftsa.frame()
     local kmin, kmax = fftsa.sg_window_bins(n / 2, fftsa.binhz)
-    local npts = kmax - kmin + 1
-    -- Below the column cap every bin is a point; above it, one or two a column.
-    local want, lim = npts, npts
-    if npts > fftsa.sg_ncol then want, lim = fftsa.sg_ncol, fftsa.sg_maxpts end
-    if fftsa.errrun ~= 0 or fftsa.sg_buf.n < want or fftsa.sg_buf.n > lim then
-      return false, string.format('frame at N=%d: %d points, wanted %d..%d (%s)',
-                                  n, fftsa.sg_buf.n, want, lim, tostring(fftsa.lasterr))
+    -- Exactly the column count, at every sample count.
+    local want = fftsa.sg_ncol
+    if fftsa.errrun ~= 0 or fftsa.sg_buf.n ~= want then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
+      return false, string.format('frame at N=%d: %d points, wanted %d (%s)',
+                                  n, fftsa.sg_buf.n, want, tostring(fftsa.lasterr))
     end
     local bi, bv = fftsa.find_peaks(n / 2, 1)
     local dk = fftsa.peak_interp(bi[1], n / 2)
     if not near((bi[1] - 1 + dk) * fftsa.binhz, SIG.f, 0.1) then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
       return false, 'incorrect peak at N=' .. n
     end
   end
@@ -1620,9 +1744,11 @@ check('a buffer allocation failure halts frames and allows recovery', (function(
          and recovered and not fftsa.halted and fftsa.errrun == 0
          and fftsa.n == 512 and fftsa.sg_nbins == 256
 end)())
+-- The pair is what must survive a sample change, not the identity of whichever one the
+-- graph happens to be showing: a frame alternates them.
 check('sample changes never allocate or replace a graph buffer', (function()
   local buffers0 = livebufs()
-  local graphbuf = fftsa.sg_buf
+  local ring1, ring2 = fftsa.sg_buf, fftsa.sg_back
   display.setvalue(fftsa.opt_n, 2)
   local real, calls = buffer.make, 0
   buffer.make = function(cap, style)
@@ -1636,9 +1762,179 @@ check('sample changes never allocate or replace a graph buffer', (function()
   display.setvalue(fftsa.opt_n, 1)
   local recovered = fftsa.options_apply()
   fftsa.frame()
+  local shown = OBJ[fftsa.sg_graph].buffer
+  local pair = (fftsa.sg_buf == ring1 and fftsa.sg_back == ring2)
+               or (fftsa.sg_buf == ring2 and fftsa.sg_back == ring1)
   return ok and allocations == 1 and recovered and not fftsa.halted and fftsa.errrun == 0
-         and livebufs() == buffers0 and OBJ[fftsa.sg_graph].buffer == graphbuf
-         and fftsa.sg_buf == graphbuf
+         and livebufs() == buffers0 and pair
+         and (shown == ring1 or shown == ring2) and shown == fftsa.sg_buf,
+         string.format('allocs=%d pair=%s shown-is-a-ring=%s bufs %d/%d',
+                       allocations, tostring(pair),
+                       tostring(shown == ring1 or shown == ring2),
+                       livebufs(), buffers0)
+end)())
+
+-- The two rings are made when the app starts and freed when it ends, with nothing
+-- created or deleted in between. Hooked at both calls rather than compared by count,
+-- because a make paired with a delete leaves livebufs() unchanged and would pass a
+-- count unnoticed -- which is how the 61-live-buffer leak got as far as the glass.
+check('the trace buffer is never allocated or freed while the app runs', (function()
+  local ring1 = fftsa.sg_buf
+  if ring1 == nil then return false, 'no trace buffer at the start' end
+  local realmake, realdel = buffer.make, buffer.delete
+  local madefull, freed = 0, 0
+  buffer.make = function(cap, style)
+    if style == buffer.STYLE_WRITABLE_FULL then madefull = madefull + 1 end
+    return realmake(cap, style)
+  end
+  buffer.delete = function(b)
+    if b == ring1 then freed = freed + 1 end
+    return realdel(b)
+  end
+  local i, err
+  for i = 1, table.getn(fftsa.sample_counts) do
+    display.setvalue(fftsa.opt_n, i)
+    if not fftsa.options_apply() then err = fftsa.lasterr end
+    fftsa.frame()
+    fftsa.frame()
+  end
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  buffer.make, buffer.delete = realmake, realdel
+  if err ~= nil then return false, tostring(err) end
+  return madefull == 0 and freed == 0 and ring1.alive
+         and fftsa.sg_buf == ring1 and fftsa.sg_back == nil
+         and ring1.capacity == fftsa.sg_maxpts,
+         string.format('made %d freed %d, alive %s, capacity %d of %d',
+                       madefull, freed, tostring(ring1.alive),
+                       ring1.capacity, fftsa.sg_maxpts)
+end)())
+
+-- The X axis is PINNED, and an auto method is a regression rather than an improvement.
+-- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
+-- notice new writes -- but it derives the range from the buffer's own timestamps, and
+-- the buffer is a ring whose startindex sweeps across it during the fill. A paint
+-- landing mid-fill computes a different range, so the axis walks and the trace slides
+-- left and right as though its point count were changing. Measured on the glass twice.
+-- Both halves are asserted: the method, and that the limits really are the span.
+check('the X axis is pinned to the visible span, not auto-ranged', (function()
+  fftsa.sg_pin_x()
+  local o = OBJ[fftsa.sg_graph]
+  local s = fftsa.sg_fscale
+  return o.xmethod == display.XSCALE_OFF
+         and near(o.xmin, fftsa.sg_flo_hz / s, 1e-9)
+         and near(o.xmax, fftsa.sg_fhi_hz / s, 1e-9),
+         string.format('method %s (auto would be %s), pinned %g..%g of %g..%g',
+                       tostring(o.xmethod), tostring(display.XSCALE_ALL),
+                       o.xmin, o.xmax, fftsa.sg_flo_hz / s, fftsa.sg_fhi_hz / s)
+end)())
+
+-- The trace buffers are FILL_ONCE, and that is a deliberate choice rather than a
+-- default left alone. FILL_CONTINUOUS works exactly as its documentation says -- it was
+-- measured accepting the mode, wrapping with no event, pinning n at capacity and
+-- returning startindex to 1 -- and the widget still draws a continuous-fill buffer as a
+-- wrapping trace, joining its newest point back to its oldest: a straight line across
+-- the whole plot. The bound buffer was read four times while that line was on the glass
+-- and was aligned every time, so the line is the fill mode and not a rotation.
+--
+-- The 0.05 s tick is a cliff, and the old code fell off it by half a millisecond: the
+-- occupancy divide turned an 80.4 ms frame into 100.5 ms, which rounds up to three ticks
+-- rather than two -- 0.15 s and 6.7 fps where 0.10 and 10 were available. Pinned at the
+-- boundary in both directions so the rounding cannot drift unnoticed.
+check('tick_period rounds up to the 0.05 s tick, and the boundary is exact', (function()
+  -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
+  -- 0.1499999999999999944, so == fails on values that are the same tick count.
+  return near(fftsa.tick_period(0.080), 0.10, 1e-9)
+         and near(fftsa.tick_period(0.0804), 0.15, 1e-9)
+         and near(fftsa.tick_period(0.040), 0.05, 1e-9)
+         and near(fftsa.tick_period(0), 0.05, 1e-9),
+         string.format('80 ms -> %.2f, 80.4 -> %.2f, 40 -> %.2f',
+                       fftsa.tick_period(0.080), fftsa.tick_period(0.0804),
+                       fftsa.tick_period(0.040))
+end)())
+
+-- The period is re-armed from frames that actually ran, not from frame_estimate(). The
+-- model is a fit at one point count and one draw path: it predicted 80.4 ms at 512 and
+-- 216 ms at 2048 against 240 measured, so it was setting the frame rate by itself, wrong
+-- in both directions. The mock's frames are far faster than the instrument's, so a
+-- measured period must fall to the 0.05 s floor while the model still asks for 0.15 --
+-- which is also what makes this fail if the re-arm is removed.
+check('the timer period follows measured work, not the model', (function()
+  display.setvalue(fftsa.opt_n, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local modelled = fftsa.period
+  local i
+  for i = 1, 10 do fftsa.frame() end
+  local measured = fftsa.period
+  fftsa.options_apply()
+  return near(modelled, 0.15, 1e-9) and near(measured, 0.05, 1e-9)
+         and measured < modelled,
+         string.format('model armed %.2f, measurement armed %.2f', modelled, measured)
+end)())
+
+check('the trace buffer is FILL_ONCE, never a ring', (function()
+  display.setvalue(fftsa.opt_n, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  return fftsa.sg_buf.fillmode == buffer.FILL_ONCE
+         and buffer.FILL_ONCE ~= buffer.FILL_CONTINUOUS,
+         string.format('fillmode=%s, continuous would be %s',
+                       tostring(fftsa.sg_buf.fillmode),
+                       tostring(buffer.FILL_CONTINUOUS))
+end)())
+
+-- sg_ncol is a live knob, and changing it must not touch the allocation: the buffers
+-- stay at the 680 they were made with and the frame simply writes fewer points. This is
+-- what lets the point count be traded against the frame rate from the socket instead of
+-- by reinstalling, so it is asserted rather than assumed.
+check('the point count can be changed without reallocating anything', (function()
+  local keep = fftsa.sg_ncol
+  local ring1 = fftsa.sg_buf
+  local bufs0 = livebufs()
+  local made = 0
+  local realmake = buffer.make
+  buffer.make = function(cap, style)
+    if style == buffer.STYLE_WRITABLE_FULL then made = made + 1 end
+    return realmake(cap, style)
+  end
+  fftsa.sg_ncol = 340
+  fftsa.frame()
+  local at340 = fftsa.sg_buf.n
+  fftsa.sg_ncol = keep
+  fftsa.frame()
+  local back = fftsa.sg_buf.n
+  buffer.make = realmake
+  return at340 == 340 and back == keep and made == 0
+         and fftsa.sg_buf == ring1 and livebufs() == bufs0
+         and ring1.capacity == fftsa.sg_maxpts,
+         string.format('340 -> %d points, %d -> %d, allocations %d, capacity %d',
+                       at340, keep, back, made, ring1.capacity)
+end)())
+
+-- THE WINDOW. The trace buffer is bound for the life of the app and refilled in place,
+-- so it sits at n = 0 from the clear to the last write and a paint landing there draws a
+-- blank or partial trace. Nothing can remove that window -- the firmware needs the clear
+-- before a FILL_ONCE buffer can be rewritten, and the alternative, filling a spare and
+-- handing it over, needs a removeall that repaints the axis labels every frame.
+--
+-- So the window is made as narrow as possible: every value is computed into preallocated
+-- arrays BEFORE the clear, leaving only buffer.write.reading inside it. A point costs
+-- about 109 us to produce and 51.6 of that is the write, so this is better than half.
+--
+-- Counting writes cannot see this -- the interleaved design also wrote only after the
+-- clear. Counting the dB conversions can: staged, every log10 happens first.
+check('the refill stages every value before clearing, so only writes are in the window',
+      (function()
+  local buf = fftsa.sg_buf
+  local w0 = WRITES
+  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
+  local staged_after = LOG10S - LOG10_AT_CLEAR
+  local wrote_before = CLEAR_AT_WRITES - w0
+  local wrote_after  = WRITES - CLEAR_AT_WRITES
+  return staged_after == 0 and wrote_before == 0
+         and wrote_after == fftsa.sg_nwrote and buf.n == fftsa.sg_nwrote,
+         string.format('%d dB conversions inside the window, %d writes before the clear,'
+                       .. ' %d after, n %d of %d', staged_after, wrote_before,
+                       wrote_after, buf.n, fftsa.sg_nwrote)
 end)())
 
 -- ---------- the merge's own regressions, each failable by reverting one line ----------
@@ -1703,25 +1999,32 @@ check('a raise while reading the form commits no part of the span', (function()
                        fhi0, fftsa.fhi)
 end)())
 
--- F2. sg_update() clears the buffer before refilling it, so a raise in there left
--- frame()'s rebind adding a trace over an empty buffer -- which binds nothing and
--- never draws again, silently, with the peak table still updating.
-check('a refill that raises leaves the trace recoverable, not blank for good',
-      (function()
+-- F2. The refill clears the bound buffer before rewriting it, so a raise inside it does
+-- empty the buffer -- and frame()'s recovery must NOT re-add a trace over the empty one,
+-- because the firmware binds nothing to an empty buffer and the trace would then never
+-- draw again, silently, with the peak table still updating. Skipping the re-add needs no
+-- recovery: the trace was never removed, and the next good refill draws through the
+-- binding it still has. Both halves are asserted, since a re-add that bound nothing
+-- would leave every other check here looking healthy.
+check('a refill that raises empties the buffer, and the next frame recovers', (function()
+  display.setvalue(fftsa.opt_rng, 3)
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
   fftsa.errrun, fftsa.errcount = 0, 0
   local g = fftsa.sg_graph
+  local adds0 = OBJ[g].adds
   local realwr = buffer.write.reading
   buffer.write.reading = function() error('refill-boom', 0) end
   fftsa.frame()
   buffer.write.reading = realwr
-  -- The premise: the refill really did clear the buffer and then fail in it.
   local emptied = fftsa.sg_buf.n == 0 and fftsa.errrun > 0
-  fftsa.frame()                              -- the first refill that can bind
+  local noadd = OBJ[g].adds == adds0
+  fftsa.frame()
   local bound = (OBJ[g].traces or 0) > 0 and OBJ[g].buffer == fftsa.sg_buf
   fftsa.errrun, fftsa.errcount = 0, 0
-  return emptied and bound and fftsa.sg_buf.n > 0,
-         string.format('emptied=%s bound=%s traces=%s n=%d', tostring(emptied),
-                       tostring(bound), tostring(OBJ[g].traces), fftsa.sg_buf.n)
+  return emptied and noadd and bound and fftsa.sg_buf.n > 0,
+         string.format('emptied=%s re-added=%s bound=%s n=%d', tostring(emptied),
+                       tostring(not noadd), tostring(bound), fftsa.sg_buf.n)
 end)())
 
 -- F8. Three quarters of the preview tracked the edit and the window label did not.
@@ -1789,14 +2092,32 @@ end)())
 
 -- The default must be untouched: fewer bins in the span than columns, so every bin
 -- is still its own point and the shipped appearance does not change.
-check('the default sample count does not decimate at all', (function()
+-- At the default the span holds fewer bins than there are columns, so no bin can be
+-- skipped: every one lands in at least one column. That is the resolution guarantee
+-- the old 'does not decimate' check was really making.
+check('the default skips no bin in the span', (function()
+  display.setvalue(fftsa.opt_rng, 3)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
   fftsa.frame()
-  local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, fftsa.binhz)
+  local nb = fftsa.sg_nbins
+  local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
   local npts = kmax - kmin + 1
-  return npts <= fftsa.sg_ncol and fftsa.sg_buf.n == npts,
-         string.format('%d bins in span, %d points written', npts, fftsa.sg_buf.n)
+  local ncol = fftsa.sg_ncol
+  local seen = {}
+  local c
+  for c = 0, ncol - 1 do
+    local a = kmin + math.floor(c * npts / ncol)
+    seen[a] = true
+  end
+  local missing = 0
+  local k
+  for k = kmin, kmax do
+    if seen[k] == nil then missing = missing + 1 end
+  end
+  return npts <= ncol and missing == 0 and fftsa.sg_buf.n == ncol,
+         string.format('%d bins over %d columns, %d skipped, %d written',
+                       npts, ncol, missing, fftsa.sg_buf.n)
 end)())
 
 -- The point of max-per-column: a tone in any bin reaches the trace. Stride sampling
@@ -1819,11 +2140,16 @@ check('a tone survives decimation whatever bin it lands in', (function()
       fftsa.sg_update(nb, fftsa.binhz)
       pwr[k] = 1e-18
       local want = (k - 1) * fftsa.binhz
+      -- Within one column: the trace carries each column's own frequency, so a tone is
+      -- drawn at its column rather than its bin. What must survive is the LEVEL --
+      -- taking the column maximum is what guarantees a narrow tone is not dropped.
+      local tol = 1.5 * fftsa.binhz * (kmax - kmin + 1) / fftsa.sg_ncol
+      if tol < 1.5 * fftsa.binhz then tol = 1.5 * fftsa.binhz end
       local hit = false
       local q
       for q = 1, fftsa.sg_buf.n do
         if fftsa.sg_buf.readings[q] > -10
-           and math.abs(fftsa.sg_buf.extra[q] - want) < 1e-6 then hit = true end
+           and math.abs(fftsa.sg_buf.extra[q] - want) < tol then hit = true end
       end
       tried = tried + 1
       if hit then found = found + 1 elseif missed < 0 then missed = k end
@@ -1838,26 +2164,101 @@ check('a tone survives decimation whatever bin it lands in', (function()
 end)())
 
 -- The floor reads as a band, not as its upper envelope: min and max both present.
-check('decimated columns carry a min as well as a max', (function()
-  display.setvalue(fftsa.opt_n, 6)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  fftsa.frame()
-  local n = fftsa.sg_buf.n
-  local spread = 0
-  local q
-  for q = 2, n do
-    local d = fftsa.sg_buf.readings[q] - fftsa.sg_buf.readings[q-1]
-    if d > spread then spread = d end
+-- The guarantee, swept over every sample count AND a range of spans: the widget is
+-- never handed more segments than the budget, whatever the column arithmetic does.
+check('the widget never gets more than the point budget, any size or span', (function()
+  local spans = {{10, 50000}, {10, 1000}, {1000, 2000}, {1999, 2000},
+                 {10, 500000}, {100000, 500000}, {10, 100}}
+  local worst, worstat = 0, ''
+  local i, j
+  for i = 1, table.getn(fftsa.sample_counts) do
+    for j = 1, table.getn(spans) do
+      display.setvalue(fftsa.opt_rng, 3)
+      display.setvalue(fftsa.opt_flo, spans[j][1])
+      display.setvalue(fftsa.opt_fhi, spans[j][2])
+      display.setvalue(fftsa.opt_n, i)
+      if not fftsa.options_apply() then return false, fftsa.lasterr end
+      fftsa.frame()
+      local n = fftsa.sg_buf.n
+      if n > worst then
+        worst = n
+        worstat = string.format('N=%d span %g-%g', fftsa.sample_counts[i],
+                                spans[j][1], spans[j][2])
+      end
+      if n > fftsa.sg_maxpts then
+        return false, string.format('%s wrote %d > budget %d', worstat, n,
+                                    fftsa.sg_maxpts)
+      end
+      -- The old 512 ceiling was a guess at what the widget could take. The plotted
+      -- area is 680 px, measured off a capture, so the budget is the column count and
+      -- 680 (one point per pixel) is the top of the range worth trying.
+      if n > 680 then
+        return false, string.format('%s wrote %d > one point per pixel', worstat, n)
+      end
+      if fftsa.sg_nwrote ~= n then
+        return false, string.format('%s counted %d but buffer holds %d', worstat,
+                                    fftsa.sg_nwrote, n)
+      end
+    end
   end
-  local pts = n
+  display.setvalue(fftsa.opt_flo, 10)
+  display.setvalue(fftsa.opt_fhi, 50000)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
-  return pts > fftsa.sg_ncol and pts <= fftsa.sg_maxpts,
-         string.format('%d points for %d columns, worst step %.1f dB', pts,
-                       fftsa.sg_ncol, spread)
+  return worst <= fftsa.sg_maxpts and worst <= 680,
+         string.format('worst %d of budget %d at %s, over %d configurations', worst,
+                       fftsa.sg_maxpts, worstat,
+                       table.getn(fftsa.sample_counts) * table.getn(spans))
 end)())
 
--- Frequencies must never go backwards: the graph plots x from the timestamp field.
+-- The budget must also hold if the column arithmetic is wrong, so it is enforced by a
+-- counter rather than inferred: raise ncol past the budget and the budget still wins.
+-- sg_ncol is settable while the app runs, so a value past capacity has to be CLAMPED,
+-- not merely survived. The frame completing is the assertion that matters: writing one
+-- point past a FILL_ONCE buffer is event 4915, a modal dialog, and a dialog per frame
+-- is as impossible to exit as one per point. Checking the bound buffer's n alone cannot
+-- see this -- an overrun raises while the SPARE is being filled, so the bound buffer is
+-- left whole at 680 and the old form of this check passed with the clamp deleted.
+check('a column count past capacity is clamped, not refused', (function()
+  local keep = fftsa.sg_ncol
+  fftsa.sg_ncol = 4096
+  display.setvalue(fftsa.opt_n, 6)
+  fftsa.options_apply()
+  fftsa.errrun, fftsa.errcount = 0, 0
+  fftsa.frame()
+  local failed, err = fftsa.errrun, fftsa.lasterr
+  local wrote = fftsa.sg_nwrote
+  local n = fftsa.sg_buf.n
+  fftsa.sg_ncol = keep
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  fftsa.errrun, fftsa.errcount = 0, 0
+  return failed == 0 and wrote == 680 and n <= fftsa.sg_maxpts and n <= 680,
+         string.format('ncol=4096 wrote %s points, n=%d, budget %d, errrun %d (%s)',
+                       tostring(wrote), n, fftsa.sg_maxpts, failed, tostring(err))
+end)())
+
+-- Repeated refills rewrite the SAME buffer, with the trace never detached and never
+-- re-added. Over three frames, because a design that rebound on alternate frames would
+-- satisfy a single-frame check while flickering the axes every other frame on the glass.
+check('repeated refills rewrite the same buffer, with no rebinding', (function()
+  display.setvalue(fftsa.opt_rng, 3)
+  display.setvalue(fftsa.opt_n, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.frame()
+  local buf = fftsa.sg_buf
+  local o = OBJ[fftsa.sg_graph]
+  local adds, removes = (o.adds or 0), (o.removes or 0)
+  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
+  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
+  return fftsa.sg_buf == buf and fftsa.sg_back == nil
+         and (o.adds or 0) == adds and (o.removes or 0) == removes
+         and o.buffer == buf and buf.n == fftsa.sg_ncol,
+         string.format('same buffer=%s, adds %d/%d, removes %d/%d, n %d of %d',
+                       tostring(fftsa.sg_buf == buf), (o.adds or 0), adds,
+                       (o.removes or 0), removes, buf.n, fftsa.sg_ncol)
+end)())
+
 check('a decimated refill writes no non-monotonic timestamp', (function()
   local i
   local worst = 0
@@ -1865,7 +2266,15 @@ check('a decimated refill writes no non-monotonic timestamp', (function()
   for i = 1, table.getn(fftsa.sample_counts) do
     display.setvalue(fftsa.opt_n, i)
     if not fftsa.options_apply() then return false, fftsa.lasterr end
+    local before = NONMONO
     fftsa.frame()
+    if NONMONO > before then
+      return false, string.format('N=%d produced %d non-monotonic writes'
+                                  .. ' (binhz %g, span %g-%g, cap %d)',
+                                  fftsa.sample_counts[i],
+                                  NONMONO - before, fftsa.binhz, fftsa.sg_flo_hz,
+                                  fftsa.sg_fhi_hz, fftsa.sg_ncol)
+    end
     if fftsa.sg_buf.n > worst then worst = fftsa.sg_buf.n end
   end
   local bad = NONMONO

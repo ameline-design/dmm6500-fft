@@ -193,6 +193,30 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
+  -- A SMALL FIXED YIELD, because the frame no longer owns the display task's whole
+  -- budget. It used to: work equalled the inter-frame interval at every count, so the
+  -- only time the task got was this delay, and a fixed 25 ms meant 250 ms a second at
+  -- 512 samples against 15 at 16384 -- the same constant, thirty times less time. It was
+  -- scaled to a fifth of the frame for that reason.
+  --
+  -- The timer period now leaves 20 % of every frame idle, and Lua is blocked on the
+  -- timer throughout that idle, so the task is scheduled there in proportion to the
+  -- frame as well. Measured at 2048 samples: dropping the yield from 43 ms to 10 and
+  -- then 5 raised idle from 46 % to 54 % and posted no 1706 at either, so the delay is
+  -- no longer what feeds the task -- it is only insurance against a frame whose work
+  -- happens to fill its whole period.
+  fftsa.sg_yield = 0.010
+  -- Re-armed here, not at startup: the period depends on the sample count, and this is
+  -- the one place the count changes. The timer object is replaced, which is a create
+  -- and a delete -- acceptable on a settings change, never in a frame.
+  --
+  -- This arm is from the model. frame() replaces it with one measured from real frames
+  -- as soon as it has eight of them, so the peak is cleared here with the count.
+  fftsa.work_peak, fftsa.work_seen = nil, 0
+  if fftsa.timer ~= nil then
+    fftsa.period = fftsa.frame_period(fftsa.n)
+    fftsa.arm(fftsa.period)
+  end
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   -- Again with the measured rate, which refines binhz and so the bin count the
   -- legend reports for a narrow span.
@@ -234,6 +258,7 @@ end
 fftsa.busy_since = nil
 fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged stuck
 
+
 -- Seconds one frame costs at a given sample count, from costs measured on the
 -- instrument on 2026-10-24 (docs/PERFORMANCE.md): 10.9 us a sample to acquire, 32.0
 -- to load and window, 3.593e-6 per butterfly-equivalent for the transform and its
@@ -259,14 +284,46 @@ function fftsa.frame()
   end
   fftsa.busy_since = os.clock()
   fftsa.busy = true
+  -- Timed, because the timer period is set from what a frame actually costs.
+  local entry = os.clock()
   local ok, err = pcall(fftsa.frame_body)
+  fftsa.frame_work = os.clock() - entry
+  -- RE-ARM FROM MEASURED WORK. frame_estimate() is a model fitted at one point count and
+  -- one draw path, and it was setting the frame rate on its own: at 512 it predicted
+  -- 80.4 ms, which divided by the 0.8 occupancy is 100.5 ms -- half a millisecond past
+  -- the 0.10 s tick, so the period came out 0.15 and the rate 6.7 fps where the frame
+  -- needed 0.10 and 10. At 2048 it errs the other way, 216 ms against 240 measured.
+  --
+  -- The peak over a window of frames, not the mean: the period has to cover the slowest
+  -- frame or ticks are dropped and the rate halves. It is only ever raised by a whole
+  -- tick and only re-armed when the tick count actually changes, so a frame that runs
+  -- long once does not re-arm the timer every frame afterwards.
+  if ok then
+    if fftsa.work_peak == nil or fftsa.frame_work > fftsa.work_peak then
+      fftsa.work_peak = fftsa.frame_work
+    end
+    fftsa.work_seen = (fftsa.work_seen or 0) + 1
+    if fftsa.work_seen >= 8 and fftsa.timer ~= nil then
+      local want = fftsa.tick_period(fftsa.work_peak)
+      if want ~= fftsa.period then
+        fftsa.period = want
+        fftsa.arm(want)
+      end
+      -- Decay the peak so a size change downwards is noticed: it is re-earned over the
+      -- next window rather than remembered for the life of the app.
+      fftsa.work_peak = fftsa.frame_work
+      fftsa.work_seen = 0
+    end
+  end
   if not ok then
-    -- Re-bind the trace after a failure so the graph is never left without one -- but
-    -- only while the buffer still holds points. sg_update() clears it before the
-    -- refill, so a raise in there would have this remove the trace and then add one
-    -- over an empty buffer, which binds nothing and never draws again. Skipping it
-    -- there needs no recovery: the trace was never removed, and the next refill draws
-    -- through the binding it still has.
+    -- Re-bind the trace after a failure so the graph is never left without one, and only
+    -- while the bound buffer still holds points: adding over an empty one binds nothing
+    -- and never draws again.
+    --
+    -- The guard is cheap insurance rather than a live case now. sg_update() clears and
+    -- fills the SPARE, so a raise in there leaves the bound buffer whole and still
+    -- bound, and the only buffer that can be left part filled is one nothing draws
+    -- from -- the next frame clears it before writing anyway.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
       pcall(function() fftsa.sg_rebind() end)
     end
@@ -571,9 +628,10 @@ end
 function fftsa.build()
   fftsa.loading_build()
   fftsa.loading_front()
-  -- Keep the graph and its backing buffer bound for the whole app lifetime. One
-  -- fixed size serves every sample count, since the trace is capped at sg_maxpts.
-  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2)
+  -- Two trace buffers at sg_maxpts, for the life of the app: allocated at the CEILING
+  -- rather than at sg_ncol so the point count stays adjustable upwards while running
+  -- without anything being resized or reallocated.
+  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
   -- The button died with the screen fftsa.sg_build() just destroyed: clear the
   -- stale handle, do not delete it.
   fftsa.optbtn = nil
@@ -588,6 +646,40 @@ end
 -- tick that lands during a frame is dropped, so the displayed rate is quantised;
 -- docs/PERFORMANCE.md has the model. One frame per tick: back-to-back frames keep
 -- the interpreter out of its event loop.
+-- The period a frame needs, with interpreter idle left over.
+--
+-- delay() lets the display task PAINT -- that is C -- but dispatching a touch means
+-- evaluating Lua, and the interpreter is inside the delay. So a press is only handled
+-- in the gap between a frame finishing and the next tick, and with the period left at
+-- the 0.05 s floor that gap is whatever the quantisation happens to leave: 45 ms of
+-- 150 at 512 samples, and 12 ms of 500 at 4096, which made Options unreachable there
+-- while 512 was fine. It was luck, not design.
+--
+-- Asking for the work to be 80 % of the period puts the idle at about 20 % at every
+-- count.
+--
+-- frame_estimate() ALREADY INCLUDES THE YIELD. It was fitted against measured frame
+-- times -- 0.080 s predicted against 81.8 ms measured at 512 -- and a measured frame is
+-- the whole frame, delay() and all. Adding sg_yield to it again counted the yield twice
+-- and pushed 512 from 105 ms of apparent busy to 131 ms after the 80 % divide, which is
+-- past the 0.10 s tick: the period came out 0.15 and the rate 6.7 fps where the frame
+-- itself only needed 0.10 and 10 fps. A tick of quantisation lost to double counting.
+-- Seconds of timer period that leave a frame of this length about 20 % idle, rounded up
+-- to the firmware's 0.05 s tick. The one place the occupancy rule lives, so the modelled
+-- first arm and the measured re-arms cannot disagree about it.
+function fftsa.tick_period(busy)
+  if busy == nil or busy <= 0 then return 0.05 end
+  local ticks = math.ceil((busy / 0.8) / 0.05)
+  if ticks < 1 then ticks = 1 end
+  return ticks * 0.05
+end
+
+-- The FIRST arm, before any frame has been timed. From here on frame() re-arms from the
+-- work it actually measures.
+function fftsa.frame_period(n)
+  return fftsa.tick_period(fftsa.frame_estimate(n))
+end
+
 function fftsa.arm(period_s)
   if period_s == nil then period_s = 0.05 end
   if fftsa.timer ~= nil then
@@ -628,7 +720,12 @@ function fftsa.start()
     fftsa.build()
     hooked = fftsa.install_cleanup()
     fftsa.apply()
-    fftsa.arm()
+    -- With the computed period, not the 0.05 s floor: apply() re-arms on a size change
+    -- but cannot do it here, because the timer is created after the first apply() runs.
+    -- Left at the floor, the default size kept whatever idle the quantisation happened
+    -- to leave -- which is the whole fault this period exists to remove.
+    fftsa.period = fftsa.frame_period(fftsa.n)
+    fftsa.arm(fftsa.period)
   end)
   if not ok then
     fftsa.lasterr = tostring(err)

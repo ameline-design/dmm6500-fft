@@ -66,7 +66,10 @@ end
 -- is a candidate whatever kmin says. The trace still draws them.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
-  local bi, bv = {}, {}
+  -- Reused, not rebuilt: two tables a frame was the only allocation left in the frame
+  -- path, and the house rule is to allocate once. Callers read them immediately.
+  if fftsa.pk_bi == nil then fftsa.pk_bi, fftsa.pk_bv = {}, {} end
+  local bi, bv = fftsa.pk_bi, fftsa.pk_bv
   for s = 1, count do bi[s] = 0; bv[s] = -1 end
   local k0 = 2 + (fftsa.fft_kdc or 0)
   if kmin == nil or kmin < k0 then kmin = k0 end
