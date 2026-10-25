@@ -339,7 +339,19 @@ function buffer.unit(u, label)
   end
   CUSTOM_UNITS[u] = t
 end
-function buffer.make(cap, style) return newbuf(cap) end
+-- REFUSES AN UNDERSIZED BUFFER, like the firmware: "capacity must be between 10 and
+-- 5311488 readings", event 4920, and make() then RETURNS NIL rather than raising. A mock
+-- that accepted any capacity is how a 6-reading marker buffer reached the instrument,
+-- where it was refused and every call on the nil handle took a 1138.
+BUF_MIN, BUF_MAX = 10, 5311488
+REFUSED_BUF_MAKES = 0
+function buffer.make(cap, style)
+  if cap == nil or cap < BUF_MIN or cap > BUF_MAX then
+    REFUSED_BUF_MAKES = REFUSED_BUF_MAKES + 1
+    return nil
+  end
+  return newbuf(cap)
+end
 -- REFUSES BY POSTING, like the firmware, rather than raising: a raising mock would have
 -- the suite testing a failure mode the instrument does not have. The refusals are counted
 -- instead, and a refused delete leaves the buffer ALIVE -- which is what made 61 live
@@ -1159,16 +1171,25 @@ check('markers off binds one trace and draws a line', (function()
                        tostring(o.drawstyle))
 end)())
 -- The marker buffer is made with the trace buffer whether or not markers are on, because
--- making it when the option is set would be an allocation while frames are running.
-check('the marker buffer exists at the peak count even with markers off', (function()
+-- making it when the option is set would be an allocation while frames are running. Its
+-- capacity is the peak count RAISED TO THE FIRMWARE'S FLOOR of 10 readings: at six the
+-- make is refused with event 4920 and answers nil, which is a marker trace that cannot
+-- exist and five 1138s from the calls that follow.
+check('the marker buffer exists and clears the firmware capacity floor', (function()
+  local want = fftsa.sg_npeak
+  if want < fftsa.sg_bufmin then want = fftsa.sg_bufmin end
   return fftsa.sg_mk ~= nil and fftsa.sg_mk.alive
-         and fftsa.sg_mk.capacity == fftsa.sg_npeak
+         and fftsa.sg_mk.capacity == want and want >= BUF_MIN
          and fftsa.sg_mk ~= fftsa.sg_buf,
-         string.format('capacity %s of %d, alive %s',
+         string.format('capacity %s, wanted %d, floor %d, alive %s',
                        tostring(fftsa.sg_mk ~= nil and fftsa.sg_mk.capacity),
-                       fftsa.sg_npeak,
+                       want, BUF_MIN,
                        tostring(fftsa.sg_mk ~= nil and fftsa.sg_mk.alive))
 end)())
+-- And nothing anywhere in a build is refused for size: a refused make answers nil, and
+-- every call on that nil is a dialog the operator has to dismiss.
+check('no buffer the app asks for is refused for its size', REFUSED_BUF_MAKES == 0,
+      'refused makes: ' .. REFUSED_BUF_MAKES)
 check('a frame writes nothing to the marker buffer while markers are off', (function()
   local before = WRITES
   local n = fftsa.sg_update_markers(fftsa.pk_bi, fftsa.pk_bv, fftsa.sg_npeak, fftsa.binhz)

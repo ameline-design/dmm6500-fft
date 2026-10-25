@@ -48,6 +48,11 @@ fftsa.sg_ncol    = 255
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
 fftsa.sg_markers = false
 fftsa.sg_mk_size = 4       -- marker radius; 1 is the built-in glyph, 2..5 are circles
+-- The firmware's floor on a reading buffer: "capacity must be between 10 and 5311488
+-- readings", event 4920. Six peaks is under it, and buffer.make then RETURNS NIL -- so the
+-- marker buffer was never created, every call on it took a 1138, and the marker trace drew
+-- nothing. A frame still writes only the peaks it found; n follows the writes.
+fftsa.sg_bufmin  = 10
 fftsa.sg_maxpts  = 680
 
 -- Firmware handles, initialised only on the first load: opening the App again
@@ -248,7 +253,9 @@ function fftsa.sg_make_buffer(nbins, npoints)
     fftsa.del_buf(fftsa.sg_mk)
     fftsa.sg_mk = nil
   end
-  fftsa.sg_mk = fftsa.sg_mkbuf(fftsa.sg_npeak)
+  local mkcap = fftsa.sg_npeak
+  if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
+  fftsa.sg_mk = fftsa.sg_mkbuf(mkcap)
   -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
   -- at the ceiling and never resized: a frame writes slots 1..sg_ncol and reads back the
   -- same, so growing a table mid-frame would allocate inside the window it exists to
