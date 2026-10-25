@@ -38,7 +38,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 
 ## Options
 
-![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath](manual-options.png)
+![The options form: Start Freq, Stop Freq, Input Range and Band-Pass in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom](manual-options.png)
 
 | Field | |
 |---|---|
@@ -48,6 +48,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
 | FFT Samples | 512 (default), 1024, 2048, 4096, 8192 or 16384. More samples give finer bins but take more time and memory. |
+| Band-Pass | Off by default. Filters the capture to the span and decimates to match — see *Band-Pass*. |
 
 The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
 **bin spacing** (`fs / N`) and **acquisition
@@ -157,10 +158,62 @@ the screen said the frequency was not.
 That is why zooming in no longer lowers the sample rate. The span selects which bins are drawn and
 leaves acquisition alone, so a tone outside the view is excluded rather than folded into it.
 
-**Folding above 50 kHz remains**, because it is the missing filter rather than the rate. At the
+**Band-Pass is the one thing that reaches this**, and only partly: it filters digitally, so it can
+remove what the digitizer has sampled honestly but not what the ADC already folded. See the next
+section.
+
+**Folding above 50 kHz remains** with Band-Pass off, because it is the missing filter rather than the
+rate. At the
 default span a 63 kHz tone appears at 37 kHz and an 84 kHz tone at 16 kHz. Two ways to tell an alias
 from a tone: widen the span, and a real tone stays put while an alias moves; or change the signal and
 watch which peak follows.
+
+## Band-Pass
+
+Off by default. On, the capture is low-pass filtered and then decimated to the span, so the transform
+sees only the band on screen. Two things come of that, and which one you get depends on the span.
+
+**A narrow span buys bin width.** The bin becomes the acquisition rate divided by the number of
+samples actually taken, so a span the filter can decimate hard reaches a resolution that would
+otherwise need a much longer transform. At 512 samples:
+
+| Stop | rate | decimation | taps | bin | bin with it off |
+|---|---|---|---|---|---|
+| 50 kHz | 500 kS/s | /3 | 51 | 325.52 Hz | 195.31 Hz |
+| 20 kHz | 200 kS/s | /3 | 51 | 130.21 Hz | 195.31 Hz |
+| 10 kHz | 100 kS/s | /3 | 51 | 65.10 Hz | 195.31 Hz |
+| 2 kHz | 100 kS/s | /7 | 65 | 27.90 Hz | 195.31 Hz |
+
+**A wide span buys an honest spectrum instead**, and costs resolution to do it. At 50 kHz nothing can
+be decimated at 100 kS/s, so the rate goes up to 500 kS/s — where content from 50 to 250 kHz is
+filtered out rather than folded in — and the bin comes out coarser than it would unfiltered. That is
+the trade: 325 Hz bins with nothing folded in, against 195 Hz bins with everything above 50 kHz
+folded on top.
+
+The readback line says which regime you are in. `BP:On /3` means the filter is in the path at a
+decimation of three. `BP:On` with a reason in brackets means it is not:
+
+| | |
+|---|---|
+| span too wide | No rate the hardware has leaves room to decimate this span. |
+| too many samples | The record needed is past the read budget — 4096 samples and up, whatever the span. |
+| filter will not fit | The transition that decimation leaves would need more taps than the ceiling. |
+
+**`fs` on the readback line is always the digitizer's rate**, never the decimated one. At `BP:On /3`
+and 200 kS/s the transform is seeing 66.667 kS/s, but the hardware is not running below its 100 kS/s
+floor and never does. The bin width and the record length are the decimated figures.
+
+It costs frame time: the filter reads several times as many samples and does one multiply-accumulate
+per tap per output. At a 2 kHz span and 512 samples that is an estimated 0.4 s a frame against 0.08 s.
+
+The filter is a Hamming-windowed sinc, cut off halfway between the span top and the decimated
+Nyquist, with taps sized from that transition. Measured through the real taps at a 20 kHz span: flat
+to **0.02 dB** across the span and **61 dB** down above the Nyquist.
+
+## About
+
+**About**, bottom left of the Options form, names the author and carries the MIT licence over two
+pages with **PgUp** and **PgDn**. **Back** returns to the form.
 
 ## How many points the trace carries
 
