@@ -1157,11 +1157,16 @@ check('band-pass on narrows the bin by the decimation', (function()
 end)())
 
 print('\npeak markers (real code)')
--- Off by default, and off means ONE trace drawn as a line: the marker buffer exists but
--- is not bound, so drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
+-- NOT OFFERED IN THE FORM YET, so these drive fftsa.sg_markers directly: the field is
+-- withheld until the second trace can be pinned, and setvalue on its nil handle raises.
+-- The machinery stays tested so it does not rot while it waits.
+check('the form does not offer peak markers', fftsa.opt_mk == nil
+      and fftsa.sg_markers == false,
+      'opt_mk=' .. tostring(fftsa.opt_mk) .. ' markers=' .. tostring(fftsa.sg_markers))
+-- Off means ONE trace drawn as a line: the marker buffer exists but is not bound, so
+-- drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
 check('markers off binds one trace and draws a line', (function()
-  display.setvalue(fftsa.opt_mk, 1)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.sg_markers = false
   fftsa.sg_bind()
   local o = OBJ[fftsa.sg_graph]
   return fftsa.sg_markers == false and o.traces == 1
@@ -1200,8 +1205,8 @@ end)())
 -- the right buffer -- the spectrum at 1, where the glyph is lost under its own line, and
 -- the markers at sg_mk_size.
 check('markers on bind a second trace and size the marker one', (function()
-  display.setvalue(fftsa.opt_mk, 2)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.sg_markers = true
+  fftsa.sg_bind()
   local o = OBJ[fftsa.sg_graph]
   local two = o.buffers ~= nil and table.getn(o.buffers) == 2
   local order = two and o.buffers[1] == fftsa.sg_buf and o.buffers[2] == fftsa.sg_mk
@@ -1224,8 +1229,8 @@ end)())
 -- landed nowhere near the spectrum, with nothing refused and nothing logged. Every trace
 -- has to come out pinned to the same limits.
 check('every bound trace is pinned to the same dB range and span', (function()
-  display.setvalue(fftsa.opt_mk, 2)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.sg_markers = true
+  fftsa.sg_bind()
   local o = OBJ[fftsa.sg_graph]
   if o.buffers == nil or table.getn(o.buffers) ~= 2 then
     return false, 'expected two traces, got ' .. tostring(o.buffers and
@@ -1343,8 +1348,8 @@ check('the marker refill happens before the trace refill', (function()
          table.concat(order, ' then ')
 end)())
 check('switching markers off again leaves one trace and a line', (function()
-  display.setvalue(fftsa.opt_mk, 1)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.sg_markers = false
+  fftsa.sg_bind()
   local o = OBJ[fftsa.sg_graph]
   return fftsa.sg_markers == false and o.traces == 1
          and o.drawstyle == display.STYLE_LINE,
@@ -1893,7 +1898,7 @@ end)())
 check('the first four fields are in column one at opt_x', (function()
   local x = fftsa.opt_x
   return obj_at(fftsa.opt_flo).x == x and obj_at(fftsa.opt_fhi).x == x
-         and obj_at(fftsa.opt_rng).x == x
+         and obj_at(fftsa.opt_rng).x == x and obj_at(fftsa.opt_bp).x == x
 end)(), 'x=' .. tostring(obj_at(fftsa.opt_flo).x))
 check('the window and sample fields are in column two at opt_x_c2', (function()
   local x = fftsa.opt_x_c2
@@ -1903,7 +1908,7 @@ end)(), 'x=' .. tostring(obj_at(fftsa.opt_win).x))
 check('each column runs top to bottom at the layout pitch', (function()
   return obj_at(fftsa.opt_fhi).y - obj_at(fftsa.opt_flo).y == pitch
          and obj_at(fftsa.opt_rng).y - obj_at(fftsa.opt_fhi).y == pitch
-         and obj_at(fftsa.opt_mk).y - obj_at(fftsa.opt_rng).y == pitch
+         and obj_at(fftsa.opt_bp).y - obj_at(fftsa.opt_rng).y == pitch
          and obj_at(fftsa.opt_beta).y - obj_at(fftsa.opt_win).y == pitch
          and obj_at(fftsa.opt_n).y - obj_at(fftsa.opt_beta).y == pitch
 end)())

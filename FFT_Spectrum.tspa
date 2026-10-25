@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 1.8
+-- $Version: 1.9
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -1920,7 +1920,8 @@ end
 -- and the gap that buys is what makes each box a touch target. display.create takes
 -- no width for an OBJ_EDIT_*, so the second column's x is the one number to check on
 -- the glass. Labels are right-aligned and end at the column x.
-fftsa.opt_nf      = 8
+-- Seven: Peak Markers is withheld. See fftsa.opt_mk below.
+fftsa.opt_nf      = 7
 fftsa.opt_cols    = 2
 fftsa.opt_x       = 185
 fftsa.opt_x_c2    = 552
@@ -2022,10 +2023,18 @@ function fftsa.build_options()
                        "FFT Samples", "resolution vs speed",
                        fftsa.sample_labels[1], fftsa.sample_labels[2], fftsa.sample_labels[3],
                        fftsa.sample_labels[4], fftsa.sample_labels[5], fftsa.sample_labels[6])
-  local x8, y8 = nextpos()
-  fftsa.opt_mk = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x8, y8,
-                       "Peak Markers", "dot on each peak",
-                       fftsa.onoff_labels[1], fftsa.onoff_labels[2])
+  -- PEAK MARKERS IS NOT OFFERED YET, so the eighth field is not created and fftsa.opt_mk
+  -- stays nil. The field reads through fftsa.getval, which answers the fallback for a nil
+  -- handle, so options_apply() sees "off" and nothing binds the marker trace.
+  --
+  -- What is missing is the second trace's scaling. The firmware does not honour a pin
+  -- applied with that trace selected, so its six points are auto-scaled across the whole
+  -- plot and land nowhere near the spectrum. The machinery below it -- the buffer, the
+  -- refill, the binding -- is all in place and tested; only the axes are wrong.
+  --
+  -- The marker form is also settled: NOT dots. drawstyle is per graph, so markers on the
+  -- peak trace put markers on the spectrum too, which is not wanted. The peaks will be
+  -- needles drawn with STYLE_LINE -- floor, peak, floor at a pixel either side.
 
   fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 400, fftsa.opt_info_y, "",
                         56575, display.FONT_SMALL, display.JUST_CENTER)   -- cyan 00DCFF
@@ -2325,7 +2334,6 @@ function fftsa.options()
   fftsa.setval(fftsa.opt_win, fftsa.win_i)
   fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
   fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
-  fftsa.setval(fftsa.opt_mk, fftsa.onoff_to_idx(fftsa.sg_markers))
   fftsa.setval(fftsa.opt_bp, fftsa.onoff_to_idx(fftsa.bp_on))
   -- Guarded like its neighbours: five field reads on handles the pool may have refused,
   -- and changescreen is the next line. Unguarded, a refusal at the end of the create list
