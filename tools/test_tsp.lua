@@ -1156,8 +1156,11 @@ end)())
 -- axis would be labelled in the wrong units, and that is invisible from inside Lua.
 check('the X axis is pinned to the window in hertz, not auto-ranged', (function()
   local lo, hi = display.graph.scalex(fftsa.sg_graph)
-  return near(lo, fftsa.sg_flo_hz, 1e-9) and near(hi, fftsa.sg_fhi_hz, 1e-9)
-end)(), 'pinned to ' .. tostring(fftsa.sg_flo_hz) .. '..' .. tostring(fftsa.sg_fhi_hz))
+  local want_lo = fftsa.sg_flo_hz
+  if fftsa.sg_flo_hz < fftsa.binhz then want_lo = 0 end
+  return near(lo, want_lo, 1e-9) and near(hi, fftsa.sg_fhi_hz, 1e-9),
+         string.format('pinned %g..%g, wanted %g..%g', lo, hi, want_lo, fftsa.sg_fhi_hz)
+end)())
 check('a changed span re-pins in hertz', (function()
   fftsa.sg_set_xrange(8000, 16000)
   local lo, hi = display.graph.scalex(fftsa.sg_graph)
@@ -1723,15 +1726,31 @@ end)())
 -- landing mid-fill computes a different range, so the axis walks and the trace slides
 -- left and right as though its point count were changing. Measured on the glass twice.
 -- Both halves are asserted: the method, and that the limits really are the span.
-check('the X axis is pinned to the visible span, not auto-ranged', (function()
+-- Pinned, never auto-ranged, and the low limit is DC when Start falls inside the first
+-- bin -- which is what gets the firmware's own ticks onto round numbers. Both halves
+-- asserted, because using DC unconditionally would squash a zoomed span into the right
+-- of the plot and nothing else here would notice.
+check('the X axis is pinned, from dc when Start is inside the first bin', (function()
   fftsa.sg_pin_x()
   local o = OBJ[fftsa.sg_graph]
+  local inbin = fftsa.sg_flo_hz < fftsa.binhz
+  local want_lo = fftsa.sg_flo_hz
+  if inbin then want_lo = 0 end
   return o.xmethod == display.XSCALE_OFF
-         and near(o.xmin, fftsa.sg_flo_hz, 1e-9)
-         and near(o.xmax, fftsa.sg_fhi_hz, 1e-9),
-         string.format('method %s (auto would be %s), pinned %g..%g of %g..%g',
-                       tostring(o.xmethod), tostring(display.XSCALE_ALL),
-                       o.xmin, o.xmax, fftsa.sg_flo_hz, fftsa.sg_fhi_hz)
+         and near(o.xmin, want_lo, 1e-9) and near(o.xmax, fftsa.sg_fhi_hz, 1e-9),
+         string.format('Start %g with %g Hz bins -> pinned %g..%g (wanted %g)',
+                       fftsa.sg_flo_hz, fftsa.binhz, o.xmin, o.xmax, want_lo)
+end)())
+check('a zoom well above the first bin keeps its own low limit', (function()
+  local flo0, fhi0 = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  fftsa.sg_set_xrange(8000, 16000)
+  local o = OBJ[fftsa.sg_graph]
+  -- Captured BEFORE the range is put back: reading o in the message would report the
+  -- restored span and print a failure-looking line on a pass.
+  local lo, hi = o.xmin, o.xmax
+  local kept = near(lo, 8000, 1e-9) and near(hi, 16000, 1e-9)
+  fftsa.sg_set_xrange(flo0, fhi0)
+  return kept, string.format('pinned %g..%g, wanted 8000..16000', lo, hi)
 end)())
 
 -- The trace buffers are FILL_ONCE, and that is a deliberate choice rather than a

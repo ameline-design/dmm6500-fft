@@ -825,6 +825,14 @@ function fftsa.sg_pin_x()
   if fftsa.sg_graph == nil then return false end
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if hi > fftsa.sg_fmax_real or hi <= lo then return false end
+  -- START THE AXIS AT DC when the requested Start falls inside the first bin, because
+  -- that bin's own lower edge IS dc and the axis is then labelled in round numbers.
+  -- The firmware steps its ticks from the lower limit, so a 10 Hz Start on a 50 kHz span
+  -- put them at 10, 10010, 20010 Hz and the row read +00.01kHz, +10.01kHz. From 0 it
+  -- reads +00.00kHz, +10.00kHz. Only when Start is below one bin: a real zoom keeps its
+  -- own limits, or the trace would be squashed into the right of the plot.
+  local b = fftsa.binhz
+  if b ~= nil and b > 0 and lo < b then lo = 0 end
   local m = fftsa.sg_xmethod
   if m == nil then m = display.XSCALE_OFF end
   -- IN HERTZ, not scaled. The trace is bound as a numeric x-y plot, X from the reading's
