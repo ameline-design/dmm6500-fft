@@ -1730,16 +1730,37 @@ end)())
 -- bin -- which is what gets the firmware's own ticks onto round numbers. Both halves
 -- asserted, because using DC unconditionally would squash a zoomed span into the right
 -- of the plot and nothing else here would notice.
-check('the X axis is pinned, from dc when Start is inside the first bin', (function()
+check('the X axis is pinned, from dc when the shift is under a pixel', (function()
   fftsa.sg_pin_x()
   local o = OBJ[fftsa.sg_graph]
-  local inbin = fftsa.sg_flo_hz < fftsa.binhz
-  local want_lo = fftsa.sg_flo_hz
-  if inbin then want_lo = 0 end
   return o.xmethod == display.XSCALE_OFF
-         and near(o.xmin, want_lo, 1e-9) and near(o.xmax, fftsa.sg_fhi_hz, 1e-9),
-         string.format('Start %g with %g Hz bins -> pinned %g..%g (wanted %g)',
-                       fftsa.sg_flo_hz, fftsa.binhz, o.xmin, o.xmax, want_lo)
+         and near(o.xmin, 0, 1e-9) and near(o.xmax, fftsa.sg_fhi_hz, 1e-9),
+         string.format('Start %g over a %g Hz span -> pinned %g..%g',
+                       fftsa.sg_flo_hz, fftsa.sg_fhi_hz, o.xmin, o.xmax)
+end)())
+-- The rule is against the PLOT WIDTH, not the bin width, and this is the case that
+-- distinguishes them. Bin width was tried first: 10 Hz sits inside a 195 Hz bin at 512
+-- samples, so the labels came out round there, and does NOT at 16384 where the bins are
+-- 6.1 Hz -- so every size above the default kept the offset. Caught on the glass only.
+check('and from dc at every sample count, not just where Start is inside bin one',
+      (function()
+  local keep = fftsa.n
+  local i, worst
+  for i = 1, table.getn(fftsa.sample_counts) do
+    display.setvalue(fftsa.opt_n, i)
+    if not fftsa.options_apply() then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
+      return false, fftsa.lasterr
+    end
+    local o = OBJ[fftsa.sg_graph]
+    if not near(o.xmin, 0, 1e-9) then
+      worst = string.format('N=%d with %g Hz bins pinned from %g',
+                            fftsa.sample_counts[i], fftsa.binhz, o.xmin)
+    end
+  end
+  display.setvalue(fftsa.opt_n, fftsa.sample_to_idx(keep))
+  fftsa.options_apply()
+  return worst == nil, worst or 'every count pins from dc'
 end)())
 check('a zoom well above the first bin keeps its own low limit', (function()
   local flo0, fhi0 = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
