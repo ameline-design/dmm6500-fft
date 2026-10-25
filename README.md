@@ -4,10 +4,11 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV over a 10 Hz to 50 kHz span at 512 samples, Hann window, with the firmware labelling the axes +020.0dB to -120.0dB and +00.00kHz to +40.00kHz](docs/manual-spectrum.png)
+![The spectrum screen at 16,384 samples: a 12.5 kHz 1.0013 V tone reading 0.0 dBV as a narrow spike, its second and third harmonics resolved as separate lines at 25.000 and 37.500 kHz, over a 10 Hz to 50 kHz span with 6.1 Hz bins. The firmware labels the axes itself, +020.0dB down to -120.0dB and +00.00kHz across to +40.00kHz](docs/manual-spectrum-16384.png)
 
 A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
-and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
+and a touchscreen, which is enough to resolve the second and third harmonics of a 12.5 kHz tone at
+−81.6 and −87.6 dBV — 6.1 Hz bins at 16,384 samples, or 195 Hz bins at 10 frames a second.
 
 `docs/MANUAL.md` is the user manual. Start there to operate it; read on for how it works.
 
@@ -39,6 +40,11 @@ processing and display add overhead. Larger sizes cost update rate, and measurab
 from 0.079 s at 512 samples to 1.686 s at 16,384, and Apply from 0.11 s to 2.89 s, so the trace
 repaints at 10 fps at the default and about every two seconds at the top size. 16,384 is usable
 rather than comfortable. `docs/PERFORMANCE.md` has every size measured.
+
+![The same tone at the default 512 samples: one 195 Hz-wide lump, the harmonics lost in the noise floor, at 10 frames a second](docs/manual-spectrum.png)
+
+The same signal at the default 512 samples, for comparison: 195 Hz bins at 10 frames a second, where
+the harmonics are in the floor. That is the trade Options exists to make.
 
 ## Choosing a window
 
