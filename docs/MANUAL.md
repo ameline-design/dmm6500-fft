@@ -184,7 +184,8 @@ Three consequences, and the first is the point of it:
 
 ![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
 and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
-as a single line near -100 dBV](manual-spectrum-16384.png)
+as a single line near -100 dB. The axes are the firmware's own, +020.0dB to -120.0dB and +00.01kHz to
++40.01kHz](manual-spectrum-16384.png)
 
 Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
 lump and the harmonics are lost in the floor.
