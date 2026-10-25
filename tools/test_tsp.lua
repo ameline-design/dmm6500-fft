@@ -103,7 +103,9 @@ display = {
   YSCALE_SWIM = 3, YSCALE_SHARED = 4, YSCALE_OFF = 5,
   AXIS_NORMAL = 0, AXIS_LOG = 1, STYLE_LINE = 0, STYLE_MARKER = 1, STYLE_BOTH = 2,
   TRACE_ACTIVE = 0, TRACE_ALL = 1, MARKER_LAST_TRACE = 0, MARKER_LAST_CUSTOM = 1,
-  ELEMENT_DATA = 'data', ELEMENT_TIME = 'time', ELEMENT_EXTRA = 2,
+  -- The firmware's own values, from its registration table. They used to be strings
+  -- here, which cannot be compared with ELEMENT_EXTRA and made a mixed-type mock.
+  ELEMENT_DATA = 0, ELEMENT_TIME = 1, ELEMENT_EXTRA = 2, ELEMENT_SOURCE = 2,
   -- Object states. Only these two are modelled, because they are the two the
   -- app uses: STATE_DISABLE and STATE_READONLY are refused on a Graph with
   -- event 1717 on the real firmware, so modelling them would model a bug.
@@ -220,6 +222,10 @@ function display.graph.add(g, ...)
   -- Firmware binds nothing for an empty buffer, even if later frames fill it.
   if arg[1].n == 0 then return end
   OBJ[g].buffer = arg[1]
+  -- Which element each axis is bound to. ELEMENT_TIME makes it the firmware's time plot,
+  -- labelled in seconds with a suffix that cannot be switched off; ELEMENT_EXTRA makes it
+  -- the numeric x-y plot, which the firmware labels in the data's own units.
+  OBJ[g].yelem, OBJ[g].xelem = arg[2], arg[4]
   OBJ[g].traces = (OBJ[g].traces or 0) + 1
 end
 function display.graph.removeall(g)
@@ -1046,32 +1052,20 @@ check('and the failure was counted rather than swallowed', fftsa.errcount == 1,
       'errcount=' .. tostring(fftsa.errcount))
 fftsa.errcount, fftsa.errrun, fftsa.lasterr = 0, 0, nil
 
--- Our own X tick labels, in kHz, below the plot (the firmware's read seconds).
-print('\ncustom axis labels (real code)')
-check('there is an X tick for each end and the divisions between',
-      fftsa.sg_xlab ~= nil and table.getn(fftsa.sg_xlab) == fftsa.sg_nxlab)
-check('X ticks are labelled across the current span',
-      OBJ[fftsa.sg_xlab[1]].text == '0.0 kHz'
-      and OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text == '50.0 kHz',
-      tostring(OBJ[fftsa.sg_xlab[1]].text) .. ' .. '
-      .. tostring(OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text))
+-- The firmware labels the axis itself now. X is bound to the reading's extra field, in
+-- hertz, which makes this its numeric x-y plot rather than a time plot -- so the labels
+-- read +00.00kHz and the app draws no label row of its own. Masking the firmware's row
+-- was tried instead and cannot work: a child inside the graph's rectangle is painted
+-- over by its per-frame repaint.
+print('\nthe firmware labels the axis (real code)')
+check('X is bound to the extra field, not the timestamp',
+      OBJ[fftsa.sg_graph].xelem == display.ELEMENT_EXTRA,
+      'xelem=' .. tostring(OBJ[fftsa.sg_graph].xelem) .. ' time would be '
+      .. tostring(display.ELEMENT_TIME))
+check('no label row is created at all', fftsa.sg_xlab == nil,
+      'sg_xlab=' .. tostring(fftsa.sg_xlab))
 check('the legend names both units', fftsa.sg_xunit_text() == 'X: kHz   Y: dBV',
       fftsa.sg_xunit_text())
--- THE invariant that makes the labels visible at all: anything inside the graph's
--- rectangle is erased by its per-frame repaint, and re-issuing it each frame
--- flickers and floods. So the ticks must sit below the graph and above the peaks.
-check('the X ticks sit BELOW the graph rectangle, where a repaint cannot erase them',
-      fftsa.sg_xlab_y > fftsa.sg_gy + fftsa.sg_gh and fftsa.sg_xlab_y < fftsa.sg_pky,
-      string.format('xlab_y=%d graph bottom=%d peaks start=%d', fftsa.sg_xlab_y,
-                    fftsa.sg_gy + fftsa.sg_gh, fftsa.sg_pky))
--- Geometry must stay in OBJECT coordinates (0..420, below the 49 px title bar).
-check('label geometry is inside the usable object area',
-      fftsa.sg_xlab_y <= 420 and fftsa.sg_px1 <= 799 and fftsa.sg_px0 >= 0,
-      string.format('xlab %d px %d..%d', fftsa.sg_xlab_y, fftsa.sg_px0, fftsa.sg_px1))
-check('the tick row is derived from the graph, so moving the graph moves it',
-      fftsa.sg_xlab_y == fftsa.sg_gy + fftsa.sg_gh + 18,
-      string.format('xlab_y=%d gy=%d gh=%d', fftsa.sg_xlab_y, fftsa.sg_gy,
-                    fftsa.sg_gh))
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
       'gy=' .. fftsa.sg_gy)
 check('the graph and the peak table both fit the panel',
@@ -1151,32 +1145,21 @@ check('a span with almost no bins in it says so in the legend', (function()
          and wide == 'X: kHz   Y: dBV',
          narrow .. ' | wide: ' .. wide
 end)())
-check('the X axis is PINNED to the window, not auto-ranged', (function()
+-- Pinned IN HERTZ, which is what makes the firmware's own labels read as frequency.
+-- Scaled limits would still draw a trace -- the data is in the extra field -- but the
+-- axis would be labelled in the wrong units, and that is invisible from inside Lua.
+check('the X axis is pinned to the window in hertz, not auto-ranged', (function()
   local lo, hi = display.graph.scalex(fftsa.sg_graph)
-  return near(lo, fftsa.sg_flo_hz / fftsa.sg_fscale, 1e-9)
-     and near(hi, fftsa.sg_fhi_hz / fftsa.sg_fscale, 1e-9)
+  return near(lo, fftsa.sg_flo_hz, 1e-9) and near(hi, fftsa.sg_fhi_hz, 1e-9)
 end)(), 'pinned to ' .. tostring(fftsa.sg_flo_hz) .. '..' .. tostring(fftsa.sg_fhi_hz))
--- The optimisation: an unchanged span must cost no display messages at all.
-check('an unchanged span is skipped, not rewritten', fftsa.sg_axis_update() == false)
-check('a changed span relabels', (function()
+check('a changed span re-pins in hertz', (function()
   fftsa.sg_set_xrange(8000, 16000)
-  return OBJ[fftsa.sg_xlab[1]].text == '8.0 kHz'
-     and OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text == '16.0 kHz'
-end)(), tostring(OBJ[fftsa.sg_xlab[1]].text) .. ' .. '
-      .. tostring(OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text))
-check('a narrow span switches the ticks to Hz', (function()
+  local lo, hi = display.graph.scalex(fftsa.sg_graph)
+  local ok1 = near(lo, 8000, 1e-9) and near(hi, 16000, 1e-9)
   fftsa.sg_set_xrange(8000, 8200)
-  return OBJ[fftsa.sg_xlab[1]].text == '8000 Hz'
-     and OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text == '8200 Hz'
-end)(), tostring(OBJ[fftsa.sg_xlab[1]].text) .. ' .. '
-      .. tostring(OBJ[fftsa.sg_xlab[fftsa.sg_nxlab]].text))
--- Re-issuing labels every frame is what flickered and saturated the display
--- processor on hardware, so a refresh must not touch them at all.
-check('a frame refresh costs ZERO label traffic', (function()
-  local before = OBJ[fftsa.sg_xlab[1]].sets or 0
-  fftsa.sg_bind_min()
-  fftsa.sg_bind_min()
-  return (OBJ[fftsa.sg_xlab[1]].sets or 0) == before
+  lo, hi = display.graph.scalex(fftsa.sg_graph)
+  return ok1 and near(lo, 8000, 1e-9) and near(hi, 8200, 1e-9),
+         string.format('narrow pinned to %g..%g', lo, hi)
 end)())
 -- Re-pinning per frame makes the firmware redraw its own axis labels, which shows
 -- as flicker on hardware. The pin survives a re-add, so a refresh must not re-pin.
@@ -1820,13 +1803,12 @@ end)())
 check('the X axis is pinned to the visible span, not auto-ranged', (function()
   fftsa.sg_pin_x()
   local o = OBJ[fftsa.sg_graph]
-  local s = fftsa.sg_fscale
   return o.xmethod == display.XSCALE_OFF
-         and near(o.xmin, fftsa.sg_flo_hz / s, 1e-9)
-         and near(o.xmax, fftsa.sg_fhi_hz / s, 1e-9),
+         and near(o.xmin, fftsa.sg_flo_hz, 1e-9)
+         and near(o.xmax, fftsa.sg_fhi_hz, 1e-9),
          string.format('method %s (auto would be %s), pinned %g..%g of %g..%g',
                        tostring(o.xmethod), tostring(display.XSCALE_ALL),
-                       o.xmin, o.xmax, fftsa.sg_flo_hz / s, fftsa.sg_fhi_hz / s)
+                       o.xmin, o.xmax, fftsa.sg_flo_hz, fftsa.sg_fhi_hz)
 end)())
 
 -- The trace buffers are FILL_ONCE, and that is a deliberate choice rather than a
@@ -2400,7 +2382,7 @@ check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
       and fftsa.opt_n == nil
       and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
-      and fftsa.sg_xlab == nil and fftsa.sg_xlab_txt == nil)
+      and fftsa.sg_xlab == nil)
 check('stop() twice is harmless', pcall(function() fftsa.stop() end))
 check('cleanup() is safe with nothing built', pcall(function() fftsa.cleanup() end))
 

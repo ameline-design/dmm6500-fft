@@ -3,13 +3,19 @@
 -- The graph draws a whole trace from a reading buffer in one repaint, so a frame
 -- is a buffer refill; per-point line objects or setpixel flood the display queue.
 --
--- The graph's X axis is hardwired to time, so each bin's frequency is written into
--- its reading's timestamp, divided by fftsa.sg_fscale, and the time axis reads as
--- frequency: at 1000 a 50 kHz span is 0..50 label-seconds and the firmware's labels
--- read as kHz, with an "s" suffix that cannot be switched off. Our own tick labels
--- in real units sit below the plot (fftsa.sg_axis_update). The scale is the largest
--- decade that keeps the span under 59 label-seconds, above which the firmware's
--- axis rolls into base-60 MM:SS.
+-- X IS THE READING'S EXTRA FIELD, NOT ITS TIMESTAMP, which makes this the firmware's
+-- numeric x-y plot rather than a time plot: the axis takes its limits in real hertz and
+-- the firmware labels them itself, SI prefix and all -- +00.00kHz, +10.00kHz.
+--
+-- The time form was used first and cost a whole row of the screen. The X axis of a time
+-- plot is labelled in seconds with a suffix that cannot be switched off, so the bin's
+-- frequency went into the timestamp divided by a decade scale and the app drew its own
+-- label row underneath in real units. Masking the firmware's row was tried and cannot
+-- work: a child object inside the graph's rectangle is painted over by its per-frame
+-- repaint, proved with a white bar that showed only for the three pixels extending past
+-- the graph's right edge. Binding the extra field instead removes the problem rather
+-- than hiding it, and with it five text objects, their per-span rewrites, and the
+-- scaled-timestamp arithmetic in the inner loop.
 --
 -- Y is dBV computed in Lua, carried in a UNIT_VOLT buffer on a fixed linear axis.
 --
@@ -59,7 +65,6 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_pk_d  = nil     -- per-peak dB text       (own field, fixed x)
   fftsa.sg_xunit = nil     -- axis unit legend
   fftsa.sg_stat  = nil
-  fftsa.sg_xlab  = nil     -- our own X tick labels, in Hz or kHz (table)
   fftsa.sg_handles_inited = true
 end
 
@@ -106,10 +111,14 @@ fftsa.sg_xmethod = display.XSCALE_OFF
 
 -- Geometry on the 800x480 panel, in object coordinates, which start below the
 -- 49-pixel title bar: a child at y=350 lands on panel row 399.
+--
+-- The graph is 20 px taller than it was. It used to stop short to leave a row for the
+-- app's own X labels; the firmware labels the axis itself now, so that row is free and
+-- the plot has it. The peak table still starts 38 px below the graph's bottom edge.
 fftsa.sg_gx      = 8
 fftsa.sg_gy      = 0
 fftsa.sg_gw      = 784
-fftsa.sg_gh      = 292
+fftsa.sg_gh      = 312
 
 -- -120 dBV is the floor because the DMM7510's front end sits 12 to 14 dB below the
 -- DMM6500's, and at -100 its noise floor was off the bottom of the plot.
@@ -117,22 +126,6 @@ fftsa.sg_dbmin   = -120
 fftsa.sg_dbmax   = 20
 fftsa.sg_vfloor  = 1e-9
 
--- Plot-box calibration: the firmware cannot be asked where it drew the box, so the
--- X-axis end pixels come from hardware captures with the axis pinned
--- (display.XSCALE_OFF). Revisit if a firmware update moves the plot box.
-fftsa.sg_px0     = 105     -- x of the X axis minimum
-fftsa.sg_px1     = 785     -- x of the X axis maximum
-
--- Our X ticks sit below the graph rectangle: an object inside it is painted over by
--- the per-frame repaint and never appears. Derived, so moving the graph moves them
--- with it. Only X gets our labels; the firmware's Y numbers are the dB values
--- themselves, with a "V" suffix.
-fftsa.sg_xlab_y  = fftsa.sg_gy + fftsa.sg_gh + 18
--- Labels are JUST_LEFT, so a tick is nudged left by about half a label's width to
--- sit centred on its gridline; the end ticks are pulled in to stay on the panel.
-fftsa.sg_xlab_hw = 26
-fftsa.sg_nxlab   = 5       -- X ticks, endpoints included
-fftsa.sg_axc     = 12632256    -- axis label colour
 -- fftsa.sg_fhi_hz starts at a sentinel meaning "every bin". A span wider than this
 -- is not a plottable axis, so the pin and the labels stay blank until fftsa.apply()
 -- narrows it.
@@ -184,42 +177,14 @@ function fftsa.sg_pin_x()
   if fftsa.sg_graph == nil then return false end
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if hi > fftsa.sg_fmax_real or hi <= lo then return false end
-  local s = fftsa.sg_fscale
   local m = fftsa.sg_xmethod
   if m == nil then m = display.XSCALE_OFF end
-  -- No pcall: the call does not raise, it posts an event, so a wrapper buys nothing and
-  -- costs a closure and a frame per call -- and this one runs every frame.
-  display.graph.scalex(fftsa.sg_graph, m, display.AXIS_NORMAL, lo / s, hi / s)
-  return true
-end
-
-
--- The span sets the precision: two adjacent ticks reading the same number are
--- worse than none. Each tick carries its own unit, since the firmware's row says "s".
-function fftsa.sg_flabel(f, span)
-  if span >= 1000 then return string.format("%.1f kHz", f / 1000) end
-  return string.format("%.0f Hz", f)
-end
-
--- Refresh the tick text only when the span changes. The tick pixels are fixed (the
--- axis is pinned), so a zoom changes the numbers and nothing else.
-function fftsa.sg_axis_update(force)
-  if fftsa.sg_xlab == nil then return false end
-  local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
-  if not force and fftsa.sg_lab_lo == lo and fftsa.sg_lab_hi == hi then return false end
-  fftsa.sg_lab_lo, fftsa.sg_lab_hi = lo, hi
-  local n = fftsa.sg_nxlab
-  local blank = (hi > fftsa.sg_fmax_real or hi <= lo)
-  fftsa.sg_xlab_txt = {}
-  for i = 1, n do
-    local txt = ""
-    if not blank then
-      txt = fftsa.sg_flabel(lo + (hi - lo) * (i - 1) / (n - 1), hi - lo)
-    end
-    fftsa.sg_xlab_txt[i] = txt
-    local h = fftsa.sg_xlab[i]
-    display.settext(h, txt)
-  end
+  -- IN HERTZ, not scaled. The trace is bound as a numeric x-y plot, X from the reading's
+  -- extra field, which carries the bin's real frequency -- so the axis limits are the
+  -- real span and the firmware labels them itself, with an SI prefix: +00.00kHz and so
+  -- on. No pcall: the call does not raise, it posts an event, so a wrapper buys nothing
+  -- and costs a closure and a frame per call.
+  display.graph.scalex(fftsa.sg_graph, m, display.AXIS_NORMAL, lo, hi)
   return true
 end
 
@@ -376,22 +341,6 @@ function fftsa.sg_write_point(buf, db, f)
   buffer.write.reading(buf, db, f, w, fr)
 end
 
--- Our own X tick labels in real frequency units. The graph's cannot be relabelled
--- or switched off (display.setabbrv() applies to option fields, not axes). Text is
--- filled in by fftsa.sg_axis_update() once a real span exists.
-function fftsa.sg_axis_build(create, small)
-  fftsa.sg_xlab = {}
-  local nx, hw = fftsa.sg_nxlab, fftsa.sg_xlab_hw
-  for i = 1, nx do
-    local x = fftsa.sg_px0 + (fftsa.sg_px1 - fftsa.sg_px0) * (i - 1) / (nx - 1) - hw
-    if i == 1  then x = x + hw end            -- first: start at the axis
-    if i == nx then x = x - hw end            -- last: keep it fully on screen
-    if x < 2 then x = 2 end
-    fftsa.sg_xlab[i] = create(fftsa.sg_scr, display.OBJ_TEXT, math.floor(x),
-                              fftsa.sg_xlab_y, "", fftsa.sg_axc, small, display.JUST_LEFT)
-  end
-  fftsa.sg_lab_lo, fftsa.sg_lab_hi = nil, nil   -- force the first text update
-end
 
 -- Build the screen once, at launch: graph, tick labels, peak table, legend. The
 -- frame loop only refills the buffer and updates text.
@@ -414,14 +363,12 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.loading_front()
 
   fftsa.sg_graph = create(fftsa.sg_scr, display.OBJ_GRAPH, fftsa.sg_gx, fftsa.sg_gy, fftsa.sg_gw, fftsa.sg_gh)
-  -- X is ELEMENT_TIME (our scaled-frequency timestamps); Y is ELEMENT_DATA (dB).
-  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA, fftsa.sg_buf, display.ELEMENT_TIME)
+  -- X is ELEMENT_EXTRA (the bin's frequency in Hz); Y is ELEMENT_DATA (dB).
+  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA, fftsa.sg_buf, display.ELEMENT_EXTRA)
   display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
   display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
                        fftsa.sg_dbmin, fftsa.sg_dbmax)
   fftsa.sg_pin_x()
-  fftsa.sg_axis_build(create, small)
-  fftsa.sg_axis_update(true)
 
   fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d = {}, {}, {}
   for p = 1, fftsa.sg_npeak do
@@ -454,8 +401,6 @@ function fftsa.sg_destroy()
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat = nil, nil, nil, nil, nil, nil, nil
-  fftsa.sg_xlab = nil
-  fftsa.sg_lab_lo, fftsa.sg_lab_hi, fftsa.sg_xlab_txt = nil, nil, nil
   -- Both: a buffer whose handle is dropped is stranded and still counts against the
   -- instrument's capacity.
   if fftsa.sg_buf ~= nil then
@@ -607,14 +552,13 @@ function fftsa.sg_set_xrange(flo_hz, fhi_hz)
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
   fftsa.sg_pin_x()
-  fftsa.sg_axis_update()
 end
 
 -- Re-bind the trace; removeall() first, or add() stacks a duplicate trace.
 function fftsa.sg_rebind()
   display.graph.removeall(fftsa.sg_graph)
   display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
-                    fftsa.sg_buf, display.ELEMENT_TIME)
+                    fftsa.sg_buf, display.ELEMENT_EXTRA)
   display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
   display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
                        fftsa.sg_dbmin, fftsa.sg_dbmax)
@@ -625,7 +569,7 @@ end
 function fftsa.sg_bind_min()
   display.graph.removeall(fftsa.sg_graph)
   display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
-                    fftsa.sg_buf, display.ELEMENT_TIME)
+                    fftsa.sg_buf, display.ELEMENT_EXTRA)
 end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint
