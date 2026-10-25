@@ -456,6 +456,16 @@ hertz and the firmware labels and SI-prefixes them itself -- `+00.00kHz`, `+10.0
 reads `dB` because the buffer's reading unit is the two-character custom unit `buffer.UNIT_CUSTOM1`,
 registered with `buffer.unit`. Confirmed on the instrument, 2026-10-25.
 
+**A log frequency axis is not available from the firmware, and was left alone.** `AXIS_LOG` is
+accepted by `scalex` and ignored: there is one log flag and the widget reads it for Y only
+(`graph+0x3A0`), and none of the eight X scale methods is logarithmic. The only route is to write
+`log10(f)` into the extra field, which positions the trace correctly and makes the firmware label the
+row in log units -- `+02.00` for 100 Hz -- so correct labels would mean reinstating the app's own
+label row and the 20 px it costs. Worth knowing before trying it: the display is 255 columns, so at
+512 samples the bottom decade gets about 106 of them over roughly 5 bins and draws as a staircase.
+It only reads properly at the large sample counts, and the column reduction would have to become
+log-spaced with it.
+
 Everything below is what that replaced, kept because two of the three are hazards.
 
 The time axis is labelled in seconds with a suffix that cannot be switched off, so each bin's
