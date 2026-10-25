@@ -363,14 +363,129 @@ fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
 fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
 fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length
 
+-- ---------- band-pass: low-pass the capture and decimate to the span ----------
+--
+-- WHAT IT BUYS IS BIN WIDTH. Acquire M samples at the hardware rate, filter, keep every
+-- Dth: the result is N samples at fs/D, so the bin is fs/M rather than fs/N and a narrow
+-- span reaches a resolution that would otherwise need a transform D times longer. A
+-- 2 kHz span at 512 samples goes from 195 Hz bins to 12.2 Hz for the cost of the reads.
+--
+-- The filter is what makes the decimation safe: keeping every Dth sample of an unfiltered
+-- record folds everything above fs/2D into the band, which is the one thing a spectrum
+-- analyser must not do quietly. It cannot undo the folding that happened at the ADC --
+-- content above the hardware Nyquist is already in the record.
+fftsa.bp_d     = 1        -- decimation in force; 1 means the filter is not in the path
+fftsa.bp_h     = nil      -- taps, 1..bp_l
+fftsa.bp_l     = 0        -- tap count, always odd so the delay is a whole sample
+fftsa.bp_out   = nil      -- the N decimated samples fft_load_rd() reads
+-- Samples the capture must hold for one record: fft_n when the filter is not decimating,
+-- (n-1)*d + l when it is. Seeded at the default count because fftsa.frame_body() rejects a
+-- capture shorter than this, and at zero that test would pass anything.
+fftsa.bp_m     = 512
+-- Read-cost ceiling. A buffer reading costs about 22 us (docs/PERFORMANCE.md), so 8192
+-- of them is about 180 ms -- already the dominant term in a frame at the small counts
+-- this feature is for. The decimation is capped to keep M under it, which is why a large
+-- sample count leaves no room to decimate at all.
+fftsa.bp_maxm  = 8192
+fftsa.bp_tapd  = 4        -- taps per unit of decimation, before the cap
+fftsa.bp_lmax  = 65       -- tap ceiling: N*L multiply-accumulates land in the frame
+
+-- Largest decimation that leaves the stop frequency inside the decimated Nyquist with
+-- room for the filter's transition, capped by what the read can afford. 2.56 is the usual
+-- margin over 2: at D exactly fs/(2*fhi) the transition band would have zero width.
+function fftsa.bp_pick_d(fs, fhi, n)
+  if fs == nil or fhi == nil or n == nil or fhi <= 0 or n < 2 then return 1 end
+  local d = math.floor(fs / (2.56 * fhi))
+  -- M = (n-1)*d + l, and l grows with d, so the cap is solved against the worst l.
+  local dmax = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (n - 1))
+  if d > dmax then d = dmax end
+  if d < 1 then d = 1 end
+  return d
+end
+
+-- Windowed-sinc low-pass, cutoff at the stop frequency, Hamming-windowed and normalised
+-- to unit DC gain so the filter cannot change a reading's amplitude. Built once per Apply,
+-- which costs L terms against fft_init's thousands.
+function fftsa.bp_build(fs, fhi, n, d)
+  fftsa.bp_d = d
+  if d < 2 then
+    fftsa.bp_l, fftsa.bp_h, fftsa.bp_m = 0, nil, n
+    return 1
+  end
+  local l = fftsa.bp_tapd * d + 1
+  if l > fftsa.bp_lmax then l = fftsa.bp_lmax end
+  if math.mod(l, 2) == 0 then l = l + 1 end
+  local fc = fhi / fs                 -- cutoff as a fraction of the sample rate
+  if fc > 0.5 / d then fc = 0.5 / d end
+  local c = (l - 1) / 2
+  local h, sum = {}, 0
+  local i
+  for i = 1, l do
+    local m = (i - 1) - c
+    local v
+    if m == 0 then
+      v = 2 * fc
+    else
+      v = math.sin(2 * math.pi * fc * m) / (math.pi * m)
+    end
+    -- Hamming, which holds the first sidelobe near -43 dB for a tap count this small.
+    v = v * (0.54 - 0.46 * math.cos(2 * math.pi * (i - 1) / (l - 1)))
+    h[i] = v
+    sum = sum + v
+  end
+  for i = 1, l do h[i] = h[i] / sum end
+  fftsa.bp_h, fftsa.bp_l = h, l
+  fftsa.bp_m = (n - 1) * d + l
+  -- Allocated once per Apply, never per frame, and only when the size changes.
+  if fftsa.bp_out == nil or fftsa.bp_n ~= n then
+    fftsa.bp_out, fftsa.bp_n = {}, n
+    for i = 1, n do fftsa.bp_out[i] = 0 end
+  end
+  return d
+end
+
+-- One decimated record: output j is the filter centred on input (j-1)*d + 1, so the
+-- inputs this needs are 1 .. (n-1)*d + l, which is fftsa.bp_m. No nil test in the inner
+-- loop -- fftsa.frame_body() rejects a capture shorter than bp_m before calling this --
+-- and the yield is per output chunk, like fft_load's.
+function fftsa.bp_filter(rd)
+  local n, d, l = fftsa.fft_n, fftsa.bp_d, fftsa.bp_l
+  local h, out = fftsa.bp_h, fftsa.bp_out
+  if d < 2 or h == nil or out == nil then return nil end
+  local chunk = fftsa.fft_yield_n
+  local lo = 1
+  while lo <= n do
+    local hi = lo + chunk - 1
+    if hi > n then hi = n end
+    local j
+    for j = lo, hi do
+      local base = (j - 1) * d
+      local acc, t = 0, nil
+      for t = 1, l do
+        acc = acc + rd[base + t] * h[t]
+      end
+      out[j] = acc
+    end
+    lo = hi + 1
+    if lo <= n then delay(fftsa.fft_yield) end
+  end
+  return out
+end
+
 function fftsa.fft_load(buf)
+  return fftsa.fft_load_rd(buf.readings)
+end
+
+-- The same load from a plain array, which is what the band-pass path produces. Extracted
+-- rather than copied: the weighted-mean removal and the windowing are subtle enough that
+-- two versions of them would drift.
+function fftsa.fft_load_rd(rd)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
   local x   = fftsa.fft_x
   local re  = fftsa.fft_re
   local im  = fftsa.fft_im
   local win = fftsa.fft_win
-  local rd  = buf.readings
 
   local wsx = 0
   -- Chunked so the yield is per chunk, not per sample: a test inside this loop would

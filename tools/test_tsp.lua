@@ -990,6 +990,118 @@ check('still exactly two timers after rebuild', live('timer') == 2,
 check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
 
+print('\nband-pass: filter and decimate to the span (real code)')
+-- Unit DC gain, odd length, symmetric. The gain matters most: a filter that did not sum
+-- to 1 would scale every reading, and the amplitude would be wrong by a constant nobody
+-- would attribute to the filter.
+check('the taps sum to one, are odd in number and symmetric', (function()
+  fftsa.bp_build(100000, 10000, 512, 4)
+  local h, l = fftsa.bp_h, fftsa.bp_l
+  if h == nil then return false, 'no taps built' end
+  local sum, worst = 0, 0
+  local i
+  for i = 1, l do sum = sum + h[i] end
+  for i = 1, l do
+    local d = math.abs(h[i] - h[l + 1 - i])
+    if d > worst then worst = d end
+  end
+  return math.mod(l, 2) == 1 and math.abs(sum - 1) < 1e-12 and worst < 1e-15,
+         string.format('%d taps, sum %.15f, worst asymmetry %g', l, sum, worst)
+end)())
+-- THE POINT OF THE FILTER. Decimating by 4 at 100 kS/s leaves a 12.5 kHz Nyquist, so a
+-- 20 kHz tone -- which the hardware samples perfectly well -- folds to 5 kHz if the
+-- record is simply thinned. Driven through the real filter it must not survive to be
+-- folded. Both tones measured through the same path, so the in-band one is the control:
+-- a filter that killed everything would pass the alias test and fail this.
+check('an out-of-band tone is stopped before it can fold in', (function()
+  local fs, fhi, n, d = 100000, 10000, 512, 4
+  fftsa.bp_build(fs, fhi, n, d)
+  local function peak_of(hz)
+    local rd = {}
+    local i
+    for i = 1, fftsa.bp_m do
+      rd[i] = math.sin(2 * math.pi * hz * (i - 1) / fs)
+    end
+    local out = fftsa.bp_filter(rd)
+    local mx = 0
+    -- The first taps are still filling, so the steady state starts after the group delay.
+    for i = math.ceil(fftsa.bp_l / d) + 1, n do
+      local v = math.abs(out[i])
+      if v > mx then mx = v end
+    end
+    return mx
+  end
+  local inband = peak_of(2000)
+  local alias  = peak_of(20000)
+  return inband > 0.9 and alias < 0.05,
+         string.format('2 kHz through at %.3f, 20 kHz down to %.4f (%.1f dB)',
+                       inband, alias, 20 * math.log10(alias / inband))
+end)())
+-- The decimation is chosen, not fixed: a narrow span can afford more of it, and a large
+-- sample count cannot afford any because the read is what it costs.
+check('the decimation follows the span and is capped by the read cost', (function()
+  local wide   = fftsa.bp_pick_d(100000, 50000, 512)
+  local narrow = fftsa.bp_pick_d(100000, 2000, 512)
+  local mid    = fftsa.bp_pick_d(100000, 10000, 512)
+  local big    = fftsa.bp_pick_d(100000, 2000, 16384)
+  local cap    = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (512 - 1))
+  return wide == 1 and mid == 3 and narrow == cap and big == 1,
+         string.format('50k->%d 10k->%d 2k->%d (cap %d), 2k at 16384->%d',
+                       wide, mid, narrow, cap, big)
+end)())
+-- Every decimation has to keep the stop frequency inside the decimated Nyquist, or the
+-- span the operator asked for would be partly folded -- which is the failure this whole
+-- feature exists to avoid.
+check('no chosen decimation puts the stop frequency past its own Nyquist', (function()
+  local fs = 100000
+  local hi
+  for hi = 2000, 50000, 500 do
+    local d = fftsa.bp_pick_d(fs, hi, 512)
+    if (fs / d) / 2 < hi then
+      return false, string.format('stop %d Hz at /%d leaves Nyquist %.0f', hi, d,
+                                  (fs / d) / 2)
+    end
+  end
+  return true, 'every stop from 2 kHz to 50 kHz stays inside its Nyquist'
+end)())
+-- Off is off: no decimation, the capture is the sample count, and the loader is the
+-- buffer one.
+check('band-pass off leaves the record and the rate alone', (function()
+  display.setvalue(fftsa.opt_bp, 1)
+  display.setvalue(fftsa.opt_n, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  return fftsa.bp_on == false and fftsa.bp_d == 1 and fftsa.bp_m == fftsa.n
+         and dmm.digitize.count == fftsa.n
+         and math.abs(fftsa.binhz - fftsa.fs_acq / fftsa.n) < 1e-9,
+         string.format('d=%d m=%d count=%d binhz=%.4f',
+                       fftsa.bp_d, fftsa.bp_m, dmm.digitize.count, fftsa.binhz)
+end)())
+-- On: the bin is finer by exactly the decimation, the capture grows to match, and the
+-- rate the transform sees is the digitizer's divided by it.
+check('band-pass on narrows the bin by the decimation', (function()
+  display.setvalue(fftsa.opt_flo, 10)
+  display.setvalue(fftsa.opt_fhi, 10000)
+  display.setvalue(fftsa.opt_n, 1)
+  display.setvalue(fftsa.opt_bp, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local plain = fftsa.binhz
+  display.setvalue(fftsa.opt_bp, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  -- Everything read at the SAME moment: the rate the transform sees is the digitizer's
+  -- divided by the decimation, which is the relationship the whole feature rests on.
+  local d = fftsa.bp_d
+  local fine, eff, acq = fftsa.binhz, fftsa.fs, fftsa.fs_acq
+  local m, count, taps = fftsa.bp_m, dmm.digitize.count, fftsa.bp_l
+  display.setvalue(fftsa.opt_bp, 1)
+  display.setvalue(fftsa.opt_fhi, 50000)
+  fftsa.options_apply()
+  return d > 1 and math.abs(fine * d - plain) < 1e-6
+         and m == (512 - 1) * d + taps and count == m
+         and math.abs(eff * d - acq) < 1e-6,
+         string.format('/%d: %.2f Hz against %.2f, fs %.1f of %.1f, capture %d of %d',
+                       d, fine, plain, eff, acq, count, m)
+end)())
+
 print('\npeak markers (real code)')
 -- Off by default, and off means ONE trace drawn as a line: the marker buffer exists but
 -- is not bound, so drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
@@ -1903,16 +2015,21 @@ check('unchanged previews do not redraw the info line', (function()
   fftsa.options_preview()
   return obj_at(fftsa.opt_info).sets == before
 end)())
+-- The measured rate the preview starts from is the DIGITIZER's, fs_acq, because that is
+-- what the timestamps measure and what pick_fs answers; the decimation divides it
+-- afterwards. Perturbing fftsa.fs instead would prove nothing now: fftsa.fs is the
+-- derived rate the transform sees.
 check('the preview uses the timestamp-measured rate for the active rate', (function()
-  local fs = fftsa.fs
-  fftsa.fs = fs - 0.25
+  local acq = fftsa.fs_acq
+  fftsa.fs_acq = acq - 0.25
   display.setvalue(fftsa.opt_fhi, fftsa.fhi)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_preview()
   local text = obj_at(fftsa.opt_info).text
-  local expected = fftsa.opt_info_text(fftsa.fs, 512)
-  fftsa.fs = fs
-  return text == expected
+  local expected = fftsa.opt_info_text(fftsa.fs_acq / fftsa.bp_d, 512, nil, nil,
+                                       fftsa.bp_d)
+  fftsa.fs_acq = acq
+  return text == expected, tostring(text) .. ' | wanted ' .. tostring(expected)
 end)())
 check('preview and Apply share stop-frequency clamping', (function()
   display.setvalue(fftsa.opt_fhi, 1)

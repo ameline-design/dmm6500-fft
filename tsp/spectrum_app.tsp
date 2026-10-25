@@ -162,11 +162,14 @@ function fftsa.options_samples()
   return fftsa.sample_counts[i]
 end
 
+-- The DIGITIZER's rate, from the capture's own timestamps. The fallback is fs_acq, not
+-- fftsa.fs: fftsa.fs is the decimated rate and returning it here would divide it twice.
 function fftsa.measure_fs(buf)
+  local back = fftsa.fs_acq or fftsa.fs
   local n = buf.n
-  if n < 4 then return fftsa.fs end
+  if n < 4 then return back end
   local t1, tN = buf.relativetimestamps[1], buf.relativetimestamps[n]
-  if tN <= t1 then return fftsa.fs end
+  if tN <= t1 then return back end
   return (n - 1) / (tN - t1)
 end
 
@@ -175,14 +178,23 @@ end
 -- fftsa.fft_init() rebuilds the window and its interpolation tables, which
 -- is the slow part of a press -- about 0.3 s for Kaiser -- hence the cover.
 function fftsa.apply()
-  fftsa.fs = fftsa.pick_fs(fftsa.fhi)
+  -- TWO RATES from here on. fs_acq is what the digitizer runs at; fftsa.fs is what the
+  -- transform sees, which is fs_acq/bp_d once the band-pass is decimating. Everything
+  -- downstream reads fftsa.fs -- binhz, the settings line, the span arithmetic -- so the
+  -- decimation is invisible to it, which is the point.
+  fftsa.fs_acq = fftsa.pick_fs(fftsa.fhi)
+  local d = 1
+  if fftsa.bp_on then d = fftsa.bp_pick_d(fftsa.fs_acq, fftsa.fhi, fftsa.n) end
+  fftsa.bp_build(fftsa.fs_acq, fftsa.fhi, fftsa.n, d)
+  local need = fftsa.bp_m
+  fftsa.fs = fftsa.fs_acq / fftsa.bp_d
   fftsa.fft_init(fftsa.n)
   -- Before the sg_set_xrange() below, which reads it: the settings line counts the bins
   -- inside the span, and that count is computed from sg_nbins.
   fftsa.sg_nbins = fftsa.n / 2
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
-  dmm.digitize.samplerate = fftsa.fs
+  dmm.digitize.samplerate = fftsa.fs_acq
   -- The bin width commits with the rate, not after the capture: a capture that fails
   -- between the two -- a trigger timeout is the obvious one -- would otherwise leave the
   -- hardware at the new rate and fftsa.binhz at the old one. The measurement below
@@ -192,19 +204,23 @@ function fftsa.apply()
   -- the capture rather than after it.
   fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   dmm.digitize.aperture   = 1e-6
-  dmm.digitize.count      = fftsa.n
-  if fftsa.cap ~= nil and fftsa.cap_n ~= fftsa.n then
+  -- The capture is bp_m long, which is fftsa.n unless the filter is decimating.
+  dmm.digitize.count      = need
+  if fftsa.cap ~= nil and fftsa.cap_n ~= need then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
   end
   if fftsa.cap == nil then
-    fftsa.cap   = buffer.make(fftsa.n * 4, buffer.STYLE_STANDARD)
-    fftsa.cap_n = fftsa.n
+    fftsa.cap   = buffer.make(need * 4, buffer.STYLE_STANDARD)
+    fftsa.cap_n = need
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
-  fftsa.fs    = fftsa.measure_fs(fftsa.cap)     -- the samplerate readback is unreliable
-  fftsa.binhz = fftsa.fs / fftsa.n
+  -- Measured from the timestamps, which are the DIGITIZER's: the readback is unreliable,
+  -- and the decimation is arithmetic afterwards, so it divides the measured rate.
+  fftsa.fs_acq = fftsa.measure_fs(fftsa.cap)
+  fftsa.fs     = fftsa.fs_acq / fftsa.bp_d
+  fftsa.binhz  = fftsa.fs / fftsa.n
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
@@ -239,11 +255,17 @@ function fftsa.frame_body()
   dmm.digitize.read(fftsa.cap)
   -- A short capture is rejected, not transformed: zero-padding the tail would give
   -- a convincing but false broadband spectrum. The previous frame stays on screen.
-  if fftsa.cap.n < fftsa.n then
+  -- The length needed is bp_m, which is fftsa.n unless the filter is decimating -- and
+  -- the filter's inner loop has no nil test, so this is what makes that safe.
+  if fftsa.cap.n < fftsa.bp_m then
     fftsa.shortreads = (fftsa.shortreads or 0) + 1
     return
   end
-  fftsa.fft_load(fftsa.cap)
+  if fftsa.bp_d > 1 then
+    fftsa.fft_load_rd(fftsa.bp_filter(fftsa.cap.readings))
+  else
+    fftsa.fft_load(fftsa.cap)
+  end
   fftsa.fft_run()
   fftsa.fft_power()
   local nb = fftsa.fft_m
@@ -277,7 +299,16 @@ fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged s
 function fftsa.frame_estimate(n)
   if n == nil or n < 2 then n = 512 end
   local log2n = math.log(n) / 0.69314718055995
-  return n * 46.6e-6 + 3.593e-6 * n * log2n + 0.04
+  local est = n * 46.6e-6 + 3.593e-6 * n * log2n + 0.04
+  -- The band-pass adds the reads it does not share with the plain path and one
+  -- multiply-accumulate per tap per output. Derived from the documented per-operation
+  -- costs -- 22 us a buffer reading, and two table reads plus a multiply and an add at
+  -- 1.4 and 1.2 us -- not measured on this loop, so it is a starting point: frame()
+  -- replaces the period with one measured from real frames after eight of them.
+  if fftsa.bp_d ~= nil and fftsa.bp_d > 1 then
+    est = est + (fftsa.bp_m - n) * 22e-6 + n * fftsa.bp_l * 5.2e-6
+  end
+  return est
 end
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
@@ -646,12 +677,18 @@ function fftsa.sample_rate_text(fs)
   return string.format("%g S/s", fs)
 end
 
--- Acquisition duration is N/fs, not the first-to-last timestamp interval (N-1)/fs.
-function fftsa.opt_info_text(fs, n, wi, bi)
+-- Acquisition duration is N/fs, not the first-to-last timestamp interval (N-1)/fs -- and
+-- with the band-pass decimating, fs is the rate the TRANSFORM sees, so N/fs is still the
+-- record length in time. The decimation is named rather than left implicit: at /4 the
+-- digitizer is running four times faster than the rate on the line.
+function fftsa.opt_info_text(fs, n, wi, bi, d)
   fs, n = fs or fftsa.fs, n or fftsa.n
-  return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
+  if d == nil then d = fftsa.bp_d end
+  local bp = ""
+  if d ~= nil and d > 1 then bp = string.format("   bp /%d", d) end
+  return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s%s",
                        fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
-                       fftsa.win_label(wi, bi))
+                       fftsa.win_label(wi, bi), bp)
 end
 
 -- Read a field, or answer the fallback if the handle was never built. The firmware
@@ -680,15 +717,24 @@ end
 
 function fftsa.options_preview()
   local lo, hi = fftsa.options_span()
+  local n = fftsa.options_samples()
   local fs = fftsa.pick_fs(hi)
   -- Reuse the timestamp-measured rate when previewing the active acquisition rate.
-  if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs end
+  if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs_acq or fftsa.fs end
+  -- The decimation the pending fields would get, so the previewed bin width is the one
+  -- Apply will actually produce rather than the undecimated one.
+  local d = 1
+  if fftsa.opt_index(fftsa.getval(fftsa.opt_bp), fftsa.onoff_labels,
+                     fftsa.onoff_to_idx(fftsa.bp_on)) == 2 then
+    d = fftsa.bp_pick_d(fs, hi, n)
+  end
+  fs = fs / d
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
-  local text = fftsa.opt_info_text(fs, fftsa.options_samples(), wi, bi)
+  local text = fftsa.opt_info_text(fs, n, wi, bi, d)
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text
