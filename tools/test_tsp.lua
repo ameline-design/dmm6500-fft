@@ -1053,10 +1053,10 @@ check('a band-pass Apply runs the digitizer at the rate it planned', (function()
   display.setvalue(fftsa.opt_flo, 10)
   display.setvalue(fftsa.opt_fhi, 10000)
   display.setvalue(fftsa.opt_n, 1)
-  display.setvalue(fftsa.opt_bp, 2)
+  fftsa.bp_on = true
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   local rate, acq, d = dmm.digitize.samplerate, fftsa.fs_acq, fftsa.bp_d
-  display.setvalue(fftsa.opt_bp, 1)
+  fftsa.bp_on = false
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   local plain = dmm.digitize.samplerate
   display.setvalue(fftsa.opt_fhi, 50000)
@@ -1077,11 +1077,11 @@ check('the readback line reports the digitizer rate, not the decimated one', (fu
   display.setvalue(fftsa.opt_flo, 10)
   display.setvalue(fftsa.opt_fhi, 20000)
   display.setvalue(fftsa.opt_n, 1)
-  display.setvalue(fftsa.opt_bp, 2)
+  fftsa.bp_on = true
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   local line = fftsa.sg_xunit_text()
   local acq, eff, d = fftsa.fs_acq, fftsa.fs, fftsa.bp_d
-  display.setvalue(fftsa.opt_bp, 1)
+  fftsa.bp_on = false
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
   if d < 2 then return false, 'no decimation at a 20 kHz span, nothing to tell apart' end
@@ -1214,7 +1214,7 @@ end)())
 -- Off is off: no decimation, the capture is the sample count, and the loader is the
 -- buffer one.
 check('band-pass off leaves the record and the rate alone', (function()
-  display.setvalue(fftsa.opt_bp, 1)
+  fftsa.bp_on = false
   display.setvalue(fftsa.opt_n, 1)
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   return fftsa.bp_on == false and fftsa.bp_d == 1 and fftsa.bp_m == fftsa.n
@@ -1229,17 +1229,17 @@ check('band-pass on narrows the bin by the decimation', (function()
   display.setvalue(fftsa.opt_flo, 10)
   display.setvalue(fftsa.opt_fhi, 10000)
   display.setvalue(fftsa.opt_n, 1)
-  display.setvalue(fftsa.opt_bp, 1)
+  fftsa.bp_on = false
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   local plain = fftsa.binhz
-  display.setvalue(fftsa.opt_bp, 2)
+  fftsa.bp_on = true
   if not fftsa.options_apply() then return false, fftsa.lasterr end
   -- Everything read at the SAME moment: the rate the transform sees is the digitizer's
   -- divided by the decimation, which is the relationship the whole feature rests on.
   local d = fftsa.bp_d
   local fine, eff, acq = fftsa.binhz, fftsa.fs, fftsa.fs_acq
   local m, count, taps = fftsa.bp_m, dmm.digitize.count, fftsa.bp_l
-  display.setvalue(fftsa.opt_bp, 1)
+  fftsa.bp_on = false
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
   -- The bin is fs_acq/(d*n), and fs_acq is the STEPPED-UP rate, so the improvement over
@@ -1256,9 +1256,10 @@ print('\npeak markers (real code)')
 -- NOT OFFERED IN THE FORM YET, so these drive fftsa.sg_markers directly: the field is
 -- withheld until the second trace can be pinned, and setvalue on its nil handle raises.
 -- The machinery stays tested so it does not rot while it waits.
-check('the form does not offer peak markers', fftsa.opt_mk == nil
-      and fftsa.sg_markers == false,
-      'opt_mk=' .. tostring(fftsa.opt_mk) .. ' markers=' .. tostring(fftsa.sg_markers))
+check('the form offers neither peak markers nor band-pass', fftsa.opt_mk == nil
+      and fftsa.opt_bp == nil and fftsa.sg_markers == false,
+      'opt_mk=' .. tostring(fftsa.opt_mk) .. ' opt_bp=' .. tostring(fftsa.opt_bp)
+      .. ' markers=' .. tostring(fftsa.sg_markers))
 -- Off means ONE trace drawn as a line: the marker buffer exists but is not bound, so
 -- drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
 check('markers off binds one trace and draws a line', (function()
@@ -1949,7 +1950,7 @@ check('no fractional timestamp was ever written', BADFRAC == 0,
 print('\noptions form (real code)')
 -- Two columns, six fields, three rows.
 local nrows, pitch, top = fftsa.opt_layout()
-check('seven fields lay out as four rows in two columns', nrows == 4,
+check('six fields lay out as three rows in two columns', nrows == 3,
       'nrows=' .. nrows)
 check('the last box ends above the button row',
       top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h
@@ -1989,10 +1990,10 @@ check('a field count that overruns is clamped to fit above the readback line',
          string.format('%d rows, pitch %d of %d asked, bottom %d vs ceiling %d',
                        r, p, fftsa.opt_dy, bottom, ceiling)
 end)())
-check('the first four fields are in column one at opt_x', (function()
+check('the first three fields are in column one at opt_x', (function()
   local x = fftsa.opt_x
   return obj_at(fftsa.opt_flo).x == x and obj_at(fftsa.opt_fhi).x == x
-         and obj_at(fftsa.opt_rng).x == x and obj_at(fftsa.opt_bp).x == x
+         and obj_at(fftsa.opt_rng).x == x
 end)(), 'x=' .. tostring(obj_at(fftsa.opt_flo).x))
 check('the window and sample fields are in column two at opt_x_c2', (function()
   local x = fftsa.opt_x_c2
@@ -2002,7 +2003,6 @@ end)(), 'x=' .. tostring(obj_at(fftsa.opt_win).x))
 check('each column runs top to bottom at the layout pitch', (function()
   return obj_at(fftsa.opt_fhi).y - obj_at(fftsa.opt_flo).y == pitch
          and obj_at(fftsa.opt_rng).y - obj_at(fftsa.opt_fhi).y == pitch
-         and obj_at(fftsa.opt_bp).y - obj_at(fftsa.opt_rng).y == pitch
          and obj_at(fftsa.opt_beta).y - obj_at(fftsa.opt_win).y == pitch
          and obj_at(fftsa.opt_n).y - obj_at(fftsa.opt_beta).y == pitch
 end)())

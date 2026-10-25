@@ -38,7 +38,7 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 
 ## Options
 
-![The options form: Start Freq, Stop Freq, Input Range and Band-Pass in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom](manual-options.png)
+![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom](manual-options.png)
 
 | Field | |
 |---|---|
@@ -48,7 +48,6 @@ In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
 | FFT Samples | 512 (default), 1024, 2048, 4096, 8192 or 16384. More samples give finer bins but take more time and memory. |
-| Band-Pass | Off by default. Filters the capture to the span and decimates to match — see *Band-Pass*. |
 
 The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
 **bin spacing** (`fs / N`) and **acquisition
@@ -170,7 +169,14 @@ watch which peak follows.
 
 ## Band-Pass
 
-Off by default. On, the capture is low-pass filtered and then decimated to the span, so the transform
+**Not offered on the form.** It works, and it is measured flat to 0.02 dB across the span with 61 dB
+of rejection above the Nyquist, but it is not worth the frame time: the filter is one
+multiply-accumulate per tap per output, 51 taps over 512 outputs, and the frame goes from 0.08 s to
+around a quarter of a second for nothing an operator can see. At 4096 samples and up the read budget
+leaves no room for it at any span. It remains settable over the socket as `fftsa.bp_on`, and the rest
+of this section describes what it does when it is on.
+
+On, the capture is low-pass filtered and then decimated to the span, so the transform
 sees only the band on screen. Two things come of that, and which one you get depends on the span.
 
 **A narrow span buys bin width.** The bin becomes the acquisition rate divided by the number of
@@ -179,16 +185,16 @@ otherwise need a much longer transform. At 512 samples:
 
 | Stop | rate | decimation | taps | bin | bin with it off |
 |---|---|---|---|---|---|
-| 50 kHz | 500 kS/s | /3 | 51 | 325.52 Hz | 195.31 Hz |
+| 50 kHz | 100 kS/s | — | — | 195.31 Hz | 195.31 Hz |
 | 20 kHz | 200 kS/s | /3 | 51 | 130.21 Hz | 195.31 Hz |
 | 10 kHz | 100 kS/s | /3 | 51 | 65.10 Hz | 195.31 Hz |
 | 2 kHz | 100 kS/s | /7 | 65 | 27.90 Hz | 195.31 Hz |
 
-**A wide span buys an honest spectrum instead**, and costs resolution to do it. At 50 kHz nothing can
-be decimated at 100 kS/s, so the rate goes up to 500 kS/s — where content from 50 to 250 kHz is
-filtered out rather than folded in — and the bin comes out coarser than it would unfiltered. That is
-the trade: 325 Hz bins with nothing folded in, against 195 Hz bins with everything above 50 kHz
-folded on top.
+**A wide span gets nothing**, and that is deliberate. The rate goes up by one step at most, and at a
+50 kHz span neither 100 nor 200 kS/s leaves room to decimate, so the filter is left out and the line
+reads `BP:On (span too wide)`. Going further up the rate list would make it possible — 500 kS/s at
+/3 — but 51 taps over 512 outputs costs about 135 ms of arithmetic, which takes the frame from 0.08 s
+to a quarter of a second to produce a bin *coarser* than the unfiltered one.
 
 The readback line says which regime you are in. `BP:On /3` means the filter is in the path at a
 decimation of three. `BP:On` with a reason in brackets means it is not:

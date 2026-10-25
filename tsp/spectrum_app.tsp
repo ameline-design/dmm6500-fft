@@ -127,23 +127,26 @@ end
 -- and keeps the resolution.
 function fftsa.bp_plan(fhi, n)
   local base = fftsa.pick_fs(fhi)
-  local r = fftsa.rates
+  -- ONE STEP UP AT MOST. Searching every rate the hardware has finds a plan for a 50 kHz
+  -- span -- 500 kS/s at /3 -- but 51 taps over 512 outputs is around 135 ms of
+  -- multiply-accumulate, and the frame goes from 0.08 s to a quarter of a second for a
+  -- bin COARSER than the unfiltered one. Not worth it: at a span that wide the filter is
+  -- left out and the line says so.
+  local cand = {base, fftsa.bp_rate(base)}
   local bestfs, bestd = nil, nil
   local i
-  for i = 1, table.getn(r) do
-    local fs = r[i]
-    -- Only rates that cover the span at all, and only those the hardware has.
+  for i = 1, 2 do
+    local fs = cand[i]
     if fs >= base then
       local d = fftsa.bp_pick_d(fs, fhi, n)
-      -- A decimation of 1 means the filter is bypassed, which is the thing to avoid: at a
-      -- 50 kHz span no decimation fits under 100 kS/s, and the rate has to go up before
-      -- the filter can run at all. Among the rates where it CAN run, the finest bin wins.
+      -- A decimation of 1 is the filter bypassed, so only plans that can actually run
+      -- are candidates; among those the finest bin wins.
       if d > 1 and (bestfs == nil or (fs / d) < (bestfs / bestd)) then
         bestfs, bestd = fs, d
       end
     end
   end
-  -- Nothing could decimate: run at the rate the span needs and leave the filter out.
+  -- Neither rate could decimate: run at the rate the span needs and leave the filter out.
   if bestfs == nil then return base, 1 end
   return bestfs, bestd
 end
@@ -454,8 +457,8 @@ end
 -- and the gap that buys is what makes each box a touch target. display.create takes
 -- no width for an OBJ_EDIT_*, so the second column's x is the one number to check on
 -- the glass. Labels are right-aligned and end at the column x.
--- Seven: Peak Markers is withheld. See fftsa.opt_mk below.
-fftsa.opt_nf      = 7
+-- Six: Peak Markers and Band-Pass are both withheld. See fftsa.opt_mk and fftsa.opt_bp.
+fftsa.opt_nf      = 6
 fftsa.opt_cols    = 2
 fftsa.opt_x       = 185
 fftsa.opt_x_c2    = 552
@@ -533,13 +536,16 @@ function fftsa.build_options()
                        fftsa.range_labels[1], fftsa.range_labels[2], fftsa.range_labels[3])
   -- Spelled out rather than built from the table: display.create takes the options
   -- as separate arguments and Lua 5.0.2 has no unpack() worth using here.
-  -- Two columns of four: the left one is what acquisition does -- the span, the range
-  -- and the filter in front of the transform -- and the right one is what the transform
-  -- and the display do with it.
-  local x4, y4 = nextpos()
-  fftsa.opt_bp = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x4, y4,
-                       "Band-Pass", "filter to the span",
-                       fftsa.onoff_labels[1], fftsa.onoff_labels[2])
+  -- BAND-PASS IS NOT OFFERED, so fftsa.opt_bp stays nil and the read falls back to
+  -- whatever fftsa.bp_on already is -- which leaves it settable over the socket without
+  -- putting it on the form.
+  --
+  -- It works and it is measured flat to 0.02 dB across the span with 61 dB of rejection
+  -- above the Nyquist. What it is not is worth the frame: the filter is one
+  -- multiply-accumulate per tap per output, 51 taps over 512 outputs, and the frame goes
+  -- from 0.08 s to around a quarter of a second. On the glass that buys nothing an
+  -- operator can see at the spans where it can run at all, and at 4096 samples and up the
+  -- read budget leaves no room for it whatever the span.
   local x5, y5 = nextpos()
   fftsa.opt_win = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x5, y5,
                        "Window", "lobe vs sidelobe",
@@ -875,7 +881,6 @@ function fftsa.options()
   fftsa.setval(fftsa.opt_win, fftsa.win_i)
   fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
   fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
-  fftsa.setval(fftsa.opt_bp, fftsa.onoff_to_idx(fftsa.bp_on))
   -- Guarded like its neighbours: five field reads on handles the pool may have refused,
   -- and changescreen is the next line. Unguarded, a refusal at the end of the create list
   -- leaves the Options button dead for the life of the app.
