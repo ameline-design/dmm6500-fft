@@ -184,9 +184,10 @@ end
 -- Written twice per Apply, by sg_set_xrange() before the capture and again after it, so
 -- the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
-   local t = string.format("%d pts   %s   %s", fftsa.n,
+   local t = string.format("%d pts   %s   %s   %s", fftsa.n,
                           fftsa.opt_info_text(fftsa.fs, fftsa.n),
-                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)])
+                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)],
+                          fftsa.bp_text())
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
   -- trace is a dot, five peak rows read ---, and this count is the only thing that says
   -- why. The width is already in the line, so the count alone is enough.
@@ -515,16 +516,36 @@ function fftsa.sg_bind()
     display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
                       fftsa.sg_mk, display.ELEMENT_EXTRA)
     display.graph.drawstyle(g, display.STYLE_BOTH)
+    -- BOTH AXES ARE PER SELECTED TRACE once there is more than one trace: the API
+    -- reference says so of scalex and scaley alike, "positions apply to selected trace
+    -- only for multitrace". Pinning once leaves the second trace auto-scaling on both
+    -- axes, and a handful of points scaled against themselves land nowhere near the
+    -- spectrum -- which is a marker trace that draws nothing visible and logs nothing.
+    --
+    -- So each trace is selected and then given its own limits and marker size. The
+    -- spectrum is selected last, so anything later lands on it.
     display.graph.select(g, fftsa.sg_mk, display.ELEMENT_DATA)
+    fftsa.sg_pin_y(g)
+    fftsa.sg_pin_x()
     display.graph.markersize(g, fftsa.sg_mk_size)
     display.graph.select(g, fftsa.sg_buf, display.ELEMENT_DATA)
+    fftsa.sg_pin_y(g)
+    fftsa.sg_pin_x()
     display.graph.markersize(g, 1)
   else
     display.graph.drawstyle(g, display.STYLE_LINE)
+    fftsa.sg_pin_y(g)
+    fftsa.sg_pin_x()
   end
+  return true
+end
+
+-- The dB axis, pinned. Its own function because sg_bind() has to call it once per trace.
+function fftsa.sg_pin_y(g)
+  if g == nil then g = fftsa.sg_graph end
+  if g == nil then return false end
   display.graph.scaley(g, display.YSCALE_OFF, display.AXIS_NORMAL,
                        fftsa.sg_dbmin, fftsa.sg_dbmax)
-  fftsa.sg_pin_x()
   return true
 end
 

@@ -116,6 +116,24 @@ function fftsa.bp_rate(fs)
   return r[n]
 end
 
+-- The rate and the decimation CHOSEN TOGETHER, by the bin width they produce. Stepping the
+-- rate up is a gain only where the decimation can absorb it: at a 50 kHz span the
+-- decimation is 1 either way, and stepping up there doubles the bin for nothing --
+-- 390.63 Hz against 195.31 measured on the glass, with the filter not even in the path.
+--
+-- The finer bin wins. On a tie the higher rate wins, because its Nyquist is further from
+-- the span and the filter then removes a band that would otherwise have folded at the ADC.
+-- Where the read budget caps the decimation -- the narrowest spans -- the base rate wins
+-- and keeps the resolution.
+function fftsa.bp_plan(fhi, n)
+  local base = fftsa.pick_fs(fhi)
+  local d0   = fftsa.bp_pick_d(base, fhi, n)
+  local up   = fftsa.bp_rate(base)
+  local d1   = fftsa.bp_pick_d(up, fhi, n)
+  if up > base and (up / d1) <= (base / d0) then return up, d1 end
+  return base, d0
+end
+
 -- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
 function fftsa.pick_fs(fhi)
   local r = fftsa.rates
@@ -207,8 +225,7 @@ function fftsa.apply()
   fftsa.fs_acq = fftsa.pick_fs(fftsa.fhi)
   local d = 1
   if fftsa.bp_on then
-    fftsa.fs_acq = fftsa.bp_rate(fftsa.fs_acq)
-    d = fftsa.bp_pick_d(fftsa.fs_acq, fftsa.fhi, fftsa.n)
+    fftsa.fs_acq, d = fftsa.bp_plan(fftsa.fhi, fftsa.n)
   end
   fftsa.bp_build(fftsa.fs_acq, fftsa.fhi, fftsa.n, d)
   local need = fftsa.bp_m
@@ -706,14 +723,26 @@ end
 -- with the band-pass decimating, fs is the rate the TRANSFORM sees, so N/fs is still the
 -- record length in time. The decimation is named rather than left implicit: at /4 the
 -- digitizer is running four times faster than the rate on the line.
-function fftsa.opt_info_text(fs, n, wi, bi, d)
-  fs, n = fs or fftsa.fs, n or fftsa.n
+-- The band-pass, always stated, on or off. When it is on the decimation is what says
+-- whether the filter is actually in the path: no decimation means the span is too wide
+-- for any, and the capture reaches the transform untouched.
+--
+-- Its own function because the two readback lines want it in different places -- last on
+-- the spectrum screen, after the input range, and last on the Options line too, where
+-- there is no range to come after.
+function fftsa.bp_text(d, on)
   if d == nil then d = fftsa.bp_d end
-  local bp = ""
-  if d ~= nil and d > 1 then bp = string.format("   bp /%d", d) end
-  return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s%s",
+  if on == nil then on = fftsa.bp_on end
+  if not on then return "BP:Off" end
+  if d ~= nil and d > 1 then return string.format("BP:On /%d", d) end
+  return "BP:On (span too wide)"
+end
+
+function fftsa.opt_info_text(fs, n, wi, bi)
+  fs, n = fs or fftsa.fs, n or fftsa.n
+  return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
                        fftsa.sample_rate_text(fs), fs / n, 1000 * n / fs,
-                       fftsa.win_label(wi, bi), bp)
+                       fftsa.win_label(wi, bi))
 end
 
 -- Read a field, or answer the fallback if the handle was never built. The firmware
@@ -749,12 +778,12 @@ function fftsa.options_preview()
   -- The decimation the pending fields would get, so the previewed bin width is the one
   -- Apply will actually produce rather than the undecimated one.
   local d = 1
-  if fftsa.opt_index(fftsa.getval(fftsa.opt_bp), fftsa.onoff_labels,
-                     fftsa.onoff_to_idx(fftsa.bp_on)) == 2 then
-    -- The stepped-up rate too, or the preview would promise a bin width Apply cannot
-    -- produce: the rate and the decimation move together.
-    fs = fftsa.bp_rate(fs)
-    d = fftsa.bp_pick_d(fs, hi, n)
+  local bp = (fftsa.opt_index(fftsa.getval(fftsa.opt_bp), fftsa.onoff_labels,
+                              fftsa.onoff_to_idx(fftsa.bp_on)) == 2)
+  if bp then
+    -- The same plan Apply will make, or the preview promises a bin width it cannot
+    -- produce: the rate and the decimation are chosen together.
+    fs, d = fftsa.bp_plan(hi, n)
   end
   fs = fs / d
   -- The window comes from the fields too, or three quarters of the line would track
@@ -762,7 +791,7 @@ function fftsa.options_preview()
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
-  local text = fftsa.opt_info_text(fs, n, wi, bi, d)
+  local text = fftsa.opt_info_text(fs, n, wi, bi) .. "   " .. fftsa.bp_text(d, bp)
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text

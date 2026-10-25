@@ -267,6 +267,7 @@ end
 function display.graph.removeall(g)
   use(g, 'graph.removeall')
   OBJ[g].buffer, OBJ[g].buffers = nil, nil
+  OBJ[g].selected, OBJ[g].xpin, OBJ[g].ypin = nil, nil, nil
   OBJ[g].traces = 0
   OBJ[g].removes = (OBJ[g].removes or 0) + 1
 end
@@ -275,7 +276,18 @@ function display.graph.drawstyle(g, s)
   OBJ[g].drawstyle = s
   OBJ[g].drawstyles = (OBJ[g].drawstyles or 0) + 1
 end
-function display.graph.scaley(g, ...)   use(g, 'graph.scaley') end
+-- PER SELECTED TRACE, which is what the API reference says of both axes: "positions
+-- apply to selected trace only for multitrace". Modelled, because a graph-wide model is
+-- kinder than the firmware and let a second trace go unpinned and invisible.
+function display.graph.scaley(g, ...)
+  use(g, 'graph.scaley')
+  local a = arg
+  if OBJ[g].ypin == nil then OBJ[g].ypin = {} end
+  if a[3] ~= nil then
+    OBJ[g].ypin[OBJ[g].selected or OBJ[g].buffer] = {a[3], a[4]}
+    OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
+  end
+end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
 function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h].fills or 0) + 1 end
 -- Records the pinned range so tests can assert the axis is not auto-ranging, and
@@ -284,19 +296,19 @@ function display.graph.scalex(g, ...)
   use(g, 'graph.scalex')
   local a = arg
   OBJ[g].xmethod = a[1]                    -- which scale method was asked for
+  if OBJ[g].xpin == nil then OBJ[g].xpin = {} end
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
+    -- Per selected trace, like scaley: the reference gives both axes the same note.
+    OBJ[g].xpin[OBJ[g].selected or OBJ[g].buffer] = {a[3], a[4]}
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
   end
   return OBJ[g].xmin, OBJ[g].xmax
 end
--- The two notify candidates that are not already modelled. Counted, not acted on: what
--- the firmware does with them is the open question the instrument has to answer.
-function display.graph.select(g, b, elem)
-  use(g, 'graph.select')
-  OBJ[g].selects = (OBJ[g].selects or 0) + 1
-  OBJ[g].selected = b
-end
+-- scaletrace is counted, not acted on: what the firmware does with it is the open
+-- question the instrument has to answer. select() is modelled above, where the marker
+-- calls that depend on it are -- defined once, because a second definition of a mock
+-- function silently wins and takes its witnesses with it.
 function display.graph.scaletrace(g, mode)
   use(g, 'graph.scaletrace')
   OBJ[g].scaletraces = (OBJ[g].scaletraces or 0) + 1
@@ -1185,6 +1197,38 @@ end)())
 -- the trace draws a peak at its column, up to half a bin out, and the table's own numbers
 -- are the corrected ones. Sorted by frequency, because drawstyle is per graph and the
 -- marker trace is drawn with a line through it too.
+-- THE BUG THAT MADE MARKERS INVISIBLE. Both axes apply their limits to the SELECTED
+-- trace only once a graph has more than one, so pinning once after adding both left the
+-- marker trace auto-scaling: its handful of points were scaled against themselves and
+-- landed nowhere near the spectrum, with nothing refused and nothing logged. Every trace
+-- has to come out pinned to the same limits.
+check('every bound trace is pinned to the same dB range and span', (function()
+  display.setvalue(fftsa.opt_mk, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local o = OBJ[fftsa.sg_graph]
+  if o.buffers == nil or table.getn(o.buffers) ~= 2 then
+    return false, 'expected two traces, got ' .. tostring(o.buffers and
+                                                          table.getn(o.buffers))
+  end
+  local i
+  for i = 1, table.getn(o.buffers) do
+    local b = o.buffers[i]
+    local y = o.ypin ~= nil and o.ypin[b]
+    local x = o.xpin ~= nil and o.xpin[b]
+    if not y then return false, 'trace ' .. i .. ' has no dB range pinned' end
+    if not x then return false, 'trace ' .. i .. ' has no span pinned' end
+    if y[1] ~= fftsa.sg_dbmin or y[2] ~= fftsa.sg_dbmax then
+      return false, string.format('trace %d pinned %g..%g, wanted %g..%g', i,
+                                  y[1], y[2], fftsa.sg_dbmin, fftsa.sg_dbmax)
+    end
+    if x[2] ~= fftsa.sg_fhi_hz then
+      return false, string.format('trace %d spans to %g, wanted %g', i, x[2],
+                                  fftsa.sg_fhi_hz)
+    end
+  end
+  return true, string.format('both traces at %g..%g dB and 0..%g Hz',
+                             fftsa.sg_dbmin, fftsa.sg_dbmax, fftsa.sg_fhi_hz)
+end)())
 check('the marker points are the peak table values, in frequency order', (function()
   fftsa.frame()
   local mk = fftsa.sg_mk
@@ -1595,7 +1639,8 @@ check('the legend carries the settings, not the axis units', (function()
   local t = fftsa.sg_xunit_text()
   fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = fs, n, r, w
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = lo, hi
-  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V', t
+  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V'
+         .. '   BP:Off', t
 end)())
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
       'gy=' .. fftsa.sg_gy)
@@ -2056,8 +2101,8 @@ check('the preview uses the timestamp-measured rate for the active rate', (funct
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_preview()
   local text = obj_at(fftsa.opt_info).text
-  local expected = fftsa.opt_info_text(fftsa.fs_acq / fftsa.bp_d, 512, nil, nil,
-                                       fftsa.bp_d)
+  local expected = fftsa.opt_info_text(fftsa.fs_acq / fftsa.bp_d, 512)
+                   .. '   ' .. fftsa.bp_text()
   fftsa.fs_acq = acq
   return text == expected, tostring(text) .. ' | wanted ' .. tostring(expected)
 end)())
