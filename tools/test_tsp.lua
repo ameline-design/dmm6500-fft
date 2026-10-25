@@ -91,7 +91,12 @@ display = {
   OBJ_EDIT_NUMBER = 'editnum', OBJ_EDIT_OPTION = 'editopt',
   EVENT_PRESS = 'press', EVENT_ENDAPP = 'endapp',
   EVENT_DRAG = 'drag', EVENT_CURSOR = 'cursor',
-  FONT_SMALL = 1, FONT_MEDIUM = 2,
+  -- Fonts, at the firmware's own values from its registration table. SMALL through HUGE
+  -- are the documented four; FONT_1..FONT_10 continue the same enum and are in the table
+  -- but not in the display API reference, so their sizes are a panel measurement.
+  FONT_SMALL = 0, FONT_MEDIUM = 1, FONT_LARGE = 2, FONT_HUGE = 3,
+  FONT_1 = 4, FONT_2 = 5, FONT_3 = 6, FONT_4 = 7, FONT_5 = 8,
+  FONT_6 = 9, FONT_7 = 10, FONT_8 = 11, FONT_9 = 12, FONT_10 = 13,
   JUST_LEFT = 0, JUST_CENTER = 1, JUST_RIGHT = 2,
   NFORMAT_PREFIX = 1, TIMER_FOREVER = -1,
   -- The firmware's own values, read out of its registration table, because the app
@@ -138,7 +143,9 @@ function display.create(parent, kind, ...)
   -- made every field read back as 1 before any setvalue.
   if kind == display.OBJ_EDIT_NUMBER then OBJ[h].value = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].value = 1 end
+  -- OBJ_TEXT is (x, y, text, colour, font, justify), so the font is a[5].
   if kind == display.OBJ_TEXT then OBJ[h].text = a[3] end
+  if kind == display.OBJ_TEXT then OBJ[h].colour, OBJ[h].font = a[4], a[5] end
   if kind == display.OBJ_TEXT then OBJ[h].justify = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].help = a[4] end
   -- Creating a screen makes it the active one. Modelled because it is the whole
@@ -211,14 +218,10 @@ display.graph = {}
 -- `traces` is the live trace count; `adds` and `removes` count the CALLS. The
 -- distinction matters: a removeall+add pair leaves the count at 1, exactly as
 -- never touching it does, so only the call counters can see a per-frame
--- detach and re-attach -- the thing that used to cost 43 ms a frame.
+-- detach and re-attach.
 function display.graph.add(g, ...)
   use(g, 'graph.add')
   OBJ[g].adds = (OBJ[g].adds or 0) + 1
-  -- The ordering witness. The display task copies the buffer when it processes the
-  -- hand-over, so the hand-over has to happen BEFORE the frame's yield: that is the
-  -- window where the bound buffer is complete and the next fill has not started.
-  OBJ[g].adddelays = DELAYS
   -- Firmware binds nothing for an empty buffer, even if later frames fill it.
   if arg[1].n == 0 then return end
   OBJ[g].buffer = arg[1]
@@ -244,11 +247,6 @@ function display.graph.scalex(g, ...)
   use(g, 'graph.scalex')
   local a = arg
   OBJ[g].xmethod = a[1]                    -- which scale method was asked for
-  -- The ordering witness. The display task copies the buffer when it processes the
-  -- notify, so the notify has to be issued BEFORE the frame's yield, not after: with the
-  -- yield first the copy lands during the next frame's fill and reads a buffer part
-  -- written. Nothing else can see that order, so the delay count is recorded here.
-  OBJ[g].xdelays = DELAYS
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
@@ -293,11 +291,10 @@ function buffer.unit(u, label)
   CUSTOM_UNITS[u] = t
 end
 function buffer.make(cap, style) return newbuf(cap) end
--- REFUSES BY POSTING, like the firmware, rather than raising. The old form raised, which
--- meant the app needed a pcall to survive its own mistake and the suite was testing a
--- failure mode the instrument does not have. The refusals are counted instead, and a
--- refused delete leaves the buffer ALIVE -- which is what made 61 live buffers on the
--- instrument when a bound one was remade without detaching first.
+-- REFUSES BY POSTING, like the firmware, rather than raising: a raising mock would have
+-- the suite testing a failure mode the instrument does not have. The refusals are counted
+-- instead, and a refused delete leaves the buffer ALIVE -- which is what made 61 live
+-- buffers on the instrument when a bound one was remade without detaching first.
 REFUSED_BUF_DELETES, REFUSED_OBJ_DELETES = 0, 0
 function buffer.delete(b)
   if type(b) ~= 'table' or not b.alive then
@@ -321,15 +318,12 @@ end
 -- what the real call does. A frame writes 255 points, so a dialog per point makes
 -- the app impossible to exit; that is why this is counted and asserted.
 BADFRAC = 0
--- The firmware's stated limit, and the mock refuses above it. fftsa.sg_split_t
--- carries at it, one representable step conservative, so the gap between the two is
--- deliberate -- and invisible from inside sg_update, which is why a check below
--- asserts the relationship rather than leaving the mock to catch it.
+-- The firmware's stated limit, and the mock refuses above it.
 FRAC_MAX = 0.9999999
 -- "Data must be added in chronological order" -- buffer.write.reading, Details.
 -- Counted rather than raised, since what the real call does with an out-of-order
--- timestamp is not known. The mock used to store secs + frac without ever comparing
--- two of them, so a non-monotonic sequence passed in silence.
+-- timestamp is not known. Comparing each write against the one before it is the only way
+-- a non-monotonic sequence shows up at all.
 NONMONO = 0
 NONMONODUMP = true
 -- WRITES counts every point written anywhere; CLEAR_AT_WRITES is the value it had when
@@ -339,8 +333,8 @@ NONMONODUMP = true
 WRITES, CLEAR_AT_WRITES = 0, 0
 -- LOG10S counts the per-point dB conversions, LOG10_AT_CLEAR its value at the last
 -- clear. These are what tell a STAGED refill from an interleaved one: counting writes
--- cannot, because the old design also wrote only after the clear -- it just did the
--- arithmetic for each point in between.
+-- cannot, because an interleaved refill also writes only after the clear -- it just does
+-- the arithmetic for each point in between.
 LOG10S, LOG10_AT_CLEAR = 0, 0
 local REAL_LOG10 = math.log10
 function math.log10(x)
@@ -802,7 +796,8 @@ check('with no table built, peak_interp says so instead of guessing', (function(
   return cv ~= nil and a == 0 and b == nil,
          string.format('with table: %s; without: %s', tostring(cv), tostring(b))
 end)())
--- The coherent gain is what calibrates amplitude, so it has to follow the window.
+-- The coherent gain is a window identity, so it must change with the window: a window
+-- selection that did not reach win_build() would leave it alone.
 check('coherent gain follows the window', (function()
   local seen = {}
   for wi = 1, nwin do
@@ -940,8 +935,8 @@ check('start() succeeds', ok, tostring(err))
 local after1, bufs1 = live(), livebufs()
 check('start() created objects', after1 > 0, 'live=' .. after1 .. ' buffers=' .. bufs1)
 check('frame and preview timers are live', live('timer') == 2)
-check('exactly three screens are live', live('screen') == 3,
-      'screens=' .. live('screen') .. ' (cover + spectrum + options)')
+check('exactly four screens are live', live('screen') == 4,
+      'screens=' .. live('screen') .. ' (cover + spectrum + options + about)')
 check('the graph has exactly one trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
@@ -955,8 +950,164 @@ check('rebuilding leaks NO buffers', livebufs() == bufs1,
       'buffers=' .. livebufs() .. ' vs ' .. bufs1)
 check('still exactly two timers after rebuild', live('timer') == 2,
       'timers=' .. live('timer'))
-check('still exactly three screens after rebuild', live('screen') == 3,
+check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
+
+print('\nthe about screen (real code)')
+-- The licence has to be the repo's, not a paraphrase of it, so it is compared against
+-- LICENSE itself. Trailing blank lines are dropped: the file ends with a newline and the
+-- screen carries no row for it.
+check('the licence on the about screen is LICENSE, verbatim', (function()
+  local f = io.open('LICENSE', 'r')
+  if f == nil then return false, 'LICENSE not readable from the suite cwd' end
+  local want, n = {}, 0
+  while true do
+    local ln = f:read('*l')
+    if ln == nil then break end
+    n = n + 1
+    want[n] = ln
+  end
+  f:close()
+  while n > 0 and want[n] == '' do want[n] = nil; n = n - 1 end
+  local got = fftsa.about_text
+  local ng = table.getn(got)
+  if ng ~= n then
+    return false, string.format('%d rows on the screen, %d lines in LICENSE', ng, n)
+  end
+  local i
+  for i = 1, n do
+    if got[i] ~= want[i] then
+      return false, string.format('row %d: %q against %q', i, tostring(got[i]),
+                                  tostring(want[i]))
+    end
+  end
+  return true, string.format('%d rows match', n)
+end)())
+check('the author line is FONT_4 and every licence row FONT_1', (function()
+  local t = obj_at(fftsa.about_name)
+  if t == nil then return false, 'no author line' end
+  local body = fftsa.about_lines
+  if body == nil or table.getn(body) == 0 then return false, 'no licence rows' end
+  local wrong, i = 0, nil
+  for i = 1, table.getn(body) do
+    if obj_at(body[i]).font ~= display.FONT_1 then wrong = wrong + 1 end
+  end
+  return t.font == display.FONT_4 and t.text == 'Author: Ian Ameline' and wrong == 0
+         and t.justify == display.JUST_CENTER and t.colour == 56575
+         and obj_at(body[1]).colour == 16777215,
+         string.format('title font %s %q just %s colour %s, %d rows, %d at the wrong'
+                       .. ' font, body colour %s',
+                       tostring(t.font), tostring(t.text), tostring(t.justify),
+                       tostring(t.colour), table.getn(body), wrong,
+                       tostring(obj_at(body[1]).colour))
+end)())
+-- One object a row, rewritten per page, so the count is the page size and not the licence
+-- length. The licence is longer than a page at FONT_1, which is what the paging is for.
+check('there is one object per row and more licence than fits a page', (function()
+  local rows = table.getn(fftsa.about_lines)
+  return rows == fftsa.about_rows and fftsa.about_pages() > 1,
+         string.format('%d row objects for %d a page, %d licence rows, %d pages',
+                       rows, fftsa.about_rows, table.getn(fftsa.about_text),
+                       fftsa.about_pages())
+end)())
+-- The rows are laid out from two constants against an undocumented font, so the one thing
+-- the host can check is that the arithmetic leaves the button row clear.
+check('a page of rows ends above the button row', (function()
+  local lasty = fftsa.about_body_y + (fftsa.about_rows - 1) * fftsa.about_body_dy
+  return lasty + fftsa.about_body_dy <= fftsa.opt_btn_y,
+         string.format('%d rows, last at y=%d, pitch %d, buttons at %d',
+                       fftsa.about_rows, lasty, fftsa.about_body_dy, fftsa.opt_btn_y)
+end)())
+-- Every licence row has to appear on some page, in order, and the last page has to blank
+-- the rows it does not fill or it shows the previous page's text under the new one.
+check('the pages carry the whole licence in order, and blank the tail', (function()
+  local seen, p, i = {}, nil, nil
+  local nseen = 0
+  for p = 1, fftsa.about_pages() do
+    fftsa.about_show_page(p)
+    for i = 1, fftsa.about_rows do
+      local want = fftsa.about_text[(p - 1) * fftsa.about_rows + i]
+      local got = obj_at(fftsa.about_lines[i]).text
+      if want == nil then
+        if got ~= '' then
+          return false, string.format('page %d row %d past the licence reads %q', p, i,
+                                      tostring(got))
+        end
+      else
+        if got ~= want then
+          return false, string.format('page %d row %d: %q against %q', p, i,
+                                      tostring(got), tostring(want))
+        end
+        nseen = nseen + 1
+        seen[(p - 1) * fftsa.about_rows + i] = true
+      end
+    end
+  end
+  fftsa.about_show_page(1)
+  local missing = 0
+  for i = 1, table.getn(fftsa.about_text) do
+    if seen[i] ~= true then missing = missing + 1 end
+  end
+  return nseen == table.getn(fftsa.about_text) and missing == 0,
+         string.format('%d of %d rows shown, %d missing', nseen,
+                       table.getn(fftsa.about_text), missing)
+end)())
+check('PgUp and PgDn clamp at the ends instead of going blank', (function()
+  local last = fftsa.about_pages()
+  fftsa.about_show_page(1)
+  fftsa.about_pgup()
+  local atfirst = fftsa.about_page
+  local p
+  for p = 1, last + 3 do fftsa.about_pgdn() end
+  local atlast = fftsa.about_page
+  local text = obj_at(fftsa.about_lines[1]).text
+  local name = obj_at(fftsa.about_name).text
+  fftsa.about_show_page(1)
+  return atfirst == 1 and atlast == last and text ~= ''
+         and name == 'Author: Ian Ameline',
+         string.format('PgUp from 1 -> %d, PgDn past %d -> %d, first row %q, author %q',
+                       atfirst, last, atlast, tostring(text), tostring(name))
+end)())
+check('the page indicator tracks the page', (function()
+  fftsa.about_show_page(2)
+  local two = obj_at(fftsa.about_pageno).text
+  fftsa.about_show_page(1)
+  local one = obj_at(fftsa.about_pageno).text
+  return one == string.format('page 1 of %d', fftsa.about_pages())
+         and two == string.format('page 2 of %d', fftsa.about_pages()),
+         tostring(one) .. ' | ' .. tostring(two)
+end)())
+-- Opened from the last page it was left on, the screen would read as a wall of capitals.
+check('opening About goes back to the first page', (function()
+  fftsa.about_show_page(fftsa.about_pages())
+  display.changescreen(fftsa.optscr)
+  fftsa.about()
+  local p = fftsa.about_page
+  fftsa.about_back()
+  fftsa.show_main()
+  return p == 1, 'page ' .. tostring(p)
+end)())
+check('About opens the screen and Back returns to the form', (function()
+  display.changescreen(fftsa.optscr)
+  local opened = fftsa.about() and display.active == fftsa.aboutscr
+  local shown = display.active
+  local returned = fftsa.about_back() and display.active == fftsa.optscr
+  local back = display.active
+  fftsa.show_main()
+  return opened and returned,
+         string.format('About showed %s (about is %s), Back showed %s (form is %s)',
+                       tostring(shown), tostring(fftsa.aboutscr), tostring(back),
+                       tostring(fftsa.optscr))
+end)())
+-- Reached when the pool refuses the screen: the button must not raise on a nil handle.
+check('About with no screen built answers false instead of raising', (function()
+  local keep = fftsa.aboutscr
+  fftsa.aboutscr = nil
+  local ok, ret = pcall(function() return fftsa.about() end)
+  fftsa.aboutscr = keep
+  return ok and ret == false, string.format('raised=%s returned=%s', tostring(not ok),
+                                            tostring(ret))
+end)())
 
 -- arm() must never stack timers (two would double the frame rate and flood)
 fftsa.arm(0.3); fftsa.arm(0.3); fftsa.arm(0.3)
@@ -971,7 +1122,7 @@ check('5 frames run without a dropped frame', fftsa.errcount == 0,
 check('peak fields were populated', OBJ[fftsa.sg_pk_f[1]].text ~= nil
       and string.find(OBJ[fftsa.sg_pk_f[1]].text, 'kHz') ~= nil,
       tostring(OBJ[fftsa.sg_pk_f[1]].text))
-check('the x-axis legend is on screen', OBJ[fftsa.sg_xunit].text ~= nil,
+check('the settings line is on screen', OBJ[fftsa.sg_xunit].text ~= nil,
       tostring(OBJ[fftsa.sg_xunit].text))
 
 -- The peak-text gate, asserted in both directions. Five frames ran above and
@@ -1000,10 +1151,8 @@ check('past the clock gate, a moved peak does draw',
 -- the only order that leaves the axes alone, so the absence of those calls is
 -- the behaviour under test, not an implementation detail.
 --
--- Counted calls, not the live trace count: a removeall+add pair leaves the
--- count at 1, exactly as never touching it does, so a count cannot tell them
--- apart. An earlier version of this test asserted the count and passed with the
--- pair restored, which is how that was found.
+-- Counted calls, not the live trace count: a removeall+add pair leaves the count at 1,
+-- exactly as never touching it does, so a count cannot tell them apart.
 print('\nper-frame repaint is in place, with a yield (real code)')
 local gh = fftsa.sg_graph
 local ad0, rm0 = (OBJ[gh].adds or 0), (OBJ[gh].removes or 0)
@@ -1026,10 +1175,8 @@ check('and the frame yields exactly once for the paint', DELAYS == dl0 + 1,
 
 -- NO GRAPH CALL AT ALL. The clear is the notify, so a frame touches nothing on the
 -- widget -- and that is what keeps the axes still. Every synchronous graph call in a
--- frame repaints the whole widget including its own axis label text, which was watched
--- happening on the glass with a removeall and add per frame: 8.5 ms of time and a
--- visible flicker. Counted per call rather than by live trace count, because a
--- removeall+add pair leaves the count at 1 exactly as never touching it does.
+-- frame repaints the whole widget including its own axis label text: measured at 8.5 ms
+-- for a removeall and add per frame, and a visible flicker on the glass.
 check('and the frame makes no graph call whatsoever', (function()
   local o = OBJ[gh]
   return (o.pins or 0) == pin0 and (o.selects or 0) == 0
@@ -1056,18 +1203,29 @@ check('and the failure was counted rather than swallowed', fftsa.errcount == 1,
       'errcount=' .. tostring(fftsa.errcount))
 fftsa.errcount, fftsa.errrun, fftsa.lasterr = 0, 0, nil
 
--- The firmware labels the axis itself now. X is bound to the reading's extra field, in
--- hertz, which makes this its numeric x-y plot rather than a time plot -- so the labels
--- read +00.00kHz and the app draws no label row of its own. Masking the firmware's row
--- was tried instead and cannot work: a child inside the graph's rectangle is painted
--- over by its per-frame repaint.
+-- The firmware labels the axis. X is bound to the reading's extra field, in hertz, which
+-- makes this its numeric x-y plot rather than a time plot -- so the labels read +00.00kHz
+-- and the app draws no label row of its own. Nor could it draw over the firmware's: a
+-- child inside the graph's rectangle is painted over by its per-frame repaint.
 print('\nthe firmware labels the axis (real code)')
 check('X is bound to the extra field, not the timestamp',
       OBJ[fftsa.sg_graph].xelem == display.ELEMENT_EXTRA,
       'xelem=' .. tostring(OBJ[fftsa.sg_graph].xelem) .. ' time would be '
       .. tostring(display.ELEMENT_TIME))
-check('no label row is created at all', fftsa.sg_xlab == nil,
-      'sg_xlab=' .. tostring(fftsa.sg_xlab))
+-- Counted, not probed by name: the firmware labels both axes, so the spectrum screen's
+-- only text children are the peak table and the settings line. Eighteen peak fields and
+-- one line at the shipped sg_npeak, and a row of tick labels coming back breaks it.
+check('no label row is created at all', (function()
+  local n = 0
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == fftsa.sg_scr and o.type == display.OBJ_TEXT then
+      n = n + 1
+    end
+  end
+  return n == fftsa.sg_npeak * 3 + 1,
+         string.format('%d text objects on the spectrum screen, want %d',
+                       n, fftsa.sg_npeak * 3 + 1)
+end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the
 -- feature: this is the only place the applied settings read back without opening Options.
@@ -1179,8 +1337,9 @@ check('a changed span re-pins in hertz', (function()
   return ok1 and near(lo, 8000, 1e-9) and near(hi, 8200, 1e-9),
          string.format('narrow pinned to %g..%g', lo, hi)
 end)())
--- Re-pinning per frame makes the firmware redraw its own axis labels, which shows
--- as flicker on hardware. The pin survives a re-add, so a refresh must not re-pin.
+-- Re-pinning makes the firmware redraw its own axis labels, which shows as flicker on
+-- hardware. The pin survives a re-add, which is what lets a rebind skip it; sg_bind_min()
+-- is that rebind, exercised here because the app only reaches it through sg_rebind().
 check('a frame refresh does NOT re-pin the axis', (function()
   local before = OBJ[fftsa.sg_graph].pins or 0
   fftsa.sg_bind_min()
@@ -1253,13 +1412,15 @@ end)())
 -- The scaled-timestamp encoding is gone with the time axis, and with it the event-1131
 -- hazard its carry existed for: the fractional-seconds field is refused above 0.9999999,
 -- and a frequency landing an ulp below an integer after the divide produced exactly that.
--- The timestamp is now the slot number, an integer, so the fraction is always 0. The
--- mock still counts a refused fraction, and the check below is what would catch a
--- fractional timestamp creeping back in.
+-- The timestamp is the slot number, an integer, so the fraction is always 0. The mock
+-- counts a refused fraction and the BADFRAC check below is what catches one creeping
+-- back in.
 
 -- Every timestamp this suite wrote was above the one before it, within its fill.
 check('no buffer fill anywhere in this suite went back in time', NONMONO == 0,
       'out-of-order writes: ' .. NONMONO)
+check('no fractional timestamp was ever written', BADFRAC == 0,
+      'fractions the firmware would refuse: ' .. BADFRAC)
 
 -- the options round trip, including an inverted span
 print('\noptions form (real code)')
@@ -1796,21 +1957,10 @@ check('a zoom well above the first bin keeps its own low limit', (function()
   return kept, string.format('pinned %g..%g, wanted 8000..16000', lo, hi)
 end)())
 
--- The trace buffers are FILL_ONCE, and that is a deliberate choice rather than a
--- default left alone. FILL_CONTINUOUS works exactly as its documentation says -- it was
--- measured accepting the mode, wrapping with no event, pinning n at capacity and
--- returning startindex to 1 -- and the widget still draws a continuous-fill buffer as a
--- wrapping trace, joining its newest point back to its oldest: a straight line across
--- the whole plot. The bound buffer was read four times while that line was on the glass
--- and was aligned every time, so the line is the fill mode and not a rotation.
---
--- The 0.05 s tick is a cliff, and the old code fell off it by half a millisecond: the
--- occupancy divide turned an 80.4 ms frame into 100.5 ms, which rounds up to three ticks
--- rather than two -- 0.15 s and 6.7 fps where 0.10 and 10 were available. Pinned at the
+-- The 0.05 s tick is a cliff: the occupancy divide turns an 80.4 ms frame into 100.5 ms,
+-- and a tick either side of that is 0.10 s and 10 fps against 0.15 and 6.7. Pinned at the
 -- boundary in both directions so the rounding cannot drift unnoticed.
 check('tick_period rounds up to the 0.05 s tick, and the boundary is exact', (function()
-  -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
-  -- 0.1499999999999999944, so == fails on values that are the same tick count.
   -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
   -- 0.1499999999999999944, so == fails on values that are the same tick count.
   --
@@ -1829,8 +1979,8 @@ end)())
 
 -- The period is re-armed from frames that actually ran, not from frame_estimate(). The
 -- model is a fit at one point count and one draw path: it predicted 80.4 ms at 512 and
--- 216 ms at 2048 against 240 measured, so it was setting the frame rate by itself, wrong
--- in both directions. The mock's frames are far faster than the instrument's, so a
+-- 216 ms at 2048 against 212 measured. Divided by the occupancy target an error of that
+-- size can land either side of a tick boundary, which is a 50 % swing in displayed rate. The mock's frames are far faster than the instrument's, so a
 -- measured period must fall to the 0.05 s floor while the model still asks for 0.15 --
 -- which is also what makes this fail if the re-arm is removed.
 check('the timer period follows measured work, not the model', (function()
@@ -1846,6 +1996,11 @@ check('the timer period follows measured work, not the model', (function()
          string.format('model armed %.2f, measurement armed %.2f', modelled, measured)
 end)())
 
+-- The trace buffer is FILL_ONCE by choice, not by default. The widget draws a
+-- continuous-fill buffer as a WRAPPING trace, joining its newest point back to its
+-- oldest: a straight line across the whole plot, with the buffer itself perfectly
+-- aligned while that line is on the glass, so the line is the fill mode and not a
+-- rotation.
 check('the trace buffer is FILL_ONCE, never a ring', (function()
   display.setvalue(fftsa.opt_n, 1)
   if not fftsa.options_apply() then return false, fftsa.lasterr end
@@ -1953,11 +2108,9 @@ check('an off-list sample count leaves Options and Apply working', (function()
                        tostring(applied), tostring(landed))
 end)())
 
--- F3 as originally written: a raise between the span commit and show_main() left flo/fhi
--- describing a span the axis, the cover and the message all disagreed with. The raise it
--- induced -- getvalue on a nil field handle -- cannot happen any more, because the reads
--- test for nil and fall back instead. The property that mattered is still asserted: a
--- field whose handle was never built costs that field and nothing else.
+-- A field whose handle the pool never gave us costs that field and nothing else: the
+-- reads test for nil and fall back, so the span still commits and the axis, the cover and
+-- the message all describe the same one.
 check('a missing field costs that field alone, and the span still commits', (function()
   local flo0, fhi0 = fftsa.flo, fftsa.fhi
   local keepn, n0 = fftsa.opt_n, fftsa.n
@@ -2046,8 +2199,8 @@ end)())
 -- F13. Three constants that have to agree and nothing said so.
 -- ---------- the trace column cap ----------
 
--- The graph is 784 px wide. Above the cap the firmware was being handed up to 16056
--- points to throw away by a rule that can discard the bin a tone sits in.
+-- The graph is 784 px wide, so above the cap the firmware is handed points to throw away
+-- by a rule that can discard the bin a tone sits in.
 check('the trace never exceeds the column cap at any sample count', (function()
   local worst, worstn = 0, 0
   local i
@@ -2073,8 +2226,8 @@ end)())
 -- The default must be untouched: fewer bins in the span than columns, so every bin
 -- is still its own point and the shipped appearance does not change.
 -- At the default the span holds fewer bins than there are columns, so no bin can be
--- skipped: every one lands in at least one column. That is the resolution guarantee
--- the old 'does not decimate' check was really making.
+-- skipped: every one lands in at least one column. That is the resolution guarantee at
+-- the default, and it is weaker at every larger size.
 check('the default skips no bin in the span', (function()
   display.setvalue(fftsa.opt_rng, 3)
   display.setvalue(fftsa.opt_n, 1)
@@ -2169,9 +2322,8 @@ check('the widget never gets more than the point budget, any size or span', (fun
         return false, string.format('%s wrote %d > budget %d', worstat, n,
                                     fftsa.sg_maxpts)
       end
-      -- The old 512 ceiling was a guess at what the widget could take. The plotted
-      -- area is 680 px, measured off a capture, so the budget is the column count and
-      -- 680 (one point per pixel) is the top of the range worth trying.
+      -- The plotted area is 680 px, measured off a capture, so the budget is the column
+      -- count and 680 -- one point per pixel -- is the top of the range worth trying.
       if n > 680 then
         return false, string.format('%s wrote %d > one point per pixel', worstat, n)
       end
@@ -2328,8 +2480,8 @@ check('no field pair leaves an empty span or an empty bin window', (function()
                        leastat, bad and (' -- ' .. bad) or '')
 end)())
 
--- The pool-exhaustion path is the one show_error exists for, and it used to blank
--- the panel there: display.create returns nil, every child goes to a nil parent and
+-- The pool-exhaustion path is the one show_error exists for, and the one that can blank
+-- the panel: display.create returns nil, every child goes to a nil parent and
 -- changescreen(nil) raises inside the pcall.
 print('\nstartup failure (real code)')
 check('show_error survives an exhausted pool and does not blank the panel',
@@ -2372,7 +2524,7 @@ check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
       and fftsa.opt_n == nil
       and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
-      and fftsa.sg_xlab == nil)
+      and fftsa.aboutscr == nil and fftsa.about_lines == nil)
 check('stop() twice is harmless', pcall(function() fftsa.stop() end))
 check('cleanup() is safe with nothing built', pcall(function() fftsa.cleanup() end))
 
@@ -2623,8 +2775,8 @@ do
 
   -- Regenerated by tools/make_refs.lua, which has its OWN window, its own
   -- weighted-mean removal and its own O(N^2) DFT -- so these are not the app's
-  -- output pinned against the app. Bin 1 is 1.3e-29 rather than the 1.07e-04 the
-  -- arithmetic mean used to leave there: that zero IS the weighted mean working.
+  -- output pinned against the app. Bin 1 is 1.3e-29 where an arithmetic mean leaves
+  -- 1.07e-04: that zero IS the weighted mean working.
   local REF = {
     [1]   = 1.300361262791e-29, [2]   = 1.021704940227e-09,
     [3]   = 5.016625104977e-10, [20]  = 2.976886198854e-03,

@@ -39,9 +39,9 @@ fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 -- has a null one bin from the peak, which leaves the three-bin interpolation below
 -- ill-conditioned, so the peak readings would be wrong in a way the trace does not
 -- show.
--- No Hamming: it exited the app on the instrument, with no offline reproduction and
--- no mechanism found, so it is not offered. Kaiser at beta 6 covers it to within a
--- dB of sidelobe level and a fraction of a bin of main-lobe width.
+-- No Hamming: it exits the app on the instrument and the mechanism was never found.
+-- Kaiser at beta 6 covers it to within a dB of sidelobe level and a fraction of a bin of
+-- main-lobe width.
 fftsa.win_names = {"Hann", "Blackman", "Blk-Harris", "Kaiser"}
 -- Index-parallel to fftsa.win_names, coefficients a0 - a1*cos + a2*cos2 - a3*cos3.
 -- Kaiser has no entry, which is how fftsa.win_build() tells it apart.
@@ -162,7 +162,7 @@ fftsa.win_mono = false    -- r(d) rose all the way to half a bin
 -- by fftsa.find_peaks(). 0 before the first fftsa.fft_init().
 fftsa.fft_dctol = 0.05    -- 5 % of amplitude, 0.45 dB
 fftsa.fft_kdc   = 0
-fftsa.fft_kdcn  = 6       -- bins scanned; covers Kaiser b=18's 5.83-bin main lobe
+fftsa.fft_kdcn  = 6       -- bins scanned; covers Kaiser b=18's 5.82-bin main lobe
 
 -- Costs (fft_gn+1)*N/2 cosines at init and nothing per frame.
 function fftsa.win_tables(N)
@@ -353,16 +353,12 @@ end
 -- how far that reaches and fftsa.find_peaks() stops reporting there; nothing
 -- separates a pedestal from a tone inside one lobe of DC.
 -- The display task shares this core with the interpreter and runs only while Lua is
--- blocked, so a stretch of Lua with no delay() in it is a stretch in which a touch
--- cannot be dispatched. At 16384 samples fft_load and fft_run are 0.5 s and 0.8 s of
--- unbroken arithmetic, and the app's only delay was the 25 ms at the end of a refill:
--- the Options button then took several presses over several seconds to answer.
---
--- The cure is more yield points rather than a longer one. Each costs fft_yield seconds
--- plus a call, and they are placed where the enclosing loop is cheap -- per chunk in
--- fft_load, per stage in fft_run -- so the per-sample inner loops are untouched. Both
--- gates are sized so the default 512 samples reaches neither and its frame rate is
--- unchanged.
+-- blocked, so a stretch of Lua with no delay() in it is a stretch in which a touch cannot
+-- be dispatched -- and at 16384 samples fft_load and fft_run are 0.5 s and 0.8 s of
+-- arithmetic. Hence many yield points rather than one long one: each costs fft_yield plus
+-- a call, and they sit where the enclosing loop is cheap -- per chunk in fft_load, per
+-- stage in fft_run -- so the per-sample inner loops are untouched. Both gates are sized
+-- so the default 512 samples reaches neither.
 fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
 fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
 fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length

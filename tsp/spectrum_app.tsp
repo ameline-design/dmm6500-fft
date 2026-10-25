@@ -7,10 +7,11 @@
 -- the start frequency only windows the display, the input range is
 -- dmm.digitize.range, and the window and its beta pick the analysis window.
 --
--- Every screen, field and buffer is created once in fftsa.start(), behind the
--- loading cover, and deleted once by fftsa.stop(). A press only ever switches
--- screens: a create/delete cycle risks part of the 463-object pool for the rest of
--- the power cycle, because a refused display.delete raises nothing.
+-- Every screen and field is created once in fftsa.start(), behind the loading cover,
+-- and deleted once by fftsa.stop(). A press only ever switches screens: a create/delete
+-- cycle risks part of the 463-object pool for the rest of the power cycle, because a
+-- refused display.delete raises nothing. The capture buffer and the frame timer are the
+-- two exceptions, replaced on a settings change or a measured change of period.
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
@@ -65,25 +66,20 @@ end
 
 -- SAMPLE RATE: THE SPAN MAY RAISE IT, NEVER LOWER IT BELOW THE FLOOR.
 --
--- There is no anti-alias filter in front of the digitizer, so a rate whose Nyquist
--- falls below what is actually on the wire folds that content into the display as
--- peaks that are not there. Measured on the bench 2026-10-23: a pure 21.1 kHz sine,
--- shown over a 0 to 7 kHz span at 20 kS/s, drew one 4.5135 V peak at 1.100 kHz --
--- 21100 reduced mod 20000 -- amplitude right to four digits, with nothing on the
--- screen to say the frequency was not.
+-- There is no anti-alias filter in front of the digitizer, so a rate whose Nyquist falls
+-- below what is on the wire folds that content in as peaks that are not there, at full
+-- amplitude and with nothing on the glass to say so.
 --
--- The direction is what matters. RAISING the rate can only remove aliases; lowering
--- it is what creates them. So zooming in never drops the rate: the span selects
--- which bins are drawn, and below the floor it stops affecting acquisition at all.
--- Widening the span past the floor's Nyquist does raise the rate, because showing
--- 200 kHz honestly requires sampling for it.
+-- The direction is what matters. RAISING the rate can only remove aliases; lowering it is
+-- what creates them. So zooming in never drops the rate: the span selects which bins are
+-- drawn, and below the floor it stops affecting acquisition at all. Widening the span
+-- past the floor's Nyquist does raise the rate, because showing 200 kHz honestly requires
+-- sampling for it.
 --
--- The floor is 100 kS/s, which gives 195.3 Hz bins at the default 512 samples.
--- Increasing the sample count makes bins finer. Raising the rate
--- coarsens the bins in proportion, which is the price of the wider view.
---
--- Content above the chosen Nyquist still folds. That is the missing filter, not the
--- rate, and no setting here removes it.
+-- The floor is 100 kS/s, which gives 195.3 Hz bins at the default 512 samples. A higher
+-- sample count makes bins finer; a higher rate coarsens them in proportion, which is the
+-- price of the wider view. Content above the chosen Nyquist still folds: that is the
+-- missing filter, not the rate, and no setting here removes it.
 fftsa.fs_min = 100000
 -- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
 fftsa.rates  = {100000, 200000, 500000, 1000000}
@@ -162,19 +158,19 @@ end
 function fftsa.apply()
   fftsa.fs = fftsa.pick_fs(fftsa.fhi)
   fftsa.fft_init(fftsa.n)
-  -- Before the sg_set_xrange() below, which reads it: the legend reports how many
-  -- bins land in the span, and nbins is half of that answer.
+  -- Before the sg_set_xrange() below, which reads it: the settings line counts the bins
+  -- inside the span, and that count is computed from sg_nbins.
   fftsa.sg_nbins = fftsa.n / 2
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs
-  -- The bin width commits with the rate, not after the capture. A raise in between
-  -- -- a trigger timeout is the obvious one -- used to leave the hardware at the new
-  -- rate and fftsa.binhz at the old one, and a 12.5 kHz tone then read 2500.0 Hz
-  -- with errcount 0. The measurement below refines this by about 0.01 %.
+  -- The bin width commits with the rate, not after the capture: a capture that fails
+  -- between the two -- a trigger timeout is the obvious one -- would otherwise leave the
+  -- hardware at the new rate and fftsa.binhz at the old one. The measurement below
+  -- refines it by about 0.01 %.
   fftsa.binhz = fftsa.fs / fftsa.n
-  -- Same reason: the span is fftsa.flo/fhi, already committed by options_apply(),
-  -- so pinning the axis to it never depended on the capture.
+  -- The span is fftsa.flo/fhi, committed by options_apply(), so the axis is pinned before
+  -- the capture rather than after it.
   fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   dmm.digitize.aperture   = 1e-6
   dmm.digitize.count      = fftsa.n
@@ -193,22 +189,10 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
-  -- A SMALL FIXED YIELD, because the frame no longer owns the display task's whole
-  -- budget. It used to: work equalled the inter-frame interval at every count, so the
-  -- only time the task got was this delay, and a fixed 25 ms meant 250 ms a second at
-  -- 512 samples against 15 at 16384 -- the same constant, thirty times less time. It was
-  -- scaled to a fifth of the frame for that reason.
-  --
-  -- The timer period now leaves 20 % of every frame idle, and Lua is blocked on the
-  -- timer throughout that idle, so the task is scheduled there in proportion to the
-  -- frame as well. Measured at 2048 samples: dropping the yield from 43 ms to 10 and
-  -- then 5 raised idle from 46 % to 54 % and posted no 1706 at either, so the delay is
-  -- no longer what feeds the task -- it is only insurance against a frame whose work
-  -- happens to fill its whole period.
-  fftsa.sg_yield = 0.010
   -- Re-armed here, not at startup: the period depends on the sample count, and this is
-  -- the one place the count changes. The timer object is replaced, which is a create
-  -- and a delete -- acceptable on a settings change, never in a frame.
+  -- the one place the count changes. The timer object is replaced, which is a create and
+  -- a delete; frame() does the same when the measured tick count changes, which is the
+  -- only other place it happens.
   --
   -- This arm is from the model. frame() replaces it with one measured from real frames
   -- as soon as it has eight of them, so the peak is cleared here with the count.
@@ -262,12 +246,12 @@ fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged s
 -- Seconds one frame costs at a given sample count, from costs measured on the
 -- instrument on 2026-10-24 (docs/PERFORMANCE.md): 10.9 us a sample to acquire, 32.0
 -- to load and window, 3.593e-6 per butterfly-equivalent for the transform and its
--- power, 3.7 us a sample for the peak search, and a fill now capped by sg_maxpts.
--- Predicts 0.080 s at 512 against 81.8 ms measured, and 3.33 s at 32768.
+-- power, 3.7 us a sample for the peak search, and a fill fixed at sg_ncol points.
+-- Predicts 0.080 s at 512 against 0.079 measured and 1.63 s at 16384 against 1.686.
 --
--- busy_max exists to break a guard a host abort left set, and until it expires the
--- app looks dead -- so it has to clear a legitimate frame and not much more. Scaling
--- it as 2.0 * n/512 gave 128 s at 32768 against a real frame of 3.3.
+-- busy_max exists to break a guard a host abort left set, and until it expires the app
+-- looks dead -- so it has to clear a legitimate frame and not much more. Three times the
+-- model does that at every count; a multiple of the sample count does not.
 function fftsa.frame_estimate(n)
   if n == nil or n < 2 then n = 512 end
   local log2n = math.log(n) / 0.69314718055995
@@ -289,10 +273,9 @@ function fftsa.frame()
   local ok, err = pcall(fftsa.frame_body)
   fftsa.frame_work = os.clock() - entry
   -- RE-ARM FROM MEASURED WORK. frame_estimate() is a model fitted at one point count and
-  -- one draw path, and it was setting the frame rate on its own: at 512 it predicted
-  -- 80.4 ms, which divided by the 0.8 occupancy is 100.5 ms -- half a millisecond past
-  -- the 0.10 s tick, so the period came out 0.15 and the rate 6.7 fps where the frame
-  -- needed 0.10 and 10. At 2048 it errs the other way, 216 ms against 240 measured.
+  -- one draw path -- 80.4 ms against 79 measured at 512, 216 against 212 at 2048 -- and
+  -- divided by the occupancy target an error of that size can land either side of a tick
+  -- boundary, which is a 50 % swing in displayed rate. The period follows real frames.
   --
   -- The peak over a window of frames, not the mean: the period has to cover the slowest
   -- frame or ticks are dropped and the rate halves. It is only ever raised by a whole
@@ -319,10 +302,6 @@ function fftsa.frame()
     -- Re-bind the trace after a failure so the graph is never left without one, and only
     -- while the bound buffer still holds points: adding over an empty one binds nothing
     -- and never draws again.
-    --
-    -- A refill that raises does not need this: the buffer stays bound, so the next frame
-    -- clears and refills it. What needs it is a raise inside sg_rebind() itself, between
-    -- the removeall and the add, which leaves the graph with no trace at all.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
       fftsa.sg_rebind()
     end
@@ -378,8 +357,9 @@ fftsa.opt_btn_y   = 360
 fftsa.opt_btn_gap = 24      -- air kept between the last box and the button row
 fftsa.opt_info_y  = 323
 
--- Rows, pitch and top for the field block. The pitch asks for every pixel available
--- and the clamp decides what it gets: the last box has to end above the button row.
+-- Rows, pitch and top for the field block. The pitch is the preferred one, clamped if a
+-- field count ever needs it: the last box has to end above the button row. At the six
+-- fields the form carries, three rows at the preferred 100 leave the clamp inert.
 function fftsa.opt_layout()
   local nrows = math.ceil(fftsa.opt_nf / fftsa.opt_cols)
   local eh, edy = fftsa.opt_edit_h, fftsa.opt_edit_dy
@@ -469,11 +449,159 @@ function fftsa.build_options()
   display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_apply) end")
   local b_cancel = create(fftsa.optscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y, "Cancel", 140)
   display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_cancel) end")
+  local b_about = create(fftsa.optscr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "About", 140)
+  display.setevent(b_about, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.about) end")
   -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
   -- the visible screen, and leaving from the form must still tear down.
   display.setevent(fftsa.optscr, display.EVENT_ENDAPP,
                    "if fftsa ~= nil then fftsa.cleanup() end")
   return fftsa.optscr
+end
+
+-- ==================== About ====================
+-- An OBJ_TEXT y is the text's BASELINE, not the top of its box, which is why these sit
+-- lower than a button's y for the same apparent position.
+fftsa.about_x        = 12
+fftsa.about_title_x  = 400        -- centred, so the x is the screen's middle
+fftsa.about_title_y  = 30
+fftsa.about_body_y   = 70
+-- FONT_1's line pitch, measured on the panel: the numbered fonts are in the firmware's
+-- registration table but not in the display API reference, and FONT_1 draws about 17 px
+-- tall. Eleven rows at this pitch end clear of the button row at opt_btn_y.
+fftsa.about_body_dy  = 20
+-- Rows a page. 14 splits the licence after the blank line that follows the copyright
+-- notice, so the first page carries everything up to it and the second starts flush with
+-- the warranty block instead of with a blank row.
+fftsa.about_rows     = 14
+fftsa.about_page     = 1
+fftsa.about_c_title  = 56575      -- cyan 00DCFF
+fftsa.about_c_body   = 16777215   -- white
+
+-- The licence, verbatim from LICENSE and wrapped there: OBJ_TEXT does not wrap, so one
+-- line is one row, and a blank line is a row of its own.
+fftsa.about_text = {
+  "MIT License",
+  "",
+  "Copyright (c) 2026 Ian Ameline",
+  "",
+  "Permission is hereby granted, free of charge, to any person obtaining a copy",
+  'of this software and associated documentation files (the "Software"), to deal',
+  "in the Software without restriction, including without limitation the rights",
+  "to use, copy, modify, merge, publish, distribute, sublicense, and/or sell",
+  "copies of the Software, and to permit persons to whom the Software is",
+  "furnished to do so, subject to the following conditions:",
+  "",
+  "The above copyright notice and this permission notice shall be included in",
+  "all copies or substantial portions of the Software.",
+  "",
+  'THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR',
+  "IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,",
+  "FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE",
+  "AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER",
+  "LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,",
+  "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE",
+  "SOFTWARE.",
+}
+
+function fftsa.destroy_about()
+  if fftsa.aboutscr ~= nil then
+    -- Never delete the screen currently on show: leave it first.
+    fftsa.show_main()
+    fftsa.del_obj(fftsa.aboutscr)
+  end
+  fftsa.aboutscr, fftsa.about_name, fftsa.about_lines = nil, nil, nil
+  fftsa.about_pageno, fftsa.about_page = nil, 1
+end
+
+function fftsa.about_pages()
+  local rows = fftsa.about_rows
+  return math.ceil(table.getn(fftsa.about_text) / rows)
+end
+
+-- Page p into the row objects, which are made once and rewritten. A row past the end of
+-- the licence is blanked rather than left holding the previous page.
+function fftsa.about_show_page(p)
+  if fftsa.about_lines == nil then return false end
+  local last = fftsa.about_pages()
+  if p < 1 then p = 1 end
+  if p > last then p = last end
+  fftsa.about_page = p
+  local base, i = (p - 1) * fftsa.about_rows, nil
+  for i = 1, fftsa.about_rows do
+    local s = fftsa.about_text[base + i]
+    if s == nil then s = "" end
+    fftsa.settxt(fftsa.about_lines[i], s)
+  end
+  fftsa.settxt(fftsa.about_pageno, string.format("page %d of %d", p, last))
+  return true
+end
+
+function fftsa.about_pgup()
+  return fftsa.about_show_page(fftsa.about_page - 1)
+end
+
+function fftsa.about_pgdn()
+  return fftsa.about_show_page(fftsa.about_page + 1)
+end
+
+-- Built at launch with every other screen. A create on a visible screen is what strands
+-- objects, and the only screen visible during a build is the loading cover.
+function fftsa.build_about()
+  fftsa.destroy_about()
+  local create = display.create
+  fftsa.aboutscr = create(display.ROOT, display.OBJ_SCREEN, "ABOUT")
+  if fftsa.aboutscr == nil then
+    fftsa.lasterr = "display object pool exhausted building the about screen -- "
+                    .. "power cycle the instrument."
+    return false, fftsa.lasterr
+  end
+  fftsa.loading_front()
+  -- Outside the paged rows, so it stays put whichever page is showing.
+  fftsa.about_name = create(fftsa.aboutscr, display.OBJ_TEXT, fftsa.about_title_x,
+                            fftsa.about_title_y, "Author: Ian Ameline",
+                            fftsa.about_c_title, display.FONT_4, display.JUST_CENTER)
+  fftsa.about_lines = {}
+  local y, i = fftsa.about_body_y, nil
+  for i = 1, fftsa.about_rows do
+    fftsa.about_lines[i] = create(fftsa.aboutscr, display.OBJ_TEXT, fftsa.about_x, y, "",
+                                  fftsa.about_c_body, display.FONT_1, display.JUST_LEFT)
+    y = y + fftsa.about_body_dy
+  end
+  fftsa.about_pageno = create(fftsa.aboutscr, display.OBJ_TEXT, fftsa.about_title_x,
+                              fftsa.opt_btn_y - 8, "", fftsa.about_c_title,
+                              display.FONT_SMALL, display.JUST_CENTER)
+  local b_up = create(fftsa.aboutscr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "PgUp", 140)
+  display.setevent(b_up, display.EVENT_PRESS,
+                   "if fftsa ~= nil then fftsa.guard(fftsa.about_pgup) end")
+  local b_dn = create(fftsa.aboutscr, display.OBJ_BUTTON, 168, fftsa.opt_btn_y,
+                      "PgDn", 140)
+  display.setevent(b_dn, display.EVENT_PRESS,
+                   "if fftsa ~= nil then fftsa.guard(fftsa.about_pgdn) end")
+  local b_back = create(fftsa.aboutscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y,
+                        "Back", 140)
+  display.setevent(b_back, display.EVENT_PRESS,
+                   "if fftsa ~= nil then fftsa.guard(fftsa.about_back) end")
+  -- End App is delivered to the visible screen, and this one can be it.
+  display.setevent(fftsa.aboutscr, display.EVENT_ENDAPP,
+                   "if fftsa ~= nil then fftsa.cleanup() end")
+  fftsa.about_show_page(1)
+  return fftsa.aboutscr
+end
+
+-- A press only switches, like Options: a nil handle means the pool refused at build.
+-- Always from the first page, so the screen reads the same every time it is opened.
+function fftsa.about()
+  if fftsa.aboutscr == nil then return false end
+  fftsa.about_show_page(1)
+  display.changescreen(fftsa.aboutscr)
+  return true
+end
+
+-- Back to the form it was opened from, or to the spectrum if the form is gone.
+function fftsa.about_back()
+  if fftsa.optscr == nil then return fftsa.show_main() end
+  display.changescreen(fftsa.optscr)
+  return true
 end
 
 function fftsa.sample_rate_text(fs)
@@ -494,8 +622,7 @@ end
 -- returns nil from display.create when the object pool is exhausted, so a field handle
 -- can legitimately be nil, and getvalue on nil is a raise in OUR code -- not a firmware
 -- refusal. Testing for nil here is what keeps a missing field from taking Options and
--- Apply down with it, which is what the pcalls around these calls used to do at the cost
--- of a closure each and of hiding the reason.
+-- Apply down with it.
 function fftsa.getval(h, fallback)
   if h == nil then return fallback end
   return display.getvalue(h)
@@ -527,7 +654,7 @@ function fftsa.options_preview()
                              fftsa.kbeta_i)
   local text = fftsa.opt_info_text(fs, fftsa.options_samples(), wi, bi)
   if text ~= fftsa.opt_info_last then
-    display.settext(fftsa.opt_info, text)
+    fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text
   end
 end
@@ -546,9 +673,9 @@ function fftsa.guard(f)
   return ok
 end
 
--- Put a line on the glass where the axis legend goes. Failures that are only
--- recorded in fftsa.lasterr are invisible to the operator, who sees a press that
--- did nothing and a previous spectrum still running. The legend is rewritten by the
+-- Put a line on the glass, on the settings line under the peak rows. Failures that are
+-- only recorded in fftsa.lasterr are invisible to the operator, who sees a press that did
+-- nothing and a previous spectrum still running. The settings line is rewritten by the
 -- next fftsa.sg_set_xrange(), so this is not sticky.
 function fftsa.say(msg)
   if fftsa.sg_xunit ~= nil then
@@ -570,20 +697,18 @@ end
 -- means the object pool refused and building it now would fail the same way.
 function fftsa.options()
   if fftsa.optscr == nil then return false end
-  -- Guarded, NOT pcall'd. The firmware does not raise -- display.create RETURNS NIL when
-  -- the object pool is exhausted, and it is setvalue on that nil handle that raises, in
-  -- our own code. A nil test removes the raise instead of catching it, which is the same
-  -- protection without a closure per field: an exhausted pool then costs the fields it
-  -- could not build rather than the Options button and Apply together.
+  -- A nil handle is what an exhausted pool leaves, so every field goes through the
+  -- nil-testing setters: the cost is then the fields the pool refused, not the Options
+  -- button and Apply together.
   fftsa.setval(fftsa.opt_flo, fftsa.flo)
   fftsa.setval(fftsa.opt_fhi, fftsa.fhi)
   fftsa.setval(fftsa.opt_rng, fftsa.range_to_idx(fftsa.range))
   fftsa.setval(fftsa.opt_win, fftsa.win_i)
   fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
   fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
-  -- Guarded like its neighbours: four getvalue/settext calls on handles the pool may
-  -- have refused, and changescreen is the next line. Unguarded, a refusal at the end
-  -- of the create list leaves the Options button dead for the life of the app.
+  -- Guarded like its neighbours: five field reads on handles the pool may have refused,
+  -- and changescreen is the next line. Unguarded, a refusal at the end of the create list
+  -- leaves the Options button dead for the life of the app.
   fftsa.options_preview()
   display.changescreen(fftsa.optscr)
   return true
@@ -653,7 +778,7 @@ end
 function fftsa.build()
   fftsa.loading_build()
   fftsa.loading_front()
-  -- Two trace buffers at sg_maxpts, for the life of the app: allocated at the CEILING
+  -- The trace buffer at sg_maxpts, for the life of the app: allocated at the CEILING
   -- rather than at sg_ncol so the point count stays adjustable upwards while running
   -- without anything being resized or reallocated.
   local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
@@ -665,44 +790,28 @@ function fftsa.build()
   display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options) end")
   local optok, optwhy = fftsa.build_options()
   if optok == false then return false, optwhy end
+  local aboutok, aboutwhy = fftsa.build_about()
+  if aboutok == false then return false, aboutwhy end
   return fftsa.sg_scr
 end
 
--- Arm the frame timer; it is active only while its parent screen is visible.
--- 0.05 s is the firmware's floor (arm(0.045) is refused with event 1131), and a
--- tick that lands during a frame is dropped, so the displayed rate is quantised;
--- docs/PERFORMANCE.md has the model. One frame per tick: back-to-back frames keep
--- the interpreter out of its event loop.
--- The period a frame needs, with interpreter idle left over.
---
--- delay() lets the display task PAINT -- that is C -- but dispatching a touch means
--- evaluating Lua, and the interpreter is inside the delay. So a press is only handled
--- in the gap between a frame finishing and the next tick, and with the period left at
--- the 0.05 s floor that gap is whatever the quantisation happens to leave: 45 ms of
--- 150 at 512 samples, and 12 ms of 500 at 4096, which made Options unreachable there
--- while 512 was fine. It was luck, not design.
---
--- Asking for the work to be 80 % of the period puts the idle at about 20 % at every
--- count.
---
--- frame_estimate() ALREADY INCLUDES THE YIELD. It was fitted against measured frame
--- times -- 0.080 s predicted against 81.8 ms measured at 512 -- and a measured frame is
--- the whole frame, delay() and all. Adding sg_yield to it again counted the yield twice
--- and pushed 512 from 105 ms of apparent busy to 131 ms after the 80 % divide, which is
--- past the 0.10 s tick: the period came out 0.15 and the rate 6.7 fps where the frame
--- itself only needed 0.10 and 10 fps. A tick of quantisation lost to double counting.
 -- Seconds of timer period that leave a frame of this length about 20 % idle, rounded up
--- to the firmware's 0.05 s tick. The one place the occupancy rule lives, so the modelled
--- first arm and the measured re-arms cannot disagree about it.
+-- to the firmware's 0.05 s tick floor (arm(0.045) is refused with event 1131). The one
+-- place the occupancy rule lives, so the modelled first arm and the measured re-arms
+-- cannot disagree about it.
+--
+-- The idle is what dispatches a touch. delay() lets the display task PAINT -- that is C
+-- -- but a press means evaluating Lua, and a tick landing during a frame is dropped, so
+-- without the headroom the gap is whatever the quantisation happens to leave: at the
+-- 0.05 s floor that was 12 ms of 500 at 4096 samples, and Options was unreachable there.
 --
 -- The slack matters as much as the 0.8 does. A tick is 50 ms, so holding the occupancy
--- target to the last millisecond buys a fiftieth of a tick of idle and costs a WHOLE
--- tick of rate. Measured at 512 samples: the worst frame is 80.1 ms, which over 0.8 is
--- 100.1 ms -- a tenth of a millisecond past two ticks -- so it took three and the rate
--- was 6.67 fps where 10 was there for 80.1 % occupancy instead of 80.0.
---
--- A twentieth of a tick, 2.5 ms. It can only change the answer for a frame already
--- within 2.5 ms of a boundary, and there it prefers the rate.
+-- target to the last millisecond buys a fiftieth of a tick of idle and costs a WHOLE tick
+-- of rate: the worst frame at 512 samples is 80.1 ms, which over 0.8 is 100.1 ms -- a
+-- tenth of a millisecond past two ticks -- and taking three would have been 6.67 fps
+-- against the 10 that 80.1 % occupancy allows. A twentieth of a tick, 2.5 ms, can only
+-- change the answer for a frame already that close to a boundary, and there it prefers
+-- the rate.
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return 0.05 end
   local ticks = math.ceil((busy / 0.8) / 0.05 - 0.05)
@@ -716,6 +825,9 @@ function fftsa.frame_period(n)
   return fftsa.tick_period(fftsa.frame_estimate(n))
 end
 
+-- Arm the frame timer. It is active only while its parent screen is visible, which is
+-- what stops frames while Options or About is on show. One frame per tick: back-to-back
+-- frames keep the interpreter out of its event loop.
 function fftsa.arm(period_s)
   if period_s == nil then period_s = 0.05 end
   if fftsa.timer ~= nil then
@@ -743,10 +855,6 @@ function fftsa.install_cleanup()
   return ok
 end
 
--- Startup, guarded end to end so a failure part-way leaves nothing without a
--- teardown. The opening fftsa.stop() reclaims a previous launch's handles: as an
--- installed App the script re-runs on every open, and an exit that skipped
--- EVENT_ENDAPP (the Home screen, another App) leaves them behind.
 -- One cleanup path for a failed start, so the two ways of failing cannot drift apart.
 function fftsa.start_failed(why)
   fftsa.lasterr = tostring(why)
@@ -757,6 +865,10 @@ function fftsa.start_failed(why)
   return false
 end
 
+-- Startup, guarded end to end so a failure part-way leaves nothing without a teardown.
+-- The opening fftsa.stop() reclaims a previous launch's handles: as an installed App the
+-- script re-runs on every open, and an exit that skipped EVENT_ENDAPP (the Home screen,
+-- another App) leaves them behind.
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
@@ -811,6 +923,7 @@ function fftsa.stop()
   fftsa.optbtn = nil                          -- child of the spectrum screen
   pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
   fftsa.destroy_options()
+  fftsa.destroy_about()
   fftsa.loading_destroy(display.SCREEN_HOME)
   if fftsa.errscr ~= nil then
     fftsa.del_obj(fftsa.errscr)

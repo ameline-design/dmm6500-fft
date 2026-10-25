@@ -3,16 +3,15 @@
 fftsa = fftsa or {}   -- the single global this app exposes
 
 -- ---------- loading cover ----------
--- A screen with nothing on it but a line of text, held in front while the real
--- screens are built and while Apply rebuilds the window tables. Creating a screen
--- makes it active, so every screen build raises this again before its first child or
--- the operator watches the screen assemble itself, one 12 ms create at a time.
+-- A screen with nothing on it but a line of text, held in front while the real screens
+-- are built and while Apply rebuilds the window tables. Creating a screen makes it
+-- active, so every screen build raises this again before its first child, or the operator
+-- watches the screen assemble itself one create at a time.
 --
--- Created once by fftsa.loading_build() and deleted once by fftsa.stop(), so it
--- outlives the build and is there for the Apply that rebuilds the window tables.
--- Raising it is a changescreen and nothing else: creating and deleting a cover per
--- raise would put two objects of the 463-object pool through a create/delete cycle
--- every time, and a refused delete raises nothing.
+-- Created once by fftsa.loading_build() and deleted once by fftsa.stop(). Raising it is a
+-- changescreen and nothing else: a cover created and deleted per raise would put two of
+-- the 463-object pool through a create/delete cycle every time, and a refused delete
+-- raises nothing.
 if fftsa.load_handles_inited == nil then
   fftsa.loadscr = nil
   fftsa.loadtxt = nil
