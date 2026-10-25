@@ -31,20 +31,15 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
 acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps the rate up to 1 MS/s and
 coarsens the bins with it. There is no anti-alias filter, so a rate chosen below the signal's own
-content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, drew a 4.51 V peak at
-1.100 kHz. Raising the rate can only remove aliases; lowering it is what creates them.
+content folds it into view.
 
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
-6.10 Hz spacing and a 163.84 ms record. Acquisition duration is `N / fs`, not the full frame time;
-processing and display add overhead. Larger sizes cost update rate, and measurably so: the frame goes
-from 0.079 s at 512 samples to 1.686 s at 16,384, and Apply from 0.11 s to 2.89 s, so the trace
-repaints at 10 fps at the default and about every two seconds at the top size. 16,384 is usable
-rather than comfortable. `docs/PERFORMANCE.md` has every size measured.
+6.10 Hz spacing. Larger sizes cost update rate. `docs/PERFORMANCE.md` has every size measured.
 
 ![The same tone at the default 512 samples: one 195 Hz-wide lump, the harmonics lost in the noise floor, at 10 frames a second](docs/manual-spectrum.png)
 
 The same signal at the default 512 samples, for comparison: 195 Hz bins at 10 frames a second, where
-the harmonics are in the floor. That is the trade Options exists to make.
+the harmonics are in the floor. 
 
 ## Choosing a window
 
