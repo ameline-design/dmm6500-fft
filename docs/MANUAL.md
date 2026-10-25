@@ -8,16 +8,21 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 1.000 V tone at 0.0 dBV over a 10 Hz to 50 kHz span, 512 samples, Hann window, noise floor near -100 dBV](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.01kHz to +40.01kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
 
-**Two rows of numbers sit under the plot. Read the lower one.** The graph object's X axis is
-hardwired to time, so the app writes each bin's frequency into the timestamp and the firmware labels
-it in seconds — one label-second is one kilohertz. The app prints its own row, in real units,
-beneath. The dB numbers down the left edge are the firmware's and are correct as written; ignore the
-`V` suffix.
+**Both axes are labelled in the units you want: kHz across, dB down.** That is worth a note only
+because it was not always so, and the two mechanisms are worth knowing if you read the source. The
+graph object's X axis is labelled in seconds whenever it is bound to a reading's timestamp, with a
+suffix that cannot be switched off; binding it to the reading's *extra* field instead makes it the
+firmware's numeric plot, which labels the real frequency and picks the SI prefix itself. The Y values
+are decibels held in a buffer whose unit is a two-character custom one, `dB`, for the same reason: a
+volt-unit buffer labelled them `V`.
+
+The `+` signs and the `.01` are both the firmware's doing. It signs its numeric axes, and the span
+starts at the Start frequency — 10 Hz by default, which is 0.01 kHz. Set Start to 0 for round marks.
 
 Six peaks, strongest first, in two columns:
 

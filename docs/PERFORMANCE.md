@@ -450,19 +450,31 @@ name rule above.
 
 ## The frequency axis
 
-The existing `sg_pick_fscale()` steps `s` by ten while `fhi/s >= 59`, so a 500 kHz span lands on
-`s = 10000` and the reader has to multiply the label by ten.
+**Settled, and the whole problem went away.** X is bound to the reading's **extra** field, which makes
+the graph the firmware's numeric x-y plot instead of a time plot: the axis takes its limits in real
+hertz and the firmware labels and SI-prefixes them itself -- `+00.01kHz`, `+10.01kHz`. The Y axis
+reads `dB` because the buffer's reading unit is the two-character custom unit `buffer.UNIT_CUSTOM1`,
+registered with `buffer.unit`. Confirmed on the instrument, 2026-10-25.
 
-**Fixing `s = 1e6` was tried on hardware and reverted. Do not retry it.** The idea was that the whole
-0-500 kHz span then maps to 0-0.5 label-seconds, so base 60 cannot appear and the graph's own SI
-prefixes line up with the units. What it actually did was put the firmware's axis row into a regime
-where its own choice of label count oscillates: the operator saw the row alternate between labelling
-every tick and labelling the ticks between, one frame at a time -- "normally 00.01ms, 10.01ms,
-20.01ms; when it flickers it draws 05.01ms, 15.01ms". The decade walk already prevents the base-60
-rollover, so the change bought nothing and cost a visible flicker at 1-2 Hz.
+Everything below is what that replaced, kept because two of the three are hazards.
 
-Unverified: whether the graph prefixes sub-second timestamps as `ms`/`us` or prints `0.0125s`. Both
-are decimal and unambiguous; only the first reads directly as kHz. One screenshot settles it.
+The time axis is labelled in seconds with a suffix that cannot be switched off, so each bin's
+frequency went into the timestamp divided by a decade scale (`sg_pick_fscale`, stepping while
+`fhi/s >= 59` to stay clear of the base-60 rollover) and the app drew its own label row below the
+plot in real units. Two rows of numbers, one of them wrong.
+
+- **Fixing `s = 1e6` was tried on hardware and reverted. Do not retry it.** The idea was that a whole
+  0-500 kHz span maps to 0-0.5 label-seconds, so base 60 cannot appear. What it did was put the
+  firmware's axis row into a regime where its own choice of label count oscillates: the row
+  alternated between labelling every tick and labelling the ticks between, one frame at a time --
+  "normally 00.01ms, 10.01ms, 20.01ms; when it flickers it draws 05.01ms, 15.01ms".
+- **Masking the firmware's row cannot work.** A child object inside the graph's rectangle is painted
+  over by its per-frame repaint whatever the creation order: a thick white line across the label row
+  showed up only for the three pixels extending past the graph's right edge. `OBJ_RECT` is
+  outline-only here and `display.setfill` is inert, so a filled bar is a thick `OBJ_LINE` anyway,
+  capped at 10 px by `setthickness`.
+- **`buffer.UNIT_DECIBEL` panics the instrument during build.** The custom-unit path does not, and a
+  custom label is truncated to two characters with event 4933 -- which `dB` fits exactly.
 
 Related, from the firmware: units are `buffer.UNIT_*`, with `UNIT_HERTZ = 9` and `UNIT_SECOND = 10`.
 `UNIT_SECOND` is the only unit the firmware demonstrably exercises **on an axis**, and two of the

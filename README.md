@@ -4,7 +4,7 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen: a 12.5 kHz 1.000 V tone reading 0.0 dBV over a 10 Hz to 50 kHz span, 512 samples, Hann window, noise floor near -100 dBV](docs/manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV over a 10 Hz to 50 kHz span at 512 samples, Hann window, with the firmware labelling the axes +020.0dB to -120.0dB and +00.01kHz to +40.01kHz](docs/manual-spectrum.png)
 
 A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
 and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
@@ -17,7 +17,9 @@ and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
   and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
 - **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and no graph call at all, which
-  brings axes, grid, labels and auto-scaling with it. The trace is a fixed **255 columns** at every
+  brings axes, grid, labels and auto-scaling with it. The firmware labels both axes in real units --
+  kHz across, from binding X to the reading's extra field rather than its timestamp, and dB down,
+  from a two-character custom buffer unit. The trace is a fixed **255 columns** at every
   sample count, each carrying the **maximum of the bins it covers**, so a narrow tone always reaches
   it however many bins the span holds.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
