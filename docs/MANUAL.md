@@ -8,7 +8,7 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.0012 V tone reading 0.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
