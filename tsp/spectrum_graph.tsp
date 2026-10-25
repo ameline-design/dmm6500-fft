@@ -44,11 +44,11 @@ fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 -- Fixed, not sized to the span: a frame then always writes exactly this many points and
 -- the widget's load is constant and predictable whatever the sample count or span.
 --
--- 255 points, with the pair ALLOCATED AT 680 and freed only when the app ends. One
--- point per pixel was tried and withdrawn on cost: it made the fill 77 ms against about
--- 28 ms here, and the frame is what the operator feels. sg_ncol is settable while the
--- app runs, up to sg_maxpts, because the buffers are FILL_ONCE and cleared -- n follows
--- the writes, so a smaller count simply draws fewer points and reallocates nothing.
+-- 255 points, in a buffer ALLOCATED AT 680 and freed only when the app ends. Not one
+-- point per pixel: 680 points cost 77 ms a fill against about 28 ms at 255, and the frame
+-- is what the operator feels. sg_ncol is settable while the app runs, up to sg_maxpts,
+-- because the buffer is FILL_ONCE and cleared -- n follows the writes, so a smaller count
+-- simply draws fewer points and reallocates nothing.
 fftsa.sg_ncol    = 255
 fftsa.sg_maxpts  = 680
 
@@ -87,15 +87,13 @@ fftsa.sg_fhi_hz  = 1e9
 -- points, so our sg_ncol fit undecimated; LATEST reads a 648-point window ending at the
 -- newest reading; GROUP is internal mode 7. If one of them follows the buffer by itself
 -- then a frame needs no graph call at all, which is the cheapest outcome available.
--- XSCALE_OFF, the pinned window, MEASURED AS THE ONLY STABLE CHOICE. XSCALE_ALL was
--- tried first, on the reasoning that it reads the whole buffer and so has to notice new
--- writes -- it does, and the trace redrew, but it also derives the X range from the
--- buffer's own timestamps. The buffer is a ring, so startindex sweeps across it as the
--- fill advances and a paint landing mid-fill computes the range from whichever slot the
--- write position had reached. The axis then walks frame to frame, which on the glass
--- reads as the trace sliding left and right as though the point count were changing.
--- The axis does not need to follow anything: the span is known, and pinning it leaves
--- the redraw to the notify below.
+-- XSCALE_OFF, the pinned window, MEASURED AS THE ONLY STABLE CHOICE. XSCALE_ALL reads
+-- the whole buffer and so does notice new writes -- the trace redraws -- but it derives
+-- the X range from the buffer's own timestamps, and those move while a frame refills: a
+-- paint landing mid-fill computes the range from however much of the trace is there. The
+-- axis then walks frame to frame, which on the glass reads as the trace sliding left and
+-- right as though the point count were changing. The axis does not need to follow
+-- anything: the span is known, and pinning it leaves the redraw to the notify below.
 fftsa.sg_xmethod = display.XSCALE_OFF
 -- Notify candidates that were tried and are NOT used, so none of them is tried again
 -- on the same reasoning: select, scaletrace(TRACE_ACTIVE), drawstyle and re-asserting
@@ -231,7 +229,7 @@ end
 --
 -- FILL_ONCE, cleared and refilled by every frame from arrays it stages first, so nothing
 -- but buffer.write.reading is inside the window where the buffer is short of a trace.
--- The clear is also the handover: the display task keeps its own copy of the readings
+-- The clear is also the notify: the display task keeps its own copy of the readings
 -- (FIRMWARE_API.md:246) and re-reads a buffer only when it is handed one, so writing over
 -- a bound buffer in place changes nothing on the glass.
 function fftsa.sg_make_buffer(nbins, npoints)
@@ -418,10 +416,10 @@ function fftsa.sg_update(nbins, binhz)
   local buf = fftsa.sg_buf
   if buf == nil then return end
   -- Points this frame writes, CLAMPED TO CAPACITY: one write past it is event 4915, a
-  -- modal dialog, and sg_ncol is settable while the app runs. Writing fewer than
-  -- capacity is fine now that the buffers are FILL_ONCE and cleared -- n follows the
-  -- writes, so the trace simply has that many points. That is what makes sg_ncol a live
-  -- knob without reallocating anything: the pair stays at the 680 they were made with.
+  -- modal dialog, and sg_ncol is settable while the app runs. Writing fewer than capacity
+  -- is fine because the buffer is FILL_ONCE and cleared -- n follows the writes, so the
+  -- trace simply has that many points. That is what makes sg_ncol a live knob without
+  -- reallocating anything: the buffer stays at the 680 it was made with.
   local ncol = fftsa.sg_ncol
   local cap  = buf.capacity
   if cap ~= nil and ncol > cap then ncol = cap end

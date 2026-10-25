@@ -212,11 +212,10 @@ writes: about 0.035 s at any count, which is also what makes the frame time line
 
 The trace buffer is bound to the graph for the life of the app and refilled in place, so it is at
 n = 0 from `clear()` until the last write and a paint landing there draws a blank or partial trace.
-That window is the flicker, and it cannot be removed -- the firmware needs the clear before a
-`FILL_ONCE` buffer can be rewritten, and the alternative of filling a second buffer and handing it
-over needs a `removeall`, which repaints the whole widget including its own axis labels every frame.
+That window is the flicker, and it cannot be removed: the firmware needs the clear before a
+`FILL_ONCE` buffer can be rewritten.
 
-So the window is made narrow instead. Every value is computed into four preallocated arrays *before*
+So the window is made narrow instead. Every value is computed into two preallocated arrays *before*
 the clear, while the buffer still holds the previous complete trace, leaving only
 `buffer.write.reading` inside it. Measured at 255 points:
 
@@ -224,7 +223,7 @@ the clear, while the buffer still holds the previous complete trace, leaving onl
 |---|---|
 | staging, outside the window | 7.6 ms |
 | clear and 255 writes, the window | **20.3 ms** |
-| the same refill interleaved, as it was | 30 ms, all of it the window |
+| the same refill interleaved | 30 ms, all of it the window |
 
 A point costs about 109 us to produce and 51.6 of that is the write, so this is the better half of
 the work moved out. There is no bulk route into a reading buffer (`FIRMWARE_API.md`), so one write a

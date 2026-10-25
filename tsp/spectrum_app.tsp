@@ -320,10 +320,9 @@ function fftsa.frame()
     -- while the bound buffer still holds points: adding over an empty one binds nothing
     -- and never draws again.
     --
-    -- The guard is cheap insurance rather than a live case now. sg_update() clears and
-    -- fills the SPARE, so a raise in there leaves the bound buffer whole and still
-    -- bound, and the only buffer that can be left part filled is one nothing draws
-    -- from -- the next frame clears it before writing anyway.
+    -- A refill that raises does not need this: the buffer stays bound, so the next frame
+    -- clears and refills it. What needs it is a raise inside sg_rebind() itself, between
+    -- the removeall and the add, which leaves the graph with no trace at all.
     if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
       fftsa.sg_rebind()
     end

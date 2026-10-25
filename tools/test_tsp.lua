@@ -245,9 +245,9 @@ function display.graph.scalex(g, ...)
   local a = arg
   OBJ[g].xmethod = a[1]                    -- which scale method was asked for
   -- The ordering witness. The display task copies the buffer when it processes the
-  -- notify, so the notify has to be issued BEFORE the frame's yield, not after: with
-  -- the yield first the copy lands during the next frame's fill and reads the ring part
-  -- way round. Nothing else can see that order, so the delay count is recorded here.
+  -- notify, so the notify has to be issued BEFORE the frame's yield, not after: with the
+  -- yield first the copy lands during the next frame's fill and reads a buffer part
+  -- written. Nothing else can see that order, so the delay count is recorded here.
   OBJ[g].xdelays = DELAYS
   if a[3] ~= nil then
     OBJ[g].xmin, OBJ[g].xmax = a[3], a[4]
@@ -1010,11 +1010,9 @@ local ad0, rm0 = (OBJ[gh].adds or 0), (OBJ[gh].removes or 0)
 local dl0 = DELAYS
 local pin0 = (OBJ[gh].pins or 0)
 fftsa.frame_body()
--- One detach and one re-attach a frame, which is the buffer swap: the refill fills the
--- spare and then points the graph at it, so no paint ever catches a partial trace. It
--- used to be zero of each -- an attached in-place refill -- and the 43 ms the swap
--- costs the display task is the price of that. More than one of either would be a
--- regression into per-point churn, which is what these numbers really guard.
+-- The frame detaches nothing and attaches nothing: the refill rewrites the buffer the
+-- graph already holds, so adds and removes must both come back unmoved. Either of them
+-- moving is a regression into per-point churn, which is what these numbers guard.
 check('the frame does not detach the trace', (OBJ[gh].removes or 0) == rm0,
       'removes=' .. tostring(OBJ[gh].removes) .. ' was ' .. tostring(rm0))
 check('nor re-attach it', (OBJ[gh].adds or 0) == ad0,
@@ -1576,10 +1574,9 @@ check('the graph mock rejects empty bindings until explicitly rebound', (functio
   buffer.delete(b)
   return rejected and rebound
 end)())
--- The bound buffer ALTERNATES between the two now, so identity is not the invariant it
--- used to be. What has to hold is that the pair never changes, both stay alive, the
--- graph always shows one of them, and exactly one trace is bound -- adds and removes
--- both advance by one a frame, so only their difference is stable.
+-- One buffer, bound for the life of the app, so its identity IS the invariant: it must
+-- be the same object, still alive, still the one the graph holds, at the same capacity,
+-- with adds and removes unmoved and no object or buffer created along the way.
 check('all size transitions keep the original trace bound and plot without leaks',
       (function()
   display.setvalue(fftsa.opt_flo, 10)
@@ -1747,8 +1744,8 @@ end)())
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
 -- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
 -- notice new writes -- but it derives the range from the buffer's own timestamps, and
--- the buffer is a ring whose startindex sweeps across it during the fill. A paint
--- landing mid-fill computes a different range, so the axis walks and the trace slides
+-- those move while a frame refills. A paint landing mid-fill computes a different range,
+-- so the axis walks and the trace slides
 -- left and right as though its point count were changing. Measured on the glass twice.
 -- Both halves are asserted: the method, and that the limits really are the span.
 -- Pinned, never auto-ranged, and the low limit is DC when Start falls inside the first
@@ -1859,13 +1856,13 @@ check('the trace buffer is FILL_ONCE, never a ring', (function()
                        tostring(buffer.FILL_CONTINUOUS))
 end)())
 
--- sg_ncol is a live knob, and changing it must not touch the allocation: the buffers
--- stay at the 680 they were made with and the frame simply writes fewer points. This is
--- what lets the point count be traded against the frame rate from the socket instead of
--- by reinstalling, so it is asserted rather than assumed.
+-- sg_ncol is a live knob, and changing it must not touch the allocation: the buffer stays
+-- at the 680 it was made with and the frame simply writes fewer points. This is what lets
+-- the point count be traded against the frame rate from the socket instead of by
+-- reinstalling, so it is asserted rather than assumed.
 check('the point count can be changed without reallocating anything', (function()
   local keep = fftsa.sg_ncol
-  local ring1 = fftsa.sg_buf
+  local trace = fftsa.sg_buf
   local bufs0 = livebufs()
   local made = 0
   local realmake = buffer.make
@@ -1878,27 +1875,26 @@ check('the point count can be changed without reallocating anything', (function(
   local at340 = fftsa.sg_buf.n
   fftsa.sg_ncol = keep
   fftsa.frame()
-  local back = fftsa.sg_buf.n
+  local restored = fftsa.sg_buf.n
   buffer.make = realmake
-  return at340 == 340 and back == keep and made == 0
-         and fftsa.sg_buf == ring1 and livebufs() == bufs0
-         and ring1.capacity == fftsa.sg_maxpts,
+  return at340 == 340 and restored == keep and made == 0
+         and fftsa.sg_buf == trace and livebufs() == bufs0
+         and trace.capacity == fftsa.sg_maxpts,
          string.format('340 -> %d points, %d -> %d, allocations %d, capacity %d',
-                       at340, keep, back, made, ring1.capacity)
+                       at340, keep, restored, made, trace.capacity)
 end)())
 
 -- THE WINDOW. The trace buffer is bound for the life of the app and refilled in place,
 -- so it sits at n = 0 from the clear to the last write and a paint landing there draws a
--- blank or partial trace. Nothing can remove that window -- the firmware needs the clear
--- before a FILL_ONCE buffer can be rewritten, and the alternative, filling a spare and
--- handing it over, needs a removeall that repaints the axis labels every frame.
+-- blank or partial trace. Nothing can remove that window: the firmware needs the clear
+-- before a FILL_ONCE buffer can be rewritten.
 --
 -- So the window is made as narrow as possible: every value is computed into preallocated
 -- arrays BEFORE the clear, leaving only buffer.write.reading inside it. A point costs
 -- about 109 us to produce and 51.6 of that is the write, so this is better than half.
 --
--- Counting writes cannot see this -- the interleaved design also wrote only after the
--- clear. Counting the dB conversions can: staged, every log10 happens first.
+-- Counting writes cannot see this: they land after the clear either way. Counting the dB
+-- conversions can, because staging puts every log10 before it.
 check('the refill stages every value before clearing, so only writes are in the window',
       (function()
   local buf = fftsa.sg_buf
@@ -2199,10 +2195,9 @@ end)())
 -- counter rather than inferred: raise ncol past the budget and the budget still wins.
 -- sg_ncol is settable while the app runs, so a value past capacity has to be CLAMPED,
 -- not merely survived. The frame completing is the assertion that matters: writing one
--- point past a FILL_ONCE buffer is event 4915, a modal dialog, and a dialog per frame
--- is as impossible to exit as one per point. Checking the bound buffer's n alone cannot
--- see this -- an overrun raises while the SPARE is being filled, so the bound buffer is
--- left whole at 680 and the old form of this check passed with the clamp deleted.
+-- point past a FILL_ONCE buffer is event 4915, a modal dialog, and a dialog per frame is
+-- as impossible to exit as one per point. The buffer's n cannot see it: clamped or
+-- overrun, n ends at capacity either way.
 check('a column count past capacity is clamped, not refused', (function()
   local keep = fftsa.sg_ncol
   fftsa.sg_ncol = 4096
@@ -2223,8 +2218,8 @@ check('a column count past capacity is clamped, not refused', (function()
 end)())
 
 -- Repeated refills rewrite the SAME buffer, with the trace never detached and never
--- re-added. Over three frames, because a design that rebound on alternate frames would
--- satisfy a single-frame check while flickering the axes every other frame on the glass.
+-- re-added. Over three frames: one frame cannot tell a binding that holds from one that
+-- is re-added every other frame, which on the glass flickers the axes at half the rate.
 check('repeated refills rewrite the same buffer, with no rebinding', (function()
   display.setvalue(fftsa.opt_rng, 3)
   display.setvalue(fftsa.opt_n, 1)
