@@ -407,8 +407,9 @@ function fftsa.build_options()
   -- A screen title over 31 characters is truncated by the firmware (event 1707).
   fftsa.optscr = create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER OPTIONS")
   if fftsa.optscr == nil then
-    error("display object pool exhausted building the options screen -- power "
-          .. "cycle the instrument.", 0)
+    fftsa.lasterr = "display object pool exhausted building the options screen -- "
+                    .. "power cycle the instrument."
+    return false, fftsa.lasterr
   end
   fftsa.loading_front()
 
@@ -656,13 +657,15 @@ function fftsa.build()
   -- Two trace buffers at sg_maxpts, for the life of the app: allocated at the CEILING
   -- rather than at sg_ncol so the point count stays adjustable upwards while running
   -- without anything being resized or reallocated.
-  fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
+  local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
+  if scr == nil then return false, why end
   -- The button died with the screen fftsa.sg_build() just destroyed: clear the
   -- stale handle, do not delete it.
   fftsa.optbtn = nil
   fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
   display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options) end")
-  fftsa.build_options()
+  local optok, optwhy = fftsa.build_options()
+  if optok == false then return false, optwhy end
   return fftsa.sg_scr
 end
 
@@ -745,14 +748,33 @@ end
 -- teardown. The opening fftsa.stop() reclaims a previous launch's handles: as an
 -- installed App the script re-runs on every open, and an exit that skipped
 -- EVENT_ENDAPP (the Home screen, another App) leaves them behind.
+-- One cleanup path for a failed start, so the two ways of failing cannot drift apart.
+function fftsa.start_failed(why)
+  fftsa.lasterr = tostring(why)
+  fftsa.stop()
+  print("fftsa start FAILED (cleaned up): " .. tostring(why))
+  -- No console as an installed App, so the failure goes on the panel.
+  fftsa.show_error(tostring(why))
+  return false
+end
+
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
 
-  local hooked = false
+  -- The display object pool running out is a RETURN, not a raise: display.create answers
+  -- nil and posts one event, and build() passes that up as false and a reason. Handled
+  -- here directly rather than raised into the boundary below, which would be reporting a
+  -- condition to ourselves.
+  local built, why = fftsa.build()
+  if built == false then return fftsa.start_failed(why or "build failed") end
+
+  local hooked = fftsa.install_cleanup()
+  -- The boundary that remains, and what it is for: apply() is arithmetic over tables
+  -- fft_init builds, so a defect in OUR code raises here. A raise escaping a timer or
+  -- button callback on this firmware posts -286 and leaves the app on screen and dead,
+  -- so one backstop per entry point stays until those paths are proved non-raising.
   local ok, err = pcall(function()
-    fftsa.build()
-    hooked = fftsa.install_cleanup()
     fftsa.apply()
     -- With the computed period, not the 0.05 s floor: apply() re-arms on a size change
     -- but cannot do it here, because the timer is created after the first apply() runs.
@@ -761,14 +783,7 @@ function fftsa.start()
     fftsa.period = fftsa.frame_period(fftsa.n)
     fftsa.arm(fftsa.period)
   end)
-  if not ok then
-    fftsa.lasterr = tostring(err)
-    fftsa.stop()
-    print("fftsa start FAILED (cleaned up): " .. tostring(err))
-    -- No console as an installed App, so the failure goes on the panel.
-    fftsa.show_error(tostring(err))
-    return false
-  end
+  if not ok then return fftsa.start_failed(tostring(err)) end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
     display.settext(fftsa.sg_xunit, "WARNING: End App will not clean up")
@@ -829,7 +844,11 @@ function fftsa.show_error(msg)
     end
     fftsa.errscr = display.create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER ERROR")
     if fftsa.errscr == nil then
-      error("object pool exhausted; no error screen", 0)
+      -- No screen to report on, so the console is all there is. Returning rather than
+      -- raising: the caller is already handling a failure and has nothing better to do
+      -- with a second one.
+      print("fftsa: object pool exhausted; no error screen")
+      return false
     end
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
                    "The analyser could not start.", 16736352,   -- red FF6060

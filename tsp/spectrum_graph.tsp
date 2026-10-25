@@ -68,9 +68,6 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_handles_inited = true
 end
 
--- Deletions the firmware refused (fftsa.del_obj), kept across a reload: non-zero
--- means objects may be stranded.
-fftsa.delfails = fftsa.delfails or 0
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
 -- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
 fftsa.sg_flo_hz  = 0
@@ -145,29 +142,24 @@ fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410       -- X-axis legend, below the peak rows
 fftsa.sg_xunit_c = 9474192   -- grey 909090
 
--- Delete without hiding a refusal: a bare pcall conflates a dead handle (harmless,
--- a child that went with its screen) with the firmware refusing (the object is
--- alive and unreachable). Callers clear the handle either way; a refusal is
--- counted in fftsa.delfails and recorded in fftsa.lasterr. The app module uses
--- these too.
+-- Delete, nil handle or not. These were wrapped in pcall to count a refusal, which
+-- cannot happen: the firmware REFUSES BY POSTING AN EVENT and returning, so the wrapper
+-- was never false and the counter it fed was dead state. A refused delete still shows up,
+-- in the only place it can -- the live-object and live-buffer counts the suite takes
+-- around a teardown, and the event log on the instrument.
+--
+-- The nil test is the part that matters. A handle is nil when display.create could not
+-- give us one, and the app module deletes handles it may never have built.
 function fftsa.del_obj(h)
   if h == nil then return true end
-  local ok, err = pcall(function() display.delete(h) end)
-  if not ok then
-    fftsa.delfails = (fftsa.delfails or 0) + 1
-    fftsa.lasterr = "display.delete refused: " .. tostring(err)
-  end
-  return ok
+  display.delete(h)
+  return true
 end
 
 function fftsa.del_buf(b)
   if b == nil then return true end
-  local ok, err = pcall(function() buffer.delete(b) end)
-  if not ok then
-    fftsa.delfails = (fftsa.delfails or 0) + 1
-    fftsa.lasterr = "buffer.delete refused: " .. tostring(err)
-  end
-  return ok
+  buffer.delete(b)
+  return true
 end
 
 -- Pin the X axis to the window: auto-range rounds outward to tidy tick values, so
@@ -325,12 +317,14 @@ function fftsa.sg_build(title, nbins, npoints)
   local create = display.create
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
-  -- create() returns nil when the pool is exhausted, posting one event and not
-  -- raising, so without this every child is built against a nil parent and
-  -- fftsa.start()'s pcall reports success.
+  -- create() returns nil when the pool is exhausted, posting one event and not raising.
+  -- Without this test every child is built against a nil parent, which DOES raise -- in
+  -- our code, not the firmware's. Answering nil and a reason is the same protection
+  -- without raising: fftsa.build() passes it to fftsa.start(), which reports it.
   if fftsa.sg_scr == nil then
-    error("display object pool exhausted building the spectrum screen -- power "
-          .. "cycle the instrument.", 0)
+    fftsa.lasterr = "display object pool exhausted building the spectrum screen -- "
+                    .. "power cycle the instrument."
+    return nil, fftsa.lasterr
   end
   -- Creating a screen makes it active, so the cover goes back in front before the
   -- first child: otherwise the operator watches the screen assemble itself.

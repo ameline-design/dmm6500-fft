@@ -293,10 +293,22 @@ function buffer.unit(u, label)
   CUSTOM_UNITS[u] = t
 end
 function buffer.make(cap, style) return newbuf(cap) end
+-- REFUSES BY POSTING, like the firmware, rather than raising. The old form raised, which
+-- meant the app needed a pcall to survive its own mistake and the suite was testing a
+-- failure mode the instrument does not have. The refusals are counted instead, and a
+-- refused delete leaves the buffer ALIVE -- which is what made 61 live buffers on the
+-- instrument when a bound one was remade without detaching first.
+REFUSED_BUF_DELETES, REFUSED_OBJ_DELETES = 0, 0
 function buffer.delete(b)
-  if type(b) ~= 'table' or not b.alive then error('buffer.delete on a dead buffer', 0) end
+  if type(b) ~= 'table' or not b.alive then
+    REFUSED_BUF_DELETES = REFUSED_BUF_DELETES + 1
+    return
+  end
   for _, o in pairs(OBJ) do
-    if o.alive and o.buffer == b then error('deleting a buffer still bound to a graph', 0) end
+    if o.alive and o.buffer == b then
+      REFUSED_BUF_DELETES = REFUSED_BUF_DELETES + 1
+      return
+    end
   end
   b.alive = false
 end
@@ -2325,14 +2337,56 @@ check('relaunching leaks NO buffers', livebufs() == bufs_one,
       'buffers=' .. livebufs() .. ' vs ' .. bufs_one)
 check('exactly two timers after a relaunch', live('timer') == 2, 'timers=' .. live('timer'))
 
--- A refused deletion must be counted, not mistaken for success.
-local realdel = display.delete
-local fails0 = fftsa.delfails
-display.delete = function() error('firmware refused', 0) end
-local delok = fftsa.del_obj(999)
-display.delete = realdel
-check('a refused delete returns false and is counted',
-      delok == false and fftsa.delfails == fails0 + 1, 'delfails=' .. fftsa.delfails)
+-- A REFUSED DELETE IS NOT A RAISE. The firmware posts an event and returns, and the
+-- buffer stays ALIVE -- which is what put 61 live buffers on the instrument when a bound
+-- buffer was remade without detaching it first, and drew two overlaid traces on the
+-- glass. So the thing worth asserting is not that the app catches something, it is that
+-- a delete is refused while bound and succeeds once detached.
+-- An exhausted display object pool is a RETURN, not a raise: display.create answers nil
+-- and posts one event. Before, the app raised on it and start()'s boundary reported the
+-- message; now sg_build answers nil and a reason, which start() has to read. A return
+-- nobody reads is worse than a raise, and nothing else in this suite exercises the path,
+-- so this is the check that the reason still reaches the operator.
+check('an exhausted object pool fails the start with a reason, and cleans up', (function()
+  local objects0, buffers0 = live(), livebufs()
+  fftsa.stop()
+  fftsa.sg_destroy()
+  fftsa.destroy_options()
+  local realcreate = display.create
+  -- Refuse only the spectrum screen, which is what sg_build tests for.
+  display.create = function(parent, kind, ...)
+    if kind == display.OBJ_SCREEN and arg[1] == 'FFT SPECTRUM ANALYSER' then return nil end
+    return realcreate(parent, kind, unpack(arg))
+  end
+  local started = fftsa.start()
+  display.create = realcreate
+  local said = string.find(tostring(fftsa.lasterr), 'pool exhausted', 1, true) ~= nil
+  local cleaned = live('timer') == 0
+  local ok = fftsa.start()                       -- and it recovers afterwards
+  return started == false and said and cleaned and ok,
+         string.format('started=%s reason=%s timers-after-fail=%s recovered=%s',
+                       tostring(started), tostring(fftsa.lasterr), tostring(cleaned),
+                       tostring(ok))
+end)())
+
+check('a buffer bound to a graph is not deleted, and goes once detached', (function()
+  local before = REFUSED_BUF_DELETES
+  local b = buffer.make(8, buffer.STYLE_WRITABLE_FULL)
+  local g = display.create(fftsa.loadscr, display.OBJ_GRAPH, 0, 0, 120, 100)
+  fftsa.sg_write_point(b, -20, 1, 1)
+  display.graph.add(g, b, display.ELEMENT_DATA, b, display.ELEMENT_EXTRA)
+  fftsa.del_buf(b)
+  local alive_while_bound = b.alive
+  local counted = REFUSED_BUF_DELETES == before + 1
+  display.graph.removeall(g)
+  fftsa.del_buf(b)
+  local freed = not b.alive
+  display.delete(g)
+  return alive_while_bound and counted and freed,
+         string.format('alive while bound=%s, refusals %d->%d, freed after detach=%s',
+                       tostring(alive_while_bound), before, REFUSED_BUF_DELETES,
+                       tostring(freed))
+end)())
 
 -- End App pressed while the OPTIONS form is on screen must still tear down.
 fftsa.options()
