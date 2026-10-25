@@ -3020,7 +3020,9 @@ end)())
 
 check('a buffer bound to a graph is not deleted, and goes once detached', (function()
   local before = REFUSED_BUF_DELETES
-  local b = buffer.make(8, buffer.STYLE_WRITABLE_FULL)
+  -- At the firmware's floor, not under it: a capacity below BUF_MIN is refused and
+  -- answers nil, which is a raise here rather than the refusal this check is about.
+  local b = buffer.make(BUF_MIN, buffer.STYLE_WRITABLE_FULL)
   local g = display.create(fftsa.loadscr, display.OBJ_GRAPH, 0, 0, 120, 100)
   fftsa.sg_write_point(b, -20, 1, 1)
   display.graph.add(g, b, display.ELEMENT_DATA, b, display.ELEMENT_EXTRA)
