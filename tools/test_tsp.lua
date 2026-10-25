@@ -1844,13 +1844,20 @@ end)())
 check('tick_period rounds up to the 0.05 s tick, and the boundary is exact', (function()
   -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
   -- 0.1499999999999999944, so == fails on values that are the same tick count.
+  -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
+  -- 0.1499999999999999944, so == fails on values that are the same tick count.
+  --
+  -- 80.1 ms is the measured worst frame at 512 samples and must still give two ticks --
+  -- that is the whole point of the slack. 82 ms is past it and must give three, which is
+  -- what stops the slack from quietly becoming a rule that always rounds down.
   return near(fftsa.tick_period(0.080), 0.10, 1e-9)
-         and near(fftsa.tick_period(0.0804), 0.15, 1e-9)
+         and near(fftsa.tick_period(0.0801), 0.10, 1e-9)
+         and near(fftsa.tick_period(0.085), 0.15, 1e-9)
          and near(fftsa.tick_period(0.040), 0.05, 1e-9)
          and near(fftsa.tick_period(0), 0.05, 1e-9),
-         string.format('80 ms -> %.2f, 80.4 -> %.2f, 40 -> %.2f',
-                       fftsa.tick_period(0.080), fftsa.tick_period(0.0804),
-                       fftsa.tick_period(0.040))
+         string.format('80 ms -> %.2f, 80.1 -> %.2f, 85 -> %.2f, 40 -> %.2f',
+                       fftsa.tick_period(0.080), fftsa.tick_period(0.0801),
+                       fftsa.tick_period(0.085), fftsa.tick_period(0.040))
 end)())
 
 -- The period is re-armed from frames that actually ran, not from frame_estimate(). The
@@ -1867,7 +1874,7 @@ check('the timer period follows measured work, not the model', (function()
   for i = 1, 10 do fftsa.frame() end
   local measured = fftsa.period
   fftsa.options_apply()
-  return near(modelled, 0.15, 1e-9) and near(measured, 0.05, 1e-9)
+  return near(modelled, 0.10, 1e-9) and near(measured, 0.05, 1e-9)
          and measured < modelled,
          string.format('model armed %.2f, measurement armed %.2f', modelled, measured)
 end)())

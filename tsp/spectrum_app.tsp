@@ -667,9 +667,18 @@ end
 -- Seconds of timer period that leave a frame of this length about 20 % idle, rounded up
 -- to the firmware's 0.05 s tick. The one place the occupancy rule lives, so the modelled
 -- first arm and the measured re-arms cannot disagree about it.
+--
+-- The slack matters as much as the 0.8 does. A tick is 50 ms, so holding the occupancy
+-- target to the last millisecond buys a fiftieth of a tick of idle and costs a WHOLE
+-- tick of rate. Measured at 512 samples: the worst frame is 80.1 ms, which over 0.8 is
+-- 100.1 ms -- a tenth of a millisecond past two ticks -- so it took three and the rate
+-- was 6.67 fps where 10 was there for 80.1 % occupancy instead of 80.0.
+--
+-- A twentieth of a tick, 2.5 ms. It can only change the answer for a frame already
+-- within 2.5 ms of a boundary, and there it prefers the rate.
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return 0.05 end
-  local ticks = math.ceil((busy / 0.8) / 0.05)
+  local ticks = math.ceil((busy / 0.8) / 0.05 - 0.05)
   if ticks < 1 then ticks = 1 end
   return ticks * 0.05
 end

@@ -630,7 +630,7 @@ end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint
 -- it. 1706 events mean it is too short.
-fftsa.sg_yield = 0.025
+fftsa.sg_yield = 0.010
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
 fftsa.sg_pk_ftol   = 0.002      -- fractional frequency move worth a redraw
