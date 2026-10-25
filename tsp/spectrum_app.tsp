@@ -80,6 +80,16 @@ end
 -- sample count makes bins finer; a higher rate coarsens them in proportion, which is the
 -- price of the wider view. Content above the chosen Nyquist still folds: that is the
 -- missing filter, not the rate, and no setting here removes it.
+-- BAND-PASS, off by default. Low-pass the capture at the stop frequency and decimate to
+-- match, so the transform sees only the band on screen. What that buys is bin width: the
+-- effective rate becomes fs/D, so the bin is fs/(D*N) and a narrow span reaches a
+-- resolution that would otherwise need a transform D times longer. The filter is what
+-- makes the decimation safe -- without it everything above the new Nyquist folds in.
+--
+-- It cannot undo the folding that happens at the ADC. The rate floor is fs_min, so
+-- content above fs_min/2 is already folded before any of this runs.
+fftsa.bp_on = false
+
 fftsa.fs_min = 100000
 -- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
 fftsa.rates  = {100000, 200000, 500000, 1000000}
@@ -92,6 +102,15 @@ function fftsa.pick_fs(fhi)
     if r[i] >= fftsa.fs_min and r[i] / 2 >= fhi then return r[i] end
   end
   return r[n]
+end
+
+-- Boolean fields are an EDIT_OPTION of two, because the firmware has no checkbox. Index
+-- 1 is off, so a field the pool refused reads as off through fftsa.getval's fallback.
+fftsa.onoff_labels = {"Off", "On"}
+
+function fftsa.onoff_to_idx(v)
+  if v then return 2 end
+  return 1
 end
 
 fftsa.ranges       = {0.1, 1, 10}
@@ -231,6 +250,9 @@ function fftsa.frame_body()
   -- Peaks are searched in the window the graph plots, so the table matches the trace.
   local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
   local bi, bv = fftsa.find_peaks(nb, fftsa.sg_npeak, kmin, kmax)
+  -- Before the spectrum refill, so the yield at the end of that refill is the first
+  -- paint either buffer sees after both are complete.
+  fftsa.sg_update_markers(bi, bv, fftsa.sg_npeak, fftsa.binhz)
   fftsa.sg_update(nb, fftsa.binhz)
   fftsa.sg_show_peaks(bi, bv, fftsa.sg_npeak, fftsa.binhz)
 end
@@ -337,6 +359,7 @@ function fftsa.destroy_options()
   fftsa.optscr, fftsa.opt_flo, fftsa.opt_fhi, fftsa.opt_rng, fftsa.opt_info =
     nil, nil, nil, nil, nil
   fftsa.opt_win, fftsa.opt_beta, fftsa.opt_n = nil, nil, nil
+  fftsa.opt_mk, fftsa.opt_bp = nil, nil
   fftsa.opt_info_last = nil
 end
 
@@ -344,7 +367,7 @@ end
 -- and the gap that buys is what makes each box a touch target. display.create takes
 -- no width for an OBJ_EDIT_*, so the second column's x is the one number to check on
 -- the glass. Labels are right-aligned and end at the column x.
-fftsa.opt_nf      = 6
+fftsa.opt_nf      = 8
 fftsa.opt_cols    = 2
 fftsa.opt_x       = 185
 fftsa.opt_x_c2    = 552
@@ -352,10 +375,10 @@ fftsa.opt_y0      = 8
 fftsa.opt_dy      = 100     -- preferred pitch; clamped to what fits
 fftsa.opt_edit_h  = 50      -- box height, measured
 fftsa.opt_edit_dy = 4       -- offset of the box inside the object
-fftsa.opt_y_adj   = -8      -- nudge of the centred block, negative being up
+fftsa.opt_y_adj   = 0       -- nudge of the centred block, negative being up
 fftsa.opt_btn_y   = 360
-fftsa.opt_btn_gap = 24      -- air kept between the last box and the button row
-fftsa.opt_info_y  = 323
+fftsa.opt_info_y  = 323     -- readback line BASELINE; an OBJ_TEXT y is its baseline
+fftsa.opt_info_h  = 20      -- its height above that baseline, so the fields clear it
 
 -- Rows, pitch and top for the field block. The pitch is the preferred one, clamped if a
 -- field count ever needs it: the last box has to end above the button row. At the six
@@ -364,15 +387,17 @@ function fftsa.opt_layout()
   local nrows = math.ceil(fftsa.opt_nf / fftsa.opt_cols)
   local eh, edy = fftsa.opt_edit_h, fftsa.opt_edit_dy
   local y0, dy  = fftsa.opt_y0, fftsa.opt_dy
+  -- The last box has to end above the READBACK LINE, which sits above the buttons: at
+  -- seven fields the button row alone leaves the bottom box over the top of it.
+  local floor_y = fftsa.opt_info_y - fftsa.opt_info_h
   if nrows > 1 then
-    local maxdy = math.floor((fftsa.opt_btn_y - fftsa.opt_btn_gap - y0 - edy - eh)
-                             / (nrows - 1))
+    local maxdy = math.floor((floor_y - y0 - edy - eh) / (nrows - 1))
     if dy > maxdy then dy = maxdy end
   end
   -- Centred, because three rows do not fill the form, then nudged. Only ever down,
   -- and only by what is spare; the nudge is separate from y0 because the centring
   -- divides the leftover space and would give back half of a move asked for there.
-  local spare = fftsa.opt_btn_y - ((nrows - 1) * dy + eh + edy) - y0
+  local spare = floor_y - ((nrows - 1) * dy + eh + edy) - y0
   if spare > 0 then y0 = y0 + math.floor(spare / 2) end
   if y0 + fftsa.opt_y_adj >= 0 then y0 = y0 + fftsa.opt_y_adj end
   fftsa.opt_nrows, fftsa.opt_dy_used, fftsa.opt_y0_used = nrows, dy, y0
@@ -420,23 +445,34 @@ function fftsa.build_options()
                        fftsa.range_labels[1], fftsa.range_labels[2], fftsa.range_labels[3])
   -- Spelled out rather than built from the table: display.create takes the options
   -- as separate arguments and Lua 5.0.2 has no unpack() worth using here.
+  -- Two columns of four: the left one is what acquisition does -- the span, the range
+  -- and the filter in front of the transform -- and the right one is what the transform
+  -- and the display do with it.
   local x4, y4 = nextpos()
-  fftsa.opt_win = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x4, y4,
+  fftsa.opt_bp = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x4, y4,
+                       "Band-Pass", "filter to the span",
+                       fftsa.onoff_labels[1], fftsa.onoff_labels[2])
+  local x5, y5 = nextpos()
+  fftsa.opt_win = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x5, y5,
                        "Window", "lobe vs sidelobe",
                        fftsa.win_names[1], fftsa.win_names[2], fftsa.win_names[3],
                        fftsa.win_names[4])
   -- Always built, not only when Kaiser is selected: a field created on a press is a
   -- create on a visible screen, and this one is inert for the other three windows.
-  local x5, y5 = nextpos()
-  fftsa.opt_beta = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x5, y5,
+  local x6, y6 = nextpos()
+  fftsa.opt_beta = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x6, y6,
                        "Kaiser Beta", "sidelobe level",
                        fftsa.kbeta_labels[1], fftsa.kbeta_labels[2], fftsa.kbeta_labels[3],
                        fftsa.kbeta_labels[4], fftsa.kbeta_labels[5], fftsa.kbeta_labels[6])
-  local x6, y6 = nextpos()
-  fftsa.opt_n = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x6, y6,
+  local x7, y7 = nextpos()
+  fftsa.opt_n = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x7, y7,
                        "FFT Samples", "resolution vs speed",
                        fftsa.sample_labels[1], fftsa.sample_labels[2], fftsa.sample_labels[3],
                        fftsa.sample_labels[4], fftsa.sample_labels[5], fftsa.sample_labels[6])
+  local x8, y8 = nextpos()
+  fftsa.opt_mk = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x8, y8,
+                       "Peak Markers", "dot on each peak",
+                       fftsa.onoff_labels[1], fftsa.onoff_labels[2])
 
   fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 400, fftsa.opt_info_y, "",
                         56575, display.FONT_SMALL, display.JUST_CENTER)   -- cyan 00DCFF
@@ -706,6 +742,8 @@ function fftsa.options()
   fftsa.setval(fftsa.opt_win, fftsa.win_i)
   fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
   fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
+  fftsa.setval(fftsa.opt_mk, fftsa.onoff_to_idx(fftsa.sg_markers))
+  fftsa.setval(fftsa.opt_bp, fftsa.onoff_to_idx(fftsa.bp_on))
   -- Guarded like its neighbours: five field reads on handles the pool may have refused,
   -- and changescreen is the next line. Unguarded, a refusal at the end of the create list
   -- leaves the Options button dead for the life of the app.
@@ -740,6 +778,12 @@ function fftsa.options_apply()
   local ri = fftsa.getval(fftsa.opt_rng)
   local wi = fftsa.getval(fftsa.opt_win)
   local bi = fftsa.getval(fftsa.opt_beta)
+  local mki = fftsa.opt_index(fftsa.getval(fftsa.opt_mk),
+                              fftsa.onoff_labels,
+                              fftsa.onoff_to_idx(fftsa.sg_markers))
+  local bpi = fftsa.opt_index(fftsa.getval(fftsa.opt_bp),
+                              fftsa.onoff_labels,
+                              fftsa.onoff_to_idx(fftsa.bp_on))
   local nnew = fftsa.options_samples()
   local nlo, nhi = fftsa.options_span()
   fftsa.flo, fftsa.fhi = nlo, nhi
@@ -748,6 +792,12 @@ function fftsa.options_apply()
   fftsa.range   = fftsa.idx_to_range(ri)
   fftsa.win_i   = fftsa.opt_index(wi, fftsa.win_names, fftsa.win_i)
   fftsa.kbeta_i = fftsa.opt_index(bi, fftsa.kbeta_labels, fftsa.kbeta_i)
+  -- Rebound only on a change: sg_bind() calls removeall, which repaints the whole widget
+  -- including its axis labels, and this is the one moment that is already a repaint.
+  local mknew = (mki == 2)
+  local mkchanged = (mknew ~= fftsa.sg_markers)
+  fftsa.sg_markers = mknew
+  fftsa.bp_on = (bpi == 2)
   -- Under the cover: fftsa.apply() rebuilds the window tables and takes a capture,
   -- and the frame timer does not run while its screen is off show, so no frame can
   -- meet half-rebuilt tables.
@@ -764,6 +814,7 @@ function fftsa.options_apply()
     fftsa.say("APPLY FAILED: " .. tostring(err))
   else
     fftsa.halted, fftsa.errrun = false, 0
+    if mkchanged then fftsa.sg_bind() end
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
   return ok

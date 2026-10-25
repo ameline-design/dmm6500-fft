@@ -69,11 +69,17 @@ local function newbuf(cap)
   local b = {alive = true, cap = cap, capacity = cap, n = 0, readings = {},
              relativetimestamps = {}, extra = {}, seconds = {},
              fillmode = buffer.FILL_ONCE, startindex = 1, endindex = 0, wpos = 1}
+  -- The firmware calls this column extravalues. The mock stored it as `extra` alone,
+  -- which is a name the instrument does not have: reading b.extra over the socket is
+  -- error -286. Both names are the SAME TABLE here, so a test or a probe written in the
+  -- firmware's vocabulary works and neither name can drift from the other.
+  b.extravalues = b.extra
   function b.clear()
     CLEAR_AT_WRITES, LOG10_AT_CLEAR = WRITES, LOG10S
     b.n = 0
     b.wpos, b.startindex, b.endindex = 1, 1, 0
     b.readings, b.relativetimestamps, b.extra, b.seconds = {}, {}, {}, {}
+    b.extravalues = b.extra
   end
   BUFS[table.getn(BUFS) + 1] = b
   return b
@@ -228,20 +234,47 @@ function display.graph.add(g, ...)
   OBJ[g].adds = (OBJ[g].adds or 0) + 1
   -- Firmware binds nothing for an empty buffer, even if later frames fill it.
   if arg[1].n == 0 then return end
-  OBJ[g].buffer = arg[1]
+  -- buffer is the FIRST trace bound, which is the spectrum; buffers is every trace in
+  -- the order they were added, so a second one can be asserted without changing what
+  -- OBJ[g].buffer means to the checks that came before markers existed.
+  if OBJ[g].buffer == nil then OBJ[g].buffer = arg[1] end
+  if OBJ[g].buffers == nil then OBJ[g].buffers = {} end
+  OBJ[g].buffers[table.getn(OBJ[g].buffers) + 1] = arg[1]
   -- Which element each axis is bound to. ELEMENT_TIME makes it the firmware's time plot,
   -- labelled in seconds with a suffix that cannot be switched off; ELEMENT_EXTRA makes it
   -- the numeric x-y plot, which the firmware labels in the data's own units.
   OBJ[g].yelem, OBJ[g].xelem = arg[2], arg[4]
   OBJ[g].traces = (OBJ[g].traces or 0) + 1
 end
+-- select() names a BUFFER, not a trace index, and the marker calls apply to whichever
+-- trace is selected -- so the mock records the selection and attributes each marker size
+-- to the buffer that was active when it was set.
+function display.graph.select(g, b, ...)
+  use(g, 'graph.select')
+  OBJ[g].selected = b
+  OBJ[g].selects = (OBJ[g].selects or 0) + 1
+end
+function display.graph.markersize(g, size, ...)
+  use(g, 'graph.markersize')
+  if OBJ[g].marksize == nil then OBJ[g].marksize = {} end
+  OBJ[g].marksize[OBJ[g].selected] = size
+  OBJ[g].marksizelast = size
+end
+function display.graph.markerlastcolor(g, kind, ...)
+  use(g, 'graph.markerlastcolor')
+  OBJ[g].marklastcolor = kind
+end
 function display.graph.removeall(g)
   use(g, 'graph.removeall')
-  OBJ[g].buffer = nil
+  OBJ[g].buffer, OBJ[g].buffers = nil, nil
   OBJ[g].traces = 0
   OBJ[g].removes = (OBJ[g].removes or 0) + 1
 end
-function display.graph.drawstyle(g, s)  use(g, 'graph.drawstyle') end
+function display.graph.drawstyle(g, s)
+  use(g, 'graph.drawstyle')
+  OBJ[g].drawstyle = s
+  OBJ[g].drawstyles = (OBJ[g].drawstyles or 0) + 1
+end
 function display.graph.scaley(g, ...)   use(g, 'graph.scaley') end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
 function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h].fills or 0) + 1 end
@@ -957,6 +990,160 @@ check('still exactly two timers after rebuild', live('timer') == 2,
 check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
 
+print('\npeak markers (real code)')
+-- Off by default, and off means ONE trace drawn as a line: the marker buffer exists but
+-- is not bound, so drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
+check('markers off binds one trace and draws a line', (function()
+  display.setvalue(fftsa.opt_mk, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  fftsa.sg_bind()
+  local o = OBJ[fftsa.sg_graph]
+  return fftsa.sg_markers == false and o.traces == 1
+         and o.drawstyle == display.STYLE_LINE and o.buffer == fftsa.sg_buf,
+         string.format('markers=%s traces=%s style=%s',
+                       tostring(fftsa.sg_markers), tostring(o.traces),
+                       tostring(o.drawstyle))
+end)())
+-- The marker buffer is made with the trace buffer whether or not markers are on, because
+-- making it when the option is set would be an allocation while frames are running.
+check('the marker buffer exists at the peak count even with markers off', (function()
+  return fftsa.sg_mk ~= nil and fftsa.sg_mk.alive
+         and fftsa.sg_mk.capacity == fftsa.sg_npeak
+         and fftsa.sg_mk ~= fftsa.sg_buf,
+         string.format('capacity %s of %d, alive %s',
+                       tostring(fftsa.sg_mk ~= nil and fftsa.sg_mk.capacity),
+                       fftsa.sg_npeak,
+                       tostring(fftsa.sg_mk ~= nil and fftsa.sg_mk.alive))
+end)())
+check('a frame writes nothing to the marker buffer while markers are off', (function()
+  local before = WRITES
+  local n = fftsa.sg_update_markers(fftsa.pk_bi, fftsa.pk_bv, fftsa.sg_npeak, fftsa.binhz)
+  return n == 0 and WRITES == before, string.format('wrote %d points, %d writes',
+                                                    n, WRITES - before)
+end)())
+-- On: two traces, STYLE_BOTH because drawstyle is per graph, and the sizes attributed to
+-- the right buffer -- the spectrum at 1, where the glyph is lost under its own line, and
+-- the markers at sg_mk_size.
+check('markers on bind a second trace and size the marker one', (function()
+  display.setvalue(fftsa.opt_mk, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local o = OBJ[fftsa.sg_graph]
+  local two = o.buffers ~= nil and table.getn(o.buffers) == 2
+  local order = two and o.buffers[1] == fftsa.sg_buf and o.buffers[2] == fftsa.sg_mk
+  local sized = o.marksize ~= nil and o.marksize[fftsa.sg_mk] == fftsa.sg_mk_size
+                and o.marksize[fftsa.sg_buf] == 1
+  return fftsa.sg_markers == true and two and order
+         and o.drawstyle == display.STYLE_BOTH and sized,
+         string.format('traces=%s spectrum-first=%s style=%s marker size=%s spectrum=%s',
+                       tostring(two), tostring(order), tostring(o.drawstyle),
+                       tostring(o.marksize and o.marksize[fftsa.sg_mk]),
+                       tostring(o.marksize and o.marksize[fftsa.sg_buf]))
+end)())
+-- The markers carry the INTERPOLATED frequency and amplitude, which is the whole point:
+-- the trace draws a peak at its column, up to half a bin out, and the table's own numbers
+-- are the corrected ones. Sorted by frequency, because drawstyle is per graph and the
+-- marker trace is drawn with a line through it too.
+check('the marker points are the peak table values, in frequency order', (function()
+  fftsa.frame()
+  local mk = fftsa.sg_mk
+  -- One point a peak the finder actually reported, which is not always six: a clean tone
+  -- leaves most of the list empty, and an empty slot must not become a marker at 0 Hz.
+  local found = 0
+  local i
+  for i = 1, fftsa.sg_npeak do
+    local k = fftsa.pk_bi[i]
+    if k ~= nil and k > 0 and fftsa.pk_bv[i] > 0 then found = found + 1 end
+  end
+  if mk.n ~= found then
+    return false, string.format('%d marker points for %d peaks', mk.n, found)
+  end
+  if mk.n < 1 then return false, 'no peaks to mark' end
+  for i = 2, mk.n do
+    if not (mk.extravalues[i] > mk.extravalues[i - 1]) then
+      return false, string.format('point %d at %g Hz is not above %g', i,
+                                  mk.extravalues[i], mk.extravalues[i - 1])
+    end
+  end
+  -- The strongest peak's own frequency has to be among them, to within a bin.
+  local k = fftsa.pk_bi[1]
+  local dk = fftsa.peak_interp(k, fftsa.sg_nbins)
+  local want = (k - 1 + (dk or 0)) * fftsa.binhz
+  local best, bestd = nil, nil
+  for i = 1, mk.n do
+    local d = math.abs(mk.extravalues[i] - want)
+    if bestd == nil or d < bestd then best, bestd = mk.extravalues[i], d end
+  end
+  return bestd < fftsa.binhz,
+         string.format('%d points for %d peaks, strongest wanted %.1f Hz, nearest %.1f',
+                       mk.n, found, want, best)
+end)())
+-- The sort, driven directly. The end-to-end check above cannot reach it: the mock's
+-- capture is one tone, so the finder reports a single peak and a one-point buffer is
+-- sorted whatever the code does. These three arrive strongest-first with their
+-- frequencies deliberately out of order.
+check('markers come out in frequency order from an amplitude-ordered list', (function()
+  -- peak_interp is stubbed so BOTH columns are a known function of the bin: the offset
+  -- is zero and the amplitude is k/1000, giving 0.005, 0.02 and 0.04 V for bins 5, 20
+  -- and 40. Driving it with the real estimator instead reads the live spectrum, where
+  -- the amplitude has nothing to do with the bv passed in -- which is how this check
+  -- first "failed" against correct code.
+  local real = fftsa.peak_interp
+  fftsa.peak_interp = function(k, nb) return 0, k * 0.001 end
+  local bi, bv = {20, 5, 40}, {1.0, 0.5, 0.25}
+  local n = fftsa.sg_update_markers(bi, bv, 3, 100)
+  local mk = fftsa.sg_mk
+  fftsa.peak_interp = real
+  if n ~= 3 or mk.n ~= 3 then
+    return false, string.format('wrote %d, buffer holds %d', n, mk.n)
+  end
+  local hz, db = {}, {}
+  local i
+  for i = 1, mk.n do hz[i], db[i] = mk.extravalues[i], mk.readings[i] end
+  -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. Each has to carry its OWN amplitude
+  -- through the sort, which here means dB rising with frequency.
+  local want = {{400, 20 * math.log10(0.005)},
+                {1900, 20 * math.log10(0.020)},
+                {3900, 20 * math.log10(0.040)}}
+  for i = 1, 3 do
+    if math.abs(hz[i] - want[i][1]) > 1 then
+      return false, string.format('point %d at %.0f Hz, wanted %.0f',
+                                  i, hz[i], want[i][1])
+    end
+    if math.abs(db[i] - want[i][2]) > 0.01 then
+      return false, string.format('point %d at %.0f Hz carries %.2f dB, wanted %.2f',
+                                  i, hz[i], db[i], want[i][2])
+    end
+  end
+  return true, string.format('%.0f Hz %.1f dB, %.0f Hz %.1f dB, %.0f Hz %.1f dB',
+                             hz[1], db[1], hz[2], db[2], hz[3], db[3])
+end)())
+check('the marker refill happens before the trace refill', (function()
+  -- The trace's clear is the last notify in a frame, so its write count has to be the
+  -- one that moves last: markers filled after it would leave the spectrum short of a
+  -- trace at the yield.
+  local order = {}
+  local realwr = buffer.write.reading
+  local realclear = fftsa.sg_mk.clear
+  buffer.write.reading = function(b, ...)
+    local tag = 'other'
+    if b == fftsa.sg_mk then tag = 'marker' elseif b == fftsa.sg_buf then tag = 'trace' end
+    if order[table.getn(order)] ~= tag then order[table.getn(order) + 1] = tag end
+    return realwr(b, unpack(arg))
+  end
+  fftsa.frame()
+  buffer.write.reading = realwr
+  return table.getn(order) >= 2 and order[1] == 'marker' and order[2] == 'trace',
+         table.concat(order, ' then ')
+end)())
+check('switching markers off again leaves one trace and a line', (function()
+  display.setvalue(fftsa.opt_mk, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local o = OBJ[fftsa.sg_graph]
+  return fftsa.sg_markers == false and o.traces == 1
+         and o.drawstyle == display.STYLE_LINE,
+         string.format('traces=%s style=%s', tostring(o.traces), tostring(o.drawstyle))
+end)())
+
 print('\nthe about screen (real code)')
 -- Every screen title, with its length: the firmware truncates one over 31 characters and
 -- posts 1707, and a truncated title is the sort of thing that reaches the glass unnoticed.
@@ -1182,6 +1369,11 @@ local gh = fftsa.sg_graph
 local ad0, rm0 = (OBJ[gh].adds or 0), (OBJ[gh].removes or 0)
 local dl0 = DELAYS
 local pin0 = (OBJ[gh].pins or 0)
+-- Snapshotted, not compared against zero: sg_bind() calls select and drawstyle when the
+-- marker trace goes on or off, so only the change ACROSS A FRAME says anything.
+local sel0 = (OBJ[gh].selects or 0)
+local st0 = (OBJ[gh].scaletraces or 0)
+local ds0 = (OBJ[gh].drawstyles or 0)
 fftsa.frame_body()
 -- The frame detaches nothing and attaches nothing: the refill rewrites the buffer the
 -- graph already holds, so adds and removes must both come back unmoved. Either of them
@@ -1203,11 +1395,11 @@ check('and the frame yields exactly once for the paint', DELAYS == dl0 + 1,
 -- for a removeall and add per frame, and a visible flicker on the glass.
 check('and the frame makes no graph call whatsoever', (function()
   local o = OBJ[gh]
-  return (o.pins or 0) == pin0 and (o.selects or 0) == 0
-         and (o.scaletraces or 0) == 0,
-         string.format('pins %s was %s, selects %s, scaletraces %s',
-                       tostring(o.pins), tostring(pin0), tostring(o.selects),
-                       tostring(o.scaletraces))
+  return (o.pins or 0) == pin0 and (o.selects or 0) == sel0
+         and (o.scaletraces or 0) == st0 and (o.drawstyles or 0) == ds0,
+         string.format('pins %d/%d selects %d/%d scaletrace %d/%d drawstyle %d/%d',
+                       (o.pins or 0), pin0, (o.selects or 0), sel0,
+                       (o.scaletraces or 0), st0, (o.drawstyles or 0), ds0)
 end)())
 
 -- The yield is the only thing feeding the display task, so a zero or missing
@@ -1450,7 +1642,7 @@ check('no fractional timestamp was ever written', BADFRAC == 0,
 print('\noptions form (real code)')
 -- Two columns, six fields, three rows.
 local nrows, pitch, top = fftsa.opt_layout()
-check('six fields lay out as three rows in two columns', nrows == 3,
+check('seven fields lay out as four rows in two columns', nrows == 4,
       'nrows=' .. nrows)
 check('the last box ends above the button row',
       top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h
@@ -1460,21 +1652,24 @@ check('the last box ends above the button row',
                       + fftsa.opt_edit_h, fftsa.opt_btn_y))
 check('the pitch is at least the box height, so boxes cannot overlap',
       pitch >= fftsa.opt_edit_h, 'pitch=' .. pitch .. ' box=' .. fftsa.opt_edit_h)
+-- The readback line's y is its BASELINE, so clearing it means clearing opt_info_h above
+-- that, which is the ceiling opt_layout() clamps the pitch against.
 check('the readback line clears the last box and the buttons',
-      fftsa.opt_info_y > top + (nrows - 1) * pitch + fftsa.opt_edit_dy
-                             + fftsa.opt_edit_h
+      fftsa.opt_info_y - fftsa.opt_info_h
+        >= top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h
         and fftsa.opt_info_y < fftsa.opt_btn_y,
-      'info_y=' .. fftsa.opt_info_y)
+      string.format('bottom=%d, line clears at %d, buttons at %d',
+                    top + (nrows - 1) * pitch + fftsa.opt_edit_dy + fftsa.opt_edit_h,
+                    fftsa.opt_info_y - fftsa.opt_info_h, fftsa.opt_btn_y))
 check('the readout is centered and five pixels lower', (function()
   local o = obj_at(fftsa.opt_info)
   return o.x == 400 and o.y == 323 and o.justify == display.JUST_CENTER
 end)())
--- Nine fields, five rows: the first count where the clamp changes the outcome and
--- not just the pitch. 274 px over four gaps is 68, and unclamped the last box would
--- end at 454 against a button row at 360. Six fields -- now the live count -- still
--- lay out as three rows at the same pitch and top as five, so a six-field case here
--- would be a second copy of 'the readback line clears the last box'.
-check('a field count that overruns is clamped to fit above the button row',
+-- Nine fields, five rows: a count past the live seven, so the clamp is exercised beyond
+-- what the form actually carries. Asserted against the readback line, which is the real
+-- ceiling -- clearing the button row is not enough and was what let seven fields lay the
+-- bottom box over the top of the line.
+check('a field count that overruns is clamped to fit above the readback line',
       (function()
   local keep = fftsa.opt_nf
   fftsa.opt_nf = 9
@@ -1482,11 +1677,12 @@ check('a field count that overruns is clamped to fit above the button row',
   fftsa.opt_nf = keep
   fftsa.opt_layout()
   local bottom = t + (r - 1) * p + fftsa.opt_edit_dy + fftsa.opt_edit_h
-  return r == 5 and p < fftsa.opt_dy and bottom <= fftsa.opt_btn_y,
-         string.format('%d rows, pitch %d of %d asked, bottom %d vs button %d',
-                       r, p, fftsa.opt_dy, bottom, fftsa.opt_btn_y)
+  local ceiling = fftsa.opt_info_y - fftsa.opt_info_h
+  return r == 5 and p < fftsa.opt_dy and bottom <= ceiling,
+         string.format('%d rows, pitch %d of %d asked, bottom %d vs ceiling %d',
+                       r, p, fftsa.opt_dy, bottom, ceiling)
 end)())
-check('the first three fields are in column one at opt_x', (function()
+check('the first four fields are in column one at opt_x', (function()
   local x = fftsa.opt_x
   return obj_at(fftsa.opt_flo).x == x and obj_at(fftsa.opt_fhi).x == x
          and obj_at(fftsa.opt_rng).x == x
@@ -1499,6 +1695,7 @@ end)(), 'x=' .. tostring(obj_at(fftsa.opt_win).x))
 check('each column runs top to bottom at the layout pitch', (function()
   return obj_at(fftsa.opt_fhi).y - obj_at(fftsa.opt_flo).y == pitch
          and obj_at(fftsa.opt_rng).y - obj_at(fftsa.opt_fhi).y == pitch
+         and obj_at(fftsa.opt_mk).y - obj_at(fftsa.opt_rng).y == pitch
          and obj_at(fftsa.opt_beta).y - obj_at(fftsa.opt_win).y == pitch
          and obj_at(fftsa.opt_n).y - obj_at(fftsa.opt_beta).y == pitch
 end)())
@@ -2440,9 +2637,9 @@ check('a decimated refill writes no non-monotonic timestamp', (function()
                                  bad, worst)
 end)())
 
-check('sample_counts, sample_labels and opt_nf agree',
-      table.getn(fftsa.sample_counts) == table.getn(fftsa.sample_labels)
-        and fftsa.opt_nf == 6,
+-- opt_nf is NOT the sample count; it was equal to it by coincidence at six fields.
+check('sample_counts and sample_labels agree',
+      table.getn(fftsa.sample_counts) == table.getn(fftsa.sample_labels),
       string.format('counts=%d labels=%d opt_nf=%d',
                     table.getn(fftsa.sample_counts),
                     table.getn(fftsa.sample_labels), fftsa.opt_nf))

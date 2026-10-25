@@ -41,6 +41,13 @@ fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 -- because the buffer is FILL_ONCE and cleared -- n follows the writes, so a smaller count
 -- simply draws fewer points and reallocates nothing.
 fftsa.sg_ncol    = 255
+
+-- PEAK MARKERS, off by default. A second trace of one point a peak, carrying the
+-- interpolated frequency and amplitude the peak table reports -- so a marker sits where
+-- the peak really is, which is up to half a bin off the column the trace draws there.
+-- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
+fftsa.sg_markers = false
+fftsa.sg_mk_size = 4       -- marker radius; 1 is the built-in glyph, 2..5 are circles
 fftsa.sg_maxpts  = 680
 
 -- Firmware handles, initialised only on the first load: opening the App again
@@ -56,6 +63,7 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_pk_d  = nil     -- per-peak dB text       (own field, fixed x)
   fftsa.sg_xunit = nil     -- settings line under the peak rows
   fftsa.sg_stat  = nil
+  fftsa.sg_mk    = nil
   fftsa.sg_handles_inited = true
 end
 
@@ -215,7 +223,7 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- Already built at the right size: keep it, and write nothing but sg_nbins. sg_build()
   -- is the only caller and start() the only caller of that, so this is the one place the
   -- no-reallocation rule is stated in code rather than left implicit in the call graph.
-  if fftsa.sg_buf ~= nil and fftsa.sg_buf.capacity == want then
+  if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
     return fftsa.sg_buf
   end
   -- DETACH BEFORE DELETING. The firmware refuses to delete a buffer that is still
@@ -232,6 +240,14 @@ function fftsa.sg_make_buffer(nbins, npoints)
     fftsa.sg_buf = nil
   end
   fftsa.sg_buf = fftsa.sg_mkbuf(want)
+  -- The marker trace, one point a peak. Made here with the trace buffer and freed with it,
+  -- whether or not markers are switched on: allocating it when the option is set would be
+  -- an allocation while frames are running.
+  if fftsa.sg_mk ~= nil then
+    fftsa.del_buf(fftsa.sg_mk)
+    fftsa.sg_mk = nil
+  end
+  fftsa.sg_mk = fftsa.sg_mkbuf(fftsa.sg_npeak)
   -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
   -- at the ceiling and never resized: a frame writes slots 1..sg_ncol and reads back the
   -- same, so growing a table mid-frame would allocate inside the window it exists to
@@ -240,6 +256,12 @@ function fftsa.sg_make_buffer(nbins, npoints)
   local j
   for j = 1, want do
     fftsa.sg_st_db[j], fftsa.sg_st_hz[j] = fftsa.sg_dbmin, 0
+  end
+  -- The marker sort's own slots, one more than the peak count because the insertion
+  -- writes j+1 before n has grown.
+  fftsa.sg_mk_db, fftsa.sg_mk_hz = {}, {}
+  for j = 1, fftsa.sg_npeak + 1 do
+    fftsa.sg_mk_db[j], fftsa.sg_mk_hz[j] = fftsa.sg_dbmin, 0
   end
   return fftsa.sg_buf
 end
@@ -304,11 +326,7 @@ function fftsa.sg_build(title, nbins, npoints)
 
   fftsa.sg_graph = create(fftsa.sg_scr, display.OBJ_GRAPH, fftsa.sg_gx, fftsa.sg_gy, fftsa.sg_gw, fftsa.sg_gh)
   -- X is ELEMENT_EXTRA (the bin's frequency in Hz); Y is ELEMENT_DATA (dB).
-  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA, fftsa.sg_buf, display.ELEMENT_EXTRA)
-  display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
-  display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
-                       fftsa.sg_dbmin, fftsa.sg_dbmax)
-  fftsa.sg_pin_x()
+  fftsa.sg_bind()
 
   fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d = {}, {}, {}
   for p = 1, fftsa.sg_npeak do
@@ -346,7 +364,10 @@ function fftsa.sg_destroy()
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
   end
-  fftsa.sg_buf = nil
+  if fftsa.sg_mk ~= nil then
+    fftsa.del_buf(fftsa.sg_mk)
+  end
+  fftsa.sg_buf, fftsa.sg_mk = nil, nil
   collectgarbage()
 end
 
@@ -477,15 +498,39 @@ function fftsa.sg_set_xrange(flo_hz, fhi_hz)
   fftsa.sg_pin_x()
 end
 
--- Re-bind the trace; removeall() first, or add() stacks a duplicate trace.
-function fftsa.sg_rebind()
-  display.graph.removeall(fftsa.sg_graph)
-  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
+-- Bind the traces: the spectrum always, the markers when they are switched on. The one
+-- place that decides, so the build and a rebind cannot disagree about what is bound.
+--
+-- removeall() first, or add() stacks a duplicate trace. drawstyle is per GRAPH, so markers
+-- on means STYLE_BOTH for both traces -- the spectrum keeps size 1, which is the built-in
+-- glyph and is lost under its own line, while the marker trace gets sg_mk_size. markersize
+-- applies to the ACTIVE trace, and select() takes the buffer rather than an index.
+function fftsa.sg_bind()
+  local g = fftsa.sg_graph
+  if g == nil then return false end
+  display.graph.removeall(g)
+  display.graph.add(g, fftsa.sg_buf, display.ELEMENT_DATA,
                     fftsa.sg_buf, display.ELEMENT_EXTRA)
-  display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
-  display.graph.scaley(fftsa.sg_graph, display.YSCALE_OFF, display.AXIS_NORMAL,
+  if fftsa.sg_markers and fftsa.sg_mk ~= nil then
+    display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
+                      fftsa.sg_mk, display.ELEMENT_EXTRA)
+    display.graph.drawstyle(g, display.STYLE_BOTH)
+    display.graph.select(g, fftsa.sg_mk, display.ELEMENT_DATA)
+    display.graph.markersize(g, fftsa.sg_mk_size)
+    display.graph.select(g, fftsa.sg_buf, display.ELEMENT_DATA)
+    display.graph.markersize(g, 1)
+  else
+    display.graph.drawstyle(g, display.STYLE_LINE)
+  end
+  display.graph.scaley(g, display.YSCALE_OFF, display.AXIS_NORMAL,
                        fftsa.sg_dbmin, fftsa.sg_dbmax)
   fftsa.sg_pin_x()
+  return true
+end
+
+-- The recovery path after a failed frame, and the same binding as the build.
+function fftsa.sg_rebind()
+  return fftsa.sg_bind()
 end
 
 -- Detach and re-add the trace. Not called by the app; tools/test_tsp.lua exercises it.
@@ -513,6 +558,53 @@ fftsa.sg_pk_lf     = {}
 fftsa.sg_pk_lv     = {}
 
 fftsa.sg_peaks_off = false      -- disables the peak table, to attribute display traffic
+
+-- Refill the marker trace from the peak list: one point a peak, at the frequency and
+-- amplitude the peak table reports rather than the column the trace drew. Nothing when
+-- markers are off, so the buffer keeps its seed and the trace it is not bound to costs
+-- nothing.
+--
+-- SORTED BY FREQUENCY. The peaks arrive strongest-first, and drawstyle is per graph, so
+-- the marker trace is drawn with a line through it as well: in amplitude order that line
+-- zigzags across the plot. Six points, so an insertion sort is the whole cost.
+--
+-- Filled BEFORE the spectrum refill. The clear is a notify, and the frame's yield comes
+-- after the spectrum's writes, so the paint at the yield sees both buffers complete.
+function fftsa.sg_update_markers(bi, bv, count, binhz)
+  local mk = fftsa.sg_mk
+  if mk == nil or not fftsa.sg_markers then return 0 end
+  local log10, sqrt = math.log10, math.sqrt
+  local hz, db = fftsa.sg_mk_hz, fftsa.sg_mk_db
+  local n = 0
+  local p
+  for p = 1, count do
+    local k = bi[p]
+    if k ~= nil and k > 0 and bv[p] > 0 then
+      local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)
+      if iv == nil then dk, iv = 0, sqrt(bv[p]) end
+      local f = (k - 1 + dk) * binhz
+      local d = 20 * log10(iv)
+      if not (d > fftsa.sg_dbmin) then d = fftsa.sg_dbmin end
+      if not (d < fftsa.sg_dbmax) then d = fftsa.sg_dbmax end
+      -- Insertion by frequency, so the slots come out increasing in x.
+      local j = n
+      while j > 0 and hz[j] > f do
+        hz[j + 1], db[j + 1] = hz[j], db[j]
+        j = j - 1
+      end
+      hz[j + 1], db[j + 1] = f, d
+      n = n + 1
+    end
+  end
+  if n == 0 then return 0 end
+  local wr = buffer.write.reading
+  local i
+  mk.clear()
+  for i = 1, n do
+    wr(mk, db[i], hz[i], i, 0)
+  end
+  return n
+end
 
 -- Gated at fftsa.sg_pk_period and skipped when no peak moved beyond the tolerances,
 -- so a dithering last digit does not redraw the block on a steady signal.
