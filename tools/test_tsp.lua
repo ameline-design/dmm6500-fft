@@ -1070,8 +1070,19 @@ check('X is bound to the extra field, not the timestamp',
       .. tostring(display.ELEMENT_TIME))
 check('no label row is created at all', fftsa.sg_xlab == nil,
       'sg_xlab=' .. tostring(fftsa.sg_xlab))
-check('the legend names both units', fftsa.sg_xunit_text() == 'X: kHz   Y: dBV',
-      fftsa.sg_xunit_text())
+-- The whole line, against a literal, for a state pinned here. Probing for the pieces one
+-- at a time passes on a line that has them in any arrangement, and the arrangement is the
+-- feature: this is the only place the applied settings read back without opening Options.
+check('the legend carries the settings, not the axis units', (function()
+  local fs, n, r, w = fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i
+  local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = 100000, 512, 10, 1
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 10, 50000
+  local t = fftsa.sg_xunit_text()
+  fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = fs, n, r, w
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = lo, hi
+  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V', t
+end)())
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
       'gy=' .. fftsa.sg_gy)
 check('the graph and the peak table both fit the panel',
@@ -1147,8 +1158,8 @@ check('a span with almost no bins in it says so in the legend', (function()
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 10, 50000
   local wide = fftsa.sg_xunit_text()
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.binhz = lo, hi, bz
-  return string.find(narrow, '1 bin in this span', 1, true) ~= nil
-         and wide == 'X: kHz   Y: dBV',
+  return string.find(narrow, 'only 1 bin in the span', 1, true) ~= nil
+         and string.find(wide, 'in the span', 1, true) == nil,
          narrow .. ' | wide: ' .. wide
 end)())
 -- Pinned IN HERTZ, which is what makes the firmware's own labels read as frequency.
@@ -1588,7 +1599,6 @@ check('all size transitions keep the original trace bound and plot without leaks
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
        or dmm.digitize.count ~= n or fftsa.cap.cap ~= n * 4
        or fftsa.sg_buf.capacity ~= fftsa.sg_maxpts
-       or fftsa.sg_back ~= nil
        or OBJ[graph0].buffer ~= graphbuf0
        or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
        or OBJ[graph0].adds ~= adds0 or OBJ[graph0].removes ~= removes0
@@ -1597,10 +1607,10 @@ check('all size transitions keep the original trace bound and plot without leaks
        or fftsa.busy_max < 3.0 * fftsa.frame_estimate(n) - 1e-9
     then
       display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
-      return false, string.format('N=%d: same buffer=%s spare=%s adds %s/%s'
+      return false, string.format('N=%d: same buffer=%s cap=%d adds %s/%s'
                                   .. ' objs %d/%d bufs %d/%d', n,
                                   tostring(fftsa.sg_buf == graphbuf0),
-                                  tostring(fftsa.sg_back),
+                                  fftsa.sg_buf.capacity,
                                   tostring(OBJ[graph0].adds), tostring(adds0),
                                   live(), objects0, livebufs(), buffers0)
     end
@@ -1653,11 +1663,11 @@ check('a buffer allocation failure halts frames and allows recovery', (function(
          and recovered and not fftsa.halted and fftsa.errrun == 0
          and fftsa.n == 512 and fftsa.sg_nbins == 256
 end)())
--- The pair is what must survive a sample change, not the identity of whichever one the
--- graph happens to be showing: a frame alternates them.
+-- The buffer object itself must survive a sample change, still bound to the graph: the
+-- capacity is the ceiling at every size, so a resize has nothing to reallocate.
 check('sample changes never allocate or replace a graph buffer', (function()
   local buffers0 = livebufs()
-  local ring1, ring2 = fftsa.sg_buf, fftsa.sg_back
+  local trace = fftsa.sg_buf
   display.setvalue(fftsa.opt_n, 2)
   local real, calls = buffer.make, 0
   buffer.make = function(cap, style)
@@ -1672,24 +1682,20 @@ check('sample changes never allocate or replace a graph buffer', (function()
   local recovered = fftsa.options_apply()
   fftsa.frame()
   local shown = OBJ[fftsa.sg_graph].buffer
-  local pair = (fftsa.sg_buf == ring1 and fftsa.sg_back == ring2)
-               or (fftsa.sg_buf == ring2 and fftsa.sg_back == ring1)
   return ok and allocations == 1 and recovered and not fftsa.halted and fftsa.errrun == 0
-         and livebufs() == buffers0 and pair
-         and (shown == ring1 or shown == ring2) and shown == fftsa.sg_buf,
-         string.format('allocs=%d pair=%s shown-is-a-ring=%s bufs %d/%d',
-                       allocations, tostring(pair),
-                       tostring(shown == ring1 or shown == ring2),
-                       livebufs(), buffers0)
+         and livebufs() == buffers0 and fftsa.sg_buf == trace and shown == trace,
+         string.format('allocs=%d same=%s bound=%s bufs %d/%d',
+                       allocations, tostring(fftsa.sg_buf == trace),
+                       tostring(shown == trace), livebufs(), buffers0)
 end)())
 
--- The two rings are made when the app starts and freed when it ends, with nothing
+-- The trace buffer is made when the app starts and freed when it ends, with nothing
 -- created or deleted in between. Hooked at both calls rather than compared by count,
--- because a make paired with a delete leaves livebufs() unchanged and would pass a
--- count unnoticed -- which is how the 61-live-buffer leak got as far as the glass.
+-- because a make paired with a delete leaves livebufs() unchanged and passes a count
+-- unnoticed -- which is how the 61-live-buffer leak got as far as the glass.
 check('the trace buffer is never allocated or freed while the app runs', (function()
-  local ring1 = fftsa.sg_buf
-  if ring1 == nil then return false, 'no trace buffer at the start' end
+  local trace = fftsa.sg_buf
+  if trace == nil then return false, 'no trace buffer at the start' end
   local realmake, realdel = buffer.make, buffer.delete
   local madefull, freed = 0, 0
   buffer.make = function(cap, style)
@@ -1697,7 +1703,7 @@ check('the trace buffer is never allocated or freed while the app runs', (functi
     return realmake(cap, style)
   end
   buffer.delete = function(b)
-    if b == ring1 then freed = freed + 1 end
+    if b == trace then freed = freed + 1 end
     return realdel(b)
   end
   local i, err
@@ -1711,12 +1717,31 @@ check('the trace buffer is never allocated or freed while the app runs', (functi
   fftsa.options_apply()
   buffer.make, buffer.delete = realmake, realdel
   if err ~= nil then return false, tostring(err) end
-  return madefull == 0 and freed == 0 and ring1.alive
-         and fftsa.sg_buf == ring1 and fftsa.sg_back == nil
-         and ring1.capacity == fftsa.sg_maxpts,
+  return madefull == 0 and freed == 0 and trace.alive
+         and fftsa.sg_buf == trace
+         and trace.capacity == fftsa.sg_maxpts,
          string.format('made %d freed %d, alive %s, capacity %d of %d',
-                       madefull, freed, tostring(ring1.alive),
-                       ring1.capacity, fftsa.sg_maxpts)
+                       madefull, freed, tostring(trace.alive),
+                       trace.capacity, fftsa.sg_maxpts)
+end)())
+-- The guard inside sg_make_buffer, called directly. sg_build() is its only caller and
+-- start() the only caller of that, so nothing in the app reaches it a second time, and
+-- a guard nothing reaches is a guard nothing checks. A buffer remade here would also be
+-- detached from the graph on the way, so the binding is asserted too.
+check('making the trace buffer again at the same size keeps the one in use', (function()
+  local trace = fftsa.sg_buf
+  local realmake, made = buffer.make, 0
+  buffer.make = function(cap, style)
+    if style == buffer.STYLE_WRITABLE_FULL then made = made + 1 end
+    return realmake(cap, style)
+  end
+  local got = fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)
+  buffer.make = realmake
+  return made == 0 and got == trace and fftsa.sg_buf == trace and trace.alive
+         and OBJ[fftsa.sg_graph].buffer == trace,
+         string.format('made %d, same %s, still bound %s', made,
+                       tostring(got == trace),
+                       tostring(OBJ[fftsa.sg_graph].buffer == trace))
 end)())
 
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
@@ -2000,9 +2025,12 @@ end)())
 
 -- T1. The hoist: sg_nbins has to describe the new size before the sg_set_xrange() at
 -- the top of apply(), because the legend reports how many bins land in the span.
+-- A 501 Hz span holds 2 bins at 512 samples and 82 at 16384, so the warning appears at
+-- one size and not at the other. The match is on the warning's own words: the settings
+-- line always carries a bin WIDTH, so a bare 'bin' matches either way.
 check('the legend bin count follows a resize in the same Apply', (function()
   display.setvalue(fftsa.opt_flo, 1999)
-  display.setvalue(fftsa.opt_fhi, 2000)
+  display.setvalue(fftsa.opt_fhi, 2500)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
   local at512 = fftsa.sg_xunit_text()
@@ -2014,8 +2042,8 @@ check('the legend bin count follows a resize in the same Apply', (function()
   display.setvalue(fftsa.opt_flo, 1000)
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
-  return nb == 8192 and string.find(at512, 'bin', 1, true) ~= nil
-         and string.find(at16k, 'bin', 1, true) ~= nil and at512 ~= at16k,
+  return nb == 8192 and string.find(at512, 'only 2 bins in the span', 1, true) ~= nil
+         and string.find(at16k, 'in the span', 1, true) == nil,
          '512: ' .. tostring(at512) .. ' | 16384: ' .. tostring(at16k)
 end)())
 
@@ -2207,7 +2235,7 @@ check('repeated refills rewrite the same buffer, with no rebinding', (function()
   local adds, removes = (o.adds or 0), (o.removes or 0)
   fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
   fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
-  return fftsa.sg_buf == buf and fftsa.sg_back == nil
+  return fftsa.sg_buf == buf
          and (o.adds or 0) == adds and (o.removes or 0) == removes
          and o.buffer == buf and buf.n == fftsa.sg_ncol,
          string.format('same buffer=%s, adds %d/%d, removes %d/%d, n %d of %d',

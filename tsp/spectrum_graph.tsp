@@ -144,8 +144,8 @@ fftsa.sg_pk_cf   = 14745568  -- freq colour (pale green)
 fftsa.sg_pk_cv   = 13166335  -- volt colour (pale blue)
 fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
 fftsa.sg_xunit_x = 8
-fftsa.sg_xunit_y = 410       -- X-axis legend, below the peak rows
-fftsa.sg_xunit_c = 9474192   -- grey 909090
+fftsa.sg_xunit_y = 410       -- settings line, below the peak rows
+fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview line
 
 -- Delete, nil handle or not. These were wrapped in pcall to count a refusal, which
 -- cannot happen: the firmware REFUSES BY POSTING AN EVENT and returning, so the wrapper
@@ -195,10 +195,19 @@ function fftsa.sg_pin_x()
   return true
 end
 
+-- The settings line, under the peak rows: everything in Options that the axes do not
+-- already show. The span is the X axis and the dB range is the Y axis, so neither is
+-- repeated; sample count, rate, bin width, record length, window and input range are.
+--
+-- Written twice per Apply, by sg_set_xrange() before the capture and again after it, so
+-- the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
-  local t = "X: kHz   Y: dBV"
-  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins:
-  -- the trace is a dot, five peak rows read ---, and nothing else says why.
+   local t = string.format("%d pts   %s   %s", fftsa.n,
+                          fftsa.opt_info_text(fftsa.fs, fftsa.n),
+                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)])
+  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
+  -- trace is a dot, five peak rows read ---, and this count is the only thing that says
+  -- why. The width is already in the line, so the count alone is enough.
   local b = fftsa.binhz
   if b ~= nil and b > 0 then
     local k0, k1 = fftsa.sg_window_bins(fftsa.sg_nbins, b)
@@ -206,52 +215,32 @@ function fftsa.sg_xunit_text()
     if n < 3 then
       local plural = "s"
       if n == 1 then plural = "" end
-      t = t .. string.format("   %d bin%s in this span of %.0f Hz", n, plural, b)
+      t = t .. string.format("   only %d bin%s in the span", n, plural)
     end
   end
   return t
 end
 
--- The two trace buffers the frame alternates between. WRITABLE_FULL carries value, extra
--- and timestamp per point: UNIT_VOLT holding dB numbers, extra UNIT_HERTZ.
+-- The trace buffer. WRITABLE_FULL carries value, extra and timestamp per point: the value
+-- is dB under a two-character custom unit, the extra is the bin's frequency in hertz.
 --
 -- MADE ONCE, WHEN THE APP STARTS, AND FREED ONLY BY fftsa.sg_destroy() WHEN IT ENDS.
 -- Capacity is sg_maxpts -- the ceiling, not the current sg_ncol -- whatever the sample
 -- count, so neither a size change nor a change of point count needs a new buffer: this
 -- writes sg_nbins and returns. Nothing allocates or frees while frames are running.
 --
--- WHY TWO, AND WHY FILL_ONCE. Both were established on the instrument, and each rules
--- out the obvious cheaper design.
---
--- One buffer, overwritten in place, is invisible. The display task keeps its own copy of
--- the readings (FIRMWARE_API.md:246): all 340 points were moved to -20 dBV with the
--- frame parked and the plot area came back byte-identical. Being handed a buffer is what
--- makes the task re-read one, so a frame has to hand one over.
---
--- FILL_CONTINUOUS removes the need to clear, and every mechanical claim about it held --
--- the mode reads back, writing past capacity wraps with no event, n pins at capacity,
--- and after exactly capacity writes startindex is 1 again. It is still unusable here:
--- the widget draws a continuous-fill buffer as a WRAPPING trace and joins its newest
--- point back to its oldest, which on the glass is a straight line across the whole plot.
--- Measured against the alternative explanation -- the bound buffer was read four times
--- while that line was on screen and was perfectly aligned every time, startindex 1,
--- endindex 680, timestamps monotonic -- so the line is the fill mode, not a rotation.
---
--- So: FILL_ONCE, and a frame clears and fills the one the graph is NOT showing before
--- handing it over. The clear is what the firmware needs and it happens where nothing can
--- see it; the bound buffer is always a complete trace and is never written at all.
+-- FILL_ONCE, cleared and refilled by every frame from arrays it stages first, so nothing
+-- but buffer.write.reading is inside the window where the buffer is short of a trace.
+-- The clear is also the handover: the display task keeps its own copy of the readings
+-- (FIRMWARE_API.md:246) and re-reads a buffer only when it is handed one, so writing over
+-- a bound buffer in place changes nothing on the glass.
 function fftsa.sg_make_buffer(nbins, npoints)
   fftsa.sg_nbins = nbins
   local want = npoints or fftsa.sg_maxpts
-  -- Already built at the right size: keep them, and write nothing but sg_nbins.
-  --
-  -- An invariant, not a fix: sg_build() is the only caller and start() the only caller
-  -- of that, so today this never returns early. It is here because it is the one place
-  -- the rule is expressed in code rather than left implicit in the call graph -- proved
-  -- by putting an allocation into apply(), which then allocates nothing with this
-  -- present and fourteen buffers with it removed.
-  if fftsa.sg_buf ~= nil and fftsa.sg_back ~= nil
-     and fftsa.sg_buf.capacity == want and fftsa.sg_back.capacity == want then
+  -- Already built at the right size: keep it, and write nothing but sg_nbins. sg_build()
+  -- is the only caller and start() the only caller of that, so this is the one place the
+  -- no-reallocation rule is stated in code rather than left implicit in the call graph.
+  if fftsa.sg_buf ~= nil and fftsa.sg_buf.capacity == want then
     return fftsa.sg_buf
   end
   -- DETACH BEFORE DELETING. The firmware refuses to delete a buffer that is still
@@ -267,12 +256,7 @@ function fftsa.sg_make_buffer(nbins, npoints)
     fftsa.del_buf(fftsa.sg_buf)
     fftsa.sg_buf = nil
   end
-  if fftsa.sg_back ~= nil then
-    fftsa.del_buf(fftsa.sg_back)
-    fftsa.sg_back = nil
-  end
-  fftsa.sg_buf  = fftsa.sg_mkbuf(want)
-  fftsa.sg_back = nil
+  fftsa.sg_buf = fftsa.sg_mkbuf(want)
   -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
   -- at the ceiling and never resized: a frame writes slots 1..sg_ncol and reads back the
   -- same, so growing a table mid-frame would allocate inside the window it exists to
@@ -385,15 +369,12 @@ function fftsa.sg_destroy()
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat = nil, nil, nil, nil, nil, nil, nil
-  -- Both: a buffer whose handle is dropped is stranded and still counts against the
-  -- instrument's capacity.
+  -- Deleted, not just dropped: a buffer whose handle is dropped is stranded and still
+  -- counts against the instrument's capacity.
   if fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
   end
-  if fftsa.sg_back ~= nil then
-    fftsa.del_buf(fftsa.sg_back)
-  end
-  fftsa.sg_buf, fftsa.sg_back = nil, nil
+  fftsa.sg_buf = nil
   collectgarbage()
 end
 
@@ -414,9 +395,10 @@ function fftsa.sg_window_bins(nbins, binhz)
   return kmin, kmax
 end
 
--- Refill the trace from fftsa.fft_pwr into the buffer the graph is NOT showing, then
--- hand that buffer over. The clear and the whole fill therefore happen where no paint
--- can see them, and the bound buffer is replaced only by a complete one.
+-- Refill the trace from fftsa.fft_pwr: every column is staged into sg_st_db and sg_st_hz
+-- first, then the buffer is cleared and written. Only the writes are inside the window
+-- where the buffer holds less than a full trace, which is what keeps a paint landing
+-- mid-refill from drawing a short one.
 --
 -- The display task shares this core with the interpreter and runs only while Lua is
 -- blocked, so the delay at the end is what gets the new trace painted; too short and the
