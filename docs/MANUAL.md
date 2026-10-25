@@ -10,7 +10,7 @@ screen and buffer the app made.
 
 ![The spectrum screen: a 12.5 kHz 1.000 V tone at 0.0 dBV over a 10 Hz to 50 kHz span, 512 samples, Hann window, noise floor near -100 dBV](manual-spectrum.png)
 
-+20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, about 10 frames a second.
++20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
 
 **Two rows of numbers sit under the plot. Read the lower one.** The graph object's X axis is
@@ -72,7 +72,7 @@ carries** below).
 
 | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|
-| Apply | 0.11 s | 0.23 s | 0.39 s | 0.76 s | 1.49 s | **2.91 s** |
+| Apply | 0.11 s | 0.22 s | 0.38 s | 0.74 s | 1.46 s | **2.89 s** |
 
 Most of it is the gain table and the window: both are rebuilt for the new size, and both are
 proportional to it. The loading screen is up for all of it.
@@ -156,10 +156,10 @@ watch which peak follows.
 
 ## How many points the trace carries
 
-The graph is 784 pixels wide, so a sample count above 512 gives more bins than there are columns to
-draw them in -- 8192 bins at 16384 samples. The app therefore reduces the trace to **256 columns**,
-and the reduction is not a stride: each column reports the **minimum and the maximum** of the bins
-that fall in it.
+The plotted area is 680 pixels wide, measured off a panel capture, so a sample count above 512 gives
+more bins than there are columns to draw them in -- 8192 bins at 16384 samples. The app therefore
+draws a fixed **255 columns** at every sample count, and the reduction is not a stride: each column
+reports the **maximum** of the bins that fall in it.
 
 Three consequences, and the first is the point of it:
 
@@ -179,15 +179,20 @@ Three consequences, and the first is the point of it:
 
 ![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
 and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
-as a band between about -100 and -118 dBV](manual-spectrum-16384.png)
+as a single line near -100 dBV](manual-spectrum-16384.png)
 
-The band along the bottom is the per-column minimum and maximum. Compare the 512-sample shot at the
-top of this manual, where the same tone is a single 195 Hz-wide lump and the harmonics are lost in
-the floor.
+Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
+lump and the harmonics are lost in the floor.
+
+Because each column reports its maximum, the noise floor reads about 6 dB high and as an upper
+envelope rather than a band. Writing the minimum as well was tried and withdrawn: it doubled the
+point count and made every second segment span the whole noise band, about 45 px, where a
+single-valued trace moves a few pixels between neighbours -- and the firmware's cost of drawing a
+trace is per segment length.
 
 Reducing the trace does not reduce the **table**: `find_peaks` reads every bin at full resolution, so
 a reported frequency is never a column edge. It is also what makes the larger counts usable at all --
-writing 8191 points costs 51.6 us each, about 0.42 s a frame, against 0.03 s for 502.
+writing 8191 points costs 51.6 us each, about 0.42 s a frame, against 0.035 s for 255.
 
 ## The peak table is more accurate than the trace
 
@@ -269,19 +274,27 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. At 512 samples:
   200 kS/s to 100 kHz (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz).
   Divide all three by 32 at 16384 samples. 500 kHz is the highest tone the instrument can show.
-- **About 10 frames a second at 512 samples, and far slower above it.** The firmware's shortest
-  timer period is 0.05 s and a tick arriving mid-frame is dropped, so the displayed rate is
-  `1 / (0.05 * ceil(frame / 0.05))` -- a ladder of 20, 10, 6.67, 5 fps and on down, not just those
-  four. Measured frame times and the rates they give:
+- **10 frames a second at 512 samples, and far slower above it.** The firmware's shortest timer
+  period is 0.05 s and a tick arriving mid-frame is dropped, so the rate can only be `1 / (0.05 * k)`
+  -- a ladder of 20, 10, 6.67, 5 fps and on down. The app times its own frames and picks the smallest
+  period that leaves about a fifth of it idle, so the rate below is what it settles on rather than
+  wherever the rounding fell:
 
   | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
   |---|---|---|---|---|---|---|
-  | frame | 0.095 s | 0.161 s | 0.258 s | 0.456 s | 0.855 s | 1.681 s |
-  | displayed | 10 fps | 5 fps | 3.3 fps | 2 fps | 1.1 fps | **0.6 fps** |
+  | frame | 0.079 s | 0.122 s | 0.212 s | 0.460 s | 0.860 s | 1.686 s |
+  | displayed | 10 fps | 5 fps | 3.33 fps | 1.67 fps | 0.91 fps | **0.47 fps** |
 
-  At 16384 the trace repaints about every **2 s** -- 0.5 Hz, measured on the installed app -- and the
-  glass is unresponsive for most of each frame: the display task only runs while Lua is blocked. The
-  frame figures above exclude that paint, so they run a tick or two optimistic.
+  That reserved idle is what keeps the **Options** button answering: `delay()` lets the display task
+  paint, but dispatching a press needs the Lua interpreter, and during a frame the interpreter is
+  busy. It costs 4096 and 8192 about a tick each against leaving the period at the floor, and in
+  exchange every size stays operable -- at 16384 the trace repaints about every two seconds and the
+  button still answers. **16384 is usable rather than comfortable**, and 32768 is not offered.
+
+- **The trace flickers slightly.** The firmware requires a writable buffer to be cleared before it
+  can be rewritten, so the trace buffer is empty for the 20 ms it takes to write 255 points, and a
+  repaint landing in that window draws a partial trace. Everything the refill needs is computed
+  before the clear to keep that window as short as the write calls themselves.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
 - **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin

@@ -9,7 +9,7 @@ The short version: **precision is not what this app pays for, and neither is the
 It pays for interpreter dispatch and for marshalled calls across the TSP API. Every lever below is
 about doing fewer operations, not cheaper ones.
 
-## The displayed frame rate is quantised, and that is the whole story
+## The displayed frame rate is quantised, and the app chooses which tick it lands on
 
 The app offers 512 through 16,384 samples in Options, retaining 512 as the default. Every size was
 measured on the instrument on 2026-10-24 -- see **Every selectable sample count, measured** below --
@@ -33,6 +33,17 @@ displayed = 1 / (0.05 * ceil(frame / 0.05))
 which admits 20, 10, 6.67, 5 fps and nothing between. **Shaving a frame from 81 ms to 55 ms buys
 nothing; getting it from 51 to 49 doubles the rate.** Optimising this app means crossing a boundary,
 not reducing a number.
+
+That formula describes a period left at the 0.05 s floor, which is what the app used to do, and the
+idle it leaves is then an accident of rounding -- 44 % at 512 samples and 2 % at 4096. The second
+figure is why the Options button was unreachable at the larger counts: `delay()` lets the display task
+paint, but dispatching a touch needs the Lua interpreter, and during a frame the interpreter is busy,
+so the only time a press can be handled is the gap between a frame ending and the next tick.
+
+The app now arms the timer deliberately, at the smallest tick count leaving about a fifth of the
+period idle, from the peak work over eight real frames (`fftsa.tick_period`). The quantisation is
+unchanged -- it is the firmware's -- but which tick a size lands on is now a decision with a reason
+rather than a remainder.
 
 ### Measured, N=512, 256 bins, graph 784x272, timer frozen, frames back to back
 
@@ -135,26 +146,41 @@ event log read afterwards; if 1706 appears, `sg_yield` is short of the display t
 ## Every selectable sample count, measured
 
 Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, a 12.5 kHz 1.000 V tone, graph
-784x292, frame timer parked so each figure is one synchronous call. Taken 2026-10-24.
+784x292, 255 trace points at every count. Twelve frames a size, called synchronously with the timer
+parked, so the period each size settles on has been re-armed from real frames before it is read.
+Taken 2026-10-25, event log clean throughout. `tools/../../fftmeas/docmeas5.py` is the run.
 
-| N | Apply | frame | displayed | trace points | bin width |
-|---|---|---|---|---|---|
-| 512 | 0.105 s | 0.095 s | 10 fps | 255 | 195.31 Hz |
-| 1024 | 0.232 s | 0.161 s | 5 fps | 380 | 97.66 Hz |
-| 2048 | 0.393 s | 0.258 s | 3.3 fps | 441 | 48.83 Hz |
-| 4096 | 0.755 s | 0.456 s | 2 fps | 475 | 24.41 Hz |
-| 8192 | 1.488 s | 0.855 s | 1.1 fps | 496 | 12.21 Hz |
-| 16384 | 2.906 s | 1.681 s | 0.6 fps modelled, **0.5 Hz observed** | 502 | 6.10 Hz |
+| N | Apply | frame | worst frame | period | displayed | occupancy | bin width | record |
+|---|---|---|---|---|---|---|---|---|
+| 512 | 0.106 s | 0.079 s | 0.081 s | 0.10 s | **10.0 fps** | 81 % | 195.31 Hz | 5.1 ms |
+| 1024 | 0.219 s | 0.122 s | 0.125 s | 0.20 s | 5.0 fps | 62 % | 97.66 Hz | 10.2 ms |
+| 2048 | 0.376 s | 0.212 s | 0.215 s | 0.30 s | 3.33 fps | 72 % | 48.83 Hz | 20.5 ms |
+| 4096 | 0.737 s | 0.460 s | 0.526 s | 0.60 s | 1.67 fps | 88 % | 24.41 Hz | 41.0 ms |
+| 8192 | 1.455 s | 0.860 s | 0.883 s | 1.10 s | 0.91 fps | 80 % | 12.21 Hz | 81.9 ms |
+| 16384 | 2.893 s | 1.686 s | 1.730 s | 2.15 s | 0.47 fps | 80 % | 6.10 Hz | 163.8 ms |
 
-The 0.095 s frame at 512 against the 81.8 ms of the phase table above is the same configuration
-measured a different way, through `options_apply` rather than per phase.
+**The worst frame is not the mean plus noise.** At 4096 the slowest of twelve is 0.526 s against a
+0.460 s mean, a 14 % outlier, and it is what puts that row on 0.60 s rather than 0.55 -- the period
+covers the slowest frame by design, so one slow frame in a window costs a tick until the window
+turns over. Every other count holds within 2 % of its mean. The occupancy column is `worst / period`,
+so 4096's 88 % is that outlier arriving after the period had been armed from a lower peak.
 
-**These frame times are a floor, not what the operator sees.** They were taken with the frame timer
-parked and `saved_frame()` called synchronously, which leaves out the display task's own paint -- in
-the running app that work lands between frames and costs another tick or two. Measured on the
-installed app at 16384 the update is about **0.5 Hz**, a 2.0 s period, against the 0.59 fps the 1.681 s
-figure predicts: the real frame is nearer 1.95 s. Treat the table as per-phase cost and the 0.5 Hz as
-the rate.
+**The displayed rate is now a figure the app chooses, not one the quantisation leaves.** The period
+is re-armed from the peak work over eight real frames, through `fftsa.tick_period()`, which asks for
+the work to be about 80 % of the period and rounds up to the firmware's 0.05 s tick. So `period` is
+what the operator sees and `worst frame` is what it was sized to cover -- the mean is only there to
+show the spread is small, under 2 % at every count.
+
+4096 and 8192 are **slower than an earlier revision of this table** recorded -- 1.67 fps against 2.0,
+0.91 against 1.1 -- and that is the rule working rather than a regression. Those figures came from a
+period left at the 0.05 s floor with ticks dropped, which gave the interpreter 2 % idle at 4096 and
+made the Options button unreachable there. A fifth of each frame is now idle by construction, and the
+button answers at 16384.
+
+Two sources of error this table had before, both now gone: the frame times were taken without the
+display task's paint and so ran a tick or two optimistic, and the trace point count grew with N
+(255 at 512 up to 502 at 16384) which moved the fill cost between rows. The trace is a fixed 255
+points at every count.
 
 ### Where a frame goes, per sample and per bin
 
@@ -169,12 +195,41 @@ Each measured on its own, so the frame can be built from them for any count:
 | max-scan over `fft_pwr` | **2.5 us a bin** | per bin examined by the column reduction |
 
 `fftsa.frame_estimate(n)` in `spectrum_app.tsp` is these numbers, and predicts 0.080 s at 512
-against 0.095 measured and 1.63 s at 16384 against 1.681. `busy_max` is three times it.
+against 0.079 measured and 1.63 s at 16384 against 1.686. `busy_max` is three times it.
 
-**The column cap is why the larger counts are usable.** Writing every bin at 16384 would be 8191
-points at 51.6 us, about 0.42 s a frame -- a quarter of the whole frame -- for points the firmware
-then discards, 784 pixels being all it has. Reducing to 256 columns costs a 2.5 us scan per bin plus
-about 500 writes: 0.05 s.
+**The model no longer sets the frame rate**, and it should not be made to. It is a fit at one point
+count and one draw path, and it errs both ways: 80.4 ms at 512 against 79, and 216 ms at 2048 against
+212. Divided by the occupancy target those errors land either side of a tick boundary, which is a
+50 % swing in displayed rate. `frame_estimate` is now used only for the first arm, before any frame
+has been timed, and for `busy_max`; `fftsa.frame()` re-arms from measurement thereafter.
+
+**The fixed column count is why the larger counts are usable.** Writing every bin at 16384 would be
+8191 points at 51.6 us, about 0.42 s a frame -- a quarter of the whole frame -- for points the
+firmware then discards, 784 pixels being all it has. 255 columns costs a 2.5 us scan per bin plus 255
+writes: about 0.035 s at any count, which is also what makes the frame time linear in N.
+
+### The refill, and the window it opens
+
+The trace buffer is bound to the graph for the life of the app and refilled in place, so it is at
+n = 0 from `clear()` until the last write and a paint landing there draws a blank or partial trace.
+That window is the flicker, and it cannot be removed -- the firmware needs the clear before a
+`FILL_ONCE` buffer can be rewritten, and the alternative of filling a second buffer and handing it
+over needs a `removeall`, which repaints the whole widget including its own axis labels every frame.
+
+So the window is made narrow instead. Every value is computed into four preallocated arrays *before*
+the clear, while the buffer still holds the previous complete trace, leaving only
+`buffer.write.reading` inside it. Measured at 255 points:
+
+| | time |
+|---|---|
+| staging, outside the window | 7.6 ms |
+| clear and 255 writes, the window | **20.3 ms** |
+| the same refill interleaved, as it was | 30 ms, all of it the window |
+
+A point costs about 109 us to produce and 51.6 of that is the write, so this is the better half of
+the work moved out. There is no bulk route into a reading buffer (`FIRMWARE_API.md`), so one write a
+point is the floor, and caching the function in a local -- 65 us against 72 through the table -- is
+the only other lever.
 
 ### Apply, and why it is the figure an operator notices
 

@@ -4,7 +4,7 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen: two tones at 21.1 and 42.2 kHz, 4.5 and 4.0 V, over a 0 to 50 kHz span with the Hann window](docs/manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.000 V tone reading 0.0 dBV over a 10 Hz to 50 kHz span, 512 samples, Hann window, noise floor near -100 dBV](docs/manual-spectrum.png)
 
 A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
 and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
@@ -16,10 +16,10 @@ and a touchscreen, which is enough for 195 Hz resolution at 10 frames a second.
 - **Digitizes** up to 1 MS/s, with selectable 512 to 16,384 samples per frame (default 512).
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
   and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
-- **Plots** through `display.OBJ_GRAPH`, one call a frame rather than one a point, which brings axes,
-  grid, labels and auto-scaling with it. Above 256 bins in the span the trace is reduced to the
-  graph's 256 columns by the **minimum and maximum of each column**, so a narrow tone always reaches
-  it and the noise floor reads as a band.
+- **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and no graph call at all, which
+  brings axes, grid, labels and auto-scaling with it. The trace is a fixed **255 columns** at every
+  sample count, each carrying the **maximum of the bins it covers**, so a narrow tone always reaches
+  it however many bins the span holds.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Previews acquisition settings** in Options: sampling rate, bin spacing and record duration
@@ -34,9 +34,9 @@ content folds it into view — a pure 21.1 kHz sine, sampled for a 7 kHz span, d
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
 6.10 Hz spacing and a 163.84 ms record. Acquisition duration is `N / fs`, not the full frame time;
 processing and display add overhead. Larger sizes cost update rate, and measurably so: the frame goes
-from 0.095 s at 512 samples to 1.681 s at 16,384, and Apply from 0.11 s to 2.91 s. The trace repaints
-about every 2 s at the top size -- 0.5 Hz observed -- and the glass is unresponsive for most of each
-frame, because the display task only runs while Lua is blocked. `docs/PERFORMANCE.md` has every size measured.
+from 0.079 s at 512 samples to 1.686 s at 16,384, and Apply from 0.11 s to 2.89 s, so the trace
+repaints at 10 fps at the default and about every two seconds at the top size. 16,384 is usable
+rather than comfortable. `docs/PERFORMANCE.md` has every size measured.
 
 ## Choosing a window
 
@@ -143,10 +143,20 @@ the Lua task blocks — so a Lua frame rate means nothing by itself. A frame loo
 measures 35.6 Hz in Lua while dropping display messages and updating the glass three times a second.
 Every frame therefore blocks once, deliberately, for the paint.
 
-That also fixes the frame rate. A timer tick arriving mid-frame is dropped rather than queued, and
-the shortest period the firmware accepts is 0.05 s, so the displayed rate is quantised to
-`1/(0.05 × ceil(frame/0.05))` — 20, 10, 6.67 fps and nothing between. Getting a frame under 50 ms
-doubles the rate; shaving it from 81 ms to 55 ms buys nothing.
+That also quantises the frame rate. A timer tick arriving mid-frame is dropped rather than queued,
+and the shortest period the firmware accepts is 0.05 s, so the displayed rate can only be
+`1/(0.05 × k)` — 20, 10, 6.67 fps and nothing between. Shaving a frame from 81 ms to 55 ms buys
+nothing; getting it under 50 ms doubles the rate.
+
+**So the app sets the period rather than letting the quantisation set it.** It times its own frames
+and arms the timer at the smallest tick count that leaves about a fifth of the period idle, because
+that idle is the only time a touch can be dispatched: `delay()` lets the display task paint, but
+dispatching a press needs the Lua interpreter, which is inside the delay. Leaving the period at the
+floor gave 44 % idle at 512 samples and 2 % at 4,096 purely by accident of rounding, and the Options
+button was unreachable at the larger counts. The rule costs 4,096 and 8,192 about a tick each and
+makes every size operable. One consequence worth knowing: a frame landing within 2.5 ms of a tick
+boundary is rounded *down*, because holding the occupancy target to the last millisecond would trade
+a whole tick of rate for a fiftieth of a tick of idle.
 
 **The interpreter is the bottleneck, not the arithmetic.** A Lua table read costs about 1.4 µs and an
 arithmetic operation about 1.2 µs — some 480 cycles at 400 MHz for one multiply whose floating-point
