@@ -8,7 +8,7 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.01kHz to +40.01kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.0013 V tone reading 0.0 dBV, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
@@ -21,8 +21,11 @@ firmware's numeric plot, which labels the real frequency and picks the SI prefix
 are decibels held in a buffer whose unit is a two-character custom one, `dB`, for the same reason: a
 volt-unit buffer labelled them `V`.
 
-The `+` signs and the `.01` are both the firmware's doing. It signs its numeric axes, and the span
-starts at the Start frequency — 10 Hz by default, which is 0.01 kHz. Set Start to 0 for round marks.
+The `+` signs are the firmware's doing — it signs its numeric axes. The tick numbers are round
+because the axis is pinned from DC whenever the Start frequency is under one pixel of the span, which
+it is at every default: a 10 Hz Start on a 50 kHz span would otherwise put the ticks at 10, 10010 and
+20010 Hz and label them `+00.01kHz`. Zoom into a narrow band and the axis keeps that band's own
+limits, so the trace still fills the plot.
 
 Six peaks, strongest first, in two columns:
 
@@ -184,8 +187,8 @@ Three consequences, and the first is the point of it:
 
 ![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
 and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
-as a single line near -100 dB. The axes are the firmware's own, +020.0dB to -120.0dB and +00.01kHz to
-+40.01kHz](manual-spectrum-16384.png)
+as a single line near -100 dB. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
++40.00kHz](manual-spectrum-16384.png)
 
 Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
 lump and the harmonics are lost in the floor.

@@ -452,7 +452,7 @@ name rule above.
 
 **Settled, and the whole problem went away.** X is bound to the reading's **extra** field, which makes
 the graph the firmware's numeric x-y plot instead of a time plot: the axis takes its limits in real
-hertz and the firmware labels and SI-prefixes them itself -- `+00.01kHz`, `+10.01kHz`. The Y axis
+hertz and the firmware labels and SI-prefixes them itself -- `+00.00kHz`, `+10.00kHz`. The Y axis
 reads `dB` because the buffer's reading unit is the two-character custom unit `buffer.UNIT_CUSTOM1`,
 registered with `buffer.unit`. Confirmed on the instrument, 2026-10-25.
 
