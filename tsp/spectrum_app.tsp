@@ -762,7 +762,11 @@ end
 function fftsa.bp_text(d, on)
   if d == nil then d = fftsa.bp_d end
   if on == nil then on = fftsa.bp_on end
-  if not on then return "BP:Off" end
+  -- NOTHING when it is off, which is the only state the form can produce: the field is
+  -- withheld, so "BP:Off" on every line would be a permanent label for a feature that is
+  -- not there. It still speaks up when something sets fftsa.bp_on over the socket, or the
+  -- decimation would be invisible.
+  if not on then return "" end
   if d ~= nil and d > 1 then return string.format("BP:On /%d", d) end
   return "BP:On (" .. fftsa.bp_why(fftsa.fs_acq, fftsa.fhi, fftsa.n) .. ")"
 end
@@ -827,7 +831,9 @@ function fftsa.options_preview()
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
-  local text = fftsa.opt_info_text(fs, n, wi, bi, acq) .. "   " .. fftsa.bp_text(d, bp)
+  local text = fftsa.opt_info_text(fs, n, wi, bi, acq)
+  local bptxt = fftsa.bp_text(d, bp)
+  if bptxt ~= "" then text = text .. "   " .. bptxt end
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text

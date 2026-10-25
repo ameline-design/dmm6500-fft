@@ -195,10 +195,11 @@ end
 -- Written twice per Apply, by sg_set_xrange() before the capture and again after it, so
 -- the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
-   local t = string.format("%d pts   %s   %s   %s", fftsa.n,
+   local t = string.format("%d pts   %s   %s", fftsa.n,
                           fftsa.opt_info_text(fftsa.fs, fftsa.n),
-                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)],
-                          fftsa.bp_text())
+                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)])
+  local bptxt = fftsa.bp_text()
+  if bptxt ~= "" then t = t .. "   " .. bptxt end
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
   -- trace is a dot, five peak rows read ---, and this count is the only thing that says
   -- why. The width is already in the line, so the count alone is enough.

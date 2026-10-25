@@ -1087,6 +1087,8 @@ check('the readback line reports the digitizer rate, not the decimated one', (fu
   if d < 2 then return false, 'no decimation at a 20 kHz span, nothing to tell apart' end
   -- The acquisition rate is in the line and the decimated one is NOT, while the bin
   -- width is computed from the decimated rate.
+  local named = string.find(line, string.format('BP:On /%d', d), 1, true) ~= nil
+  if not named then return false, 'the line does not name the decimation: ' .. line end
   local shown = string.find(line, fftsa.sample_rate_text(acq), 1, true) ~= nil
   local hidden = string.find(line, fftsa.sample_rate_text(eff), 1, true) == nil
   local bin = string.find(line, string.format('bin %.2f Hz', eff / 512), 1, true) ~= nil
@@ -1760,8 +1762,9 @@ check('the legend carries the settings, not the axis units', (function()
   local t = fftsa.sg_xunit_text()
   fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = fs, n, r, w
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = lo, hi
-  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V'
-         .. '   BP:Off', t
+  -- No band-pass figure: the field is withheld, and the line only mentions it when
+  -- something has set fftsa.bp_on over the socket.
+  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V', t
 end)())
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
       'gy=' .. fftsa.sg_gy)
@@ -2222,7 +2225,6 @@ check('the preview uses the timestamp-measured rate for the active rate', (funct
   fftsa.options_preview()
   local text = obj_at(fftsa.opt_info).text
   local expected = fftsa.opt_info_text(fftsa.fs_acq / fftsa.bp_d, 512)
-                   .. '   ' .. fftsa.bp_text()
   fftsa.fs_acq = acq
   return text == expected, tostring(text) .. ' | wanted ' .. tostring(expected)
 end)())
