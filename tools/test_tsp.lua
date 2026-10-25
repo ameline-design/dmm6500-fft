@@ -994,6 +994,33 @@ print('\nband-pass: filter and decimate to the span (real code)')
 -- Unit DC gain, odd length, symmetric. The gain matters most: a filter that did not sum
 -- to 1 would scale every reading, and the amplitude would be wrong by a constant nobody
 -- would attribute to the filter.
+-- The band-pass is given one rate up, so the filter can remove a band that would
+-- otherwise have folded at the ADC. The hardware has four exact rates and nothing
+-- between, so "double" means the next one, and 1 MS/s is the ceiling.
+check('the band-pass steps the acquisition rate up one, and stops at 1 MS/s', (function()
+  local got = {}
+  local i
+  for i = 1, table.getn(fftsa.rates) do got[i] = fftsa.bp_rate(fftsa.rates[i]) end
+  return got[1] == 200000 and got[2] == 500000 and got[3] == 1000000
+         and got[4] == 1000000,
+         string.format('100k->%g 200k->%g 500k->%g 1M->%g', got[1], got[2], got[3],
+                       got[4])
+end)())
+check('a band-pass Apply runs the digitizer at the stepped rate', (function()
+  display.setvalue(fftsa.opt_flo, 10)
+  display.setvalue(fftsa.opt_fhi, 10000)
+  display.setvalue(fftsa.opt_n, 1)
+  display.setvalue(fftsa.opt_bp, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local rate, acq = dmm.digitize.samplerate, fftsa.fs_acq
+  display.setvalue(fftsa.opt_bp, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local plain = dmm.digitize.samplerate
+  display.setvalue(fftsa.opt_fhi, 50000)
+  fftsa.options_apply()
+  return rate == 200000 and plain == 100000 and acq == 200000,
+         string.format('band-pass at %g, plain at %g', rate, plain)
+end)())
 check('the taps sum to one, are odd in number and symmetric', (function()
   fftsa.bp_build(100000, 10000, 512, 4)
   local h, l = fftsa.bp_h, fftsa.bp_l
@@ -1095,7 +1122,10 @@ check('band-pass on narrows the bin by the decimation', (function()
   display.setvalue(fftsa.opt_bp, 1)
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
-  return d > 1 and math.abs(fine * d - plain) < 1e-6
+  -- The bin is fs_acq/(d*n), and fs_acq is the STEPPED-UP rate, so the improvement over
+  -- the plain path is d divided by the rate step rather than d itself. Both relationships
+  -- asserted: the bin against the rate actually used, and that it is still an improvement.
+  return d > 1 and math.abs(fine - acq / (d * 512)) < 1e-6 and fine < plain
          and m == (512 - 1) * d + taps and count == m
          and math.abs(eff * d - acq) < 1e-6,
          string.format('/%d: %.2f Hz against %.2f, fs %.1f of %.1f, capture %d of %d',

@@ -94,6 +94,28 @@ fftsa.fs_min = 100000
 -- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
 fftsa.rates  = {100000, 200000, 500000, 1000000}
 
+-- ONE RATE UP, which is what the band-pass is given. A digital filter can only remove
+-- what the ADC did not already fold: at 100 kS/s everything above 50 kHz is in the record
+-- as an alias before any of this runs, and no filter afterwards can separate it. Sampling
+-- faster raises that Nyquist, and the filter then removes the band that used to fold.
+--
+-- The next rate in fftsa.rates rather than literally twice: the hardware has 100k, 200k,
+-- 500k and 1M and nothing between, and 1 MS/s is the ceiling.
+--
+-- The cost is read budget. The bin is fs_acq/M, so holding the resolution means doubling
+-- M with the rate -- and where bp_maxm already caps the decimation, at the narrowest
+-- spans, the bin comes out coarser instead. Alias rejection is bought with resolution
+-- there, which is the trade this makes deliberately.
+function fftsa.bp_rate(fs)
+  local r = fftsa.rates
+  local n = table.getn(r)
+  local i
+  for i = 1, n do
+    if r[i] > fs then return r[i] end
+  end
+  return r[n]
+end
+
 -- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
 function fftsa.pick_fs(fhi)
   local r = fftsa.rates
@@ -184,7 +206,10 @@ function fftsa.apply()
   -- decimation is invisible to it, which is the point.
   fftsa.fs_acq = fftsa.pick_fs(fftsa.fhi)
   local d = 1
-  if fftsa.bp_on then d = fftsa.bp_pick_d(fftsa.fs_acq, fftsa.fhi, fftsa.n) end
+  if fftsa.bp_on then
+    fftsa.fs_acq = fftsa.bp_rate(fftsa.fs_acq)
+    d = fftsa.bp_pick_d(fftsa.fs_acq, fftsa.fhi, fftsa.n)
+  end
   fftsa.bp_build(fftsa.fs_acq, fftsa.fhi, fftsa.n, d)
   local need = fftsa.bp_m
   fftsa.fs = fftsa.fs_acq / fftsa.bp_d
@@ -726,6 +751,9 @@ function fftsa.options_preview()
   local d = 1
   if fftsa.opt_index(fftsa.getval(fftsa.opt_bp), fftsa.onoff_labels,
                      fftsa.onoff_to_idx(fftsa.bp_on)) == 2 then
+    -- The stepped-up rate too, or the preview would promise a bin width Apply cannot
+    -- produce: the rate and the decimation move together.
+    fs = fftsa.bp_rate(fs)
     d = fftsa.bp_pick_d(fs, hi, n)
   end
   fs = fs / d
