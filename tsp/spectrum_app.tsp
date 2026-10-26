@@ -967,20 +967,14 @@ function fftsa.icon_redraw(h)
   return true
 end
 
--- Put both icons back. A button draws its focus highlight and its pressed state over
--- everything inside its rectangle, and an icon is a child object the firmware does not
--- redraw afterwards -- so any touch blanks whichever button has focus, and re-asserting
--- from the handler is too early because the repaint comes after it. The frame calls this
--- at the peak cadence, which is late enough and costs 0.1 ms a second.
+-- Called from fftsa.sg_slow_tick(), which is where the cadence is explained. Re-asserting
+-- from a press handler instead does not work: the firmware's repaint comes after it.
 function fftsa.icons_reassert()
   fftsa.lock_icon()
   fftsa.icon_redraw(fftsa.optimg)
   return true
 end
 
--- Re-pinning here as well as on the tick snaps a dragged view back on the press rather
--- than a second later, and is the whole mechanism while the app is halted.
---
 -- The icon goes before the restore, so a restore that fails cannot leave the padlock
 -- showing the opposite of fftsa.sg_lock for the rest of the session.
 function fftsa.toggle_lock()

@@ -60,6 +60,12 @@ the graph reports its own pan and zoom, and a check that has had no report does 
 reads the limits back at 0.0094 ms each, and writes only a limit that has really moved. Nothing moved means nothing written, and the axis that
 did not move is left alone.
 
+**Very narrow spans high up the range have a dead zone.** A pan smaller than about a millionth of
+the stop frequency is taken for rounding and left alone. On ordinary spans that is a thousandth of a
+pixel, but on a 10 Hz window at 499 kHz it is some thirty pixels — the trace can be nudged visibly
+without the lock putting it back, while the padlock still reads closed. Such a window holds no bins
+at all, so the trace is empty before this matters, but it is the lock's limit rather than a fault.
+
 **A restore costs a visible pause.** The write lands inside a frame, so that frame takes 202 ms
 instead of 81 and the app re-arms its timer from the slowest frame it has seen — 3.3 frames a second,
 held for about two and a half seconds while that peak decays. Restoring one axis rather than two is

@@ -20,8 +20,8 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
 - **Digitizes** up to 1 MS/s, with selectable 512 to 16,384 samples per frame (default 512).
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
   and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
-- **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and no graph call in the frame at
-  all, which brings axes, grid, labels and auto-scaling with it. The firmware labels both axes in real units --
+- **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and no graph call in a frame
+  nobody has touched, which brings axes, grid, labels and auto-scaling with it. The firmware labels both axes in real units --
   kHz across, from binding X to the reading's extra field rather than its timestamp, and dB down,
   from a two-character custom buffer unit. The trace is a fixed **255 columns** at every
   sample count, each carrying the **maximum of the bins it covers**, so a narrow tone always reaches
@@ -32,8 +32,8 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
   brushed screen slides the trace off its axes. On by default, and free until you touch it: the graph
   reports its own pan, and a once-a-second check does nothing without a report. One that has a report
   reads the limits back at 0.0094 ms and rewrites only an axis that really moved — a write costs
-  60 ms, so doing it per frame collapsed the update rate. The padlock button turns it
-  off, and the cog beside it opens Options.
+  60 ms, so doing it per frame collapsed the update rate. The padlock toggles it: press once to pan
+  freely, press again to lock and snap the window back at once. The cog beside it opens Options.
 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
 acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps 
