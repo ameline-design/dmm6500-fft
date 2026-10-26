@@ -439,11 +439,10 @@ function fftsa.frame()
     fftsa.errrun = 0
   end
   -- An unlocked gesture's span is installed here, between frames: fftsa.apply() re-plans
-  -- the digitizer and takes its own capture, so it cannot run inside a frame that is using
-  -- the buffers. halted keeps the timer out of frame_body meanwhile, and the guard above is
-  -- still held. Skipped when a teardown waits, and when the frame above was the one that
-  -- gave up: halted is cleared again at the end of this block, so retuning through a halt
-  -- would restart the loop that had just stopped itself.
+  -- the digitizer and takes its own capture, so it cannot run inside a frame using the
+  -- buffers. halted keeps the timer out of frame_body meanwhile and the guard above is still
+  -- held. Skipped when a teardown waits, and when the frame above gave up -- halted is
+  -- cleared at the end of this block, so retuning through a halt would restart that loop.
   if fftsa.retune_pending and not fftsa.stop_pending and not fftsa.halted then
     fftsa.retune_pending = false
     -- A re-plan rebuilds the window tables and takes a capture -- the same work an Apply
