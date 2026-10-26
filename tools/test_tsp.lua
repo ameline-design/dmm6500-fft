@@ -2130,21 +2130,27 @@ end)())
 -- value outside a field's declared range hands the firmware one the field would refuse --
 -- reachable from a pinch high up the span, where the start can land above the Start
 -- field's own ceiling.
+-- Swept, not sampled: every pair drawn from the values either limit can be interesting at --
+-- each field's floor and ceiling, one either side of each, zero, negative, reversed and
+-- absurd. 400 pairs of pure arithmetic, which is cheaper than choosing seven and hoping.
 check('every clamped span is a pair the two fields would accept', (function()
   local lof, hif = OBJ[fftsa.opt_flo], OBJ[fftsa.opt_fhi]
   if lof.vmin == nil or hif.vmax == nil then return false, 'the fields declared no range' end
-  local cases = {{0, 0}, {1, 1}, {499999, 500000}, {600000, 900000}, {10, 50000},
-                 {499000, 499010}, {250000, 250001}}
-  local bad, i = nil, nil
-  for i = 1, table.getn(cases) do
-    local lo, hi = fftsa.span_clamp(cases[i][1], cases[i][2])
-    if lo < lof.vmin or lo > lof.vmax or hi < hif.vmin or hi > hif.vmax or lo >= hi then
-      bad = string.format('%g..%g clamped to %g..%g, fields take %g..%g and %g..%g',
-                          cases[i][1], cases[i][2], lo, hi,
-                          lof.vmin, lof.vmax, hif.vmin, hif.vmax)
+  local vals = {-1e9, -1000, -1, 0, 1, 9, 10, 11, 1999, 2000, 2001, 49999, 50000,
+                498999, 499000, 499001, 499999, 500000, 500001, 1e9}
+  local n, bad, i, j = table.getn(vals), nil, nil, nil
+  for i = 1, n do
+    for j = 1, n do
+      local lo, hi = fftsa.span_clamp(vals[i], vals[j])
+      if (lo < lof.vmin or lo > lof.vmax or hi < hif.vmin or hi > hif.vmax
+          or lo >= hi) and bad == nil then
+        bad = string.format('%g..%g clamped to %g..%g; fields take %g..%g and %g..%g',
+                            vals[i], vals[j], lo, hi,
+                            lof.vmin, lof.vmax, hif.vmin, hif.vmax)
+      end
     end
   end
-  return bad == nil, bad
+  return bad == nil, bad or string.format('%d pairs', n * n)
 end)())
 -- Our own pin fires EVENT_SCALE as well, so fires keep arriving after an adoption. The
 -- read-back answering with the limits just written is what stops this being an
