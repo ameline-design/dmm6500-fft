@@ -78,6 +78,13 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_handles_inited = true
 end
 
+-- Touch pans and zooms the graph, and the widget cannot be told not to: display.setstate
+-- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a locked view is
+-- restored instead, sg_update() re-pinning both axes every frame -- two graph calls an
+-- unlocked app does not make, which is why this starts off. Not a handle, so a relaunch
+-- resets it on purpose.
+fftsa.sg_lock = false
+
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
 -- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
 fftsa.sg_flo_hz  = 0
@@ -495,8 +502,14 @@ function fftsa.sg_update(nbins, binhz)
   for i = 1, nwrote do
     wr(buf, st_db[i], st_hz[i], i, 0)
   end
-  -- No graph call. The clear above is the notify, and the trace stays bound to the
-  -- same buffer for the life of the app -- so nothing here can repaint the axes.
+  -- No notify call. The clear above is the notify, and the trace stays bound to the
+  -- same buffer for the life of the app.
+  -- Undo a touch pan or zoom. Belongs outside the write window above, where the repaint a
+  -- graph call triggers would draw a half-filled trace, and ahead of the paint below.
+  if fftsa.sg_lock then
+    fftsa.sg_pin_x()
+    fftsa.sg_pin_y()
+  end
   -- The paint. The bound buffer is complete and the next fill has not begun, so this is
   -- the window in which a copy is correct by construction.
   delay(fftsa.sg_yield)

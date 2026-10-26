@@ -36,6 +36,24 @@ Six peaks, strongest first, in two columns:
 In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 3 to 6 are noise,
 74 dB down.
 
+Two buttons sit to the right of the peak table: a **padlock**, which locks the view, and a **cog**,
+which opens Options.
+
+## Locking the view
+
+The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
+refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So a brushed screen slides the trace
+sideways and the axis labels no longer describe the span.
+
+Press the padlock and it closes: from then on every frame puts the axes back where they belong. A
+drag still moves the trace, and the next frame undoes it, so the snap-back takes one frame — a tenth
+of a second at the 512-sample default, and about two seconds at 16384, where frames are 2.1 s apart.
+Press it again and it opens, leaving the view wherever your finger left it; the next Apply, or a
+zoom, re-pins it.
+
+Restoring the axes costs two graph calls a frame, which is why the lock starts off rather than on.
+Nothing else about a locked frame differs.
+
 ## Options
 
 ![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom](manual-options.png)
@@ -353,7 +371,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   | frame | 0.079 s | 0.122 s | 0.212 s | 0.460 s | 0.860 s | 1.686 s |
   | displayed | 10 fps | 5 fps | 3.33 fps | 1.67 fps | 0.91 fps | **0.47 fps** |
 
-  That reserved idle is what keeps the **Options** button answering: `delay()` lets the display task
+  That reserved idle is what keeps the **padlock** and **cog** answering: `delay()` lets the display task
   paint, but dispatching a press needs the Lua interpreter, and during a frame the interpreter is
   busy. It costs 4096 and 8192 about a tick each against leaving the period at the floor, and in
   exchange every size stays operable -- at 16384 the trace repaints about every two seconds and the

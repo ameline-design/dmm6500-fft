@@ -50,7 +50,11 @@ fftsa.shortreads = 0        -- captures rejected for returning fewer than n samp
 if fftsa.handles_inited == nil then
   fftsa.cap      = nil      -- acquisition buffer
   fftsa.cap_n    = nil      -- the fftsa.n it was sized for
-  fftsa.optbtn   = nil      -- Options button on the spectrum screen
+  fftsa.optbtn   = nil      -- Options (cog) button on the spectrum screen
+  fftsa.optimg   = nil      -- cog image drawn over it
+  fftsa.lockbtn  = nil      -- Lock button beside it
+  fftsa.lockimg_c = nil     -- closed-padlock image over the Lock button
+  fftsa.lockimg_o = nil     -- open-padlock image over it; one of the pair is visible
   fftsa.timer    = nil      -- periodic timer driving frames
   fftsa.errscr   = nil      -- error screen shown if startup fails
   fftsa.optscr   = nil      -- options form screen
@@ -967,6 +971,76 @@ function fftsa.options_cancel()
   fftsa.show_main()
 end
 
+-- Lock and Options: two icon buttons in the slot Options filled alone. A button carries
+-- no image and display.settext does not accept one, so an icon is an OBJ_IMAGE child
+-- created after its button, which puts it on top; a press on the icon reaches the button
+-- underneath.
+fftsa.btn_y      = 350
+fftsa.btn_h      = 60       -- measured off a panel capture
+fftsa.btn_lock_x = 660
+fftsa.btn_lock_w = 60
+fftsa.btn_opt_x  = 730
+fftsa.btn_opt_w  = 60
+fftsa.lock_img_w = 28       -- fftlockc and fftlocko are 28x34
+fftsa.lock_img_h = 34
+fftsa.cog_img_w  = 34       -- fftcog is 34x34
+fftsa.cog_img_h  = 34
+
+-- tools/package_tspa.py reads these out of the source to decide which assets/<name>.png
+-- to embed, so inlining one of them stops its image shipping.
+fftsa.img_lock_c = "fftlockc"
+fftsa.img_lock_o = "fftlocko"
+fftsa.img_cog    = "fftcog"
+
+-- The lock state on the glass is which of the padlock pair is visible: closed while the
+-- view is locked, open while it is free.
+function fftsa.lock_icon()
+  local on, off = fftsa.lockimg_o, fftsa.lockimg_c
+  if fftsa.sg_lock then on, off = fftsa.lockimg_c, fftsa.lockimg_o end
+  if off ~= nil then display.setstate(off, display.STATE_INVISIBLE) end
+  if on  ~= nil then display.setstate(on,  display.STATE_ENABLE) end
+end
+
+-- Re-pinning here as well as in the frame snaps a dragged view back on the press rather
+-- than a frame later, and is the whole mechanism while the app is halted.
+function fftsa.toggle_lock()
+  fftsa.sg_lock = not fftsa.sg_lock
+  if fftsa.sg_lock then
+    fftsa.sg_pin_x()
+    fftsa.sg_pin_y()
+  end
+  fftsa.lock_icon()
+  return fftsa.sg_lock
+end
+
+-- A button whose icon did not load is blank but still works, so a nil here is recorded
+-- rather than failing the start.
+function fftsa.icon_at(x, y, name)
+  if name == nil then return nil end
+  local img = display.create(fftsa.sg_scr, display.OBJ_IMAGE, x, y, name)
+  if img == nil then
+    fftsa.lasterr = "image " .. tostring(name) .. " did not load"
+    fftsa.say(fftsa.lasterr)
+  end
+  return img
+end
+
+-- A button with one or two icons centred over it, two being the padlock pair. An
+-- exhausted object pool returns nil, so the icons are skipped without their button:
+-- an icon alone looks pressable and does nothing.
+function fftsa.icon_button(x, w, cmd, iw, ih, name1, name2)
+  local b = display.create(fftsa.sg_scr, display.OBJ_BUTTON, x, fftsa.btn_y, " ", w)
+  if b == nil then
+    fftsa.lasterr = "button at x=" .. tostring(x) .. " could not be created"
+    fftsa.say(fftsa.lasterr)
+    return nil, nil, nil
+  end
+  display.setevent(b, display.EVENT_PRESS, cmd)
+  local ix = x + math.floor((w - iw) / 2)
+  local iy = fftsa.btn_y + math.floor((fftsa.btn_h - ih) / 2)
+  return b, fftsa.icon_at(ix, iy, name1), fftsa.icon_at(ix, iy, name2)
+end
+
 -- Everything the app ever displays, created here and nowhere else. The cover comes
 -- first so that no screen is ever assembled in view.
 function fftsa.build()
@@ -977,11 +1051,19 @@ function fftsa.build()
   -- without anything being resized or reallocated.
   local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
   if scr == nil then return false, why end
-  -- The button died with the screen fftsa.sg_build() just destroyed: clear the
-  -- stale handle, do not delete it.
-  fftsa.optbtn = nil
-  fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
-  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options) end")
+  -- The buttons died with the screen fftsa.sg_build() just destroyed: clear the
+  -- stale handles, do not delete them.
+  fftsa.optbtn, fftsa.optimg = nil, nil
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = fftsa.icon_button(
+    fftsa.btn_lock_x, fftsa.btn_lock_w,
+    "if fftsa ~= nil then fftsa.guard(fftsa.toggle_lock) end",
+    fftsa.lock_img_w, fftsa.lock_img_h, fftsa.img_lock_c, fftsa.img_lock_o)
+  fftsa.lock_icon()
+  fftsa.optbtn, fftsa.optimg = fftsa.icon_button(
+    fftsa.btn_opt_x, fftsa.btn_opt_w,
+    "if fftsa ~= nil then fftsa.guard(fftsa.options) end",
+    fftsa.cog_img_w, fftsa.cog_img_h, fftsa.img_cog)
   local optok, optwhy = fftsa.build_options()
   if optok == false then return false, optwhy end
   local aboutok, aboutwhy = fftsa.build_about()
@@ -1114,7 +1196,8 @@ function fftsa.stop()
   -- Timer first: stop frames before removing what the frames use.
   if fftsa.timer ~= nil then fftsa.del_obj(fftsa.timer) end
   fftsa.timer = nil
-  fftsa.optbtn = nil                          -- child of the spectrum screen
+  fftsa.optbtn, fftsa.optimg = nil, nil       -- children of the spectrum screen
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
   pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
   fftsa.destroy_options()
   fftsa.destroy_about()

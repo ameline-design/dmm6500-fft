@@ -17,7 +17,8 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
 - **Digitizes** up to 1 MS/s, with selectable 512 to 16,384 samples per frame (default 512).
 - **Transforms** with a real-input radix-2 FFT in Lua 5.0.2. The window, the bit-reversal permutation
   and every twiddle factor are precomputed when settings are applied. 256 to 8,192 bins.
-- **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and no graph call at all, which
+- **Plots** through `display.OBJ_GRAPH`, one buffer refill a frame and, with the view unlocked, no
+  graph call at all, which
   brings axes, grid, labels and auto-scaling with it. The firmware labels both axes in real units --
   kHz across, from binding X to the reading's extra field rather than its timestamp, and dB down,
   from a two-character custom buffer unit. The trace is a fixed **255 columns** at every
@@ -27,6 +28,9 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Previews acquisition settings** in Options: sampling rate, bin spacing and record duration
   update as the stop frequency or FFT sample count changes.
+- **Locks the view.** The firmware's graph pans and zooms on touch and will not be told not to, so a
+  brushed screen slides the trace off its axes. The padlock button restores the window every frame
+  instead; the cog beside it opens Options.
 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
 acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps the rate up to 1 MS/s and

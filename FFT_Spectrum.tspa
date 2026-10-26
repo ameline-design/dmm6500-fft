@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 2.1
+-- $Version: 2.2
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -891,6 +891,13 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_handles_inited = true
 end
 
+-- Touch pans and zooms the graph, and the widget cannot be told not to: display.setstate
+-- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a locked view is
+-- restored instead, sg_update() re-pinning both axes every frame -- two graph calls an
+-- unlocked app does not make, which is why this starts off. Not a handle, so a relaunch
+-- resets it on purpose.
+fftsa.sg_lock = false
+
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
 -- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
 fftsa.sg_flo_hz  = 0
@@ -1308,8 +1315,14 @@ function fftsa.sg_update(nbins, binhz)
   for i = 1, nwrote do
     wr(buf, st_db[i], st_hz[i], i, 0)
   end
-  -- No graph call. The clear above is the notify, and the trace stays bound to the
-  -- same buffer for the life of the app -- so nothing here can repaint the axes.
+  -- No notify call. The clear above is the notify, and the trace stays bound to the
+  -- same buffer for the life of the app.
+  -- Undo a touch pan or zoom. Belongs outside the write window above, where the repaint a
+  -- graph call triggers would draw a half-filled trace, and ahead of the paint below.
+  if fftsa.sg_lock then
+    fftsa.sg_pin_x()
+    fftsa.sg_pin_y()
+  end
   -- The paint. The bound buffer is complete and the next fill has not begun, so this is
   -- the window in which a copy is correct by construction.
   delay(fftsa.sg_yield)
@@ -1589,7 +1602,11 @@ fftsa.shortreads = 0        -- captures rejected for returning fewer than n samp
 if fftsa.handles_inited == nil then
   fftsa.cap      = nil      -- acquisition buffer
   fftsa.cap_n    = nil      -- the fftsa.n it was sized for
-  fftsa.optbtn   = nil      -- Options button on the spectrum screen
+  fftsa.optbtn   = nil      -- Options (cog) button on the spectrum screen
+  fftsa.optimg   = nil      -- cog image drawn over it
+  fftsa.lockbtn  = nil      -- Lock button beside it
+  fftsa.lockimg_c = nil     -- closed-padlock image over the Lock button
+  fftsa.lockimg_o = nil     -- open-padlock image over it; one of the pair is visible
   fftsa.timer    = nil      -- periodic timer driving frames
   fftsa.errscr   = nil      -- error screen shown if startup fails
   fftsa.optscr   = nil      -- options form screen
@@ -2506,6 +2523,76 @@ function fftsa.options_cancel()
   fftsa.show_main()
 end
 
+-- Lock and Options: two icon buttons in the slot Options filled alone. A button carries
+-- no image and display.settext does not accept one, so an icon is an OBJ_IMAGE child
+-- created after its button, which puts it on top; a press on the icon reaches the button
+-- underneath.
+fftsa.btn_y      = 350
+fftsa.btn_h      = 60       -- measured off a panel capture
+fftsa.btn_lock_x = 660
+fftsa.btn_lock_w = 60
+fftsa.btn_opt_x  = 730
+fftsa.btn_opt_w  = 60
+fftsa.lock_img_w = 28       -- fftlockc and fftlocko are 28x34
+fftsa.lock_img_h = 34
+fftsa.cog_img_w  = 34       -- fftcog is 34x34
+fftsa.cog_img_h  = 34
+
+-- tools/package_tspa.py reads these out of the source to decide which assets/<name>.png
+-- to embed, so inlining one of them stops its image shipping.
+fftsa.img_lock_c = "fftlockc"
+fftsa.img_lock_o = "fftlocko"
+fftsa.img_cog    = "fftcog"
+
+-- The lock state on the glass is which of the padlock pair is visible: closed while the
+-- view is locked, open while it is free.
+function fftsa.lock_icon()
+  local on, off = fftsa.lockimg_o, fftsa.lockimg_c
+  if fftsa.sg_lock then on, off = fftsa.lockimg_c, fftsa.lockimg_o end
+  if off ~= nil then display.setstate(off, display.STATE_INVISIBLE) end
+  if on  ~= nil then display.setstate(on,  display.STATE_ENABLE) end
+end
+
+-- Re-pinning here as well as in the frame snaps a dragged view back on the press rather
+-- than a frame later, and is the whole mechanism while the app is halted.
+function fftsa.toggle_lock()
+  fftsa.sg_lock = not fftsa.sg_lock
+  if fftsa.sg_lock then
+    fftsa.sg_pin_x()
+    fftsa.sg_pin_y()
+  end
+  fftsa.lock_icon()
+  return fftsa.sg_lock
+end
+
+-- A button whose icon did not load is blank but still works, so a nil here is recorded
+-- rather than failing the start.
+function fftsa.icon_at(x, y, name)
+  if name == nil then return nil end
+  local img = display.create(fftsa.sg_scr, display.OBJ_IMAGE, x, y, name)
+  if img == nil then
+    fftsa.lasterr = "image " .. tostring(name) .. " did not load"
+    fftsa.say(fftsa.lasterr)
+  end
+  return img
+end
+
+-- A button with one or two icons centred over it, two being the padlock pair. An
+-- exhausted object pool returns nil, so the icons are skipped without their button:
+-- an icon alone looks pressable and does nothing.
+function fftsa.icon_button(x, w, cmd, iw, ih, name1, name2)
+  local b = display.create(fftsa.sg_scr, display.OBJ_BUTTON, x, fftsa.btn_y, " ", w)
+  if b == nil then
+    fftsa.lasterr = "button at x=" .. tostring(x) .. " could not be created"
+    fftsa.say(fftsa.lasterr)
+    return nil, nil, nil
+  end
+  display.setevent(b, display.EVENT_PRESS, cmd)
+  local ix = x + math.floor((w - iw) / 2)
+  local iy = fftsa.btn_y + math.floor((fftsa.btn_h - ih) / 2)
+  return b, fftsa.icon_at(ix, iy, name1), fftsa.icon_at(ix, iy, name2)
+end
+
 -- Everything the app ever displays, created here and nowhere else. The cover comes
 -- first so that no screen is ever assembled in view.
 function fftsa.build()
@@ -2516,11 +2603,19 @@ function fftsa.build()
   -- without anything being resized or reallocated.
   local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
   if scr == nil then return false, why end
-  -- The button died with the screen fftsa.sg_build() just destroyed: clear the
-  -- stale handle, do not delete it.
-  fftsa.optbtn = nil
-  fftsa.optbtn = display.create(fftsa.sg_scr, display.OBJ_BUTTON, 645, 350, "Options", 145)
-  display.setevent(fftsa.optbtn, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options) end")
+  -- The buttons died with the screen fftsa.sg_build() just destroyed: clear the
+  -- stale handles, do not delete them.
+  fftsa.optbtn, fftsa.optimg = nil, nil
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = fftsa.icon_button(
+    fftsa.btn_lock_x, fftsa.btn_lock_w,
+    "if fftsa ~= nil then fftsa.guard(fftsa.toggle_lock) end",
+    fftsa.lock_img_w, fftsa.lock_img_h, fftsa.img_lock_c, fftsa.img_lock_o)
+  fftsa.lock_icon()
+  fftsa.optbtn, fftsa.optimg = fftsa.icon_button(
+    fftsa.btn_opt_x, fftsa.btn_opt_w,
+    "if fftsa ~= nil then fftsa.guard(fftsa.options) end",
+    fftsa.cog_img_w, fftsa.cog_img_h, fftsa.img_cog)
   local optok, optwhy = fftsa.build_options()
   if optok == false then return false, optwhy end
   local aboutok, aboutwhy = fftsa.build_about()
@@ -2653,7 +2748,8 @@ function fftsa.stop()
   -- Timer first: stop frames before removing what the frames use.
   if fftsa.timer ~= nil then fftsa.del_obj(fftsa.timer) end
   fftsa.timer = nil
-  fftsa.optbtn = nil                          -- child of the spectrum screen
+  fftsa.optbtn, fftsa.optimg = nil, nil       -- children of the spectrum screen
+  fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
   pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
   fftsa.destroy_options()
   fftsa.destroy_about()
@@ -2741,4 +2837,82 @@ UyyXEdvyOJbL6KG/sHRNDC3ymiK6RRHdp4geU0Qvj43ePU2EPSmE94pEH65Y241uFSXlChKJrqZe
 mAJsH8PyZqNHxCXACuAp2FjG6biR7oateFdRKOIo6rW9jKP0lEZ9EV/dyPyT71U2LvDF89+h97Lu
 +4xncr2WfI3vWvRCnpS671hz2dg6KlG7D+aUxf0ibR38UxOidYg36cvg4YZ4alYJo73fWVSVjf8B
 F9I6BO14ZugM/Q/QWSQaP45UwOY7vtdBAAAAAElFTkSuQmCC
+endimage
+loadimage fftlockc FFT_Spectrum
+iVBORw0KGgoAAAANSUhEUgAAABwAAAAiCAYAAABMfblJAAAEJElEQVR42r1Wz2tcVRT+vnPemzgp
+6Q+DVTSlgnUyaU2LFEOEYlZdCIIULYpIXUjrwpWo4Fbd1X9CRBBBdKMbEQQFa3c6lJdMLGhFSkOh
+RE2YzHv3neOid8p0OtO8ieKFYd6799zvu+fc75zzFNWGAvDey7Fjx/ZOT09PXr9+vdNnI1WAWHHd
+5+bmHgfwsrufcPcDJAXAVQA/kvxkeXn5+749vhPC3hpnZ2c/EJE3RITuDvebeCRBEnHuI5KvZ1m2
+cTdS3oVMomefqeqpEIK5e7jJwxQA4ruRVFVVM7uQpunJVqvViYR3kI6KuwAom83meVU9VRRFDgAi
+UlPV1N03APylqomq1gAwhJCLyJN5nn8IwEY5I6PIGo3GUZJvhhBKkomIiLtn7v4igNkkSRpm9oy7
+XxARIZmEEIKqPt9oNJ4GYKdPn9ZtCZeWliR686qIwN1LkjSzdpqmJ5aXlz9tt9tXL126tLaysvLV
+/v37nzKz70REAJi7u4i8VlU0t1TZbDZ/JnnUzIokSdKyLJ9bWVn5/NChQxOXL1/OAeDw4cNplmV5
+o9F4QlUvuruRVDNbm5iYeKTVam0OCmhYSH1hYWG3uz8UPU1DCB0R+QEAI5kD8CzLCgCcmpr6ycz+
+IKnu7iTvK4riwWFODRXNxsZG0luLABPuPhWJBqPiIYRdJOv9uGVZalXRQFUH5TwSAACKohB3T267
+G9IrEw697BEAfQf0KjjJMNGUZXlHDrk74zr7q1BF+6GECqCMAMUggJkV0YuyH7eivcZicFvcy5mZ
+mfq+ffvu6Xa7e0lyIKTT8/PzN4qikDRNreeZqvowexG5d35+/kae56Hdbv99W81cWlqSa9euvU/y
+JXffBUBJ7hkIx5/ubiPulwCG2QcR6br7l+7+Vrvd3kwA2Nra2ru1Wu2dEAJ6B+11hD7QPQNODN7Z
+SPs0Tc/leV4HcIaLi4v19fX1X0g+EDfJiCrkQ555l6rlff8OoFDVRrK+vj4JoNbX1blNGbS+Q/UE
+sV3ZFHe3siz3iIhUziEAHrtGAaAjIjrGXoiIScVPDbi7iQjLsvya5GOqOmtmH4sIo9fYSeKP5Ist
+aktVz2ZZ9jsAHDx48Gy9Xj9J8n6/KYBtDz5OaSMAS5Jkq5dOV65cyQEUQ0T1rwlpZqWITHa73fPH
+jx9PAFiz2XxPRGbcvayKNY6HEtPmhU6nMxWnX4lzrCwcjD82Y3cggI1xN++E8FYqubv8H4QwM2KH
+IxnDlu4OkrvzPL/YbDbN3R8eKIfbE+7gtCoij+4wMpLUarWtbrdrJMuqaotJ7hU9817zNbNNabVa
+myS/SJJEIwAr/CQW7Uq2aZoqyW9WV1d/S6Lq3g4hTJJ81szq4+RVhZKYhxC+FZFzdyTskSNHDsTv
+z/9shBA6q6urv/aE9w93AA+Mzx8TnwAAAABJRU5ErkJggg==
+endimage
+loadimage fftlocko FFT_Spectrum
+iVBORw0KGgoAAAANSUhEUgAAABwAAAAiCAYAAABMfblJAAAEIUlEQVR42r1WQWtdRRT+zpm5L30t
+SUWwSlGeYH29pqabYslCzEJdCIIFDYoLXWjbnS5UcKtupD9CunAjQd3oRkRBRO1OX8tN3mtRoyLN
+RmJNTN+9M+dzkXk1TfKS+0L1wOVyZ+ac78yZ7ztzBTubpDfb7fZDzrmXST4KoAVAAfwK4Gsze6/X
+632xwYe7BdxpTvI8fxfAq6raIAmSAEBZN3DdzqvqK0VRrOwEKjuAKQDmef6h9/5UCAEkKwAiIl5E
+YGYRgImIc86pmX2XZdljnU5nLQFuAdUhgAog5nl+znt/qqqqEoCpauac8yRXSF5z65YBQAihVNXp
+sizPA7Bhm9FhYO12+7iIvBZCiCLiVVVJFiSfA3DUe982sydJfquqKiI+hBCcc8+02+0nANjs7Kzb
+FXBmZkYBQFVfUlWQjCIiZtbNsuzh+fn5D7rd7u+XLl1aWlhY+PTQoUOPmNlXqqoAjCRV9Wxd0txg
+ZZ7nP4jIcTOrvPdZjPHphYWFj44cOTJ25cqVEgAmJyezoijKxOALJE1EnJktjY2N3dfpdFY3E2i7
+kvLkyZMTAA4nJvoQwt+q+g0ASWAEwKIoKgAyPj7+vZn9JiKOJEXkjqqqDm+3qW1Js7Ky4kn6tFhE
+ZB/J8QS0uSoMIRwQkebGuDFGV5c0cM4xMQ0JZGgAAKiqSlOC/56NCOsAEgAuXrx4TVWnzSwn+QDJ
+3Hv/Y1pjQxIkapgfMh7n5+cv4z8wvwNrdXZ29sbH3NycDWN5jHGLyEnKgAPDAB2AuHGXc3NzuyXM
+BFhtnjCzKs3HFNsA3HTQsdVq7ZuYmGjWLU+MUZxz7Pf7t4nIzfRXvX1qauqPsixDt9v966YmPTMz
+o1evXn1HRJ4neWC7Uux4h62DHdzk8yfJoKp9kp+QfL3b7a56ALa0tPRWo9F4M4SATYnWtnRlbUzi
+4CBWlmVnyrJsAnhBpqenm8vLy5dF5K7kpHXib0MyGbJmIJnKOdf2y8vL+wE00sGyRiltQ1IDQuzW
+p5WkxRgPqqrWFi0ApmuqArCmqm4EX6iqaY1fjcEZmapKjPEzEXnQOXfUzN5XVdmu+4zaabbgpTvx
+unPudFEUvwBAq9U63Ww2HxeRO7lOgF0T1xGpb9776wM5LS4ulgCqTSS5JYBiZlFV9/f7/XMnTpzw
+ACzP87dV9W6SsW6sUXaoSTbPrq2tjafhF9NYbfHqHjS+mq4jAbAyqvNeAG9IiaT+H4Aws731vxFk
+AQBCEiIyUZblhTzPjeS9I7TDdcA9ZOtU9f49VkZ9o9G43u/3TURiXbYlkXOERm8AaGar2ul0VkXk
+Y++9SwGkxqOpaddam2WZE5HPe73ezz6x7o0Qwn4RecrMmqPoqkZLLEMIX6rqmS2CPXbs2D3ph/eW
+WQhhrdfr/TQg3j8X8AbEvHdjaAAAAABJRU5ErkJggg==
+endimage
+loadimage fftcog FFT_Spectrum
+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
 endimage

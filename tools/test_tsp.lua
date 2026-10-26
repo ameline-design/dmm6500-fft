@@ -95,6 +95,7 @@ display = {
   OBJ_SCREEN = 'screen', OBJ_GRAPH = 'graph', OBJ_TEXT = 'text',
   OBJ_BUTTON = 'button', OBJ_TIMER = 'timer', OBJ_RECT = 'rect',
   OBJ_EDIT_NUMBER = 'editnum', OBJ_EDIT_OPTION = 'editopt',
+  OBJ_IMAGE = 'image',
   EVENT_PRESS = 'press', EVENT_ENDAPP = 'endapp',
   EVENT_DRAG = 'drag', EVENT_CURSOR = 'cursor',
   -- Fonts, at the firmware's own values from its registration table. SMALL through HUGE
@@ -154,6 +155,12 @@ function display.create(parent, kind, ...)
   if kind == display.OBJ_TEXT then OBJ[h].colour, OBJ[h].font = a[4], a[5] end
   if kind == display.OBJ_TEXT then OBJ[h].justify = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].help = a[4] end
+  -- OBJ_IMAGE is (x, y, image name), so a[3] is the loadimage name. Kept because a name
+  -- the archive does not carry draws nothing and reports nothing: a blank button.
+  if kind == display.OBJ_IMAGE then OBJ[h].image = a[3] end
+  -- A button's label, which the firmware offers no way to read back -- so this field
+  -- exists for this suite, to hold the icon buttons to a blank face.
+  if kind == display.OBJ_BUTTON then OBJ[h].label = a[3] end
   -- Creating a screen makes it the active one. Modelled because it is the whole
   -- reason the cover has to be raised again after every screen create. The title is
   -- kept because the firmware truncates one over 31 characters with event 1707.
@@ -299,6 +306,7 @@ function display.graph.scaley(g, ...)
     local i
     for i = 1, table.getn(t) do OBJ[g].ypin[t[i]] = {a[3], a[4]} end
     OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
+    OBJ[g].ypins = (OBJ[g].ypins or 0) + 1  -- counted, like the x pin
   end
 end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
@@ -317,6 +325,10 @@ function display.graph.scalex(g, ...)
     local i
     for i = 1, table.getn(t) do OBJ[g].xpin[t[i]] = {a[3], a[4]} end
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
+    -- Where in the frame the pin landed, as the buffer-write count at that moment. The
+    -- view lock re-pins every frame, and a pin between the clear and the last write
+    -- would put the re-paint it triggers on a half-filled trace.
+    OBJ[g].pin_at_writes = WRITES
   end
   return OBJ[g].xmin, OBJ[g].xmax
 end
@@ -1702,7 +1714,7 @@ check('and the frame yields exactly once for the paint', DELAYS == dl0 + 1,
 -- widget -- and that is what keeps the axes still. Every synchronous graph call in a
 -- frame repaints the whole widget including its own axis label text: measured at 8.5 ms
 -- for a removeall and add per frame, and a visible flicker on the glass.
-check('and the frame makes no graph call whatsoever', (function()
+check('and an unlocked frame makes no graph call whatsoever', (function()
   local o = OBJ[gh]
   return (o.pins or 0) == pin0 and (o.selects or 0) == sel0
          and (o.scaletraces or 0) == st0 and (o.drawstyles or 0) == ds0,
@@ -1710,11 +1722,150 @@ check('and the frame makes no graph call whatsoever', (function()
                        (o.pins or 0), pin0, (o.selects or 0), sel0,
                        (o.scaletraces or 0), st0, (o.drawstyles or 0), ds0)
 end)())
+check('the view lock is off, so that is the default cost of a frame',
+      fftsa.sg_lock == false, tostring(fftsa.sg_lock))
 
 -- The yield is the only thing feeding the display task, so a zero or missing
 -- one is a silent regression into the jumpy behaviour. Assert the value too.
 check('the yield is the configured amount', fftsa.sg_yield > 0.005
       and fftsa.sg_yield < 0.1, tostring(fftsa.sg_yield))
+
+-- ---------- the view lock and the two icon buttons ----------
+-- The graph pans and zooms on touch and the firmware offers no way to refuse it:
+-- display.setstate answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So
+-- the lock restores the window instead of preventing the gesture, which makes the cost a
+-- per-frame one and the placement of the re-pin inside the frame the thing to hold still.
+print('\nview lock and the icon buttons (real code)')
+local function img_children(scr)
+  local t = {}
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == scr and o.type == display.OBJ_IMAGE then
+      t[o.image] = o
+    end
+  end
+  return t
+end
+
+check('the loadimage names are three distinct non-empty strings',
+      fftsa.img_lock_c ~= nil and fftsa.img_lock_o ~= nil and fftsa.img_cog ~= nil
+      and fftsa.img_lock_c ~= fftsa.img_lock_o
+      and fftsa.img_lock_c ~= fftsa.img_cog and fftsa.img_lock_o ~= fftsa.img_cog,
+      tostring(fftsa.img_lock_c) .. ' ' .. tostring(fftsa.img_lock_o) .. ' '
+      .. tostring(fftsa.img_cog))
+check('both buttons exist on the spectrum screen',
+      fftsa.lockbtn ~= nil and fftsa.optbtn ~= nil
+      and OBJ[fftsa.lockbtn].parent == fftsa.sg_scr
+      and OBJ[fftsa.optbtn].parent == fftsa.sg_scr)
+-- A 60 px face cannot hold a word, and a label under a transparent icon shows through
+-- it, so the design is a blank button with the icon as its only marking.
+check('with blank faces, because the icon is the whole label',
+      OBJ[fftsa.lockbtn].label == ' ' and OBJ[fftsa.optbtn].label == ' ',
+      '[' .. tostring(OBJ[fftsa.lockbtn].label) .. '] ['
+      .. tostring(OBJ[fftsa.optbtn].label) .. ']')
+check('side by side on the peak-table row, inside the 800 px panel',
+      OBJ[fftsa.lockbtn].x == fftsa.btn_lock_x and OBJ[fftsa.optbtn].x == fftsa.btn_opt_x
+      and OBJ[fftsa.lockbtn].y == fftsa.btn_y and OBJ[fftsa.optbtn].y == fftsa.btn_y
+      and fftsa.btn_lock_x + fftsa.btn_lock_w <= fftsa.btn_opt_x
+      and fftsa.btn_opt_x + fftsa.btn_opt_w <= 800)
+check('Lock presses toggle_lock and the cog opens the options form', (function()
+  local l = display.events[fftsa.lockbtn][display.EVENT_PRESS]
+  local o = display.events[fftsa.optbtn][display.EVENT_PRESS]
+  return string.find(l, 'toggle_lock', 1, true) ~= nil
+         and string.find(o, 'fftsa.options', 1, true) ~= nil, l .. ' | ' .. o
+end)())
+check('all three icons were created, as children of the spectrum screen', (function()
+  local im = img_children(fftsa.sg_scr)
+  return im[fftsa.img_lock_c] ~= nil and im[fftsa.img_lock_o] ~= nil
+         and im[fftsa.img_cog] ~= nil
+end)())
+check('each icon centred on its button', (function()
+  local im = img_children(fftsa.sg_scr)
+  local lx = fftsa.btn_lock_x + math.floor((fftsa.btn_lock_w - fftsa.lock_img_w) / 2)
+  local ly = fftsa.btn_y + math.floor((fftsa.btn_h - fftsa.lock_img_h) / 2)
+  local ox = fftsa.btn_opt_x + math.floor((fftsa.btn_opt_w - fftsa.cog_img_w) / 2)
+  local c, o, g = im[fftsa.img_lock_c], im[fftsa.img_lock_o], im[fftsa.img_cog]
+  return c.x == lx and c.y == ly and o.x == lx and o.y == ly and g.x == ox,
+         string.format('closed %d,%d open %d,%d cog %d, wanted %d,%d and %d',
+                       c.x, c.y, o.x, o.y, g.x, lx, ly, ox)
+end)())
+-- The state on the glass is which padlock is visible, so exactly one of the pair can be.
+check('unlocked shows the open padlock and only that one',
+      OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true,
+      'open hidden=' .. tostring(OBJ[fftsa.lockimg_o].hidden)
+      .. ' closed hidden=' .. tostring(OBJ[fftsa.lockimg_c].hidden))
+
+local pin1, ypin1 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+check('a press locks the view', fftsa.toggle_lock() == true and fftsa.sg_lock == true)
+check('and re-pins both axes at once, without waiting for a frame',
+      (OBJ[gh].pins or 0) == pin1 + 1 and (OBJ[gh].ypins or 0) == ypin1 + 1,
+      string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin1,
+                    (OBJ[gh].ypins or 0), ypin1))
+check('and swaps the padlock to closed',
+      OBJ[fftsa.lockimg_c].hidden == false and OBJ[fftsa.lockimg_o].hidden == true)
+
+-- The gesture, as the firmware leaves it: a pan moves the axis limits, nothing else.
+-- A locked frame has to put them back; an unlocked one must leave them alone, because
+-- that is the pan the operator asked for.
+local function drag_axes()
+  OBJ[gh].xmin, OBJ[gh].xmax = 12345, 23456
+  OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
+end
+local pin2, ypin2 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+-- Snapshotted rather than compared against sg_flo_hz: sg_pin_x() moves a sub-pixel Start
+-- down to DC so the firmware's tick labels read +00.00kHz, and a test that re-derived
+-- that would be asserting its own copy of the rule instead of the restore.
+local wx0, wx1 = OBJ[gh].xmin, OBJ[gh].xmax
+local wy0, wy1 = OBJ[gh].ymin, OBJ[gh].ymax
+drag_axes()
+fftsa.frame_body()
+check('a locked frame restores the window a drag moved',
+      OBJ[gh].xmin == wx0 and OBJ[gh].xmax == wx1
+      and OBJ[gh].ymin == wy0 and OBJ[gh].ymax == wy1,
+      string.format('x %s..%s y %s..%s, wanted %s..%s and %s..%s',
+                    tostring(OBJ[gh].xmin), tostring(OBJ[gh].xmax),
+                    tostring(OBJ[gh].ymin), tostring(OBJ[gh].ymax),
+                    tostring(wx0), tostring(wx1), tostring(wy0), tostring(wy1)))
+check('for exactly two graph calls, one an axis', (OBJ[gh].pins or 0) == pin2 + 1
+      and (OBJ[gh].ypins or 0) == ypin2 + 1,
+      string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin2,
+                    (OBJ[gh].ypins or 0), ypin2))
+-- A pin between the clear and the last write would repaint a half-filled trace, which
+-- is the blank-plot window the frame is built to keep short.
+check('and the pin lands after the last write, never inside the refill window',
+      OBJ[gh].pin_at_writes == WRITES and WRITES > CLEAR_AT_WRITES,
+      'pin at ' .. tostring(OBJ[gh].pin_at_writes) .. ' writes, frame ended at '
+      .. tostring(WRITES) .. ', cleared at ' .. tostring(CLEAR_AT_WRITES))
+
+check('a second press unlocks it', fftsa.toggle_lock() == false and fftsa.sg_lock == false)
+check('and shows the open padlock again',
+      OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true)
+local pin3, ypin3 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+drag_axes()
+fftsa.frame_body()
+check('an unlocked frame leaves a panned view alone', OBJ[gh].xmin == 12345
+      and OBJ[gh].ymin == -77 and (OBJ[gh].pins or 0) == pin3
+      and (OBJ[gh].ypins or 0) == ypin3,
+      string.format('x from %s, pins %d/%d', tostring(OBJ[gh].xmin),
+                    (OBJ[gh].pins or 0), pin3))
+-- Unlocking does not restore the view: the pan is what the operator asked for, and the
+-- next Apply or zoom re-pins anyway.
+check('unlocking leaves the panned view where the finger left it', OBJ[gh].xmax == 23456,
+      tostring(OBJ[gh].xmax))
+fftsa.sg_pin_x()
+fftsa.sg_pin_y()
+
+-- A press after the screen is gone. The handles are nil by then and a nil handed to the
+-- firmware is a modal dialog per call, so both halves have to test for one.
+check('toggling with nothing built neither raises nor touches the firmware', (function()
+  local g, c, o = fftsa.sg_graph, fftsa.lockimg_c, fftsa.lockimg_o
+  fftsa.sg_graph, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
+  local ok, err = pcall(function() fftsa.toggle_lock() fftsa.toggle_lock() end)
+  fftsa.sg_graph, fftsa.lockimg_c, fftsa.lockimg_o = g, c, o
+  fftsa.sg_lock = false
+  fftsa.lock_icon()
+  return ok, tostring(err)
+end)())
+check('and the lock is back off for the frames below', fftsa.sg_lock == false)
 
 -- A frame that raises part way through must still leave a usable graph.
 local realupd = fftsa.sg_update
@@ -3057,6 +3208,8 @@ check('stop() frees every buffer it made', livebufs() == base_bufs,
 check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optscr == nil and fftsa.opt_flo == nil and fftsa.opt_fhi == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
+      and fftsa.optimg == nil and fftsa.lockbtn == nil and fftsa.lockimg_c == nil
+      and fftsa.lockimg_o == nil
       and fftsa.opt_n == nil
       and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
       and fftsa.aboutscr == nil and fftsa.about_lines == nil)

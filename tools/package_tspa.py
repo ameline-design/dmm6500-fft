@@ -11,6 +11,7 @@ the App runs the concatenated definitions and then fftsa.start().
 """
 import base64
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -35,6 +36,14 @@ OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
 MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
            'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp']
 
+# Panel icons: assets/<name>.png, embedded as their own loadimage block. The names are
+# NOT listed here -- script_images() reads them out of the modules' `fftsa.img_* = "name"`
+# declarations, because a name that exists on only one side of this is a blank button on
+# the glass and nothing else. Matched both ways: a declared name with no file is a
+# failure, and so is a file nothing declares.
+ASSETS = os.path.join(ROOT, 'assets')
+IMG_DECL = re.compile(r'^\s*fftsa\.img_\w+\s*=\s*"([^"]+)"', re.M)
+
 MANIFEST = [
     ('Title', 'FFT Spectrum Analyser'),
     # All three are tested and working. The DMM6500 and DAQ6510 share the same
@@ -56,7 +65,7 @@ MANIFEST = [
     # Tracks the repo's git tag, so the version in MENU > Manage Apps identifies which
     # tree is installed. Bump it with the tag, or an install cannot be told from the one
     # it replaced.
-    ('Version', '2.1'),
+    ('Version', '2.2'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was
@@ -157,6 +166,55 @@ def png_icon(W=60, H=60):
     return png
 
 
+def png_size(blob, path):
+    """Width and height out of the IHDR, and a refusal for anything shaped wrong.
+    loadimage documents "standard PNG format (compressed 24 bit with Alpha)" and the
+    firmware's loader reports nothing when it declines one, so the check belongs here."""
+    if blob[:8] != b'\x89PNG\r\n\x1a\n' or blob[12:16] != b'IHDR':
+        raise SystemExit('%s is not a PNG' % path)
+    w, h, depth, ctype = struct.unpack('>IIBB', blob[16:26])
+    if depth != 8 or ctype not in (2, 6):
+        raise SystemExit('%s is %d-bit colour type %d; loadimage takes 8-bit RGB or RGBA'
+                         % (path, depth, ctype))
+    return w, h
+
+
+def script_images(body):
+    """The panel icons the script asks for, as (name, PNG bytes), from its own
+    `fftsa.img_* = "name"` declarations matched against assets/."""
+    names = []
+    for n in IMG_DECL.findall(body):
+        if n not in names:
+            names.append(n)
+    have = []
+    if os.path.isdir(ASSETS):
+        have = sorted(f[:-4] for f in os.listdir(ASSETS) if f.endswith('.png'))
+    missing = [n for n in names if n not in have]
+    if missing:
+        raise SystemExit('declared in tsp/ with no assets/<name>.png: '
+                         + ', '.join(missing))
+    unused = [n for n in have if n not in names]
+    if unused:
+        raise SystemExit('in assets/ but no fftsa.img_* names it: ' + ', '.join(unused))
+    images = []
+    for n in names:
+        path = os.path.join(ASSETS, n + '.png')
+        with open(path, 'rb') as f:
+            blob = f.read()
+        w, h = png_size(blob, path)
+        print('  image: %-9s %2dx%-2d  %5d bytes' % (n, w, h, len(blob)))
+        images.append((n, blob))
+    return images
+
+
+def emit_image(out, name, blob):
+    """One loadimage block. The second token links the image to the script, which is
+    what makes the instrument save and delete the two together."""
+    out.append('loadimage %s %s' % (name, NAME))
+    out.extend(textwrap.wrap(base64.b64encode(blob).decode('ascii'), 76))
+    out.append('endimage')
+
+
 def gate(body):
     """Refuse to write an archive the instrument could not parse. Fails closed: a
     missing 5.0.2 compiler is a failure, not a skip, because the whole point is that
@@ -205,18 +263,22 @@ def main():
     out.append('endscript')
 
     # Everything between the two wrapper lines is what the instrument compiles.
-    gate('\n'.join(out[1:-1]) + '\n')
+    body = '\n'.join(out[1:-1]) + '\n'
+    gate(body)
 
-    b64 = base64.b64encode(png_icon()).decode('ascii')
-    out.append('loadimage %s %s' % (ICON, NAME))
-    out.extend(textwrap.wrap(b64, 76))
-    out.append('endimage')
+    # The App icon first, generated rather than stored because it is one drawing this
+    # file already owns; then the panel icons the script names.
+    emit_image(out, ICON, png_icon())
+    images = script_images(body)
+    for name, blob in images:
+        emit_image(out, name, blob)
 
     text = '\r\n'.join(out) + '\r\n'        # CRLF, like the Keithley examples
     with open(OUT, 'w', newline='') as f:
         f.write(text)
     print('wrote %s (%d bytes, %d lines)' % (OUT, len(text), len(out)))
-    print('  script: %s   icon: %s   modules: %d' % (NAME, ICON, len(MODULES)))
+    print('  script: %s   icon: %s   modules: %d   panel icons: %d'
+          % (NAME, ICON, len(MODULES), len(images)))
 
 
 if __name__ == '__main__':
