@@ -3,15 +3,12 @@
 fftsa = fftsa or {}   -- the single global this app exposes
 
 -- ---------- loading cover ----------
--- A screen with nothing on it but a line of text, held in front while the real screens
--- are built and while Apply rebuilds the window tables. Creating a screen makes it
--- active, so every screen build raises this again before its first child, or the operator
--- watches the screen assemble itself one create at a time.
---
--- Created once by fftsa.loading_build() and deleted once by fftsa.stop(). Raising it is a
--- changescreen and nothing else: a cover created and deleted per raise would put two of
--- the 463-object pool through a create/delete cycle every time, and a refused delete
--- raises nothing.
+-- A screen holding nothing but a line of text, kept in front while the real screens are
+-- built and while Apply rebuilds the window tables. Creating a screen makes it active, so
+-- every screen build raises this again before its first child, or the operator watches a
+-- screen assemble itself one create at a time. Made once, deleted once by stop(); raising
+-- it is a changescreen and nothing else, since a create/delete per raise would churn the
+-- 463-object pool.
 if fftsa.load_handles_inited == nil then
   fftsa.loadscr = nil
   fftsa.loadtxt = nil
@@ -54,13 +51,10 @@ end
 
 -- ---------- peak finder ----------
 
--- Top `count` local maxima of fftsa.fft_pwr, strongest first, as two 1..count
--- arrays: bin indices and power (volts-squared). kmin/kmax restrict the search to
--- the bins the graph shows, so the table never reports a tone that is absent from
--- the trace.
--- Index 1 is DC and the fftsa.fft_kdc bins above it carry the mean removal's own
--- error rather than signal (fft_core.tsp measures how far that reaches), so neither
--- is a candidate whatever kmin says. The trace still draws them.
+-- Top `count` local maxima of fftsa.fft_pwr, strongest first, as bin indices and power.
+-- kmin/kmax restrict the search to the bins the graph shows, so the table never reports a
+-- tone absent from the trace. Index 1 and the fftsa.fft_kdc bins above it carry the mean
+-- removal's own error rather than signal, so neither is a candidate whatever kmin says.
 function fftsa.find_peaks(nbins, count, kmin, kmax)
   local pwr = fftsa.fft_pwr
   -- Reused, not rebuilt: two tables a frame was the only allocation left in the frame
@@ -84,15 +78,12 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
       if ml == nil then ml = -1 end
       if mr == nil then mr = -1 end
       if m > ml and m >= mr then
-        -- A tone inside the DC region leaks enough into the first reportable bin
-        -- to make it a local maximum, and that bin then reports the tone a whole
-        -- bin and 16 dB out. The estimator already knows: it saturates at -0.5,
-        -- the end of its table, which says the three bins are not one tone
-        -- centred here. So refuse a peak whose own estimate lands a quarter bin
-        -- or more below the lowest reportable bin. Measured, a genuine tone there
-        -- estimates within 0.017 bins of it, against the leak's 0.500, so the
-        -- quarter-bin margin sits in the middle of the gap. Only k0 can trigger
-        -- it, since the offset cannot reach half a bin.
+        -- A tone inside the DC region leaks enough into the first reportable bin to
+        -- make it a local maximum, which then reports the tone a whole bin and 16 dB
+        -- out. The estimator saturates at -0.5 there, saying the three bins are not one
+        -- tone centred here -- so refuse a peak estimating a quarter bin or more below
+        -- the lowest reportable bin. A genuine tone there estimates within 0.017 bins,
+        -- against the leak's 0.500, so the margin sits in the middle of the gap.
         local keep = true
         if k == k0 then
           local d = fftsa.peak_interp(k, nbins)

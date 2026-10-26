@@ -1,12 +1,10 @@
 -- fft_core.tsp -- real-input FFT for the DMM6500's TSP (Lua 5.0.2)
 --
--- fftsa.fft_init() builds everything loop-invariant once: the analysis window, the
--- bit-reversal swap list, the butterfly twiddles, the untangle twiddles and the two
--- peak-interpolation tables. The real input is packed into N/2 complex points,
--- z[k] = x[2k-1] + i*x[2k], an N/2-point transform runs on those, and one untangle
--- pass recovers the N/2 bins as power (|X|^2, volts-squared peak). The display works
--- in dB, so anything that wants volts takes the square root at the point of use.
--- tools/test_tsp.lua checks the result against a direct DFT.
+-- fftsa.fft_init() builds everything loop-invariant once: window, bit-reversal swaps,
+-- butterfly and untangle twiddles, peak-interpolation tables. The real input packs into
+-- N/2 complex points z[k] = x[2k-1] + i*x[2k], an N/2-point transform runs on those, and
+-- one untangle pass recovers the N/2 bins as power, volts-squared peak. Anything wanting
+-- volts takes the square root at the point of use.
 --
 -- Lua 5.0.2: no '#' operator (table.getn), no hex literals, no bitwise operators.
 
@@ -33,15 +31,13 @@ fftsa.fft_cg     = 0.5
 fftsa.fft_ksq    = 0      -- power scale applied to the untangled |2X|^2
 
 -- ============================ analysis windows ============================
--- Every entry is a generalised cosine sum except Kaiser, which is the one with a
--- knob: beta trades main-lobe width against sidelobe level, so it spans the named
--- windows and goes past them. Rectangular is deliberately absent -- its transform
--- has a null one bin from the peak, which leaves the three-bin interpolation below
--- ill-conditioned, so the peak readings would be wrong in a way the trace does not
--- show.
--- No Hamming: it exits the app on the instrument and the mechanism was never found.
--- Kaiser at beta 6 covers it to within a dB of sidelobe level and a fraction of a bin of
--- main-lobe width.
+-- Every entry is a generalised cosine sum except Kaiser, whose beta trades main-lobe
+-- width against sidelobe level and so spans the named windows and goes past them.
+--
+-- Rectangular is absent: its transform has a null one bin from the peak, which leaves the
+-- three-bin interpolation ill-conditioned, so peak readings would be wrong in a way the
+-- trace does not show. Hamming is absent because it exits the app on the instrument;
+-- Kaiser at beta 6 covers it to within a dB of sidelobe level.
 fftsa.win_names = {"Hann", "Blackman", "Blk-Harris", "Kaiser"}
 -- Index-parallel to fftsa.win_names, coefficients a0 - a1*cos + a2*cos2 - a3*cos3.
 -- Kaiser has no entry, which is how fftsa.win_build() tells it apart.
@@ -52,12 +48,11 @@ fftsa.win_cos = {
 }
 fftsa.win_i = 1             -- index into fftsa.win_names
 
--- Kaiser beta as a fixed list rather than a typed number: every value here is
--- verified for peak frequency and amplitude in tools/test_tsp.lua, and a typed beta
--- would admit shapes nothing has measured. The floor is 4 because the first null
--- sits at sqrt(1 + (beta/pi)^2) bins, which has to stay outside 1.5 bins for the
--- interpolation to read main lobe rather than sidelobe: beta 3.5 is the boundary.
--- Labels carry the measured peak sidelobe level, that being what beta buys.
+-- A fixed list rather than a typed number: every value here is verified for peak
+-- frequency and amplitude in the suite, and a typed beta would admit unmeasured shapes.
+-- The floor is 4 because the first null sits at sqrt(1 + (beta/pi)^2) bins and has to
+-- stay outside 1.5 bins for the interpolation to read main lobe rather than sidelobe,
+-- which puts the boundary at 3.5. Labels carry the peak sidelobe level beta buys.
 fftsa.kbetas       = {4, 6, 9, 12, 15, 18}
 fftsa.kbeta_labels = {"4  -30dB", "6  -44dB", "9  -66dB",
                       "12  -90dB", "15  -114dB", "18  -139dB"}
@@ -142,13 +137,10 @@ end
 -- A tone at bin k+d puts the three bins around the peak at -d, 1-d and 1+d on the
 -- window's own transform, so with
 --   G(x) = |sum w[i]*cos(2*pi*x*(i-c)/N)| / sum w[i],    c = (N+1)/2
--- the normalised main lobe, the ratio r = (R-L)/(L+2C+R) is a fixed odd function of
--- d, and the scalloping loss is exactly G(d). fftsa.fft_gtab samples G out to 1.5
--- bins and fftsa.fft_dtab is r -> d, inverted from it at init.
---
--- Both come from the window samples in use, so a window change needs no new
--- constants and the symmetric-window correction falls out instead of being assumed.
--- The grids are chosen so that d, 1-d and 1+d all land on gtab nodes.
+-- the normalised main lobe, the ratio r = (R-L)/(L+2C+R) is a fixed odd function of d and
+-- the scalloping loss is exactly G(d). fft_gtab samples G out to 1.5 bins and fft_dtab
+-- inverts it to r -> d. Both come from the window samples in use, so a window change
+-- needs no new constants; the grids put d, 1-d and 1+d on gtab nodes.
 fftsa.fft_ghx  = 0.025    -- gtab step, in bins
 fftsa.fft_gn   = 60       -- gtab spans 0 .. fft_gn*fft_ghx = 1.5 bins
 fftsa.fft_dn   = 40       -- dtab nodes, spaced uniformly in r
@@ -337,43 +329,35 @@ function fftsa.fft_init(N)
   end
 end
 
--- Load N samples from a reading buffer, remove DC, window, and pack sample pairs
--- into the M complex points. Two passes, because the mean must be known before it
--- is subtracted; the samples are staged in fftsa.fft_x since a buffer element costs
--- far more to read than a table entry. Returns the mean (DC level).
+-- Load N samples from a reading buffer, remove DC, window, and pack sample pairs into
+-- the M complex points. Two passes, because the mean must be known before it is
+-- subtracted; samples are staged in fftsa.fft_x, a buffer element costing far more to
+-- read than a table entry. Returns the mean.
 --
--- The mean is window-weighted, sum(w*x)/sum(w). What has to be zero is the DC of
--- the sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the
--- weighted mean makes it vanish. The arithmetic mean zeroes the true DC instead,
--- leaving the window's own DC response spread over the first few bins as G(k):
--- measured, a 1.000 V tone at bin 10.5 leaves a -27 dBc line at bin 1 under every
--- window, against -147 here, and Kaiser b=18's sidelobes are at -139.
+-- The mean is window-weighted, sum(w*x)/sum(w). What has to vanish is the DC of the
+-- sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the weighted
+-- mean makes it. The arithmetic mean zeroes the true DC instead and leaves the window's
+-- own DC response spread over the first few bins: a 1.000 V tone at bin 10.5 then leaves
+-- a -27 dBc line at bin 1 under every window, against -147 here.
 --
--- The price is that near DC the estimate is the tone. fftsa.win_tables() measures
--- how far that reaches and fftsa.find_peaks() stops reporting there; nothing
--- separates a pedestal from a tone inside one lobe of DC.
+-- The price is that near DC the estimate is the tone, so win_tables() measures how far
+-- that reaches and find_peaks() stops reporting there.
 -- The display task shares this core with the interpreter and runs only while Lua is
--- blocked, so a stretch of Lua with no delay() in it is a stretch in which a touch cannot
--- be dispatched -- and at 16384 samples fft_load and fft_run are 0.5 s and 0.8 s of
--- arithmetic. Hence many yield points rather than one long one: each costs fft_yield plus
--- a call, and they sit where the enclosing loop is cheap -- per chunk in fft_load, per
--- stage in fft_run -- so the per-sample inner loops are untouched. Both gates are sized
--- so the default 512 samples reaches neither.
+-- blocked, so a stretch with no delay() in it cannot dispatch a touch -- and at 16384
+-- samples fft_load and fft_run are 0.5 s and 0.8 s of arithmetic. Hence many yield points
+-- rather than one long one, placed where the enclosing loop is cheap so the per-sample
+-- inner loops are untouched. Both gates are sized so 512 samples reaches neither.
 fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
 fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
 fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length
 
 -- ---------- band-pass: low-pass the capture and decimate to the span ----------
 --
--- WHAT IT BUYS IS BIN WIDTH. Acquire M samples at the hardware rate, filter, keep every
--- Dth: the result is N samples at fs/D, so the bin is fs/M rather than fs/N and a narrow
--- span reaches a resolution that would otherwise need a transform D times longer. A
--- 2 kHz span at 512 samples goes from 195 Hz bins to 12.2 Hz for the cost of the reads.
---
--- The filter is what makes the decimation safe: keeping every Dth sample of an unfiltered
--- record folds everything above fs/2D into the band, which is the one thing a spectrum
--- analyser must not do quietly. It cannot undo the folding that happened at the ADC --
--- content above the hardware Nyquist is already in the record.
+-- What it buys is bin width. Acquire M samples at the hardware rate, filter, keep every
+-- Dth: the result is N samples at fs/D, so the bin is fs/M rather than fs/N -- a 2 kHz
+-- span at 512 samples goes from 195 Hz bins to 12.2 Hz for the cost of the reads. The
+-- filter is what makes that safe, since decimating an unfiltered record folds everything
+-- above fs/2D into the band. It cannot undo folding already done at the ADC.
 fftsa.bp_d     = 1        -- decimation in force; 1 means the filter is not in the path
 fftsa.bp_h     = nil      -- taps, 1..bp_l
 fftsa.bp_l     = 0        -- tap count, always odd so the delay is a whole sample
@@ -387,21 +371,18 @@ fftsa.bp_m     = 512
 -- this feature is for. The decimation is capped to keep M under it, which is why a large
 -- sample count leaves no room to decimate at all.
 fftsa.bp_maxm  = 8192
--- TAPS COME FROM THE TRANSITION WIDTH, not from the decimation. A Hamming-windowed FIR
--- needs about 3.3/transition taps for its stopband, where the transition is measured as a
--- fraction of the sample rate -- and getting this wrong is not a subtle fault: at a 20 kHz
--- span and /3 the old "4 taps per unit of decimation" gave 13 taps where the transition
--- needed 50, and the result read 3.5 dB LOW at 16.6 kHz and 1.9 dB low at 12.5 kHz,
--- measured against the same stimulus with the filter off.
+-- Taps come from the transition width, not from the decimation: a Hamming-windowed FIR
+-- needs about 3.3/transition taps for its stopband, the transition being a fraction of
+-- the sample rate. Too few is not a subtle fault -- 13 taps where the transition needs 50
+-- reads 3.5 dB low at the top of the span.
 fftsa.bp_tapk  = 3.3      -- Hamming's transition constant
 fftsa.bp_lmax  = 65       -- tap ceiling: N*L multiply-accumulates land in the frame
 
--- Largest decimation that leaves the stop frequency inside the decimated Nyquist with
--- room for the filter's transition, capped by what the read can afford. 2.56 is the usual
--- margin over 2: at D exactly fs/(2*fhi) the transition band would have zero width.
--- The transition a given decimation leaves, as a fraction of the sample rate: from the
--- stop frequency up to the decimated Nyquist. Negative or zero means the span does not
--- fit under that decimation at all.
+-- Largest decimation leaving the stop frequency inside the decimated Nyquist with room
+-- for the transition, capped by what the read can afford. 2.56 is the usual margin over
+-- 2: at D exactly fs/(2*fhi) the transition band has zero width.
+-- The transition a decimation leaves, as a fraction of the sample rate. Zero or negative
+-- means the span does not fit under it at all.
 function fftsa.bp_transition(fs, fhi, d)
   return 1 / (2 * d) - fhi / fs
 end
@@ -616,15 +597,14 @@ function fftsa.fft_run()
   end
 end
 
--- Untangle the half-size transform into the N/2 real-input bins and write their
--- power, scaled to volts-squared peak, into fftsa.fft_pwr[1..M]. Bin j (1-based)
--- is the frequency (j-1)*fs/N.
+-- Untangle the half-size transform into the N/2 real-input bins and write their power,
+-- volts-squared peak, into fftsa.fft_pwr[1..M]. Bin j is the frequency (j-1)*fs/N.
 --
--- With Z the M-point transform of the packed input and Zc the conjugate of Z at
--- the mirror index (M-k) mod M,
+-- With Z the M-point transform of the packed input and Zc the conjugate of Z at the
+-- mirror index (M-k) mod M,
 --   X[k] = (Z + Zc)/2 + e^(-2*pi*i*k/N) * (Z - Zc)/(2i)
--- The halves are folded into fftsa.fft_ksq. Bins k and M-k share the same four
--- loads, so the pass walks mirror pairs; bin 0 and bin M/2 are their own mirrors.
+-- Bins k and M-k share the same four loads, so the pass walks mirror pairs; bin 0 and
+-- bin M/2 are their own mirrors.
 function fftsa.fft_power()
   local M    = fftsa.fft_m
   local re   = fftsa.fft_re
@@ -658,13 +638,10 @@ function fftsa.fft_power()
   return M
 end
 
--- Sub-bin peak estimate from the peak bin and its two neighbours. Read from the peak
--- bin alone, a tone between bin centres is off by up to half a bin and low by the
--- scalloping loss -- 1.42 dB with Hann, 0.82 dB with Kaiser at beta 12. Both come
--- back from the window's own main lobe, through the tables fftsa.win_tables() built.
---
--- Returns d (-0.5..0.5) and the amplitude in volts, or 0 and nil when there is no
--- estimate (a spectrum edge, a sparse power array); callers fall back to the bin.
+-- Sub-bin peak estimate from the peak bin and its two neighbours. From the peak bin
+-- alone a tone between centres is off by up to half a bin and low by the scalloping loss,
+-- 1.42 dB with Hann; both come back from the window's own main lobe. Returns d in
+-- -0.5..0.5 and volts, or 0 and nil at a spectrum edge, where callers use the bin.
 function fftsa.peak_interp(k, nb)
   local pwr = fftsa.fft_pwr
   if k == nil or k < 2 then return 0, nil end

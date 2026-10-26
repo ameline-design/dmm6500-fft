@@ -48,18 +48,18 @@ refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So a brushed scree
 sideways and the axis labels no longer describe the span.
 
 **The lock is on when the app starts**, and the padlock shows closed. Pan or zoom the trace and the
-next frame puts it back, so the snap-back takes one frame — a tenth of a second at the 512-sample
-default, about two seconds at 16384 where frames are 2.1 s apart. Press the padlock and it opens,
+view is restored within about a second — the check runs once a second, not once a frame, so at 16384
+samples it lands on the next frame instead, about two seconds. Press the padlock and it opens,
 leaving the view wherever your finger left it; the next Apply, or a zoom, re-pins it. Press it again
-and it closes, restoring the window immediately rather than at the next frame.
+and it closes, restoring the window at once rather than waiting for the next check.
 
-**An untouched locked frame costs nothing.** Writing an axis limit takes 60 ms and repaints the whole
-graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the update
-rate and visibly flickers the trace. So the lock is told when to look: the graph reports its own pan
-and zoom, a report makes it read the limits back at 0.0094 ms each, and only a limit that has really
-moved is written. Nothing moved means nothing written, and the axis that did not move is not touched
-either. Expect a second or so of reduced update rate after a restore, while the write's own repaint
-and event reports settle.
+**An untouched lock costs two reads a second.** Writing an axis limit takes 60 ms and repaints the
+whole graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the
+update rate and visibly flickers the trace, which is what it did. So the lock is told when to look:
+the graph reports its own pan and zoom, a report makes it read the limits back at 0.0094 ms each, and
+only a limit that has really moved is written. Nothing moved means nothing written, and the axis that
+did not move is left alone. Expect a second or so of reduced update rate after a restore, while the
+write's own repaint and the reports it generates settle.
 
 Both buttons lose their icon for a moment when they take the yellow focus highlight, because the
 firmware paints the highlight over everything inside the button. The app redraws the icons once a
