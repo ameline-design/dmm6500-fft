@@ -2243,6 +2243,52 @@ check('and a press with nothing moved writes no axis at all', (function()
                        (OBJ[gh].ypins or 0), yp)
 end)())
 
+-- The gesture arithmetic is a feedback loop: the axis is pinned from the span and the span
+-- is then taken back off the axis. So it has to be a fixed point at each wall and free of
+-- hysteresis in between. Thirty gestures deep, driven straight into sg_adopt_x, because a
+-- drift of ten hertz a drag is invisible in a single-step check -- and ten hertz a drag is
+-- exactly what measuring the DC wall from flomin instead of zero would cost.
+check('panning into a wall is a fixed point, and panning back and forth does not drift',
+      (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
+  local function settle(lo, hi)
+    fftsa.flo, fftsa.fhi = lo, hi
+    fftsa.sg_set_xrange(lo, hi)
+  end
+  -- One gesture, expressed as a nudge to the limits the pin last wrote -- which is what the
+  -- read-back answers with, so this is the loop the instrument closes.
+  local function gesture(dlo, dhi)
+    local wlo, whi = fftsa.sg_xwant()
+    fftsa.sg_adopt_x(wlo + dlo, whi + dhi)
+    return fftsa.flo, fftsa.fhi
+  end
+  local bad, i = nil, nil
+  local function wall(lo, hi, dlo, dhi, name)
+    settle(lo, hi)
+    local a, b = gesture(dlo, dhi)
+    for i = 1, 30 do
+      local c, d = gesture(dlo, dhi)
+      if (c ~= a or d ~= b) and bad == nil then
+        bad = string.format('%s moved at step %d: %g..%g became %g..%g',
+                            name, i, a, b, c, d)
+      end
+    end
+  end
+  wall(10, 50000, -1000, -1000, 'the DC wall')        -- default span, start on the wall
+  wall(470000, 500000, 1000, 1000, 'the top limit')
+  settle(100000, 150000)
+  for i = 1, 30 do
+    gesture(1000, 1000)
+    gesture(-1000, -1000)
+  end
+  if (fftsa.flo ~= 100000 or fftsa.fhi ~= 150000) and bad == nil then
+    bad = string.format('30 pans out and back drifted to %g..%g', fftsa.flo, fftsa.fhi)
+  end
+  settle(lo0, hi0)
+  fftsa.retune_pending = false
+  return bad == nil, bad
+end)())
+
 -- The icons, which a focus repaint covers. The frame puts them back at the peak cadence,
 -- so the assertion is that a frame redraws them at all -- setstate to a state the object
 -- already holds may be taken as nothing to do, hence the invisible-then-enable pair.
