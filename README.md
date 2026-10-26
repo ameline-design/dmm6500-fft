@@ -29,9 +29,10 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Locks the view.** The firmware's graph pans and zooms on touch and will not be told not to, so a
-  brushed screen slides the trace off its axes. On by default: the graph reports its own pan, and a
-  once-a-second check reads the limits back at 0.0094 ms and rewrites only an axis that really moved
-  — a write costs 60 ms, so doing it per frame collapsed the update rate. The padlock button turns it
+  brushed screen slides the trace off its axes. On by default, and free until you touch it: the graph
+  reports its own pan, and a once-a-second check does nothing without a report. One that has a report
+  reads the limits back at 0.0094 ms and rewrites only an axis that really moved — a write costs
+  60 ms, so doing it per frame collapsed the update rate. The padlock button turns it
   off, and the cog beside it opens Options.
 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves

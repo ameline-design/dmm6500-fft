@@ -53,11 +53,11 @@ samples it lands on the next frame instead, about two seconds. Press the padlock
 leaving the view wherever your finger left it; the next Apply, or a zoom, re-pins it. Press it again
 and it closes, restoring the window at once rather than waiting for the next check.
 
-**An untouched lock costs two reads a second.** Writing an axis limit takes 60 ms and repaints the
+**An untouched lock makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
 whole graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the
 update rate and visibly flickers the trace, which is what it did. So the lock is told when to look:
-the graph reports its own pan and zoom, a report makes it read the limits back at 0.0094 ms each, and
-only a limit that has really moved is written. Nothing moved means nothing written, and the axis that
+the graph reports its own pan and zoom, and a check that has had no report does nothing. One that has
+reads the limits back at 0.0094 ms each, and writes only a limit that has really moved. Nothing moved means nothing written, and the axis that
 did not move is left alone. Expect a second or so of reduced update rate after a restore, while the
 write's own repaint and the reports it generates settle.
 
