@@ -280,13 +280,14 @@ with the frame loop parked; an earlier run that left frames running measured the
 would have been contaminated either way, so the park is what makes them comparable. Cross-checked
 from the host at 139.9 ms for the pair against a 7.3 ms bare round trip.
 
-That number is why the view lock is driven by `display.EVENT_SCALE` rather than by re-asserting the
+That number is why a gesture is settled from `display.EVENT_SCALE` rather than by re-asserting the
 limits each frame. **At 512 samples the margin is about 1 ms.** The frame is 81.0 ms and
 `tick_period()`'s 10 fps bucket ends at 82.0 ms, so 121 ms of pinning per frame does not shave the
 rate, it collapses it -- and on the glass it read as a flickering trace, which is what the operator
-reported. One pin per gesture is 121 ms once; an untouched locked frame makes no graph call at all.
+reported. One write per gesture is 60 ms once, or 121 for both axes; an untouched frame makes no
+graph call at all.
 
-The read-back is affordable at 0.0094 ms and is what the lock tests with -- **but its return values
+The read-back is affordable at 0.0094 ms and is what the settle tests with -- **but its return values
 "are only valid when the objects event generation is set to ALL"**, and non-button objects have no
 events enabled by default. On a graph nobody had registered an event on, `scalex(g)` and `scaley(g)`
 answered nil and posted no event, so a lock that skipped its pin on nil did nothing whatsoever and
@@ -294,7 +295,17 @@ every offline test passed, because the mock answered unconditionally. Registerin
 supplies the precondition, so the registration is not an optimisation: without it the read-back does
 not work. It costs nothing per frame -- frame work measured 74.7 ms minimum with it on and with it
 off, at 512 samples -- and it reports the gesture as well, which lets a tick that saw no report skip
-even the reads.
+even the reads. The registration is therefore unconditional: the dB axis is restored whatever the
+padlock says, and an unlocked frequency gesture has to be read before it can be adopted.
+
+An **adopted** gesture -- padlock open, the span following the axis -- costs the same one axis write
+while the stop frequency stays inside the sample rate in force. Crossing a rate step (Nyquist at
+50 k, 100 k, 250 k and 500 kHz) instead calls `fftsa.apply()` from `fftsa.frame()`, between frames
+and with `halted` set so no tick can enter a frame underneath it -- it reconfigures the digitizer and
+takes its own capture with the same buffers a frame is using. That is exactly the work an Options
+Apply does: the window and interpolation tables, which the code puts at about 0.3 s for Kaiser, plus
+one capture of `N / fs`. Not measured as a unit, and the only new cost here is that a gesture can
+trigger it.
 
 A reading-buffer element costs **16x a plain Lua table element**. That is the single most important
 number in this file: it is why the load phase is what it is, and why copying a buffer into a plain

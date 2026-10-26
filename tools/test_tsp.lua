@@ -152,6 +152,10 @@ function display.create(parent, kind, ...)
   -- seeded value is a[6]. a[5] is the format constant, and reading that as the value
   -- made every field read back as 1 before any setvalue.
   if kind == display.OBJ_EDIT_NUMBER then OBJ[h].value = a[6] end
+  -- The field's declared range, recorded so a test can ask whether a value the app wants
+  -- to put IN the field is one the field would take. setvalue is not modelled as refusing
+  -- an out-of-range value, because what the firmware does with one is unmeasured.
+  if kind == display.OBJ_EDIT_NUMBER then OBJ[h].vmin, OBJ[h].vmax = a[7], a[8] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].value = 1 end
   -- OBJ_TEXT is (x, y, text, colour, font, justify), so the font is a[5].
   if kind == display.OBJ_TEXT then OBJ[h].text = a[3] end
@@ -1758,12 +1762,13 @@ check('and that holds with the view lock on, which is the default',
 check('the yield is the configured amount', fftsa.sg_yield > 0.005
       and fftsa.sg_yield < 0.1, tostring(fftsa.sg_yield))
 
--- ---------- the view lock and the two icon buttons ----------
+-- ---------- settling a gesture, and the two icon buttons ----------
 -- The graph pans and zooms on touch and the firmware offers no way to refuse it:
--- display.setstate answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So
--- the lock restores the window instead of preventing the gesture, which makes the cost a
--- per-frame one and the placement of the re-pin inside the frame the thing to hold still.
-print('\nview lock and the icon buttons (real code)')
+-- display.setstate answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a
+-- gesture is settled after the fact, from inside a frame -- which puts two things under
+-- test here that nothing else covers: that an untouched view writes no axis at all, and
+-- that the write lands outside the refill window.
+print('\nsettling a gesture, and the icon buttons (real code)')
 local function img_children(scr)
   local t = {}
   for _, o in pairs(OBJ) do
@@ -1859,10 +1864,11 @@ check('three locked ticks on an untouched view write no limit at all',
       (OBJ[gh].pins or 0) == pinq and (OBJ[gh].ypins or 0) == ypinq,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pinq,
                     (OBJ[gh].ypins or 0), ypinq))
-check('and sg_lock_check() reports it had nothing to do',
-      fftsa.sg_lock_check() == false)
+check('and sg_scale_check() reports it had nothing to do',
+      fftsa.sg_scale_check() == false)
 
 local pin2, ypin2 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+local lockflo, lockfhi = fftsa.flo, fftsa.fhi
 tick_due()
 drag_axes()
 fftsa.frame_body()
@@ -1873,6 +1879,13 @@ check('a locked tick restores the window a reported pan moved',
                     tostring(OBJ[gh].xmin), tostring(OBJ[gh].xmax),
                     tostring(OBJ[gh].ymin), tostring(OBJ[gh].ymax),
                     tostring(wx0), tostring(wx1), tostring(wy0), tostring(wy1)))
+-- The safety property of the closed padlock: it restores, it never adopts. A locked gesture
+-- that reached fftsa.flo/fhi would retune the hardware from a brushed screen.
+check('and a locked gesture leaves the FFT range alone',
+      fftsa.flo == lockflo and fftsa.fhi == lockfhi
+      and fftsa.retune_pending == false,
+      string.format('%g..%g was %g..%g, pending=%s', fftsa.flo, fftsa.fhi,
+                    lockflo, lockfhi, tostring(fftsa.retune_pending)))
 check('writing each axis exactly once', (OBJ[gh].pins or 0) == pin2 + 1
       and (OBJ[gh].ypins or 0) == ypin2 + 1,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin2,
@@ -1938,7 +1951,7 @@ check('and a nil read-back is treated as moved, so the lock is never silently de
         display.events[g] = nil          -- read-back answers nil now
         local p = (OBJ[g].pins or 0)
         fftsa.sg_ev = 1
-        local wrote = fftsa.sg_restore()
+        local wrote = fftsa.sg_settle()
         display.events[g] = saved
         return wrote == true and (OBJ[g].pins or 0) == p + 1
       end)())
@@ -1955,7 +1968,7 @@ check('a read-back that answers one limit is treated as moved, not as unmoved', 
   end
   OBJ[gh].xmax = wx0 + (wx1 - wx0) * 0.75              -- a zoom anchored at the left
   fftsa.sg_ev = 1
-  local ok, wrote = pcall(fftsa.sg_restore)
+  local ok, wrote = pcall(fftsa.sg_settle)
   display.graph.scalex = real
   if not ok then return false, 'raised: ' .. tostring(wrote) end
   return wrote == true and (OBJ[gh].pins or 0) == p0 + 1 and OBJ[gh].xmax == wx1,
@@ -1969,51 +1982,265 @@ check('a zero-height axis is not a permanent write', (function()
 end)())
 -- sg_bind re-asserts the pins because removeall and add may reset what the object
 -- carries. The report registration sits in the same position, and sg_rebind() reaches
--- sg_bind from the failed-frame path -- so one raised frame must not cost the lock.
-check('sg_bind re-asserts the pan report, so a rebind cannot kill the lock', (function()
+-- sg_bind from the failed-frame path -- so one raised frame must not cost the settle.
+--
+-- In BOTH lock states, because the report is no longer the lock's: the dB axis is restored
+-- either way and an unlocked frequency gesture has to be read before it can be adopted. A
+-- registration tied to the lock is what left the feature dead after an unlocked relaunch.
+check('sg_bind re-registers the pan report whatever the lock says', (function()
   local was = fftsa.sg_lock
-  fftsa.sg_lock = true
-  display.events[gh] = nil                             -- as a reset object would look
-  fftsa.sg_bind()
-  local back = display.events[gh] ~= nil
-                and display.events[gh][display.EVENT_SCALE] ~= nil
-  -- and an unlocked rebind must NOT register one
-  fftsa.sg_lock = false
-  display.events[gh] = nil
-  fftsa.sg_bind()
-  local still_off = display.events[gh] == nil
-                    or display.events[gh][display.EVENT_SCALE] == nil
+  local function rebound(lock)
+    fftsa.sg_lock = lock
+    display.events[gh] = nil                           -- as a reset object would look
+    fftsa.sg_bind()
+    return display.events[gh] ~= nil
+           and display.events[gh][display.EVENT_SCALE] ~= nil
+  end
+  local on, off = rebound(true), rebound(false)
   fftsa.sg_lock = was
-  fftsa.sg_lock_hook(was)
-  return back and still_off,
-         'locked rebind registered=' .. tostring(back)
-         .. ' unlocked rebind clean=' .. tostring(still_off)
+  return on and off, 'locked=' .. tostring(on) .. ' unlocked=' .. tostring(off)
 end)())
 
 check('a press unlocks it', fftsa.toggle_lock() == false and fftsa.sg_lock == false)
 check('and shows the open padlock again',
       OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true)
-local pin3, ypin3 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
-tick_due()
-drag_axes()
-fftsa.frame_body()
-check('an unlocked tick leaves a panned view alone', OBJ[gh].xmin == 12345
-      and OBJ[gh].ymin == -77 and (OBJ[gh].pins or 0) == pin3
-      and (OBJ[gh].ypins or 0) == ypin3,
-      string.format('x from %s, pins %d/%d', tostring(OBJ[gh].xmin),
-                    (OBJ[gh].pins or 0), pin3))
--- Unlocking does not restore the view: the pan is what the operator asked for, and the
--- next Apply or zoom re-pins anyway.
-check('unlocking leaves the panned view where the finger left it', OBJ[gh].xmax == 23456,
-      tostring(OBJ[gh].xmax))
--- Locking re-pins at once, so a view dragged while free snaps back on the press rather
--- than at the next frame -- and that is the whole mechanism while the app is halted.
-check('locking again restores it immediately, without waiting for a frame', (function()
-  local p = (OBJ[gh].pins or 0)
+
+-- ---------- unlocked, where the span follows the axis ----------
+-- The span sets the sample rate, the bin width and the peak search window, so a check
+-- down here that left it moved would rewrite the premise of every later one in the file.
+-- Put back through fftsa.apply() at the end of the section, not by assignment.
+local SPAN_LO, SPAN_HI = fftsa.flo, fftsa.fhi
+local RATE0 = dmm.digitize.samplerate
+
+-- Restored whatever the lock says. Gated on the lock, a dragged dB axis would stay where
+-- the finger dropped it with Apply the only way back -- and unlike the frequency axis
+-- there is no setting behind it for the gesture to be asking for.
+check('an unlocked tick still restores the dB axis', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  return OBJ[gh].ymin == fftsa.sg_dbmin and OBJ[gh].ymax == fftsa.sg_dbmax
+         and (OBJ[gh].ypins or 0) == yp + 1 and (OBJ[gh].pins or 0) == p,
+         string.format('y %s..%s ypins %d/%d, and X must not move: pins %d/%d',
+                       tostring(OBJ[gh].ymin), tostring(OBJ[gh].ymax),
+                       (OBJ[gh].ypins or 0), yp, (OBJ[gh].pins or 0), p)
+end)())
+
+-- The feature: unlocked, the axis wins and the analyser retunes to it. A pan inside the
+-- rate in force is the cheap case -- those bins are captured already, so it costs one axis
+-- write and a settings line and no capture at all.
+check('an unlocked pan retunes the FFT to the range on the glass', (function()
+  OBJ[gh].xmin, OBJ[gh].xmax = 12000, 40000
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  local wlo, whi = fftsa.sg_xwant()
+  return fftsa.flo == 12000 and fftsa.fhi == 40000
+         and fftsa.sg_flo_hz == 12000 and fftsa.sg_fhi_hz == 40000
+         and near(OBJ[gh].xmin, wlo, 1e-9) and near(OBJ[gh].xmax, whi, 1e-9),
+         string.format('flo/fhi %g/%g sg %g/%g axis %g..%g', fftsa.flo, fftsa.fhi,
+                       fftsa.sg_flo_hz, fftsa.sg_fhi_hz, OBJ[gh].xmin, OBJ[gh].xmax)
+end)())
+check('and asks for no re-plan, the rate in force already covering it',
+      fftsa.retune_pending == false and dmm.digitize.samplerate == RATE0,
+      'pending=' .. tostring(fftsa.retune_pending) .. ' rate='
+      .. tostring(dmm.digitize.samplerate) .. '/' .. tostring(RATE0))
+-- The form is the other half of "the range of the FFT". A gesture the Options fields never
+-- heard about would be undone by the next Apply, silently and a second later.
+check('Options opens on the range the gesture set', (function()
+  fftsa.options()
+  local lo, hi = fftsa.getval(fftsa.opt_flo), fftsa.getval(fftsa.opt_fhi)
+  fftsa.options_cancel()
+  return lo == 12000 and hi == 40000,
+         'the form reads ' .. tostring(lo) .. '..' .. tostring(hi)
+end)())
+-- One clamp, two callers. A copy of the rule inside options_span is a second rule free to
+-- drift from this one, and then the form offers a range a gesture cannot reach or the other
+-- way about. Only pairs the form itself can hold: a negative field is not a span, and
+-- options_span keeps what is in force for one rather than clamping it.
+check('the form and a gesture clamp through the same function', (function()
+  local cases = {{0, 9e9}, {400000, 300000}, {10, 50000}, {1, 1}}
+  local lo0, hi0 = fftsa.getval(fftsa.opt_flo), fftsa.getval(fftsa.opt_fhi)
+  local bad, i = nil, nil
+  for i = 1, table.getn(cases) do
+    local lo, hi = cases[i][1], cases[i][2]
+    local clo, chi = fftsa.span_clamp(lo, hi)
+    fftsa.setval(fftsa.opt_flo, lo)
+    fftsa.setval(fftsa.opt_fhi, hi)
+    local flo, fhi = fftsa.options_span()
+    if flo ~= clo or fhi ~= chi then
+      bad = string.format('%g..%g: form said %g..%g, the clamp said %g..%g',
+                          lo, hi, flo, fhi, clo, chi)
+    end
+  end
+  fftsa.setval(fftsa.opt_flo, lo0)
+  fftsa.setval(fftsa.opt_fhi, hi0)
+  return bad == nil, bad
+end)())
+-- And the clamp agrees with the FIELDS, not merely with itself. fftsa.options() writes
+-- fftsa.flo and fftsa.fhi straight into the two edit objects, so a clamp that can return a
+-- value outside a field's declared range hands the firmware one the field would refuse --
+-- reachable from a pinch high up the span, where the start can land above the Start
+-- field's own ceiling.
+check('every clamped span is a pair the two fields would accept', (function()
+  local lof, hif = OBJ[fftsa.opt_flo], OBJ[fftsa.opt_fhi]
+  if lof.vmin == nil or hif.vmax == nil then return false, 'the fields declared no range' end
+  local cases = {{0, 0}, {1, 1}, {499999, 500000}, {600000, 900000}, {10, 50000},
+                 {499000, 499010}, {250000, 250001}}
+  local bad, i = nil, nil
+  for i = 1, table.getn(cases) do
+    local lo, hi = fftsa.span_clamp(cases[i][1], cases[i][2])
+    if lo < lof.vmin or lo > lof.vmax or hi < hif.vmin or hi > hif.vmax or lo >= hi then
+      bad = string.format('%g..%g clamped to %g..%g, fields take %g..%g and %g..%g',
+                          cases[i][1], cases[i][2], lo, hi,
+                          lof.vmin, lof.vmax, hif.vmin, hif.vmax)
+    end
+  end
+  return bad == nil, bad
+end)())
+-- Our own pin fires EVENT_SCALE as well, so fires keep arriving after an adoption. The
+-- read-back answering with the limits just written is what stops this being an
+-- adopt-fire-adopt loop walking the span away from where the finger left it.
+check('the fires an adoption causes adopt nothing further', (function()
+  local lo, hi, p = fftsa.flo, fftsa.fhi, (OBJ[gh].pins or 0)
+  local i
+  for i = 1, 5 do
+    fftsa.sg_ev = 1
+    tick_due()
+    fftsa.frame_body()
+  end
+  return fftsa.flo == lo and fftsa.fhi == hi and (OBJ[gh].pins or 0) == p,
+         string.format('span %g/%g was %g/%g, pins %d/%d', fftsa.flo, fftsa.fhi,
+                       lo, hi, (OBJ[gh].pins or 0), p)
+end)())
+-- A widget limit is a float and an Options field is not. Unrounded, the form would show one
+-- number and re-apply another, losing the gesture's span at the next Apply.
+check('an adopted span is whole hertz, whatever the widget reports', (function()
+  OBJ[gh].xmin, OBJ[gh].xmax = 9000.4, 33000.6
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  return fftsa.flo == 9000 and fftsa.fhi == 33001,
+         string.format('%s..%s, wanted 9000..33001', tostring(fftsa.flo),
+                       tostring(fftsa.fhi))
+end)())
+
+-- A gesture can ask for anything: below DC, past the fastest rate's Nyquist, or narrower
+-- than a bin. What it gets comes from fftsa.span_clamp, the function the Options form goes
+-- through too, so a gesture cannot reach a range the form could not.
+--
+-- A pan off an end stops rather than narrowing: the span is held and the pair shifted back
+-- inside the limits. It matters because the default start is 10 Hz, already on the wall --
+-- without the shift, panning left there would zoom in a little on every drag.
+check('a pan into DC stops the window rather than narrowing it', (function()
+  local span = fftsa.fhi - fftsa.flo
+  OBJ[gh].xmin, OBJ[gh].xmax = -9000, span - 9000
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  return fftsa.flo == fftsa.flomin and (fftsa.fhi - fftsa.flo) >= span - fftsa.flomin,
+         string.format('%g..%g: span %g, was %g', fftsa.flo, fftsa.fhi,
+                       fftsa.fhi - fftsa.flo, span)
+end)())
+-- A ZOOM is not shifted: its span is the request, so an edge it cannot reach clamps and
+-- the other end stays where the gesture put it. Shifting one would answer a pinch with a
+-- span nobody asked for.
+check('a zoom past the top clamps the stop and keeps the start', (function()
+  OBJ[gh].xmin, OBJ[gh].xmax = 300000, 900000
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  return fftsa.flo == 300000 and fftsa.fhi == fftsa.fhi_max,
+         string.format('%g..%g, wanted 300000..%g', fftsa.flo, fftsa.fhi, fftsa.fhi_max)
+end)())
+-- That zoom crossed the rate ladder, and a new rate means a new capture: fftsa.apply()
+-- reconfigures the digitizer and reads one, which cannot happen inside a frame that is
+-- already using the buffers. The flag is how the gesture reaches fftsa.frame().
+check('a stop past the rate in force asks for a re-plan rather than taking one',
+      fftsa.retune_pending == true, 'pending=' .. tostring(fftsa.retune_pending))
+check('and fftsa.frame() installs it once, between frames', (function()
+  local rate0 = dmm.digitize.samplerate
+  fftsa.frame()
+  local after, cleared = dmm.digitize.samplerate, (fftsa.retune_pending == false)
+  fftsa.frame()                            -- and does not do it again
+  return cleared and after ~= rate0 and after == fftsa.pick_fs(fftsa.fhi)
+         and dmm.digitize.samplerate == after and fftsa.halted == false,
+         string.format('rate %s -> %s, wanted %s; pending=%s halted=%s',
+                       tostring(rate0), tostring(after),
+                       tostring(fftsa.pick_fs(fftsa.fhi)),
+                       tostring(fftsa.retune_pending), tostring(fftsa.halted))
+end)())
+-- Through apply(), because putting back only the numbers would leave the hardware
+-- describing the gesture's span while every later check read the file's.
+fftsa.flo, fftsa.fhi = SPAN_LO, SPAN_HI
+fftsa.apply()
+fftsa.retune_pending = false
+check('the span is back where the rest of the file expects it, hardware included',
+      fftsa.flo == SPAN_LO and fftsa.fhi == SPAN_HI
+      and dmm.digitize.samplerate == RATE0,
+      string.format('%g..%g rate %s/%s', fftsa.flo, fftsa.fhi,
+                    tostring(dmm.digitize.samplerate), tostring(RATE0)))
+-- Apply re-plans from the same fftsa.flo/fhi the gesture set, so a flag left set past one
+-- buys a second identical apply on the next frame -- a visible hitch for nothing.
+check('an Apply consumes a gesture still waiting to be re-planned', (function()
+  fftsa.options()                          -- fills the form from the span in force
+  fftsa.retune_pending = true
+  local ok = fftsa.options_apply()
+  return ok and fftsa.retune_pending == false
+         and fftsa.flo == SPAN_LO and fftsa.fhi == SPAN_HI,
+         string.format('ok=%s pending=%s span %g..%g', tostring(ok),
+                       tostring(fftsa.retune_pending), fftsa.flo, fftsa.fhi)
+end)())
+-- A frame that gave up has to stay given up. halted is cleared after a re-plan, so a
+-- gesture waiting in the flag would restart the loop that had just stopped itself and
+-- write a settings line over the HALTED message.
+check('a pending re-plan does not resurrect a halted app', (function()
+  local realupd = fftsa.sg_update
+  fftsa.errcount, fftsa.errrun, fftsa.retune_pending = 0, 0, false
+  fftsa.sg_update = function() error('raised for the halt test', 0) end
+  -- Taken to one short of the limit with no gesture waiting, because the flag has to be
+  -- set for the frame that gives up: that is the only frame where the two can collide.
+  local i
+  for i = 1, (fftsa.errmax or 20) - 1 do fftsa.frame() end
+  local before = fftsa.halted
+  fftsa.retune_pending = true
+  fftsa.frame()
+  fftsa.sg_update = realupd
+  local halted, pending = fftsa.halted, fftsa.retune_pending
+  fftsa.halted, fftsa.errrun, fftsa.errcount, fftsa.lasterr = false, 0, 0, nil
+  fftsa.retune_pending = false
+  display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
+  return before == false and halted == true and pending == true,
+         string.format('halted %s -> %s, pending=%s', tostring(before),
+                       tostring(halted), tostring(pending))
+end)())
+
+-- Locking settles at once, which is also the only settle a halted app gets. With the lock
+-- on the frequency axis goes BACK: the press is the operator saying the span in force is
+-- the one they want, so a drag inside the same second is discarded, not adopted.
+check('locking snaps a dragged view back instead of adopting it', (function()
+  local lo, hi = fftsa.flo, fftsa.fhi
+  OBJ[gh].xmin, OBJ[gh].xmax = 12345, 23456
+  fftsa.sg_ev = 3
   local on = fftsa.toggle_lock()
-  return on == true and (OBJ[gh].pins or 0) == p + 1 and OBJ[gh].xmin == wx0,
-         string.format('on=%s pins %d/%d xmin=%s', tostring(on),
-                       (OBJ[gh].pins or 0), p, tostring(OBJ[gh].xmin))
+  return on == true and fftsa.flo == lo and fftsa.fhi == hi
+         and near(OBJ[gh].xmin, wx0, 1e-9) and near(OBJ[gh].xmax, wx1, 1e-9)
+         and fftsa.sg_ev == 0,
+         string.format('on=%s span %g/%g was %g/%g, axis %g..%g wanted %g..%g, ev=%s',
+                       tostring(on), fftsa.flo, fftsa.fhi, lo, hi,
+                       OBJ[gh].xmin, OBJ[gh].xmax, wx0, wx1, tostring(fftsa.sg_ev))
+end)())
+-- A press with nothing out of place writes no axis, so Lock no longer flickers the trace:
+-- the unconditional pair it used to write was 121 ms and one visible repaint every press.
+check('and a press with nothing moved writes no axis at all', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  fftsa.toggle_lock()                      -- off
+  fftsa.toggle_lock()                      -- on again, with nothing having moved
+  return (OBJ[gh].pins or 0) == p and (OBJ[gh].ypins or 0) == yp,
+         string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), p,
+                       (OBJ[gh].ypins or 0), yp)
 end)())
 
 -- The icons, which a focus repaint covers. The frame puts them back at the peak cadence,
@@ -2075,14 +2302,14 @@ check('toggling with nothing built neither raises nor touches the firmware', (fu
   fftsa.lock_icon()
   return ok, tostring(err)
 end)())
--- Left as the app would leave it: lock off AND the report unregistered. The two are
--- driven together by toggle_lock, so a suite that unregisters only one of them hands
--- every later check a graph state the app cannot produce.
-fftsa.sg_lock_hook(false)
-check('and the lock is back off for the frames below, report included',
-      fftsa.sg_lock == false
-      and (display.events[gh] == nil
-           or display.events[gh][display.EVENT_SCALE] == nil),
+-- Left as the app would leave it: the lock off for the frames below, and the report still
+-- registered, because that is now unconditional. A suite that unregistered it would hand
+-- every later check a graph state the app cannot produce -- one whose scale read-back
+-- answers nil.
+fftsa.sg_hook_scale()
+check('and the lock is back off for the frames below, report still registered',
+      fftsa.sg_lock == false and display.events[gh] ~= nil
+      and display.events[gh][display.EVENT_SCALE] ~= nil,
       'lock=' .. tostring(fftsa.sg_lock) .. ' ev='
       .. tostring(display.events[gh] and display.events[gh][display.EVENT_SCALE]))
 
@@ -2254,9 +2481,9 @@ check('a scale read-back answers only while event generation is on', (function()
   -- the precondition, so the test has to set both sides of it itself.
   display.events[g] = nil
   local off_x, off_y = display.graph.scalex(g), display.graph.scaley(g)
-  fftsa.sg_lock_hook(true)
+  fftsa.sg_hook_scale()
   local on_x, on_y = display.graph.scalex(g), display.graph.scaley(g)
-  fftsa.sg_lock_hook(false)
+  display.events[g] = nil                  -- the app never does this; the firmware did
   local back_x = display.graph.scalex(g)
   display.events[g] = saved
   return off_x == nil and off_y == nil and on_x ~= nil and on_y ~= nil

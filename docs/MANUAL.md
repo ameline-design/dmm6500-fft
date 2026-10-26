@@ -38,39 +38,66 @@ to 6 are noise, 84 dB down. At 195 Hz bins the harmonics sit close enough to the
 frequencies read tens of hertz out — 24.927 kHz for one that is really 25.000. The 16,384-sample
 capture further down resolves them exactly.
 
-Two buttons sit to the right of the peak table: a **padlock**, which locks the view, and a **cog**,
-which opens Options.
+Two buttons sit to the right of the peak table: a **padlock**, which decides what a sideways drag
+means, and a **cog**, which opens Options.
 
-## Locking the view
+## Dragging and zooming the trace
 
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
-refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So a brushed screen slides the trace
-sideways and the axis labels no longer describe the span.
+refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So every gesture is settled after the
+fact, about a second later: the check runs once a second rather than once a frame, so at 16384
+samples it lands on the next frame instead, about two seconds.
 
-**The lock is on when the app starts**, and the padlock shows closed. Pan or zoom the trace and the
-view is restored within about a second — the check runs once a second, not once a frame, so at 16384
-samples it lands on the next frame instead, about two seconds. Press the padlock and it opens,
-leaving the view wherever your finger left it; the next Apply, or a zoom, re-pins it. Press it again
-and it closes, restoring the window at once rather than waiting for the next check.
+**The dB axis always goes back**, whatever the padlock says. The scale is fixed at -120 to +20 dBV
+and there is no setting behind it, so a dragged dB axis is only a worse view of the same data.
 
-**An untouched lock makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
+**The padlock decides what a horizontal gesture means.** It is closed when the app starts.
+
+- **Closed** — the frequency axis goes back to the span in force. Pan or zoom and the trace snaps
+  back within about a second.
+- **Open** — the span follows the axis. Drag or pinch and the analyser **retunes** to the range you
+  have brought into view: Start and Stop in Options change to match, the firmware relabels the axis,
+  and the next frame measures that range.
+
+Pressing the padlock closed settles the view at once rather than waiting for the next check, so a
+drag within the same second snaps back instead of being adopted. Pressing it open settles nothing,
+and the span already in force stays in force until something is dragged.
+
+**What a retune costs depends on whether the sample rate has to change.** The digitizer runs at the
+lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency, so:
+
+- A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
+  bins are captured already. Note that zooming in gives more plot columns per bin, not finer
+  resolution: the bin width is the rate over the sample count, and neither has changed.
+- A zoom out past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
+  frames. The settings line reads `retuning to ... Hz` while it does the same work an Apply does —
+  the window tables, about 0.3 s for Kaiser, plus one capture. With the **band-pass on** every change
+  re-plans, because the filter's cutoff is derived from the stop frequency.
+
+**A gesture cannot leave the allowed range.** Start clamps to 10 Hz … 499 kHz and Stop to
+2 kHz … 500 kHz — the limits the Options fields themselves declare, enforced through one function so
+the form cannot be handed a value its own field would refuse. A pan that runs off either end stops
+rather than narrowing — its span is held and the window shifted back inside the limits — while a zoom
+keeps the span it asked for and clamps only the edge it cannot reach. Adopted limits are rounded to
+whole hertz, so the Options fields can show and re-apply them unchanged.
+
+**An untouched view makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
 whole graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the
-update rate and visibly flickers the trace, which is what it did. So the lock is told when to look:
+update rate and visibly flickers the trace, which is what it did. So the app is told when to look:
 the graph reports its own pan and zoom, and a check that has had no report does nothing. One that has
-reads the limits back at 0.0094 ms each, and writes only a limit that has really moved. Nothing moved means nothing written, and the axis that
-did not move is left alone.
+reads the limits back at 0.0094 ms each, and writes only a limit that has really moved.
 
-**Very narrow spans high up the range have a dead zone.** A pan smaller than about a millionth of
-the stop frequency is taken for rounding and left alone. On ordinary spans that is a thousandth of a
-pixel, but on a 10 Hz window at 499 kHz it is some thirty pixels — the trace can be nudged visibly
-without the lock putting it back, while the padlock still reads closed. Such a window holds no bins
-at all, so the trace is empty before this matters, but it is the lock's limit rather than a fault.
+**Very narrow spans high up the range have a dead zone.** A movement smaller than about a millionth
+of the stop frequency is taken for rounding and left alone. On ordinary spans that is a thousandth of
+a pixel, but on a 10 Hz window at 499 kHz it is some thirty pixels — the trace can be nudged visibly
+and be neither restored nor adopted. Such a window holds no bins at all, so the trace is empty before
+this matters, but it is a limit rather than a fault.
 
-**A restore costs a visible pause.** The write lands inside a frame, so that frame takes 202 ms
-instead of 81 and the app re-arms its timer from the slowest frame it has seen — 3.3 frames a second,
-held for about two and a half seconds while that peak decays. Restoring one axis rather than two is
-5 fps for about a second and a half. So a drag costs a brief stutter and then recovers; holding a
-finger down and dragging continuously keeps paying it.
+**A write costs a visible pause.** It lands inside a frame, so that frame takes 141 ms instead of 81
+for one axis and 202 for both, and the app re-arms its timer from the slowest frame it has seen: 5
+frames a second for about a second and a half, or 3.3 for two and a half, while that peak decays. So
+a gesture costs a brief stutter and then recovers; holding a finger down and dragging continuously
+keeps paying it, and with the padlock open keeps retuning as well.
 
 Both buttons lose their icon for a moment when they take the yellow focus highlight, because the
 firmware paints the highlight over everything inside the button. The app redraws the icons once a
@@ -90,6 +117,10 @@ works either way.
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
 | FFT Samples | 512 (default), 1024, 2048, 4096, 8192 or 16384. More samples give finer bins but take more time and memory. |
+
+Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
+open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
+trace*. Apply supersedes a gesture the app has not finished acting on.
 
 The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
 **bin spacing** (`fs / N`) and **acquisition

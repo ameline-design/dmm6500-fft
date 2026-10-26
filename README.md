@@ -28,12 +28,16 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
   it however many bins the span holds.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
-- **Locks the view.** The firmware's graph pans and zooms on touch and will not be told not to, so a
-  brushed screen slides the trace off its axes. On by default, and free until you touch it: the graph
-  reports its own pan, and a once-a-second check does nothing without a report. One that has a report
-  reads the limits back at 0.0094 ms and rewrites only an axis that really moved — a write costs
-  60 ms, so doing it per frame collapsed the update rate. The padlock toggles it: press once to pan
-  freely, press again to lock and snap the window back at once. The cog beside it opens Options.
+- **Settles every gesture.** The firmware's graph pans and zooms on touch and will not be told not to,
+  so a brushed screen slides the trace off its axes. The dB axis always goes back — there is no
+  setting behind it. The **padlock** decides what a sideways drag means: closed, the frequency axis
+  snaps back to the span in force; open, the span follows the axis, so dragging or pinching
+  **retunes** the analyser to the range you brought into view, Options fields and all, clamped
+  through the same function the form uses. Free until you touch it: the graph reports its own pan, and
+  a once-a-second check does nothing without a report. One that has a report reads the limits back at
+  0.0094 ms and writes only an axis that really moved — a write costs 60 ms, so doing it per frame
+  collapsed the update rate. A retune that needs a new sample rate re-plans between frames, never
+  inside one. The cog beside the padlock opens Options.
 
 The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
 acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps 

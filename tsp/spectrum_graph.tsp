@@ -48,10 +48,11 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_handles_inited = true
 end
 
--- Touch pans and zooms the graph, and the widget cannot be told not to: display.setstate
--- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a locked view is
--- restored after the fact. At rest that is no graph call at all -- sg_lock_check returns
--- on its own gate -- and 121 ms once per gesture. Not a handle, so a relaunch resets it.
+-- Touch pans and zooms the graph and the widget cannot be told not to: display.setstate
+-- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a gesture is
+-- settled after the fact, and this says how the frequency axis settles -- locked, back onto
+-- the span in force; unlocked, the span follows the axis. dB is restored either way. Not a
+-- handle, so a relaunch resets it.
 fftsa.sg_lock = true
 
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
@@ -483,7 +484,7 @@ function fftsa.sg_bind()
   -- the object carries, and the read-back needs the registration to answer at all.
   -- sg_rebind() reaches here from the failed-frame path, so without this one raised frame
   -- could leave a closed padlock over a view that still pans. Idempotent.
-  fftsa.sg_lock_hook(fftsa.sg_lock)
+  fftsa.sg_hook_scale()
   return true
 end
 
@@ -496,15 +497,15 @@ function fftsa.sg_pin_y(g)
   return true
 end
 
--- The view lock. Writing an axis limit costs 60 ms and repaints the whole widget, so
+-- Settling a gesture. Writing an axis limit costs 60 ms and repaints the whole widget, so
 -- re-asserting both every frame is most of an 81 ms frame at 512 samples -- a slower,
--- flickering trace. Reading one back costs 0.0094 ms, so the lock reads before it writes.
+-- flickering trace. Reading one back costs 0.0094 ms, so a settle reads before it writes.
 --
 -- The read-back's "return values are only valid when the objects event generation is set
 -- to ALL", and non-button objects have none by default -- so on a graph with no event
--- registered, scalex and scaley answer nil and post nothing. sg_lock_hook is therefore
--- not an optimisation: the read-back does not work without it. It reports the gesture
--- too, which lets a tick that saw no fire skip even the reads.
+-- registered, scalex and scaley answer nil and post nothing. sg_hook_scale is therefore
+-- not an optimisation: nothing here works without it. It reports the gesture too, which
+-- lets a tick that saw no fire skip even the reads.
 --
 -- Our own write also fires EVENT_SCALE, asynchronously, and needs no special case: the
 -- echo reads back as the limits just written. EVENT_CURSOR never fires.
@@ -529,13 +530,12 @@ fftsa.sg_ev = 0        -- EVENT_SCALE fires since the tick last looked
 -- exactly, the scale can be the span alone and the dead zone goes.
 fftsa.sg_tol = 1e-6
 
--- Turn the graph's pan-and-zoom reporting on and off with the lock. Measured at 512
--- samples, the registration costs nothing per frame: frame work was 74.7 ms minimum
--- either way.
---
--- Without the report there is no lock at all, and the symptom is a closed padlock over a
--- view that still pans -- which is invisible unless it says so, hence the message.
-function fftsa.sg_lock_hook(on)
+-- Turn the graph's pan-and-zoom reporting on. Unconditional, not tied to the lock: the dB
+-- axis is restored either way and an unlocked frequency gesture has to be read before it
+-- can be adopted. Measured at 512 samples it costs nothing per frame -- 74.7 ms of work
+-- minimum with it on and off -- so there is nothing to switch off. Without the report
+-- nothing settles, and the symptom is a view that pans while the padlock reads closed.
+function fftsa.sg_hook_scale()
   local g = fftsa.sg_graph
   if g == nil then return false end
   if display.EVENT_SCALE == nil then
@@ -543,12 +543,8 @@ function fftsa.sg_lock_hook(on)
     fftsa.say(fftsa.lasterr)
     return false
   end
-  if on then
-    display.setevent(g, display.EVENT_SCALE,
-                     "if fftsa ~= nil then fftsa.sg_ev = (fftsa.sg_ev or 0) + 1 end")
-  else
-    display.setevent(g, display.EVENT_SCALE, 0)
-  end
+  display.setevent(g, display.EVENT_SCALE,
+                   "if fftsa ~= nil then fftsa.sg_ev = (fftsa.sg_ev or 0) + 1 end")
   fftsa.sg_ev = 0
   return true
 end
@@ -567,64 +563,112 @@ function fftsa.sg_moved(got, want, span)
       or (want - got) > scale * fftsa.sg_tol
 end
 
--- Put back whichever axis a gesture moved, and only that one: each write repaints the
--- widget. Only limits are compared, not the scale method the pins also re-assert -- an
--- axis switched to auto-ranging moves its own limits, so the next tick catches it and the
--- pin restores XSCALE_OFF along with them.
-function fftsa.sg_restore()
+-- The dB axis, put back whenever a gesture moved it, lock or no lock. Nothing stands behind
+-- this axis for a gesture to be asking for -- its limits are constants and Options does not
+-- offer them -- so a dragged dB scale is only a worse view of the same data.
+function fftsa.sg_restore_y(g)
+  if g == nil then g = fftsa.sg_graph end
+  if g == nil then return false end
+  local span = fftsa.sg_dbmax - fftsa.sg_dbmin
+  local y1, y2 = display.graph.scaley(g)
+  -- Either limit nil means the read-back told us nothing useful -- both returns are
+  -- documented optional -- and a gesture was reported, so the axis is presumed moved: a
+  -- pin costs a frame, a dead restore costs the feature.
+  if y1 == nil or y2 == nil
+     or fftsa.sg_moved(y1, fftsa.sg_dbmin, span)
+     or fftsa.sg_moved(y2, fftsa.sg_dbmax, span) then
+    fftsa.sg_pin_y(g)
+    return true
+  end
+  return false
+end
+
+-- Adopt the frequency axis a gesture left behind: unlocked, a drag or a pinch retunes the
+-- analyser to what it asked to see. The pin that follows puts the axis on the CLAMPED span,
+-- so a gesture reaching past the hardware's limits visibly stops at them instead of being
+-- left beyond a span it never got.
+function fftsa.sg_adopt_x(lo, hi)
+  -- Rounded, because an axis limit is a float and an Options field is not: unrounded, the
+  -- form could neither show nor re-apply the span the gesture had just set.
+  local nlo, nhi = math.floor(lo + 0.5), math.floor(hi + 0.5)
+  -- A PAN off an end stops rather than zooming: its span is held and the pair shifted back
+  -- inside the limits, which matters because the default start of 10 Hz is already on the
+  -- wall. A zoom gets no shift, its span being the thing asked for. Judged on sg_xwant()'s
+  -- span, not sg_fhi_hz minus sg_flo_hz -- the DC snap separates those, and every pan would
+  -- then read as a zoom. One hertz of slack: what the rounding costs, and no pinch is.
+  local wlo, whi = fftsa.sg_xwant()
+  if wlo ~= nil and math.abs((nhi - nlo) - (whi - wlo)) <= 1 then
+    if nlo < 0 then
+      nhi, nlo = nhi - nlo, 0
+    elseif nhi > fftsa.fhi_max then
+      nlo, nhi = nlo - (nhi - fftsa.fhi_max), fftsa.fhi_max
+    end
+  end
+  nlo, nhi = fftsa.span_clamp(nlo, nhi)
+  -- Asked before fftsa.fhi moves, since the question is whether the plan in force covers
+  -- the new stop.
+  local replan = fftsa.plan_changed(nhi)
+  fftsa.flo, fftsa.fhi = nlo, nhi
+  fftsa.sg_set_xrange(nlo, nhi)
+  -- A new plan cannot be installed from inside a frame: fftsa.apply() reconfigures the
+  -- digitizer and takes its own capture. fftsa.frame() runs it between frames.
+  if replan then fftsa.retune_pending = true end
+  return true
+end
+
+-- The frequency axis after a reported gesture, settled whichever way the lock says. Only
+-- limits are compared, not the scale method the pin also re-asserts -- an axis switched to
+-- auto-ranging moves its own limits, so the next tick catches it and the pin restores
+-- XSCALE_OFF along with them.
+function fftsa.sg_settle_x(g)
+  if g == nil then g = fftsa.sg_graph end
+  if g == nil then return false end
+  local wlo, whi = fftsa.sg_xwant()
+  if wlo == nil then return false end      -- span not plottable: nothing to compare
+  local x1, x2 = display.graph.scalex(g)
+  -- A nil read-back names no range, so there is nothing to adopt and the only coherent
+  -- move is back onto the span. Guarding the lower limit alone would leave a left-anchored
+  -- zoom -- which moves the upper one by itself -- invisible.
+  if x1 == nil or x2 == nil then
+    fftsa.sg_pin_x()
+    return true
+  end
+  if not (fftsa.sg_moved(x1, wlo, whi - wlo)
+          or fftsa.sg_moved(x2, whi, whi - wlo)) then
+    return false
+  end
+  if fftsa.sg_lock then
+    fftsa.sg_pin_x()
+    return true
+  end
+  return fftsa.sg_adopt_x(x1, x2)
+end
+
+-- Both axes, each touched only if it moved, because every write repaints the widget.
+function fftsa.sg_settle()
   local g = fftsa.sg_graph
   if g == nil then return false end
   -- Cleared before the writes, not after. A write takes 60 ms an axis and fires
   -- EVENT_SCALE itself, so clearing afterwards discards every fire from that window --
   -- including a finger still dragging through it.
   fftsa.sg_ev = 0
-  local wrote = false
-  local wlo, whi = fftsa.sg_xwant()
-  if wlo ~= nil then
-    local x1, x2 = display.graph.scalex(g)
-    -- Either limit nil means the read-back told us nothing useful -- both returns are
-    -- documented optional. A gesture was reported, so the axis is presumed moved: a pin
-    -- costs a frame, a dead lock costs the feature. Guarding only the lower limit would
-    -- leave a left-anchored zoom, which moves the upper one alone, invisible.
-    if x1 == nil or x2 == nil
-       or fftsa.sg_moved(x1, wlo, whi - wlo)
-       or fftsa.sg_moved(x2, whi, whi - wlo) then
-      fftsa.sg_pin_x()
-      wrote = true
-    end
-  end
-  local yspan = fftsa.sg_dbmax - fftsa.sg_dbmin
-  local y1, y2 = display.graph.scaley(g)
-  if y1 == nil or y2 == nil
-     or fftsa.sg_moved(y1, fftsa.sg_dbmin, yspan)
-     or fftsa.sg_moved(y2, fftsa.sg_dbmax, yspan) then
-    fftsa.sg_pin_y(g)
-    wrote = true
-  end
-  return wrote
+  -- dB first, because it is the half that cannot raise: the X half reaches into the app
+  -- module for the clamp and the plan, and a frame carries that on a pcall.
+  local wy = fftsa.sg_restore_y(g)
+  local wx = fftsa.sg_settle_x(g)
+  return wy or wx
 end
 
-function fftsa.sg_lock_check()
+function fftsa.sg_scale_check()
   if (fftsa.sg_ev or 0) == 0 then return false end
-  return fftsa.sg_restore()
+  return fftsa.sg_settle()
 end
 
--- The press path: restores at once rather than at the next tick, and writes both axes
--- without checking, so a lock press costs 121 ms and visibly flickers the trace once.
-function fftsa.sg_relock()
-  if fftsa.sg_graph == nil then return false end
-  fftsa.sg_pin_x()
-  fftsa.sg_pin_y()
-  fftsa.sg_ev = 0
-  return true
-end
-
--- Both repairs, on their own gate at the same period as the peak table -- the constant is
+-- Both jobs, on their own gate at the same period as the peak table -- the constant is
 -- shared, the clock is not, since sg_show_peaks re-stamps only when a peak moves. Each
--- undoes something a touch did, so neither needs the frame rate, and at 60 ms a write the
--- lock must not have it. A tick with nothing to do costs one os.clock() and the five
--- setstate calls the icons take. Driven from the frame, so nothing is repaired while the
--- app is halted; the press path covers the lock there.
+-- answers a touch, so neither needs the frame rate, and at 60 ms an axis write the settle
+-- must not have it. A tick with nothing to do costs one os.clock() and the icons' five
+-- setstate calls. Driven from the frame, so a halted app settles only on a Lock press.
 fftsa.sg_tick_last = nil
 
 function fftsa.sg_slow_tick()
@@ -634,7 +678,7 @@ function fftsa.sg_slow_tick()
     return false
   end
   fftsa.sg_tick_last = now
-  if fftsa.sg_lock then fftsa.sg_lock_check() end
+  fftsa.sg_scale_check()
   if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
   return true
 end

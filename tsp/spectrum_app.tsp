@@ -30,17 +30,38 @@ fftsa.fhi     = 50000       -- display stop frequency (Hz)
 -- of points.
 fftsa.fhi_max = 500000
 fftsa.fhi_min = 2000
+-- Ceiling for the start, a kilohertz under the stop's so the form cannot be set to a span
+-- of nothing. It is the Start field's own max, and span_clamp holds a gesture to the same
+-- line: without that, a pinch high up the range could hand Options a start its own field
+-- would refuse.
+fftsa.flo_max = fftsa.fhi_max - 1000
 fftsa.range   = 10          -- digitizer input range (V): 0.1 / 1 / 10
 fftsa.fs      = 100000      -- sample rate (picked from fftsa.fhi, then measured)
 fftsa.binhz   = 0           -- true bin width, from measured fs
 fftsa.busy    = false       -- reentrancy guard (never preserved across a reload)
 fftsa.stop_pending = false  -- a teardown deferred until the running frame ends
+fftsa.retune_pending = false -- a gesture's span, waiting for its re-plan between frames
 fftsa.halted  = false       -- frames suppressed after repeated failures
 fftsa.lasterr = nil         -- last frame error, nil if none
 fftsa.errcount = 0          -- count of dropped frames
 fftsa.errrun  = 0           -- consecutive dropped frames
 fftsa.errmax  = 20          -- give up (and say so) after this many in a row
 fftsa.shortreads = 0        -- captures rejected for returning fewer than n samples
+
+-- The legal span, for anything that asks for one: the Options form and an unlocked graph
+-- gesture both come through here, or the form would offer a range a gesture could not
+-- reach. Each end clamps to its own field's declared range, then the pair is ordered -- a
+-- stop at or below the start holds no bins. The stop lands wholly above flomin, so dropping
+-- the start to its floor always leaves start < stop; repairing the start first would not.
+function fftsa.span_clamp(lo, hi)
+  local nlo, nhi = lo, hi
+  if nhi > fftsa.fhi_max then nhi = fftsa.fhi_max end
+  if nhi < fftsa.fhi_min then nhi = fftsa.fhi_min end
+  if nlo < fftsa.flomin then nlo = fftsa.flomin end
+  if nlo > fftsa.flo_max then nlo = fftsa.flo_max end
+  if nlo >= nhi then nlo = fftsa.flomin end
+  return nlo, nhi
+end
 
 -- Firmware handles, initialised only on the first load: opening the App again in
 -- one power session re-runs this body, and clearing a live handle would strand the
@@ -141,6 +162,16 @@ function fftsa.pick_fs(fhi)
     if r[i] >= fftsa.fs_min and r[i] / 2 >= fhi then return r[i] end
   end
   return r[n]
+end
+
+-- Does a new stop frequency need the hardware re-planned? The digitizer runs at the lowest
+-- rate whose Nyquist covers the stop, so a stop inside the rate in force changes only which
+-- bins are plotted: one axis write, no capture. With the band-pass on ANY change re-plans,
+-- its cutoff sitting between the stop and the decimated Nyquist. Plan against plan, never
+-- against fs_acq, which holds the rate measured off the capture's own timestamps.
+function fftsa.plan_changed(fhi_new)
+  if fftsa.bp_on then return fhi_new ~= fftsa.fhi end
+  return fftsa.pick_fs(fhi_new) ~= fftsa.pick_fs(fftsa.fhi)
 end
 
 -- Boolean fields are an EDIT_OPTION of two, matching the other fields on the form rather
@@ -407,6 +438,24 @@ function fftsa.frame()
   else
     fftsa.errrun = 0
   end
+  -- An unlocked gesture's span is installed here, between frames: fftsa.apply() re-plans
+  -- the digitizer and takes its own capture, so it cannot run inside a frame that is using
+  -- the buffers. halted keeps the timer out of frame_body meanwhile, and the guard above is
+  -- still held. Skipped when a teardown waits, and when the frame above was the one that
+  -- gave up -- halted is cleared below, so retuning would restart a loop that just stopped.
+  if fftsa.retune_pending and not fftsa.stop_pending and not fftsa.halted then
+    fftsa.retune_pending = false
+    -- A re-plan rebuilds the window tables and takes a capture -- the same work an Apply
+    -- does, with the trace frozen for it. The line says why; apply() rewrites it at the end.
+    fftsa.say(string.format("retuning to %.0f - %.0f Hz", fftsa.flo, fftsa.fhi))
+    fftsa.halted = true
+    local rok, rerr = pcall(function() fftsa.apply() end)
+    fftsa.halted = false
+    if not rok then
+      fftsa.lasterr = tostring(rerr)
+      fftsa.say("RETUNE FAILED: " .. tostring(rerr))
+    end
+  end
   fftsa.busy = false
   -- A teardown that arrived mid-frame waits here, where nothing is in flight.
   if fftsa.stop_pending then
@@ -501,7 +550,7 @@ function fftsa.build_options()
   local x1, y1 = nextpos()
   fftsa.opt_flo = create(fftsa.optscr, display.OBJ_EDIT_NUMBER, x1, y1,
                        "Start Freq", "low edge",
-                       display.NFORMAT_PREFIX, fftsa.flo, fftsa.flomin, fftsa.fhi_max - 1000, "Hz")
+                       display.NFORMAT_PREFIX, fftsa.flo, fftsa.flomin, fftsa.flo_max, "Hz")
   local x2, y2 = nextpos()
   fftsa.opt_fhi = create(fftsa.optscr, display.OBJ_EDIT_NUMBER, x2, y2,
                        "Stop Freq", "display top",
@@ -856,22 +905,17 @@ function fftsa.options()
   return true
 end
 
+-- The form's span: read the two fields, then clamp through fftsa.span_clamp, which is also
+-- where a graph gesture lands. A field the object pool refused reads as nil through
+-- getval's fallback, and a value the form cannot produce is not a span -- either keeps what
+-- is in force rather than being clamped into something.
 function fftsa.options_span()
+  local nlo, nhi = fftsa.flo, fftsa.fhi
   local lo = fftsa.getval(fftsa.opt_flo, fftsa.flo)
   local hi = fftsa.getval(fftsa.opt_fhi, fftsa.fhi)
-  -- Clamp each end to what the fixed rate can show, then order the pair: a stop at
-  -- or below the start is a window with no bins in it. One repair is enough and
-  -- provably so -- the stop lands in fhi_min..fhi_max and fhi_min is above flomin,
-  -- so dropping the start to its floor always leaves start < stop. Repairing the
-  -- start without re-testing the stop does NOT, which is why the order matters.
-  local nlo, nhi = fftsa.flo, fftsa.fhi
   if hi ~= nil and hi > 0 then nhi = hi end
   if lo ~= nil and lo >= 0 then nlo = lo end
-  if nhi > fftsa.fhi_max then nhi = fftsa.fhi_max end
-  if nhi < fftsa.fhi_min then nhi = fftsa.fhi_min end
-  if nlo < fftsa.flomin then nlo = fftsa.flomin end
-  if nlo >= nhi then nlo = fftsa.flomin end
-  return nlo, nhi
+  return fftsa.span_clamp(nlo, nhi)
 end
 
 function fftsa.options_apply()
@@ -918,6 +962,10 @@ function fftsa.options_apply()
     fftsa.say("APPLY FAILED: " .. tostring(err))
   else
     fftsa.halted, fftsa.errrun = false, 0
+    -- Apply supersedes a gesture waiting to be re-planned: it has just re-planned from
+    -- the same fftsa.flo/fhi, so leaving the flag set buys a second, identical apply on
+    -- the next frame.
+    fftsa.retune_pending = false
     if mkchanged then fftsa.sg_bind() end
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
@@ -975,13 +1023,14 @@ function fftsa.icons_reassert()
   return true
 end
 
--- The icon goes before the restore, so a restore that fails cannot leave the padlock
--- showing the opposite of fftsa.sg_lock for the rest of the session.
+-- The icon goes before the settle, so a settle that fails cannot leave the padlock showing
+-- the opposite of fftsa.sg_lock for the rest of the session. Locking settles at once rather
+-- than at the next tick, which is also the only settle a halted app gets; unlocking settles
+-- nothing, because a free view is exactly what the press asked for.
 function fftsa.toggle_lock()
   fftsa.sg_lock = not fftsa.sg_lock
-  fftsa.sg_lock_hook(fftsa.sg_lock)
   fftsa.lock_icon()
-  if fftsa.sg_lock then fftsa.sg_relock() end
+  if fftsa.sg_lock then fftsa.sg_settle() end
   return fftsa.sg_lock
 end
 
@@ -1032,7 +1081,6 @@ function fftsa.build()
     "if fftsa ~= nil then fftsa.guard(fftsa.toggle_lock) end",
     fftsa.lock_img_w, fftsa.lock_img_h, fftsa.img_lock_c, fftsa.img_lock_o)
   fftsa.lock_icon()
-  fftsa.sg_lock_hook(fftsa.sg_lock)
   fftsa.optbtn, fftsa.optimg = fftsa.icon_button(
     fftsa.btn_opt_x, fftsa.btn_opt_w,
     "if fftsa ~= nil then fftsa.guard(fftsa.options) end",
@@ -1115,6 +1163,8 @@ end
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
+  -- A gesture from the previous launch must not re-plan this one's first frame.
+  fftsa.retune_pending = false
 
   -- The display object pool running out is a RETURN, not a raise: display.create answers
   -- nil and posts one event, and build() passes that up as false and a reason. Handled
