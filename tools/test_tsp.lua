@@ -2192,16 +2192,25 @@ end)())
 check('every clamped span is a pair the two fields would accept', (function()
   local lof, hif = OBJ[fftsa.opt_flo], OBJ[fftsa.opt_fhi]
   if lof.vmin == nil or hif.vmax == nil then return false, 'the fields declared no range' end
-  local vals = {-1e9, -1000, -1, 0, 1, 9, 10, 11, 1999, 2000, 2001, 49999, 50000,
-                498999, 499000, 499001, 499999, 500000, 500001, 1e9}
+  -- NaN and both infinities are in the list on purpose: the postcondition is meant to hold
+  -- for any two numbers, and NaN is the one input that defeats a clamp written as
+  -- comparisons -- it would come out neither in range nor ordered.
+  local nan = 0 / 0
+  if nan == nan then return false, 'this host does not produce a NaN from 0/0' end
+  local vals = {nan, -1 / 0, 1 / 0, -1e9, -1000, -1, 0, 1, 9, 10, 11, 1999, 2000, 2001,
+                49999, 50000, 498999, 499000, 499001, 499999, 500000, 500001, 1e9}
   local n, bad, i, j = table.getn(vals), nil, nil, nil
   for i = 1, n do
     for j = 1, n do
       local lo, hi = fftsa.span_clamp(vals[i], vals[j])
-      if (lo < lof.vmin or lo > lof.vmax or hi < hif.vmin or hi > hif.vmax
-          or lo >= hi) and bad == nil then
-        bad = string.format('%g..%g clamped to %g..%g; fields take %g..%g and %g..%g',
-                            vals[i], vals[j], lo, hi,
+      -- Asserted as POSITIVES. Written the other way round -- "fails if lo < vmin or ..." --
+      -- a NaN result makes every one of those comparisons false and the test agrees with
+      -- the defect it exists to catch. fftsa.sg_update has the same note for the same reason.
+      local ok = lo >= lof.vmin and lo <= lof.vmax
+                 and hi >= hif.vmin and hi <= hif.vmax and lo < hi
+      if not ok and bad == nil then
+        bad = string.format('%s..%s clamped to %s..%s; fields take %g..%g and %g..%g',
+                            tostring(vals[i]), tostring(vals[j]), tostring(lo), tostring(hi),
                             lof.vmin, lof.vmax, hif.vmin, hif.vmax)
       end
     end

@@ -1708,6 +1708,13 @@ fftsa.shortreads = 0        -- captures rejected for returning fewer than n samp
 -- above fhi_min by then, so dropping the start to flomin always leaves start < stop.
 function fftsa.span_clamp(lo, hi)
   local nlo, nhi = lo, hi
+  -- NaN first, or it passes through as a pair that is neither in range nor ordered: every
+  -- comparison below is false for one. Tested against itself, NaN being the only value not
+  -- equal to itself; repaired to the floors, which is the narrowest legal span. Callers
+  -- should still refuse a NaN rather than adopt this, and sg_adopt_x does -- but the
+  -- postcondition belongs here, where it holds for any two numbers whatever.
+  if nlo ~= nlo then nlo = fftsa.flomin end
+  if nhi ~= nhi then nhi = fftsa.fhi_min end
   if nhi > fftsa.fhi_max then nhi = fftsa.fhi_max end
   if nhi < fftsa.fhi_min then nhi = fftsa.fhi_min end
   if nlo < fftsa.flomin then nlo = fftsa.flomin end
