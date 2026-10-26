@@ -61,11 +61,10 @@ the harmonics are in the floor.
 | β=15 | -114.0 | -0.67 | 5-6 | 5.6 |
 | β=18 | -138.6 | -0.56 | 5-6 | 4.7 |
 
-`tools/window_check.lua` measures every figure from the window the instrument builds. **Skirt swing**
-is the one that is not a textbook number: the level at the second bin from the peak, on a bin centre
-against half a bin off. On a centre that bin sits 2.0 bins from the tone; half a bin off, the nearer
-of the two sits 1.5 bins away — so the figure is how far the window's transform rises between those
-two offsets, and it is what makes a tone at exactly 25 kHz look sharper than the same tone at
+**Skirt swing** is the one that is not a textbook number: the level at the second bin from the peak, 
+on a bin centre against half a bin off. On a centre that bin sits 2.0 bins from the tone; half a bin off, 
+the nearer of the two sits 1.5 bins away — so the figure is how far the window's transform rises between 
+those two offsets, and it is what makes a tone at exactly 25 kHz look sharper than the same tone at
 24 kHz. Hann swings 50 dB, because its transform nulls at 2 bins exactly. Kaiser at β=15 or 18 cuts
 that to 5 dB and doubles the peak width; β=6 is the other extreme at 22 dB, its main lobe ending at
 2.16 bins. `docs/MANUAL.md` explains the effect for an operator.
@@ -75,18 +74,7 @@ the window's own transform into a 61-point table, inverts the offset-to-ratio cu
 the scalloping correction from the same table, so the estimator is derived from the window in use
 rather than fitted to one and approximated for the rest. Worst case over 83 sub-bin offsets and all
 nine settings: **4.0e-6 bins of frequency error and 0.0035 dB of amplitude error**, both at Kaiser
-β=4. `tools/test_tsp.lua` pins them at 1e-5 bins and 0.008 dB, and proves the sweep failable by
-feeding one window's data to another's tables.
-
-Both ends of the spectrum are four to six orders worse, and the suite now bounds them separately.
-
-| | frequency | amplitude |
-|---|---|---|
-| middle of the span | 4.0e-6 bins | 0.0035 dB |
-| three bins up from DC and above | 0.07 bins | 0.11 dB |
-| lowest bin the table reports | 0.11 bins | 0.19 dB |
-| below that bin, where it reports at all | 0.28 bins | 1.7 dB |
-| top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
+β=4. 
 
 ## Licence
 
