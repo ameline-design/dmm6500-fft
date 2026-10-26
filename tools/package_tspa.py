@@ -202,6 +202,13 @@ def script_images(body):
         with open(path, 'rb') as f:
             blob = f.read()
         w, h = png_size(blob, path)
+        # The script centres each icon on its button from constants of its own, and nothing
+        # else notices when a replaced PNG stops matching them -- the icon just sits off
+        # centre. The real dimensions are right here, so require the source to mention
+        # them: a 28x34 that becomes 32x40 fails the package instead of the eye.
+        if '%dx%d' % (w, h) not in body:
+            raise SystemExit('assets/%s.png is %dx%d and no module mentions that size; '
+                             'the centring constants in tsp/ are stale' % (n, w, h))
         print('  image: %-9s %2dx%-2d  %5d bytes' % (n, w, h, len(blob)))
         images.append((n, blob))
     return images

@@ -1943,6 +1943,53 @@ check('and a nil read-back is treated as moved, so the lock is never silently de
         return wrote == true and (OBJ[g].pins or 0) == p + 1
       end)())
 
+-- Both of scalex's returns are documented optional. A firmware that answered the lower
+-- limit alone would leave a left-anchored zoom -- which moves only the upper one --
+-- entirely invisible to the lock, so a nil in either position has to count as moved.
+check('a read-back that answers one limit is treated as moved, not as unmoved', (function()
+  local real = display.graph.scalex
+  local p0 = (OBJ[gh].pins or 0)
+  display.graph.scalex = function(g, ...)
+    if arg[3] == nil then return OBJ[g].xmin end       -- min only, max absent
+    return real(g, unpack(arg))
+  end
+  OBJ[gh].xmax = wx0 + (wx1 - wx0) * 0.75              -- a zoom anchored at the left
+  fftsa.sg_ev = 1
+  local ok, wrote = pcall(fftsa.sg_restore)
+  display.graph.scalex = real
+  if not ok then return false, 'raised: ' .. tostring(wrote) end
+  return wrote == true and (OBJ[gh].pins or 0) == p0 + 1 and OBJ[gh].xmax == wx1,
+         string.format('wrote=%s pins %d/%d xmax=%s', tostring(wrote),
+                       (OBJ[gh].pins or 0), p0, tostring(OBJ[gh].xmax))
+end)())
+-- An axis of no height has nothing to measure a move against, and a zero scale makes
+-- every difference exceed the tolerance -- a 60 ms write on every gesture for ever.
+check('a zero-height axis is not a permanent write', (function()
+  return fftsa.sg_moved(1e-9, 0, 0) == false and fftsa.sg_moved(5, 0, 0) == false
+end)())
+-- sg_bind re-asserts the pins because removeall and add may reset what the object
+-- carries. The report registration sits in the same position, and sg_rebind() reaches
+-- sg_bind from the failed-frame path -- so one raised frame must not cost the lock.
+check('sg_bind re-asserts the pan report, so a rebind cannot kill the lock', (function()
+  local was = fftsa.sg_lock
+  fftsa.sg_lock = true
+  display.events[gh] = nil                             -- as a reset object would look
+  fftsa.sg_bind()
+  local back = display.events[gh] ~= nil
+                and display.events[gh][display.EVENT_SCALE] ~= nil
+  -- and an unlocked rebind must NOT register one
+  fftsa.sg_lock = false
+  display.events[gh] = nil
+  fftsa.sg_bind()
+  local still_off = display.events[gh] == nil
+                    or display.events[gh][display.EVENT_SCALE] == nil
+  fftsa.sg_lock = was
+  fftsa.sg_lock_hook(was)
+  return back and still_off,
+         'locked rebind registered=' .. tostring(back)
+         .. ' unlocked rebind clean=' .. tostring(still_off)
+end)())
+
 check('a press unlocks it', fftsa.toggle_lock() == false and fftsa.sg_lock == false)
 check('and shows the open padlock again',
       OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true)
