@@ -284,10 +284,10 @@ function fftsa.win_offset(r)
 end
 
 -- Everything built here is a function of N and the window alone -- no rate, no span -- so a
--- call changing neither has nothing to do. fftsa.apply() calls it on every press and every
--- adopted gesture, and a gesture only changes the span; a Kaiser rebuild is about 0.3 s,
--- which would be the whole pause after a drag. Keyed on the window INDICES, all win_build()
--- reads; cleared on the way in, so a raise part way leaves half-built tables unremembered.
+-- call changing neither has nothing to do, and a Kaiser rebuild at 0.3 s would be the whole
+-- pause after an adopted gesture. Keyed on the window INDICES, all win_build() reads;
+-- win_tables()'s gtab constants are not in the key, nothing assigning them and a short grid
+-- raising. Cleared on the way in, so a raise part way is not remembered as a finished build.
 fftsa.fft_built_n = nil
 
 function fftsa.fft_init(N)
