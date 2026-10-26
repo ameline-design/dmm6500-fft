@@ -4,8 +4,8 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen at 16,384 samples: a 12.5 kHz 1.0013 V tone reading 0.0 dBV as a narrow spike, its 
-second and third harmonics resolved as separate lines at 25.000 and 37.500 kHz, 83 dB down, over a 10 Hz 
+![The spectrum screen at 16,384 samples: a 12.5 kHz 1.0014 V tone reading 0.0 dBV as a narrow spike, its 
+second and third harmonics resolved as separate lines at 25.000 and 37.500 kHz, 81 and 83 dB down, over a 10 Hz 
 to 50 kHz span with 6.1 Hz bins. The firmware labels the axes itself, +020.0dB down to -120.0dB and 
 +00.00kHz across to +40.00kHz](docs/manual-spectrum-16384.png)
 

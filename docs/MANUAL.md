@@ -8,7 +8,7 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 1.0012 V tone reading 0.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 1.0014 V tone reading 0.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB. A padlock button, open, and a cog button sit to the right of the peak table](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
@@ -33,8 +33,10 @@ Six peaks, strongest first, in two columns:
 1  21.100 kHz   4.5122 V   13.1 dBV
 ```
 
-In the capture, peak 2 falls at exactly twice peak 1 and 1.0 dB below it. Peaks 3 to 6 are noise,
-74 dB down.
+In the capture, peaks 2 and 3 are the tone's second and third harmonics, 81 and 82 dB down; peaks 4
+to 6 are noise, 84 dB down. At 195 Hz bins the harmonics sit close enough to the floor that their
+frequencies read tens of hertz out — 24.927 kHz for one that is really 25.000. The 16,384-sample
+capture further down resolves them exactly.
 
 Two buttons sit to the right of the peak table: a **padlock**, which locks the view, and a **cog**,
 which opens Options.
@@ -58,7 +60,7 @@ that moved.
 
 ## Options
 
-![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom](manual-options.png)
+![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom. Start Freq reads 10.0000 Hz, Stop Freq 50.0000 kHz, Input Range 10 V, Window Hann, Kaiser Beta 12 -90dB and FFT Samples 512](manual-options.png)
 
 | Field | |
 |---|---|
@@ -266,11 +268,12 @@ Three consequences, and the first is the point of it:
 
 ![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
 and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
-as a single line near -100 dB. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
+as a single line near -100 dB, with the padlock and cog buttons right of the peak table. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
 +40.00kHz](manual-spectrum-16384.png)
 
 Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
-lump and the harmonics are lost in the floor.
+lump and the harmonics are down in the noise of the trace — the table still finds them, a few tens
+of hertz out.
 
 Because each column reports its maximum, the noise floor reads about 6 dB high and as an upper
 envelope rather than a band. Writing the minimum as well was tried and withdrawn: it doubled the
