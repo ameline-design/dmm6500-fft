@@ -58,12 +58,19 @@ whole graph, which at 512 samples is most of an 81 ms frame — doing it every f
 update rate and visibly flickers the trace, which is what it did. So the lock is told when to look:
 the graph reports its own pan and zoom, and a check that has had no report does nothing. One that has
 reads the limits back at 0.0094 ms each, and writes only a limit that has really moved. Nothing moved means nothing written, and the axis that
-did not move is left alone. Expect a second or so of reduced update rate after a restore, while the
-write's own repaint and the reports it generates settle.
+did not move is left alone.
+
+**A restore costs a visible pause.** The write lands inside a frame, so that frame takes 202 ms
+instead of 81 and the app re-arms its timer from the slowest frame it has seen — 3.3 frames a second,
+held for about two and a half seconds while that peak decays. Restoring one axis rather than two is
+5 fps for about a second and a half. So a drag costs a brief stutter and then recovers; holding a
+finger down and dragging continuously keeps paying it.
 
 Both buttons lose their icon for a moment when they take the yellow focus highlight, because the
 firmware paints the highlight over everything inside the button. The app redraws the icons once a
-second, so a blank button fills itself back in; the button works either way.
+second, so a blank button fills itself back in — while frames are running, since the repair rides on
+the same tick as the peak table. A halted app keeps whatever the last touch left, and the button
+works either way.
 
 ## Options
 

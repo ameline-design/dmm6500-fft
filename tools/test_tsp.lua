@@ -1985,7 +1985,28 @@ check('and the hidden padlock stays hidden through that redraw',
       OBJ[fftsa.lockimg_o].hidden == true and OBJ[fftsa.lockimg_c].hidden == false,
       'open hidden=' .. tostring(OBJ[fftsa.lockimg_o].hidden)
       .. ' closed hidden=' .. tostring(OBJ[fftsa.lockimg_c].hidden))
--- Gated, or it is three setstate pairs every frame instead of one a second.
+-- The period itself, which nothing else pins: with the gate alone asserted, setting it to
+-- a minute would leave the suite green while the manual still promised a second.
+check('the slow tick runs at the cadence the manual quotes', (function()
+  local im = img_children(fftsa.sg_scr)
+  local cog = im[fftsa.img_cog]
+  local period = fftsa.sg_pk_period
+  if period == nil or period <= 0 or period > 2 then
+    return false, 'period=' .. tostring(period)
+  end
+  -- Just inside the period: no repair. Just outside: one.
+  local c0 = (cog.hides or 0)
+  fftsa.sg_tick_last = os.clock() - period * 0.5
+  fftsa.frame_body()
+  local held = (cog.hides or 0) == c0
+  fftsa.sg_tick_last = os.clock() - period * 1.5
+  fftsa.frame_body()
+  local fired = (cog.hides or 0) > c0
+  return held and fired,
+         string.format('period=%s held=%s fired=%s', tostring(period),
+                       tostring(held), tostring(fired))
+end)())
+-- Gated, or it is the icons' five setstate calls every frame instead of one a second.
 check('but not on every frame', (function()
   local im = img_children(fftsa.sg_scr)
   local cog = im[fftsa.img_cog]
@@ -2007,7 +2028,16 @@ check('toggling with nothing built neither raises nor touches the firmware', (fu
   fftsa.lock_icon()
   return ok, tostring(err)
 end)())
-check('and the lock is back off for the frames below', fftsa.sg_lock == false)
+-- Left as the app would leave it: lock off AND the report unregistered. The two are
+-- driven together by toggle_lock, so a suite that unregisters only one of them hands
+-- every later check a graph state the app cannot produce.
+fftsa.sg_lock_hook(false)
+check('and the lock is back off for the frames below, report included',
+      fftsa.sg_lock == false
+      and (display.events[gh] == nil
+           or display.events[gh][display.EVENT_SCALE] == nil),
+      'lock=' .. tostring(fftsa.sg_lock) .. ' ev='
+      .. tostring(display.events[gh] and display.events[gh][display.EVENT_SCALE]))
 
 -- A frame that raises part way through must still leave a usable graph.
 local realupd = fftsa.sg_update
@@ -2172,15 +2202,20 @@ end)())
 -- suite could not see it, because this mock used to answer unconditionally.
 check('a scale read-back answers only while event generation is on', (function()
   local g = fftsa.sg_graph
-  local x1 = display.graph.scalex(g)
   local saved = display.events[g]
+  -- Registered here rather than relying on whatever the app left behind: the point is
+  -- the precondition, so the test has to set both sides of it itself.
   display.events[g] = nil
-  local x2, y2 = display.graph.scalex(g), display.graph.scaley(g)
+  local off_x, off_y = display.graph.scalex(g), display.graph.scaley(g)
+  fftsa.sg_lock_hook(true)
+  local on_x, on_y = display.graph.scalex(g), display.graph.scaley(g)
+  fftsa.sg_lock_hook(false)
+  local back_x = display.graph.scalex(g)
   display.events[g] = saved
-  local x3 = display.graph.scalex(g)
-  return x1 ~= nil and x2 == nil and y2 == nil and x3 ~= nil,
-         string.format('with events %s, without %s, restored %s',
-                       tostring(x1), tostring(x2), tostring(x3))
+  return off_x == nil and off_y == nil and on_x ~= nil and on_y ~= nil
+         and back_x == nil,
+         string.format('off %s, on %s, off again %s', tostring(off_x),
+                       tostring(on_x), tostring(back_x))
 end)())
 -- Re-pinning makes the firmware redraw its own axis labels, which shows as flicker on
 -- hardware. The pin survives a re-add, which is what lets a rebind skip it; sg_bind_min()

@@ -831,8 +831,8 @@ end
 
 -- Touch pans and zooms the graph, and the widget cannot be told not to: display.setstate
 -- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a locked view is
--- restored after the fact, by fftsa.sg_lock_check(). On by default; fftsa.sg_restore is
--- what that costs. Not a handle, so a relaunch resets it on purpose.
+-- restored after the fact, by fftsa.sg_lock_check(), which does nothing until the graph
+-- reports a gesture. Not a handle, so a relaunch resets it on purpose.
 fftsa.sg_lock = true
 
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
@@ -1283,24 +1283,42 @@ end
 -- too, which lets a tick that saw no fire skip even the reads.
 --
 -- Our own write also fires EVENT_SCALE, asynchronously, and needs no special case: the
--- echo reads back as the limits just written. EVENT_CURSOR never fires. The %xmin family
--- belongs to display.waitevent() -- in a command string it is not valid Lua, so the
--- handler fails to compile silently and takes any counter in the same string with it.
+-- echo reads back as the limits just written. EVENT_CURSOR never fires.
+--
+-- A handler containing %xmin does not run -- measured, and it takes a counter in the same
+-- string down with it, so the failure looks like the event never firing. Substitution is
+-- documented for command strings and icon_button relies on none of it, so why this one
+-- fails is unestablished; do not re-reach for it without checking that first.
 fftsa.sg_ev = 0        -- EVENT_SCALE fires since the tick last looked
 
--- A limit is "moved" past this fraction of the span. Below it lies rounding in the round
--- trip, not a finger: one pixel of pan is a 680th of the span. The floor is relative to
--- the limits as well as to the span, because a narrow window a long way from DC -- Start
--- 498999.9, Stop 499010 is reachable from the form -- has a span far smaller than the
--- rounding on its own endpoints, and a span-only tolerance would then write every tick.
+-- A limit counts as moved past this fraction of sg_moved's scale, which is the larger of
+-- the span and the endpoint. Taking the endpoint is what keeps a narrow window far from
+-- DC from writing on every tick: at Start 499000, Stop 499010 -- reachable from the form
+-- -- the span is smaller than the rounding on its own endpoints.
+--
+-- The price is a dead zone in exactly that window. Scaled to the endpoint, the tolerance
+-- there is 0.499 Hz against a pixel of pan at 0.0147, so about thirty pixels of drag go
+-- unrestored while the padlock still reads closed. Accepted because the alternative is a
+-- 60 ms write every tick for ever, and because a 10 Hz span at 499 kHz holds no bins at
+-- all -- the trace is empty before the lock is the problem. What would settle it is the
+-- read-back's actual precision, which is unmeasured: if it round-trips a fractional limit
+-- exactly, the scale can be the span alone and the dead zone goes.
 fftsa.sg_tol = 1e-6
 
--- Turn the graph's pan-and-zoom reporting on and off with the lock. An unlocked app then
--- makes exactly the calls it made before the lock existed. Measured at 512 samples, the
--- registration costs nothing per frame: frame work was 74.7 ms minimum either way.
+-- Turn the graph's pan-and-zoom reporting on and off with the lock. Measured at 512
+-- samples, the registration costs nothing per frame: frame work was 74.7 ms minimum
+-- either way.
+--
+-- Without the report there is no lock at all, and the symptom is a closed padlock over a
+-- view that still pans -- which is invisible unless it says so, hence the message.
 function fftsa.sg_lock_hook(on)
   local g = fftsa.sg_graph
-  if g == nil or display.EVENT_SCALE == nil then return false end
+  if g == nil then return false end
+  if display.EVENT_SCALE == nil then
+    fftsa.lasterr = "no EVENT_SCALE on this firmware: the view lock cannot work"
+    fftsa.say(fftsa.lasterr)
+    return false
+  end
   if on then
     display.setevent(g, display.EVENT_SCALE,
                      "if fftsa ~= nil then fftsa.sg_ev = (fftsa.sg_ev or 0) + 1 end")
@@ -1330,6 +1348,10 @@ end
 function fftsa.sg_restore()
   local g = fftsa.sg_graph
   if g == nil then return false end
+  -- Cleared before the writes, not after. A write takes 60 ms an axis and fires
+  -- EVENT_SCALE itself, so clearing afterwards discards every fire from that window --
+  -- including a finger still dragging through it.
+  fftsa.sg_ev = 0
   local wrote = false
   local wlo, whi = fftsa.sg_xwant()
   if wlo ~= nil then
@@ -1350,7 +1372,6 @@ function fftsa.sg_restore()
     fftsa.sg_pin_y(g)
     wrote = true
   end
-  fftsa.sg_ev = 0
   return wrote
 end
 
@@ -1372,7 +1393,7 @@ end
 -- Both repairs, on the peak table's cadence. Each undoes something a touch did -- a pan
 -- moved the axes, a focus highlight covered a button icon -- so neither needs the frame
 -- rate, and at 60 ms a write the lock must not have it. A tick with nothing to do costs
--- one os.clock() and three setstate pairs.
+-- one os.clock() and the five setstate calls the icons take.
 fftsa.sg_tick_last = nil
 
 function fftsa.sg_slow_tick()
