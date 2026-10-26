@@ -1,4 +1,4 @@
-# A spectrum analyser that runs on the DMM6500
+# A spectrum analyser that runs on the Keithley DMM6500, DMM7510, and DAQ6510
 
 A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510, running **entirely
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
