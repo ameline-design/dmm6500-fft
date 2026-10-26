@@ -273,7 +273,19 @@ function fftsa.win_offset(r)
   return d
 end
 
+-- Everything built here is a function of N and the window alone -- no rate, no span -- so a
+-- call changing neither has nothing to do. fftsa.apply() calls it on every press and every
+-- adopted gesture, and a gesture only changes the span; a Kaiser rebuild is about 0.3 s,
+-- which would be the whole pause after a drag. Keyed on the window INDICES, all win_build()
+-- reads; cleared on the way in, so a raise part way leaves half-built tables unremembered.
+fftsa.fft_built_n = nil
+
 function fftsa.fft_init(N)
+  if fftsa.fft_built_n == N and fftsa.fft_built_win == fftsa.win_i
+     and fftsa.fft_built_beta == fftsa.kbeta_i then
+    return
+  end
+  fftsa.fft_built_n = nil
   local floor, sin, cos, pi = math.floor, math.sin, math.cos, math.pi
   local M = floor(N / 2)
   fftsa.fft_n   = N
@@ -327,6 +339,9 @@ function fftsa.fft_init(N)
     fftsa.fft_utr[jj] = cos(ang*(jj-1))
     fftsa.fft_uti[jj] = sin(ang*(jj-1))
   end
+  -- Last, so that only a complete build is remembered.
+  fftsa.fft_built_n = N
+  fftsa.fft_built_win, fftsa.fft_built_beta = fftsa.win_i, fftsa.kbeta_i
 end
 
 -- Load N samples from a reading buffer, remove DC, window, and pack sample pairs into

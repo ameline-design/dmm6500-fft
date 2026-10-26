@@ -849,6 +849,11 @@ check('and the sweep has teeth -- a wrong window in the tables is caught', (func
   fftsa.fft_init(WN)
   fftsa.fft_win = hann                        -- ...then feed them Hann data
   local wf, wa = win_sweep(128)
+  -- Declared, not left to wash out. This swapped fft_win under tables fft_init() had
+  -- already built, and fft_init() remembers what it built -- so without clearing the key
+  -- the next call for this window would skip and keep the corruption.
+  fftsa.fft_built_n = nil
+  fftsa.fft_init(WN)
   return wf > WIN_DF and wa > WIN_DA, string.format('%.2e bins, %.2f dB', wf, wa)
 end)())
 
@@ -948,7 +953,48 @@ check('win_label names beta only where beta applies', (function()
   local b = fftsa.win_label()
   return string.find(a, 'b=') == nil and string.find(b, 'b=') ~= nil, a .. ' / ' .. b
 end)())
+-- fft_init() is memoised on (N, window index, beta index), which is everything it reads --
+-- the sample rate and the displayed span appear nowhere in it. Counted through win_build,
+-- the expensive half at about 0.3 s for Kaiser, because the saving IS the pause after an
+-- unlocked drag: fftsa.apply() calls fft_init on every press and every adopted gesture, and
+-- a gesture only ever changes the span.
+check('fft_init rebuilds only when the transform itself changes', (function()
+  local real = fftsa.win_build
+  local builds = 0
+  fftsa.win_build = function(n) builds = builds + 1 return real(n) end
+  local n0, w0, b0 = fftsa.fft_n, fftsa.win_i, fftsa.kbeta_i
+  local log = {}
+  local function step(name, f)
+    local before = builds
+    f()
+    log[name] = builds - before
+  end
+  step('first',  function() fftsa.fft_built_n = nil fftsa.fft_init(512) end)
+  step('again',  function() fftsa.fft_init(512) end)
+  step('window', function() fftsa.win_i = 2 fftsa.fft_init(512) end)
+  step('beta',   function() fftsa.kbeta_i = 2 fftsa.fft_init(512) end)
+  step('size',   function() fftsa.fft_init(1024) end)
+  step('back',   function() fftsa.fft_init(1024) end)
+  -- A build that raises must not be remembered: the key is cleared on the way in and set
+  -- only at the very end, so half-built tables are never taken for finished ones.
+  local keep = fftsa.fft_gn
+  fftsa.fft_gn = keep - 1                    -- makes win_tables() raise, as its own test does
+  pcall(function() fftsa.fft_init(2048) end)
+  fftsa.fft_gn = keep
+  step('after a raise', function() fftsa.fft_init(2048) end)
+  fftsa.win_build = real
+  fftsa.win_i, fftsa.kbeta_i = w0, b0
+  fftsa.fft_built_n = nil
+  fftsa.fft_init(n0)
+  return log.first == 1 and log.again == 0 and log.window == 1 and log.beta == 1
+         and log.size == 1 and log.back == 0 and log['after a raise'] == 1,
+         string.format('first %d again %d window %d beta %d size %d back %d raise %d',
+                       log.first, log.again, log.window, log.beta, log.size, log.back,
+                       log['after a raise'])
+end)())
+
 fftsa.win_i, fftsa.kbeta_i = 1, 4
+fftsa.fft_built_n = nil
 fftsa.fft_init(512)
 dmm.digitize.count = 512
 SIG.f, SIG.amp = 12500, 1.0
@@ -2131,22 +2177,21 @@ end)())
 -- than a bin. What it gets comes from fftsa.span_clamp, the function the Options form goes
 -- through too, so a gesture cannot reach a range the form could not.
 --
--- A pan off an end stops rather than narrowing: the span is held and the pair shifted back
--- inside the limits. It matters because the default start is 10 Hz, already on the wall --
--- without the shift, panning left there would zoom in a little on every drag.
-check('a pan into DC stops the window rather than narrowing it', (function()
+-- A pan is NOT told from a pinch: both are two limits to be snapped into range. So a drag
+-- that runs off an end NARROWS the span rather than carrying it along -- that edge sticks
+-- and the other keeps coming in. Carrying the span would mean answering a pinch with a span
+-- nobody asked for, since the two gestures are indistinguishable from the limits alone.
+check('a drag below DC snaps the start up and keeps the stop it dragged to', (function()
   local span = fftsa.fhi - fftsa.flo
   OBJ[gh].xmin, OBJ[gh].xmax = -9000, span - 9000
   fftsa.sg_ev = 1
   tick_due()
   fftsa.frame_body()
-  return fftsa.flo == fftsa.flomin and (fftsa.fhi - fftsa.flo) >= span - fftsa.flomin,
-         string.format('%g..%g: span %g, was %g', fftsa.flo, fftsa.fhi,
-                       fftsa.fhi - fftsa.flo, span)
+  return fftsa.flo == fftsa.flomin and fftsa.fhi == span - 9000,
+         string.format('%g..%g, wanted %g..%g', fftsa.flo, fftsa.fhi,
+                       fftsa.flomin, span - 9000)
 end)())
--- A ZOOM is not shifted: its span is the request, so an edge it cannot reach clamps and
--- the other end stays where the gesture put it. Shifting one would answer a pinch with a
--- span nobody asked for.
+-- The same rule at the other end: the stop clamps and the start stays where it was dragged.
 check('a zoom past the top clamps the stop and keeps the start', (function()
   OBJ[gh].xmin, OBJ[gh].xmax = 300000, 900000
   fftsa.sg_ev = 1
@@ -2192,6 +2237,28 @@ check('an Apply consumes a gesture still waiting to be re-planned', (function()
          and fftsa.flo == SPAN_LO and fftsa.fhi == SPAN_HI,
          string.format('ok=%s pending=%s span %g..%g', tostring(ok),
                        tostring(fftsa.retune_pending), fftsa.flo, fftsa.fhi)
+end)())
+-- apply() pins the axis BEFORE its capture, so the labels are right while it runs. It used
+-- to pin again afterwards with the identical pair -- a second 60 ms write whose only purpose
+-- was refreshing a text line, now 60 ms off every Apply and every retune.
+--
+-- The legend write that replaced it has to survive, and asserting "the text changed" would
+-- not show that: the pin BEFORE the capture writes the legend too. What only the second
+-- write can do is quote the MEASURED rate, so the measurement is forced somewhere the
+-- nominal rate cannot reach. In the suite the mock's timestamps give exactly the nominal
+-- rate, which is why an unforced test here proves nothing.
+check('an Apply writes the frequency axis once and quotes the measured rate', (function()
+  local realm = fftsa.measure_fs
+  local p = (OBJ[gh].pins or 0)
+  fftsa.measure_fs = function() return 80000 end         -- 156.25 Hz bins, not 195.31
+  local ok, err = pcall(fftsa.apply)
+  -- Both readings taken before the restoring apply below, which writes an axis of its own.
+  local pins, t = (OBJ[gh].pins or 0), tostring(OBJ[fftsa.sg_xunit].text)
+  fftsa.measure_fs = realm
+  fftsa.apply()                                          -- back to the real rate
+  if not ok then return false, 'raised: ' .. tostring(err) end
+  return pins == p + 1 and string.find(t, '156.25', 1, true) ~= nil,
+         string.format('pins %d/%d after the forced apply, legend [%s]', pins, p, t)
 end)())
 -- A frame that gave up has to stay given up. halted is cleared after a re-plan, so a
 -- gesture waiting in the flag would restart the loop that had just stopped itself and
@@ -2243,13 +2310,12 @@ check('and a press with nothing moved writes no axis at all', (function()
                        (OBJ[gh].ypins or 0), yp)
 end)())
 
--- The gesture arithmetic is a feedback loop: the axis is pinned from the span and the span
--- is then taken back off the axis. So it has to be a fixed point at each wall and free of
--- hysteresis in between. Thirty gestures deep, driven straight into sg_adopt_x, because a
--- drift of ten hertz a drag is invisible in a single-step check -- and ten hertz a drag is
--- exactly what measuring the DC wall from flomin instead of zero would cost.
-check('panning into a wall is a fixed point, and panning back and forth does not drift',
-      (function()
+-- The gesture path is a feedback loop: the axis is pinned from the span and the span is then
+-- read back off the axis. Since a drag off an end narrows rather than carrying its span,
+-- repeated dragging into a wall has to CONVERGE rather than run away, and every pair it
+-- passes through has to be legal -- an unordered or out-of-range one reaches the Options
+-- fields. Neither property shows in a single-step check.
+check('dragging into a wall converges, and never leaves the legal range', (function()
   local lo0, hi0 = fftsa.flo, fftsa.fhi
   local function settle(lo, hi)
     fftsa.flo, fftsa.fhi = lo, hi
@@ -2257,33 +2323,31 @@ check('panning into a wall is a fixed point, and panning back and forth does not
   end
   -- One gesture, expressed as a nudge to the limits the pin last wrote -- which is what the
   -- read-back answers with, so this is the loop the instrument closes.
-  local function gesture(dlo, dhi)
+  local function gesture(d)
     local wlo, whi = fftsa.sg_xwant()
-    fftsa.sg_adopt_x(wlo + dlo, whi + dhi)
+    fftsa.sg_adopt_x(wlo + d, whi + d)
     return fftsa.flo, fftsa.fhi
   end
   local bad, i = nil, nil
-  local function wall(lo, hi, dlo, dhi, name)
+  local function wall(lo, hi, d, name)
     settle(lo, hi)
-    local a, b = gesture(dlo, dhi)
-    for i = 1, 30 do
-      local c, d = gesture(dlo, dhi)
-      if (c ~= a or d ~= b) and bad == nil then
-        bad = string.format('%s moved at step %d: %g..%g became %g..%g',
-                            name, i, a, b, c, d)
+    local plo, phi = nil, nil
+    for i = 1, 40 do
+      plo, phi = gesture(d)
+      if (plo < fftsa.flomin or plo > fftsa.flo_max or phi < fftsa.fhi_min
+          or phi > fftsa.fhi_max or plo >= phi) and bad == nil then
+        bad = string.format('%s left the range at step %d: %g..%g', name, i, plo, phi)
       end
     end
+    -- Converged, not merely slow: one more gesture has to change nothing at all.
+    local a, b = gesture(d)
+    if (a ~= plo or b ~= phi) and bad == nil then
+      bad = string.format('%s still moving after 40: %g..%g then %g..%g',
+                          name, plo, phi, a, b)
+    end
   end
-  wall(10, 50000, -1000, -1000, 'the DC wall')        -- default span, start on the wall
-  wall(470000, 500000, 1000, 1000, 'the top limit')
-  settle(100000, 150000)
-  for i = 1, 30 do
-    gesture(1000, 1000)
-    gesture(-1000, -1000)
-  end
-  if (fftsa.flo ~= 100000 or fftsa.fhi ~= 150000) and bad == nil then
-    bad = string.format('30 pans out and back drifted to %g..%g', fftsa.flo, fftsa.fhi)
-  end
+  wall(10, 50000, -5000, 'dragging into DC')       -- default span, start on the wall
+  wall(470000, 500000, 5000, 'dragging into the top limit')
   settle(lo0, hi0)
   fftsa.retune_pending = false
   return bad == nil, bad

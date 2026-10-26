@@ -302,10 +302,23 @@ An **adopted** gesture -- padlock open, the span following the axis -- costs the
 while the stop frequency stays inside the sample rate in force. Crossing a rate step (Nyquist at
 50 k, 100 k, 250 k and 500 kHz) instead calls `fftsa.apply()` from `fftsa.frame()`, between frames
 and with `halted` set so no tick can enter a frame underneath it -- it reconfigures the digitizer and
-takes its own capture with the same buffers a frame is using. That is exactly the work an Options
-Apply does: the window and interpolation tables, which the code puts at about 0.3 s for Kaiser, plus
-one capture of `N / fs`. Not measured as a unit, and the only new cost here is that a gesture can
-trigger it.
+takes its own capture with the same buffers a frame is using.
+
+Two things hold that pause down to a capture plus one axis write, and both shorten every Options
+Apply as well:
+
+* **`fft_init()` is memoised on the sample count and the window.** Everything it builds -- the
+  window, its interpolation tables, the bit-reversal swap list, the twiddles -- is a function of
+  those two and nothing else: no rate, no span. A gesture changes only the span, so it rebuilds
+  nothing. The code puts a Kaiser rebuild at about 0.3 s, which would otherwise have been the whole
+  of the pause.
+* **`apply()` pins the frequency axis once, not twice.** It pinned before its capture, so the labels
+  are right while it runs, and then pinned again afterwards with the identical pair -- a second 60 ms
+  write whose only purpose was refreshing the settings line with the measured bin width. That is a
+  `settext` alone now.
+
+What is left is one capture (`N / fs`: 5.1 ms at 512, 164 ms at 16,384), the digitizer
+reconfiguration, and the one axis write. Not measured as a unit.
 
 A reading-buffer element costs **16x a plain Lua table element**. That is the single most important
 number in this file: it is why the load phase is what it is, and why copying a buffer into a plain

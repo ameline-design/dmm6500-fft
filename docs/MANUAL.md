@@ -70,9 +70,12 @@ lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency
   bins are captured already. Note that zooming in gives more plot columns per bin, not finer
   resolution: the bin width is the rate over the sample count, and neither has changed.
 - Taking the stop past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
-  frames. The settings line reads `retuning to ... Hz` while it does the same work an Apply does —
-  the window tables, about 0.3 s for Kaiser, plus one capture. With the **band-pass on** every change
-  re-plans, because the filter's cutoff is derived from the stop frequency.
+  frames. The settings line reads `retuning to ... Hz` while it reconfigures the digitizer and takes
+  one capture. The window and interpolation tables are **not** rebuilt: they depend only on the sample
+  count and the window, and a drag changes neither — so the pause is one capture (5 ms at 512 samples,
+  164 ms at 16,384) and one axis write, rather than that plus the 0.3 s a Kaiser window costs to
+  build. With the **band-pass on** every change re-plans, because the filter's cutoff is derived from
+  the stop frequency.
 
 Note that the **default stop of 50 kHz sits exactly on the first rate step**, so the first drag to
 the right from a fresh start re-plans: 55 kHz needs 200 kS/s, which doubles the bin width at the same
@@ -81,10 +84,10 @@ back and forth across a step re-plans each way; staying on one side of it does n
 
 **A gesture cannot leave the allowed range.** Start clamps to 10 Hz … 499 kHz and Stop to
 2 kHz … 500 kHz — the limits the Options fields themselves declare, enforced through one function so
-the form cannot be handed a value its own field would refuse. A pan that runs off either end stops
-rather than narrowing — its span is held and the window shifted back inside the limits — while a zoom
-keeps the span it asked for and clamps only the edge it cannot reach. Adopted limits are rounded to
-whole hertz, so the Options fields can show and re-apply them unchanged.
+the form cannot be handed a value its own field would refuse. A pan is not told apart from a pinch —
+both are just two limits to be snapped into range — so a drag that runs off an end *narrows* the span:
+that edge sticks at the limit while the other keeps coming in. Adopted limits are rounded to whole
+hertz, so the Options fields can show and re-apply them unchanged.
 
 **An untouched view makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
 whole graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the
@@ -150,9 +153,11 @@ between the first and last samples (which is `(N - 1) / fs`). Processing and dis
 Windowing spreads each tone across several bins, so bin spacing is not a guarantee of tone separation.
 
 Apply rebuilds the window and its tables behind the loading screen, and resizes the acquisition
-buffer if needed. The graph buffer is one fixed size for every sample count and stays attached
-throughout, because the trace is capped at the graph's width (see **How many points the trace
-carries** below).
+buffer if needed. It rebuilds them only when they would differ: they are a function of the sample
+count and the window alone, so an Apply that changed only the span, the input range or the band-pass
+skips the rebuild — which is what keeps a Kaiser window from costing 0.3 s on a press that did not
+touch it. The graph buffer is one fixed size for every sample count and stays attached throughout,
+because the trace is capped at the graph's width (see **How many points the trace carries** below).
 
 **Apply costs roughly 0.2 ms per sample**, measured on 2026-10-24 and linear in the count:
 

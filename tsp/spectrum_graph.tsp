@@ -584,27 +584,13 @@ function fftsa.sg_restore_y(g)
 end
 
 -- Adopt the frequency axis a gesture left behind: unlocked, a drag or a pinch retunes the
--- analyser to what it asked to see. The pin that follows puts the axis on the CLAMPED span,
--- so a gesture reaching past the hardware's limits visibly stops at them instead of being
--- left beyond a span it never got.
+-- analyser to what it asked to see. A pan is not told from a pinch -- whatever the two
+-- limits read, snapped into the legal range, is the new span. The pin that follows puts the
+-- axis on the CLAMPED pair, so a drag past a limit visibly stops at it.
 function fftsa.sg_adopt_x(lo, hi)
   -- Rounded, because an axis limit is a float and an Options field is not: unrounded, the
   -- form could neither show nor re-apply the span the gesture had just set.
-  local nlo, nhi = math.floor(lo + 0.5), math.floor(hi + 0.5)
-  -- A PAN off an end stops rather than zooming: its span is held and the pair shifted back
-  -- inside the limits, which matters because the default start of 10 Hz is already on the
-  -- wall. A zoom gets no shift, its span being the thing asked for. Judged on sg_xwant()'s
-  -- span, not sg_fhi_hz minus sg_flo_hz -- the DC snap separates those, and every pan would
-  -- then read as a zoom. One hertz of slack: what the rounding costs, and no pinch is.
-  local wlo, whi = fftsa.sg_xwant()
-  if wlo ~= nil and math.abs((nhi - nlo) - (whi - wlo)) <= 1 then
-    if nlo < 0 then
-      nhi, nlo = nhi - nlo, 0
-    elseif nhi > fftsa.fhi_max then
-      nlo, nhi = nlo - (nhi - fftsa.fhi_max), fftsa.fhi_max
-    end
-  end
-  nlo, nhi = fftsa.span_clamp(nlo, nhi)
+  local nlo, nhi = fftsa.span_clamp(math.floor(lo + 0.5), math.floor(hi + 0.5))
   -- Asked before fftsa.fhi moves, since the question is whether the plan in force covers
   -- the new stop.
   local replan = fftsa.plan_changed(nhi)

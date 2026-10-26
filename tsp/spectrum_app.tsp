@@ -306,9 +306,10 @@ function fftsa.apply()
     fftsa.arm(fftsa.period)
   end
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
-  -- Again with the measured rate, which refines binhz and so the bin count the
-  -- legend reports for a narrow span.
-  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
+  -- The LEGEND again, not the axis. What the measured rate refined is binhz, and so the bin
+  -- count the legend reports for a narrow span; fftsa.flo and fftsa.fhi have not moved since
+  -- the pin above, so re-pinning would be a second 60 ms write of identical limits.
+  fftsa.settxt(fftsa.sg_xunit, fftsa.sg_xunit_text())
 end
 
 -- One frame: acquire, transform, plot. Runs under pcall from fftsa.frame().
