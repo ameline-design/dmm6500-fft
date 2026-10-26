@@ -68,14 +68,16 @@ lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency
 
 - A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
   bins are captured already. Note that zooming in gives more plot columns per bin, not finer
-  resolution: the bin width is the rate over the sample count, and neither has changed.
+  resolution: the bin width is the rate over the sample count, and neither has changed. (With the
+  **band-pass on** it can buy resolution, by decimating harder — see *Band-Pass*.)
 - Taking the stop past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
   frames. The settings line reads `retuning to ... Hz` while it reconfigures the digitizer and takes
   one capture. The window and interpolation tables are **not** rebuilt: they depend only on the sample
   count and the window, and a drag changes neither — so the pause is one capture (5 ms at 512 samples,
-  164 ms at 16,384) and one axis write, rather than that plus the 0.3 s a Kaiser window costs to
-  build. With the **band-pass on** every change re-plans, because the filter's cutoff is derived from
-  the stop frequency.
+  164 ms at 16,384) and one axis write, rather than that plus the table rebuild — 0.163 ms a sample,
+  which is 83 ms at 512 samples and 2.7 s at 16,384. With the **band-pass on** a change re-plans
+  whenever a filter is actually in the path, its cutoff being derived from the stop frequency; at a
+  span too wide to decimate there is no filter, and the rate alone decides.
 
 Note that the **default stop of 50 kHz sits exactly on the first rate step**, so the first drag to
 the right from a fresh start re-plans: 55 kHz needs 200 kS/s, which doubles the bin width at the same

@@ -274,10 +274,11 @@ function fftsa.win_offset(r)
 end
 
 -- Everything built here is a function of N and the window alone -- no rate, no span -- so a
--- call changing neither has nothing to do, and a Kaiser rebuild at 0.3 s would be the whole
--- pause after an adopted gesture. Keyed on the window INDICES, all win_build() reads;
--- win_tables()'s gtab constants are not in the key, nothing assigning them and a short grid
--- raising. Cleared on the way in, so a raise part way is not remembered as a finished build.
+-- call changing neither has nothing to do. That is the whole of the pause after an adopted
+-- gesture: 0.163 ms a sample, which is 83 ms at 512 and a measured 2.667 s at 16384.
+-- Keyed on the window INDICES, all win_build() reads; win_tables() also reads the five
+-- interpolation constants, left out because nothing in the tree assigns them and a grid too
+-- short raises. Cleared on the way in, so a raise part way is not taken for a finished build.
 fftsa.fft_built_n = nil
 
 function fftsa.fft_init(N)

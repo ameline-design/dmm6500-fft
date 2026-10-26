@@ -51,8 +51,9 @@ fftsa.shortreads = 0        -- captures rejected for returning fewer than n samp
 -- The legal span, for anything that asks for one: the Options form and an unlocked graph
 -- gesture both come through here, or the form would offer a range a gesture could not
 -- reach. Each end clamps to its own field's declared range, then the pair is ordered -- a
--- stop at or below the start holds no bins. The stop lands wholly above flomin, so dropping
--- the start to its floor always leaves start < stop; repairing the start first would not.
+-- stop at or below the start holds no bins. One repair settles the order whatever the four
+-- clamps did, and does so because fhi_min is wholly above flomin: the stop is already at or
+-- above fhi_min by then, so dropping the start to flomin always leaves start < stop.
 function fftsa.span_clamp(lo, hi)
   local nlo, nhi = lo, hi
   if nhi > fftsa.fhi_max then nhi = fftsa.fhi_max end
@@ -166,11 +167,17 @@ end
 
 -- Does a new stop frequency need the hardware re-planned? The digitizer runs at the lowest
 -- rate whose Nyquist covers the stop, so a stop inside the rate in force changes only which
--- bins are plotted: one axis write, no capture. With the band-pass on ANY change re-plans,
--- its cutoff sitting between the stop and the decimated Nyquist. Plan against plan, never
--- against fs_acq, which holds the rate measured off the capture's own timestamps.
+-- bins are plotted: one axis write, no capture. With the band-pass on the stop sets the
+-- filter's cutoff too, so a change re-plans -- but only where a filter is actually in the
+-- path: bp_plan answers d == 1 for a span too wide to decimate and bp_build then builds
+-- none, which puts that case back on the rate alone. Plan against plan, never against
+-- fs_acq, which holds the rate MEASURED off the timestamps and never equals a planned one.
 function fftsa.plan_changed(fhi_new)
-  if fftsa.bp_on then return fhi_new ~= fftsa.fhi end
+  if fftsa.bp_on then
+    local newfs, newd = fftsa.bp_plan(fhi_new, fftsa.n)
+    local oldfs, oldd = fftsa.bp_plan(fftsa.fhi, fftsa.n)
+    return newfs ~= oldfs or newd ~= oldd or newd > 1
+  end
   return fftsa.pick_fs(fhi_new) ~= fftsa.pick_fs(fftsa.fhi)
 end
 
@@ -247,7 +254,9 @@ end
 -- Apply the current settings to the hardware and the graph. Safe to repeat: the
 -- capture buffer is resized when needed; the graph keeps its original buffer.
 -- fftsa.fft_init() rebuilds the window and its interpolation tables, which
--- is the slow part of a press -- about 0.3 s for Kaiser -- hence the cover.
+-- is the slow part of a press -- 0.163 ms a sample, so 83 ms at 512 and a measured 2.667 s
+-- at 16384 -- hence the cover. It rebuilds nothing when neither the count nor the window
+-- moved, which is every adopted gesture and most presses.
 function fftsa.apply()
   -- TWO RATES from here on. fs_acq is what the digitizer runs at; fftsa.fs is what the
   -- transform sees, which is fs_acq/bp_d once the band-pass is decimating. Everything
@@ -297,11 +306,13 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
-  -- Re-armed here because the period depends on the sample count and this is where the
-  -- count changes. From the model; frame() replaces it with one measured from real frames
-  -- once it has eight, so the peak is cleared here with the count.
+  -- Re-armed only when the SAMPLE COUNT moved, which is the only thing the period is
+  -- derived from. arm() deletes the timer and creates a replacement, so re-arming restarts
+  -- the period and churns the object pool: an adopted gesture, which cannot change the
+  -- count, would pay a frame of latency for an identical timer and throw away the period
+  -- frame() had measured. From the model, which frame() replaces after eight real frames.
   fftsa.work_peak, fftsa.work_seen = nil, 0
-  if fftsa.timer ~= nil then
+  if fftsa.timer ~= nil and fftsa.armed_n ~= fftsa.n then
     fftsa.period = fftsa.frame_period(fftsa.n)
     fftsa.arm(fftsa.period)
   end
@@ -446,8 +457,9 @@ function fftsa.frame()
   -- cleared at the end of this block, so retuning through a halt would restart that loop.
   if fftsa.retune_pending and not fftsa.stop_pending and not fftsa.halted then
     fftsa.retune_pending = false
-    -- A re-plan rebuilds the window tables and takes a capture -- the same work an Apply
-    -- does, with the trace frozen for it. The line says why; apply() rewrites it at the end.
+    -- Reconfigures the digitizer and takes one capture, with the trace frozen for it. The
+    -- window tables are NOT rebuilt: fft_init() is keyed on the sample count and the window,
+    -- and a gesture changes neither. The line says why; apply() rewrites it at the end.
     fftsa.say(string.format("retuning to %.0f - %.0f Hz", fftsa.flo, fftsa.fhi))
     fftsa.halted = true
     local rok, rerr = pcall(function() fftsa.apply() end)
@@ -455,6 +467,10 @@ function fftsa.frame()
     if not rok then
       fftsa.lasterr = tostring(rerr)
       fftsa.say("RETUNE FAILED: " .. tostring(rerr))
+      -- sg_adopt_x left the pin to apply(), so a failure before apply's own pin would
+      -- strand the axis on the gesture's unclamped limits with the trace in the clamped
+      -- window. Nothing else would re-pin until the next gesture.
+      fftsa.sg_pin_x()
     end
   end
   fftsa.busy = false
@@ -1127,6 +1143,9 @@ function fftsa.arm(period_s)
     fftsa.timer = nil
   end
   if fftsa.sg_scr == nil then return nil end
+  -- The count the live timer was armed for, so fftsa.apply() can tell a press that needs a
+  -- new period from one that does not.
+  fftsa.armed_n = fftsa.n
   fftsa.timer = display.create(fftsa.sg_scr, display.OBJ_TIMER, period_s, display.TIMER_FOREVER)
   display.setevent(fftsa.timer, display.EVENT_PRESS, "if fftsa ~= nil and fftsa.frame ~= nil then fftsa.frame() end")
   return fftsa.timer
@@ -1164,8 +1183,6 @@ end
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
-  -- A gesture from the previous launch must not re-plan this one's first frame.
-  fftsa.retune_pending = false
 
   -- The display object pool running out is a RETURN, not a raise: display.create answers
   -- nil and posts one event, and build() passes that up as false and a reason. Handled
@@ -1228,7 +1245,13 @@ function fftsa.stop()
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
   end
+  -- The pending re-plan goes with the app. Two stops under one frame reach the teardown
+  -- from the second call, which clears stop_pending -- and fftsa.frame() then finds the flag
+  -- set with nothing left to retune, where apply() strands a fresh capture buffer on a
+  -- screen that is already gone. This is also what keeps a gesture from the previous launch
+  -- off the next one's first frame, fftsa.start() opening with a stop().
   fftsa.busy, fftsa.halted, fftsa.errrun = false, false, 0
+  fftsa.retune_pending, fftsa.armed_n = false, nil
   return true
 end
 

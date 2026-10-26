@@ -444,14 +444,21 @@ function fftsa.sg_update(nbins, binhz)
   delay(fftsa.sg_yield)
 end
 
--- The one place a zoom touches: it stores the window, rewrites the settings line and
--- re-pins the axis, which is what makes the firmware relabel.
-function fftsa.sg_set_xrange(flo_hz, fhi_hz)
+-- The window and the settings line, without the pin. Split out for the one caller that must
+-- not pin: an adopted gesture about to re-plan has fftsa.apply() pinning from the same pair
+-- a moment later, and an axis write is 60 ms.
+function fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
   if fftsa.sg_xunit ~= nil then
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end
+end
+
+-- The one place a zoom touches: it stores the window, rewrites the settings line and
+-- re-pins the axis, which is what makes the firmware relabel.
+function fftsa.sg_set_xrange(flo_hz, fhi_hz)
+  fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_pin_x()
 end
 
@@ -588,17 +595,30 @@ end
 -- limits read, snapped into the legal range, is the new span. The pin that follows puts the
 -- axis on the CLAMPED pair, so a drag past a limit visibly stops at it.
 function fftsa.sg_adopt_x(lo, hi)
+  -- Refused, not repaired: a NaN limit survives every comparison in span_clamp, so it would
+  -- reach the axis write, pick_fs and both Options fields. Tested against itself, NaN being
+  -- the one value that is not equal to itself. The span then stays as it is and the next
+  -- gesture settles it.
+  if lo ~= lo or hi ~= hi then return false end
   -- Rounded, because an axis limit is a float and an Options field is not: unrounded, the
-  -- form could neither show nor re-apply the span the gesture had just set.
+  -- form could neither show nor re-apply the span the gesture had just set. It is also what
+  -- makes this a one-step fixed point -- the pin writes integers, so the read-back that
+  -- follows rounds to itself.
   local nlo, nhi = fftsa.span_clamp(math.floor(lo + 0.5), math.floor(hi + 0.5))
   -- Asked before fftsa.fhi moves, since the question is whether the plan in force covers
   -- the new stop.
   local replan = fftsa.plan_changed(nhi)
   fftsa.flo, fftsa.fhi = nlo, nhi
-  fftsa.sg_set_xrange(nlo, nhi)
-  -- A new plan cannot be installed from inside a frame: fftsa.apply() reconfigures the
-  -- digitizer and takes its own capture. fftsa.frame() runs it between frames.
-  if replan then fftsa.retune_pending = true end
+  if replan then
+    -- No pin here: fftsa.apply() pins from this same pair, so one would be a second 60 ms
+    -- write of identical limits. The axis keeps the gesture's own limits until then, which
+    -- is where the finger left it. A new plan cannot be installed from inside a frame --
+    -- apply() reconfigures the digitizer and captures -- so fftsa.frame() runs it between.
+    fftsa.sg_store_xrange(nlo, nhi)
+    fftsa.retune_pending = true
+  else
+    fftsa.sg_set_xrange(nlo, nhi)
+  end
   return true
 end
 

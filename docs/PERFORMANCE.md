@@ -234,7 +234,9 @@ the only other lever.
 
 Apply is `fft_init`, and `fft_init` is linear at **0.163 ms a sample** -- 2.667 s at 16384 measured
 directly, 5.333 s at 32768. The gain table is 61 cosines per N/2 and the Kaiser window is an `I0`
-series per N/2, and both are rebuilt whenever anything on the form changes. There is no `delay()`
+series per N/2, and both are rebuilt whenever **the sample count or the window** changes --
+`fft_init` is keyed on those two and returns at once when neither moved, so an Apply that touched
+only the span, the input range or the band-pass costs nothing here at all. There is no `delay()`
 anywhere in it, so the loading screen is the only thing that keeps it from looking like a wedge.
 
 ### Heap

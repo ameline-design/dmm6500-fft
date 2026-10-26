@@ -330,6 +330,8 @@ function display.graph.scaley(g, ...)
     for i = 1, table.getn(t) do OBJ[g].ypin[t[i]] = {a[3], a[4]} end
     OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
     OBJ[g].ypins = (OBJ[g].ypins or 0) + 1  -- counted, like the x pin
+  else
+    OBJ[g].yreads = (OBJ[g].yreads or 0) + 1
   end
   -- With no limits this is a read, and it answers ONLY when the object has event
   -- generation enabled: "return values are only valid when the objects event generation
@@ -337,6 +339,11 @@ function display.graph.scaley(g, ...)
   -- have none by default. Modelled, because an unconditional read-back here let a view
   -- lock that never pinned anything pass the whole suite and then do nothing on the
   -- glass. On the instrument it answered nil with no event posted.
+  --
+  --
+  -- Reads are COUNTED, in the branch above: the fire-count gate exists to skip even the
+  -- reads on a tick nobody touched, and without a counter that gate cannot be told from
+  -- its absence.
   return readback(g, OBJ[g].ymin, OBJ[g].ymax)
 end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
@@ -358,6 +365,8 @@ function display.graph.scalex(g, ...)
     -- Where in the frame the pin landed, as the buffer-write count at that moment: a pin
     -- between the clear and the last write repaints a half-filled trace.
     OBJ[g].pin_at_writes = WRITES
+  else
+    OBJ[g].xreads = (OBJ[g].xreads or 0) + 1   -- see scaley: the gate skips the reads too
   end
   return readback(g, OBJ[g].xmin, OBJ[g].xmax)
 end
@@ -975,22 +984,32 @@ check('fft_init rebuilds only when the transform itself changes', (function()
   step('beta',   function() fftsa.kbeta_i = 2 fftsa.fft_init(512) end)
   step('size',   function() fftsa.fft_init(1024) end)
   step('back',   function() fftsa.fft_init(1024) end)
-  -- A build that raises must not be remembered: the key is cleared on the way in and set
-  -- only at the very end, so half-built tables are never taken for finished ones.
+  -- A build that raises must not be remembered. The case where that bites is NOT the
+  -- raising size itself -- the key still holds the last good build, which the raising call
+  -- mismatched, so a repeat of it rebuilds either way. It is the size that was good BEFORE:
+  -- its key still matches, fft_n and the tables now describe the size that failed part way,
+  -- and a memo hit would serve those. Hence clearing the key on the way in.
+  step('settle at 512', function() fftsa.fft_built_n = nil fftsa.fft_init(512) end)
   local keep = fftsa.fft_gn
   fftsa.fft_gn = keep - 1                    -- makes win_tables() raise, as its own test does
-  pcall(function() fftsa.fft_init(2048) end)
+  local raised = not pcall(function() fftsa.fft_init(8192) end)
   fftsa.fft_gn = keep
-  step('after a raise', function() fftsa.fft_init(2048) end)
+  local nmid = fftsa.fft_n                   -- the failed build got this far
+  step('back to 512 after a raise', function() fftsa.fft_init(512) end)
+  local nend = fftsa.fft_n
   fftsa.win_build = real
   fftsa.win_i, fftsa.kbeta_i = w0, b0
   fftsa.fft_built_n = nil
   fftsa.fft_init(n0)
   return log.first == 1 and log.again == 0 and log.window == 1 and log.beta == 1
-         and log.size == 1 and log.back == 0 and log['after a raise'] == 1,
-         string.format('first %d again %d window %d beta %d size %d back %d raise %d',
+         and log.size == 1 and log.back == 0
+         and raised and nmid == 8192 and log['back to 512 after a raise'] == 1
+         and nend == 512,
+         string.format('first %d again %d window %d beta %d size %d back %d; '
+                       .. 'raised=%s fft_n %s then %s, rebuilds %d',
                        log.first, log.again, log.window, log.beta, log.size, log.back,
-                       log['after a raise'])
+                       tostring(raised), tostring(nmid), tostring(nend),
+                       log['back to 512 after a raise'])
 end)())
 
 fftsa.win_i, fftsa.kbeta_i = 1, 4
@@ -1910,8 +1929,23 @@ check('three locked ticks on an untouched view write no limit at all',
       (OBJ[gh].pins or 0) == pinq and (OBJ[gh].ypins or 0) == ypinq,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pinq,
                     (OBJ[gh].ypins or 0), ypinq))
-check('and sg_scale_check() reports it had nothing to do',
-      fftsa.sg_scale_check() == false)
+-- And the fire count is what makes that free. Asserted through the READ counters, not just
+-- the return value: the moved-test alone would also write no axis on an untouched view, so
+-- a check that looked only at the pins would pass with the gate deleted. What only the gate
+-- does is skip the two read-backs.
+check('and an unfired tick does not even read the axes', (function()
+  local xr, yr = (OBJ[gh].xreads or 0), (OBJ[gh].yreads or 0)
+  fftsa.sg_ev = 0
+  local idle = fftsa.sg_scale_check()
+  local xr1, yr1 = (OBJ[gh].xreads or 0), (OBJ[gh].yreads or 0)
+  fftsa.sg_ev = 1                            -- and a fired one does read, or the gate is stuck
+  fftsa.sg_scale_check()
+  return idle == false and xr1 == xr and yr1 == yr
+         and (OBJ[gh].xreads or 0) > xr1 and (OBJ[gh].yreads or 0) > yr1,
+         string.format('idle=%s reads %d/%d then %d/%d, after a fire %d/%d',
+                       tostring(idle), xr1, yr1, xr, yr,
+                       (OBJ[gh].xreads or 0), (OBJ[gh].yreads or 0))
+end)())
 
 local pin2, ypin2 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
 local lockflo, lockfhi = fftsa.flo, fftsa.fhi
@@ -2093,6 +2127,28 @@ check('and asks for no re-plan, the rate in force already covering it',
       fftsa.retune_pending == false and dmm.digitize.samplerate == RATE0,
       'pending=' .. tostring(fftsa.retune_pending) .. ' rate='
       .. tostring(dmm.digitize.samplerate) .. '/' .. tostring(RATE0))
+-- With the band-pass ON the stop sets the filter's cutoff as well, so a change re-plans --
+-- but only where a filter is in the path. At a span too wide to decimate, bp_plan answers
+-- d == 1 and bp_build builds none, which puts that span back on the rate alone. Asked of
+-- plan_changed directly: it is pure, where provoking it through a frame would mean applying
+-- the band-pass and paying for a filtered capture to assert an arithmetic answer.
+check('with the band-pass on, a span too wide to decimate re-plans on the rate alone',
+      (function()
+  local was, lo0, hi0 = fftsa.bp_on, fftsa.flo, fftsa.fhi
+  fftsa.bp_on = true
+  fftsa.flo, fftsa.fhi = 10, 50000
+  local _, dwide = fftsa.bp_plan(50000, fftsa.n)
+  local samerate = fftsa.plan_changed(49000)     -- same rate, still d == 1
+  local steps = fftsa.plan_changed(120000)       -- crosses the rate ladder
+  local narrow = fftsa.plan_changed(4000)        -- narrow enough for the filter to run
+  local _, dnarrow = fftsa.bp_plan(4000, fftsa.n)
+  fftsa.bp_on, fftsa.flo, fftsa.fhi = was, lo0, hi0
+  return dwide == 1 and samerate == false and steps == true
+         and dnarrow > 1 and narrow == true,
+         string.format('d at 50k=%s: 49k=%s 120k=%s; d at 4k=%s: %s', tostring(dwide),
+                       tostring(samerate), tostring(steps), tostring(dnarrow),
+                       tostring(narrow))
+end)())
 -- The form is the other half of "the range of the FFT". A gesture the Options fields never
 -- heard about would be undone by the next Apply, silently and a second later.
 check('Options opens on the range the gesture set', (function()
@@ -2266,6 +2322,82 @@ check('an Apply writes the frequency axis once and quotes the measured rate', (f
   return pins == p + 1 and string.find(t, '156.25', 1, true) ~= nil,
          string.format('pins %d/%d after the forced apply, legend [%s]', pins, p, t)
 end)())
+-- A re-planning gesture leaves the pin to apply(), so between them they write ONE axis. The
+-- adopt used to pin and then apply() pinned the identical pair a moment later -- which is
+-- the same 60 ms that came off the end of apply(), put back on the new path.
+check('a gesture that re-plans writes the frequency axis once, not twice', (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
+  local p = (OBJ[gh].pins or 0)
+  OBJ[gh].xmin, OBJ[gh].xmax = 10, 120000    -- past the Nyquist of the rate in force
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  local afteradopt, pending = (OBJ[gh].pins or 0), fftsa.retune_pending
+  fftsa.frame()                              -- services the re-plan
+  local afterapply = (OBJ[gh].pins or 0)
+  fftsa.flo, fftsa.fhi = lo0, hi0            -- back to what the rest of the file expects
+  fftsa.apply()
+  fftsa.retune_pending = false
+  return pending == true and afteradopt == p and afterapply == p + 1
+         and fftsa.flo == lo0 and fftsa.fhi == hi0,
+         string.format('pins %d -> %d adopted -> %d applied, pending=%s',
+                       p, afteradopt, afterapply, tostring(pending))
+end)())
+-- arm() deletes the timer and creates a replacement, so re-arming restarts the period and
+-- churns the object pool. The period is derived from the sample count and nothing else, and
+-- a gesture cannot change it, so apply() re-arms only when the count has actually moved.
+check('an Apply that keeps the sample count does not replace the timer', (function()
+  if fftsa.timer == nil then return false, 'no timer to watch' end
+  local t0 = fftsa.timer
+  fftsa.apply()
+  local kept = (fftsa.timer == t0) and OBJ[t0].alive == true
+  -- And it does still re-arm when the count moved. Faked through armed_n rather than by
+  -- resizing the transform, so this cannot disturb the count the rest of the file runs at.
+  fftsa.armed_n = -1
+  fftsa.apply()
+  local replaced = (fftsa.timer ~= t0) and OBJ[t0].alive == false
+  return kept and replaced and fftsa.armed_n == fftsa.n,
+         string.format('kept=%s replaced=%s armed_n=%s n=%s', tostring(kept),
+                       tostring(replaced), tostring(fftsa.armed_n), tostring(fftsa.n))
+end)())
+-- A garbage read-back must not become a span. NaN survives every comparison in span_clamp,
+-- so without the refusal it would reach the axis write, pick_fs and both Options fields --
+-- and one NaN limit beside a real one that moved is enough to get here.
+check('a NaN read-back is refused rather than clamped', (function()
+  local nan = 0 / 0
+  if nan == nan then return false, 'this host does not produce a NaN from 0/0' end
+  local lo, hi, pend = fftsa.flo, fftsa.fhi, fftsa.retune_pending
+  local p = (OBJ[gh].pins or 0)
+  local a = fftsa.sg_adopt_x(nan, 40000)
+  local b = fftsa.sg_adopt_x(12000, nan)
+  return a == false and b == false and fftsa.flo == lo and fftsa.fhi == hi
+         and fftsa.retune_pending == pend and (OBJ[gh].pins or 0) == p,
+         string.format('took %s/%s, span %s..%s, pins %d/%d', tostring(a), tostring(b),
+                       tostring(fftsa.flo), tostring(fftsa.fhi), (OBJ[gh].pins or 0), p)
+end)())
+-- sg_bind() re-registers the report, and a count left over from before the rebind would
+-- make the next tick settle for a gesture that has already been dealt with.
+check('registering the report clears the fire count with it', (function()
+  fftsa.sg_ev = 9
+  local ok = fftsa.sg_hook_scale()
+  return ok == true and fftsa.sg_ev == 0, 'ev=' .. tostring(fftsa.sg_ev)
+end)())
+-- A teardown waiting under the frame wins: apply() against a torn-down app strands the
+-- capture buffer it makes. stop() is stubbed so the teardown this provokes does not take
+-- the app down for everything below.
+check('a teardown waiting makes frame() skip the re-plan', (function()
+  local realstop, stops = fftsa.stop, 0
+  fftsa.stop = function() stops = stops + 1 return true end
+  local rate0 = dmm.digitize.samplerate
+  fftsa.retune_pending, fftsa.stop_pending = true, true
+  fftsa.frame()
+  local pend, rate = fftsa.retune_pending, dmm.digitize.samplerate
+  fftsa.stop = realstop
+  fftsa.retune_pending, fftsa.stop_pending = false, false
+  return pend == true and rate == rate0 and stops == 1,
+         string.format('pending=%s rate %s/%s, stops=%d', tostring(pend),
+                       tostring(rate), tostring(rate0), stops)
+end)())
 -- A frame that gave up has to stay given up. halted is cleared after a re-plan, so a
 -- gesture waiting in the flag would restart the loop that had just stopped itself and
 -- write a settings line over the HALTED message.
@@ -2329,12 +2461,20 @@ check('dragging into a wall converges, and never leaves the legal range', (funct
   end
   -- One gesture, expressed as a nudge to the limits the pin last wrote -- which is what the
   -- read-back answers with, so this is the loop the instrument closes.
+  --
+  -- The nil guard is not decoration: check() does not pcall, so an arithmetic-on-nil here
+  -- would take the whole suite down, and a suite that dies prints no summary line and still
+  -- exits 0. Removing the fhi_min clamp reproduces exactly that.
+  local bad, i = nil, nil
   local function gesture(d)
     local wlo, whi = fftsa.sg_xwant()
+    if wlo == nil then
+      if bad == nil then bad = 'sg_xwant() went nil: the span stopped being plottable' end
+      return fftsa.flo, fftsa.fhi
+    end
     fftsa.sg_adopt_x(wlo + d, whi + d)
     return fftsa.flo, fftsa.fhi
   end
-  local bad, i = nil, nil
   local function wall(lo, hi, d, name)
     settle(lo, hi)
     local plo, phi = nil, nil
@@ -3806,6 +3946,21 @@ check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
       and fftsa.aboutscr == nil and fftsa.about_lines == nil)
 check('stop() twice is harmless', pcall(function() fftsa.stop() end))
+-- The pending re-plan goes with the app, in BOTH directions. Two stops under one frame reach
+-- the teardown from the second call, which clears stop_pending -- and frame() would then find
+-- the flag set with nothing to retune into, where apply() makes a capture buffer nothing owns
+-- and strands it. start() clears it for the other reason: a gesture from the previous launch.
+check('a teardown clears a pending re-plan, and so does a launch', (function()
+  fftsa.retune_pending = true
+  fftsa.stop()
+  local afterstop = fftsa.retune_pending
+  fftsa.retune_pending = true
+  local started = fftsa.start()
+  local afterstart = fftsa.retune_pending
+  return afterstop == false and started == true and afterstart == false,
+         string.format('after stop=%s, started=%s, after start=%s', tostring(afterstop),
+                       tostring(started), tostring(afterstart))
+end)())
 check('cleanup() is safe with nothing built', pcall(function() fftsa.cleanup() end))
 
 -- ---------- the deployed launch model: opening the App re-runs the script ----------
