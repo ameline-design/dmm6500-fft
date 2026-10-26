@@ -69,10 +69,15 @@ lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency
 - A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
   bins are captured already. Note that zooming in gives more plot columns per bin, not finer
   resolution: the bin width is the rate over the sample count, and neither has changed.
-- A zoom out past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
+- Taking the stop past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
   frames. The settings line reads `retuning to ... Hz` while it does the same work an Apply does —
   the window tables, about 0.3 s for Kaiser, plus one capture. With the **band-pass on** every change
   re-plans, because the filter's cutoff is derived from the stop frequency.
+
+Note that the **default stop of 50 kHz sits exactly on the first rate step**, so the first drag to
+the right from a fresh start re-plans: 55 kHz needs 200 kS/s, which doubles the bin width at the same
+sample count. The settings line reports the new rate and bin spacing when it comes back. Dragging
+back and forth across a step re-plans each way; staying on one side of it does not.
 
 **A gesture cannot leave the allowed range.** Start clamps to 10 Hz … 499 kHz and Stop to
 2 kHz … 500 kHz — the limits the Options fields themselves declare, enforced through one function so
