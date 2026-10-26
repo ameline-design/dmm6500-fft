@@ -308,6 +308,9 @@ function display.graph.scaley(g, ...)
     OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
     OBJ[g].ypins = (OBJ[g].ypins or 0) + 1  -- counted, like the x pin
   end
+  -- With no limits this is a read: it answers with the current ones and repaints
+  -- nothing, which is what lets the lock test an axis without costing a redraw.
+  return OBJ[g].ymin, OBJ[g].ymax
 end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
 function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h].fills or 0) + 1 end
@@ -325,9 +328,8 @@ function display.graph.scalex(g, ...)
     local i
     for i = 1, table.getn(t) do OBJ[g].xpin[t[i]] = {a[3], a[4]} end
     OBJ[g].pins = (OBJ[g].pins or 0) + 1   -- counted: re-pinning flickers the axis
-    -- Where in the frame the pin landed, as the buffer-write count at that moment. The
-    -- view lock re-pins every frame, and a pin between the clear and the last write
-    -- would put the re-paint it triggers on a half-filled trace.
+    -- Where in the frame the pin landed, as the buffer-write count at that moment: a pin
+    -- between the clear and the last write repaints a half-filled trace.
     OBJ[g].pin_at_writes = WRITES
   end
   return OBJ[g].xmin, OBJ[g].xmax
@@ -1794,28 +1796,41 @@ check('unlocked shows the open padlock and only that one',
       'open hidden=' .. tostring(OBJ[fftsa.lockimg_o].hidden)
       .. ' closed hidden=' .. tostring(OBJ[fftsa.lockimg_c].hidden))
 
+-- Snapshotted rather than compared against sg_flo_hz: sg_xwant() moves a sub-pixel Start
+-- down to DC so the firmware's tick labels read +00.00kHz, and a test that re-derived
+-- that would be asserting its own copy of the rule instead of the restore.
+local wx0, wx1 = OBJ[gh].xmin, OBJ[gh].xmax
+local wy0, wy1 = OBJ[gh].ymin, OBJ[gh].ymax
+-- The gesture, as the firmware leaves it: a pan moves the axis limits, nothing else.
+local function drag_axes()
+  OBJ[gh].xmin, OBJ[gh].xmax = 12345, 23456
+  OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
+end
+
 local pin1, ypin1 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
 check('a press locks the view', fftsa.toggle_lock() == true and fftsa.sg_lock == true)
-check('and re-pins both axes at once, without waiting for a frame',
-      (OBJ[gh].pins or 0) == pin1 + 1 and (OBJ[gh].ypins or 0) == ypin1 + 1,
+-- Writing a limit repaints the widget. Locking a view nobody has moved must therefore
+-- write nothing at all, or the press itself flickers the trace.
+check('and writes nothing, because nothing had moved',
+      (OBJ[gh].pins or 0) == pin1 and (OBJ[gh].ypins or 0) == ypin1,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin1,
                     (OBJ[gh].ypins or 0), ypin1))
 check('and swaps the padlock to closed',
       OBJ[fftsa.lockimg_c].hidden == false and OBJ[fftsa.lockimg_o].hidden == true)
 
--- The gesture, as the firmware leaves it: a pan moves the axis limits, nothing else.
--- A locked frame has to put them back; an unlocked one must leave them alone, because
--- that is the pan the operator asked for.
-local function drag_axes()
-  OBJ[gh].xmin, OBJ[gh].xmax = 12345, 23456
-  OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
-end
+-- The frame-rate requirement: a locked view nobody is touching costs the frame no
+-- graph write whatsoever. This is the check that fails if the lock ever goes back to
+-- re-asserting the limits unconditionally.
+local pinq, ypinq = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+fftsa.frame_body()
+fftsa.frame_body()
+check('two locked frames on an untouched view write no limit at all',
+      (OBJ[gh].pins or 0) == pinq and (OBJ[gh].ypins or 0) == ypinq,
+      string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pinq,
+                    (OBJ[gh].ypins or 0), ypinq))
+check('and sg_relock() says so', fftsa.sg_relock() == false)
+
 local pin2, ypin2 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
--- Snapshotted rather than compared against sg_flo_hz: sg_pin_x() moves a sub-pixel Start
--- down to DC so the firmware's tick labels read +00.00kHz, and a test that re-derived
--- that would be asserting its own copy of the rule instead of the restore.
-local wx0, wx1 = OBJ[gh].xmin, OBJ[gh].xmax
-local wy0, wy1 = OBJ[gh].ymin, OBJ[gh].ymax
 drag_axes()
 fftsa.frame_body()
 check('a locked frame restores the window a drag moved',
@@ -1825,10 +1840,38 @@ check('a locked frame restores the window a drag moved',
                     tostring(OBJ[gh].xmin), tostring(OBJ[gh].xmax),
                     tostring(OBJ[gh].ymin), tostring(OBJ[gh].ymax),
                     tostring(wx0), tostring(wx1), tostring(wy0), tostring(wy1)))
-check('for exactly two graph calls, one an axis', (OBJ[gh].pins or 0) == pin2 + 1
+check('writing each axis exactly once', (OBJ[gh].pins or 0) == pin2 + 1
       and (OBJ[gh].ypins or 0) == ypin2 + 1,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin2,
                     (OBJ[gh].ypins or 0), ypin2))
+-- One axis moving must not drag the other into a repaint it does not need.
+check('a drag on X alone writes X alone', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  OBJ[gh].xmin = wx0 + (wx1 - wx0) * 0.25
+  local moved = fftsa.sg_relock()
+  return moved == true and (OBJ[gh].pins or 0) == p + 1
+         and (OBJ[gh].ypins or 0) == yp,
+         string.format('moved=%s pins %d/%d ypins %d/%d', tostring(moved),
+                       (OBJ[gh].pins or 0), p, (OBJ[gh].ypins or 0), yp)
+end)())
+-- Below the tolerance is rounding in the round trip, not a finger: a one-pixel pan is
+-- span/680, and sg_notol is well under that.
+check('a difference far below one pixel of pan is left alone', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  OBJ[gh].xmin = wx0 + (wx1 - wx0) / (fftsa.sg_notol * 10)
+  local moved = fftsa.sg_relock()
+  return moved == false and (OBJ[gh].pins or 0) == p and (OBJ[gh].ypins or 0) == yp,
+         'moved=' .. tostring(moved)
+end)())
+check('but one pixel of pan is a finger, and is undone', (function()
+  local p = (OBJ[gh].pins or 0)
+  OBJ[gh].xmin = wx0 + (wx1 - wx0) / fftsa.sg_plotpx
+  local moved = fftsa.sg_relock()
+  return moved == true and (OBJ[gh].pins or 0) == p + 1 and OBJ[gh].xmin == wx0,
+         'moved=' .. tostring(moved) .. ' xmin=' .. tostring(OBJ[gh].xmin)
+end)())
+drag_axes()
+fftsa.frame_body()
 -- A pin between the clear and the last write would repaint a half-filled trace, which
 -- is the blank-plot window the frame is built to keep short.
 check('and the pin lands after the last write, never inside the refill window',

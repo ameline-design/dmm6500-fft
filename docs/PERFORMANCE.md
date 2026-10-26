@@ -269,11 +269,13 @@ frame and a 5.3 s Apply are the reasons 32768 is not on the Options list.
 | `display.setpixel(...)` | 10.8 - 14.6 µs | 2,500 and 60,000 call runs |
 | `display.flush(obj)` | **0.203 s** for an 800x480 surface | see the surface note below |
 
-`display.graph.scalex` and `scaley` are **not in this table and want measuring**: one of each is the
-view lock's entire per-frame cost, and `graph.add` next to them says a graph call can be milliseconds
-rather than microseconds. If the pair comes in near 4 ms each, a locked frame at 256 samples crosses
-50 ms and drops from 20 fps to 10 -- the one size where the margin is that thin. The lock is off at
-launch, so an unlocked app is unaffected either way.
+**Writing an axis limit repaints the whole widget**, label text included, and on the glass that is a
+visible flicker and a drop in frame rate -- measured by eye with the view lock re-asserting both
+limits every frame. Reading them back does not: `scalex` and `scaley` called with the id alone answer
+with the current limits and repaint nothing. So the lock reads first and writes only when a pan has
+actually moved something, which makes an untouched locked view two reads a frame and no write at all.
+Neither call is in the table above yet; `graph.add`'s 4 ms is the warning that a graph *write* is
+milliseconds, not microseconds.
 
 A reading-buffer element costs **16x a plain Lua table element**. That is the single most important
 number in this file: it is why the load phase is what it is, and why copying a buffer into a plain

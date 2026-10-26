@@ -981,22 +981,27 @@ function fftsa.del_buf(b)
   return true
 end
 
+-- The X limits the axis should hold, nil for a span that is not a plottable axis. Shared
+-- by sg_pin_x() and sg_relock() so the moved-or-not test cannot disagree with the pin.
+--
+-- Start moves to DC where that is under one pixel of plot: the firmware steps ticks from
+-- the lower limit, so a 10 Hz Start on a 50 kHz span labels them +00.01kHz. Conditional,
+-- or a real zoom would lose its own limits. Against the plot width, not the bin width,
+-- which holds only where Start falls inside bin one.
+function fftsa.sg_xwant()
+  local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  if hi > fftsa.sg_fmax_real or hi <= lo then return nil, nil end
+  if lo > 0 and lo * fftsa.sg_plotpx < (hi - lo) then lo = 0 end
+  return lo, hi
+end
+
 -- Pin the X axis to the window: auto-range rounds outward to tidy tick values, so
 -- the pixel of a given frequency would be unknowable and the firmware's labels would not
 -- describe the span.
 function fftsa.sg_pin_x()
   if fftsa.sg_graph == nil then return false end
-  local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
-  if hi > fftsa.sg_fmax_real or hi <= lo then return false end
-  -- START THE AXIS AT DC WHEN MOVING IT THERE IS INVISIBLE -- under one pixel of plot.
-  -- The firmware steps its ticks from the lower limit, so a 10 Hz Start on a 50 kHz span
-  -- put them at 10, 10010, 20010 Hz and the row read +00.01kHz, +10.01kHz; from 0 it
-  -- reads +00.00kHz. Conditional because a real zoom must keep its own limits, or an 8 to
-  -- 16 kHz window would draw in the last sixth of the plot.
-  --
-  -- The test is against the PLOT WIDTH, not the bin width: a bin-width test holds only
-  -- where Start falls inside bin one, which is the default and not 16384.
-  if lo > 0 and lo * fftsa.sg_plotpx < (hi - lo) then lo = 0 end
+  local lo, hi = fftsa.sg_xwant()
+  if lo == nil then return false end
   local m = fftsa.sg_xmethod
   if m == nil then m = display.XSCALE_OFF end
   -- IN HERTZ, not scaled. The trace is bound as a numeric x-y plot, X from the reading's
@@ -1317,12 +1322,10 @@ function fftsa.sg_update(nbins, binhz)
   end
   -- No notify call. The clear above is the notify, and the trace stays bound to the
   -- same buffer for the life of the app.
-  -- Undo a touch pan or zoom. Belongs outside the write window above, where the repaint a
-  -- graph call triggers would draw a half-filled trace, and ahead of the paint below.
-  if fftsa.sg_lock then
-    fftsa.sg_pin_x()
-    fftsa.sg_pin_y()
-  end
+  -- Undo a touch pan or zoom, if there has been one. Belongs outside the write window
+  -- above, where the repaint a graph call triggers would draw a half-filled trace, and
+  -- ahead of the paint below.
+  if fftsa.sg_lock then fftsa.sg_relock() end
   -- The paint. The bound buffer is complete and the next fill has not begun, so this is
   -- the window in which a copy is correct by construction.
   delay(fftsa.sg_yield)
@@ -1374,6 +1377,40 @@ function fftsa.sg_pin_y(g)
   display.graph.scaley(g, display.YSCALE_OFF, display.AXIS_NORMAL,
                        fftsa.sg_dbmin, fftsa.sg_dbmax)
   return true
+end
+
+-- Restore the axes only where a pan has moved them. Writing a limit repaints the whole
+-- widget, which flickers the trace and costs the frame rate; scalex and scaley called
+-- with no limits read them back instead and repaint nothing, so an untouched locked view
+-- costs two reads. The tolerance sits below one pixel of pan and above any rounding in
+-- the round trip. A nil read-back writes nothing: a lock that misses a drag beats a
+-- frame that flickers.
+fftsa.sg_notol = 10000
+
+function fftsa.sg_relock()
+  local g = fftsa.sg_graph
+  if g == nil then return false end
+  local moved = false
+  local wlo, whi = fftsa.sg_xwant()
+  if wlo ~= nil then
+    local x1, x2 = display.graph.scalex(g)
+    if x1 ~= nil and x2 ~= nil then
+      local xtol = (whi - wlo) / fftsa.sg_notol
+      if math.abs(x1 - wlo) > xtol or math.abs(x2 - whi) > xtol then
+        fftsa.sg_pin_x()
+        moved = true
+      end
+    end
+  end
+  local y1, y2 = display.graph.scaley(g)
+  if y1 ~= nil and y2 ~= nil then
+    local ytol = (fftsa.sg_dbmax - fftsa.sg_dbmin) / fftsa.sg_notol
+    if math.abs(y1 - fftsa.sg_dbmin) > ytol or math.abs(y2 - fftsa.sg_dbmax) > ytol then
+      fftsa.sg_pin_y(g)
+      moved = true
+    end
+  end
+  return moved
 end
 
 -- The recovery path after a failed frame, and the same binding as the build.
@@ -1717,8 +1754,9 @@ function fftsa.pick_fs(fhi)
   return r[n]
 end
 
--- Boolean fields are an EDIT_OPTION of two, because the firmware has no checkbox. Index
--- 1 is off, so a field the pool refused reads as off through fftsa.getval's fallback.
+-- Boolean fields are an EDIT_OPTION of two, matching the other fields on the form rather
+-- than using display.OBJ_EDIT_CHECK. Index 1 is off, so a field the pool refused reads as
+-- off through fftsa.getval's fallback.
 fftsa.onoff_labels = {"Off", "On"}
 
 function fftsa.onoff_to_idx(v)
@@ -2557,10 +2595,7 @@ end
 -- than a frame later, and is the whole mechanism while the app is halted.
 function fftsa.toggle_lock()
   fftsa.sg_lock = not fftsa.sg_lock
-  if fftsa.sg_lock then
-    fftsa.sg_pin_x()
-    fftsa.sg_pin_y()
-  end
+  if fftsa.sg_lock then fftsa.sg_relock() end
   fftsa.lock_icon()
   return fftsa.sg_lock
 end

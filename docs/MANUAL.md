@@ -45,14 +45,16 @@ The firmware's graph pans and zooms on touch, and offers no way to decline — `
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So a brushed screen slides the trace
 sideways and the axis labels no longer describe the span.
 
-Press the padlock and it closes: from then on every frame puts the axes back where they belong. A
-drag still moves the trace, and the next frame undoes it, so the snap-back takes one frame — a tenth
-of a second at the 512-sample default, and about two seconds at 16384, where frames are 2.1 s apart.
-Press it again and it opens, leaving the view wherever your finger left it; the next Apply, or a
-zoom, re-pins it.
+Press the padlock and it closes: from then on each frame checks the axes and puts back anything that
+has moved. A drag still moves the trace, and the next frame undoes it, so the snap-back takes one
+frame — a tenth of a second at the 512-sample default, and about two seconds at 16384, where frames
+are 2.1 s apart. Press it again and it opens, leaving the view wherever your finger left it; the next
+Apply, or a zoom, re-pins it.
 
-Restoring the axes costs two graph calls a frame, which is why the lock starts off rather than on.
-Nothing else about a locked frame differs.
+**The check is a read, not a write.** Writing an axis limit repaints the whole graph, which flickers
+the trace and costs frame rate, so a locked view that nobody has touched writes nothing: two
+read-backs a frame and no repaint. Only an actual pan or zoom produces a write, and only on the axis
+that moved.
 
 ## Options
 

@@ -165,8 +165,9 @@ function fftsa.pick_fs(fhi)
   return r[n]
 end
 
--- Boolean fields are an EDIT_OPTION of two, because the firmware has no checkbox. Index
--- 1 is off, so a field the pool refused reads as off through fftsa.getval's fallback.
+-- Boolean fields are an EDIT_OPTION of two, matching the other fields on the form rather
+-- than using display.OBJ_EDIT_CHECK. Index 1 is off, so a field the pool refused reads as
+-- off through fftsa.getval's fallback.
 fftsa.onoff_labels = {"Off", "On"}
 
 function fftsa.onoff_to_idx(v)
@@ -1005,10 +1006,7 @@ end
 -- than a frame later, and is the whole mechanism while the app is halted.
 function fftsa.toggle_lock()
   fftsa.sg_lock = not fftsa.sg_lock
-  if fftsa.sg_lock then
-    fftsa.sg_pin_x()
-    fftsa.sg_pin_y()
-  end
+  if fftsa.sg_lock then fftsa.sg_relock() end
   fftsa.lock_icon()
   return fftsa.sg_lock
 end
