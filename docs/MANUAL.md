@@ -47,16 +47,23 @@ The firmware's graph pans and zooms on touch, and offers no way to decline — `
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So a brushed screen slides the trace
 sideways and the axis labels no longer describe the span.
 
-Press the padlock and it closes: from then on each frame checks the axes and puts back anything that
-has moved. A drag still moves the trace, and the next frame undoes it, so the snap-back takes one
-frame — a tenth of a second at the 512-sample default, and about two seconds at 16384, where frames
-are 2.1 s apart. Press it again and it opens, leaving the view wherever your finger left it; the next
-Apply, or a zoom, re-pins it.
+**The lock is on when the app starts**, and the padlock shows closed. Pan or zoom the trace and the
+next frame puts it back, so the snap-back takes one frame — a tenth of a second at the 512-sample
+default, about two seconds at 16384 where frames are 2.1 s apart. Press the padlock and it opens,
+leaving the view wherever your finger left it; the next Apply, or a zoom, re-pins it. Press it again
+and it closes, restoring the window immediately rather than at the next frame.
 
-**The check is a read, not a write.** Writing an axis limit repaints the whole graph, which flickers
-the trace and costs frame rate, so a locked view that nobody has touched writes nothing: two
-read-backs a frame and no repaint. Only an actual pan or zoom produces a write, and only on the axis
-that moved.
+**An untouched locked frame costs nothing.** Writing an axis limit takes 60 ms and repaints the whole
+graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the update
+rate and visibly flickers the trace. So the lock is told when to look: the graph reports its own pan
+and zoom, a report makes it read the limits back at 0.0094 ms each, and only a limit that has really
+moved is written. Nothing moved means nothing written, and the axis that did not move is not touched
+either. Expect a second or so of reduced update rate after a restore, while the write's own repaint
+and event reports settle.
+
+Both buttons lose their icon for a moment when they take the yellow focus highlight, because the
+firmware paints the highlight over everything inside the button. The app redraws the icons once a
+second, so a blank button fills itself back in; the button works either way.
 
 ## Options
 

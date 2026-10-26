@@ -999,13 +999,34 @@ function fftsa.lock_icon()
   local on, off = fftsa.lockimg_o, fftsa.lockimg_c
   if fftsa.sg_lock then on, off = fftsa.lockimg_c, fftsa.lockimg_o end
   if off ~= nil then display.setstate(off, display.STATE_INVISIBLE) end
-  if on  ~= nil then display.setstate(on,  display.STATE_ENABLE) end
+  fftsa.icon_redraw(on)
+end
+
+-- Force an icon to paint. Setting a state the object already holds is 0.020 ms and may
+-- be taken as nothing to do, so the pair is what guarantees the draw, at 0.034 ms.
+function fftsa.icon_redraw(h)
+  if h == nil then return false end
+  display.setstate(h, display.STATE_INVISIBLE)
+  display.setstate(h, display.STATE_ENABLE)
+  return true
+end
+
+-- Put both icons back. A button draws its focus highlight and its pressed state over
+-- everything inside its rectangle, and an icon is a child object the firmware does not
+-- redraw afterwards -- so any touch blanks whichever button has focus, and re-asserting
+-- from the handler is too early because the repaint comes after it. The frame calls this
+-- at the peak cadence, which is late enough and costs 0.1 ms a second.
+function fftsa.icons_reassert()
+  fftsa.lock_icon()
+  fftsa.icon_redraw(fftsa.optimg)
+  return true
 end
 
 -- Re-pinning here as well as in the frame snaps a dragged view back on the press rather
 -- than a frame later, and is the whole mechanism while the app is halted.
 function fftsa.toggle_lock()
   fftsa.sg_lock = not fftsa.sg_lock
+  fftsa.sg_lock_hook(fftsa.sg_lock)
   if fftsa.sg_lock then fftsa.sg_relock() end
   fftsa.lock_icon()
   return fftsa.sg_lock
@@ -1058,6 +1079,7 @@ function fftsa.build()
     "if fftsa ~= nil then fftsa.guard(fftsa.toggle_lock) end",
     fftsa.lock_img_w, fftsa.lock_img_h, fftsa.img_lock_c, fftsa.img_lock_o)
   fftsa.lock_icon()
+  fftsa.sg_lock_hook(fftsa.sg_lock)
   fftsa.optbtn, fftsa.optimg = fftsa.icon_button(
     fftsa.btn_opt_x, fftsa.btn_opt_w,
     "if fftsa ~= nil then fftsa.guard(fftsa.options) end",

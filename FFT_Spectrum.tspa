@@ -893,10 +893,9 @@ end
 
 -- Touch pans and zooms the graph, and the widget cannot be told not to: display.setstate
 -- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a locked view is
--- restored instead, sg_update() re-pinning both axes every frame -- two graph calls an
--- unlocked app does not make, which is why this starts off. Not a handle, so a relaunch
--- resets it on purpose.
-fftsa.sg_lock = false
+-- restored after the fact, by fftsa.sg_lock_check(). On by default; fftsa.sg_restore is
+-- what that costs. Not a handle, so a relaunch resets it on purpose.
+fftsa.sg_lock = true
 
 -- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
 -- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
@@ -1322,10 +1321,10 @@ function fftsa.sg_update(nbins, binhz)
   end
   -- No notify call. The clear above is the notify, and the trace stays bound to the
   -- same buffer for the life of the app.
-  -- Undo a touch pan or zoom, if there has been one. Belongs outside the write window
-  -- above, where the repaint a graph call triggers would draw a half-filled trace, and
-  -- ahead of the paint below.
-  if fftsa.sg_lock then fftsa.sg_relock() end
+  -- Undo a reported pan and put back any icon a focus highlight covered, at most once a
+  -- second. Outside the write window above, where the repaint a graph call triggers would
+  -- draw a half-filled trace, and ahead of the paint below.
+  fftsa.sg_slow_tick()
   -- The paint. The bound buffer is complete and the next fill has not begun, so this is
   -- the window in which a copy is correct by construction.
   delay(fftsa.sg_yield)
@@ -1379,38 +1378,128 @@ function fftsa.sg_pin_y(g)
   return true
 end
 
--- Restore the axes only where a pan has moved them. Writing a limit repaints the whole
--- widget, which flickers the trace and costs the frame rate; scalex and scaley called
--- with no limits read them back instead and repaint nothing, so an untouched locked view
--- costs two reads. The tolerance sits below one pixel of pan and above any rounding in
--- the round trip. A nil read-back writes nothing: a lock that misses a drag beats a
--- frame that flickers.
-fftsa.sg_notol = 10000
+-- THE VIEW LOCK.
+--
+-- Writing an axis limit costs 60 ms and repaints the whole widget, measured with the
+-- frame loop parked: 121 ms for the pair, against a frame of 81 ms at 512 samples whose
+-- next rate bucket is 82 ms. Re-asserting both limits every frame is therefore most of
+-- the frame rate and a visible flicker, which is what it did on the glass.
+--
+-- Reading a limit back costs 0.0094 ms, so the lock reads before it writes. The catch is
+-- that the read-back's "return values are only valid when the objects event generation is
+-- set to ALL", and non-button objects have none by default: on a graph nobody had
+-- registered an event on, scalex and scaley answered nil with no event posted, and a lock
+-- that skipped its pin on that nil did nothing at all. Registering EVENT_SCALE is what
+-- supplies the precondition -- so the hook below is not an optimisation, the read-back
+-- does not work without it.
+--
+-- The same registration reports the gesture, which lets a tick that saw no fire skip even
+-- the reads. A finger drag fires it 402 times; EVENT_CURSOR never fires at all and is not
+-- registered. Our own write fires it too, asynchronously, but that needs no special case:
+-- the echo reads back as the limits we just wrote, so nothing is written again.
+--
+-- Not available: the %xmin family belongs to display.waitevent(), and a command string
+-- containing %xmin is not valid Lua -- the handler fails to compile silently, taking any
+-- counter in the same string with it.
+fftsa.sg_ev = 0        -- EVENT_SCALE fires since the tick last looked
 
-function fftsa.sg_relock()
+-- A limit is "moved" past this fraction of the span. Below it lies rounding in the round
+-- trip, not a finger: one pixel of pan is a 680th of the span. The floor is relative to
+-- the limits as well as to the span, because a narrow window a long way from DC -- Start
+-- 498999.9, Stop 499010 is reachable from the form -- has a span far smaller than the
+-- rounding on its own endpoints, and a span-only tolerance would then write every tick.
+fftsa.sg_tol = 1e-6
+
+-- Turn the graph's pan-and-zoom reporting on and off with the lock. An unlocked app then
+-- makes exactly the calls it made before the lock existed. Measured at 512 samples, the
+-- registration costs nothing per frame: frame work was 74.7 ms minimum either way.
+function fftsa.sg_lock_hook(on)
+  local g = fftsa.sg_graph
+  if g == nil or display.EVENT_SCALE == nil then return false end
+  if on then
+    display.setevent(g, display.EVENT_SCALE,
+                     "if fftsa ~= nil then fftsa.sg_ev = (fftsa.sg_ev or 0) + 1 end")
+  else
+    display.setevent(g, display.EVENT_SCALE, 0)
+  end
+  fftsa.sg_ev = 0
+  return true
+end
+
+-- Has a limit really moved? Compared against the span and against the endpoints, so the
+-- test does not vanish on a narrow window with a large offset.
+function fftsa.sg_moved(got, want, span)
+  if got == nil then return false end
+  local scale = span
+  local a = want
+  if a < 0 then a = -a end
+  if a > scale then scale = a end
+  return (got - want) > scale * fftsa.sg_tol
+      or (want - got) > scale * fftsa.sg_tol
+end
+
+-- Put back whichever axis a gesture moved, and only that one. Each write repaints the
+-- widget, so an axis that is already right must not be written.
+function fftsa.sg_restore()
   local g = fftsa.sg_graph
   if g == nil then return false end
-  local moved = false
+  local wrote = false
   local wlo, whi = fftsa.sg_xwant()
   if wlo ~= nil then
     local x1, x2 = display.graph.scalex(g)
-    if x1 ~= nil and x2 ~= nil then
-      local xtol = (whi - wlo) / fftsa.sg_notol
-      if math.abs(x1 - wlo) > xtol or math.abs(x2 - whi) > xtol then
-        fftsa.sg_pin_x()
-        moved = true
-      end
+    -- nil means the read-back has no event generation behind it after all. A gesture was
+    -- reported, so the axis is presumed moved: a pin costs a frame, a dead lock costs the
+    -- feature.
+    if x1 == nil or fftsa.sg_moved(x1, wlo, whi - wlo)
+                 or fftsa.sg_moved(x2, whi, whi - wlo) then
+      fftsa.sg_pin_x()
+      wrote = true
     end
   end
+  local yspan = fftsa.sg_dbmax - fftsa.sg_dbmin
   local y1, y2 = display.graph.scaley(g)
-  if y1 ~= nil and y2 ~= nil then
-    local ytol = (fftsa.sg_dbmax - fftsa.sg_dbmin) / fftsa.sg_notol
-    if math.abs(y1 - fftsa.sg_dbmin) > ytol or math.abs(y2 - fftsa.sg_dbmax) > ytol then
-      fftsa.sg_pin_y(g)
-      moved = true
-    end
+  if y1 == nil or fftsa.sg_moved(y1, fftsa.sg_dbmin, yspan)
+               or fftsa.sg_moved(y2, fftsa.sg_dbmax, yspan) then
+    fftsa.sg_pin_y(g)
+    wrote = true
   end
-  return moved
+  fftsa.sg_ev = 0
+  return wrote
+end
+
+-- One tick's worth of the lock: nothing at all unless a gesture was reported.
+function fftsa.sg_lock_check()
+  if (fftsa.sg_ev or 0) == 0 then return false end
+  return fftsa.sg_restore()
+end
+
+-- Kept as the name the press uses: locking restores at once rather than at the next tick.
+function fftsa.sg_relock()
+  if fftsa.sg_graph == nil then return false end
+  fftsa.sg_pin_x()
+  fftsa.sg_pin_y()
+  fftsa.sg_ev = 0
+  return true
+end
+
+-- Both repairs, once a second, on the peak table's own cadence.
+--
+-- Each undoes something a touch did -- a pan moved the axes, a focus highlight painted
+-- over a button icon -- so neither needs to run at the frame rate, and at 60 ms an axis
+-- write the lock must not. The cost of a tick that finds nothing to do is one os.clock()
+-- and, for the icons, three setstate pairs at 0.034 ms.
+fftsa.sg_tick_last = nil
+
+function fftsa.sg_slow_tick()
+  local now = os.clock()
+  if fftsa.sg_tick_last ~= nil
+     and (now - fftsa.sg_tick_last) < fftsa.sg_pk_period then
+    return false
+  end
+  fftsa.sg_tick_last = now
+  if fftsa.sg_lock then fftsa.sg_lock_check() end
+  if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
+  return true
 end
 
 -- The recovery path after a failed frame, and the same binding as the build.
@@ -2588,13 +2677,34 @@ function fftsa.lock_icon()
   local on, off = fftsa.lockimg_o, fftsa.lockimg_c
   if fftsa.sg_lock then on, off = fftsa.lockimg_c, fftsa.lockimg_o end
   if off ~= nil then display.setstate(off, display.STATE_INVISIBLE) end
-  if on  ~= nil then display.setstate(on,  display.STATE_ENABLE) end
+  fftsa.icon_redraw(on)
+end
+
+-- Force an icon to paint. Setting a state the object already holds is 0.020 ms and may
+-- be taken as nothing to do, so the pair is what guarantees the draw, at 0.034 ms.
+function fftsa.icon_redraw(h)
+  if h == nil then return false end
+  display.setstate(h, display.STATE_INVISIBLE)
+  display.setstate(h, display.STATE_ENABLE)
+  return true
+end
+
+-- Put both icons back. A button draws its focus highlight and its pressed state over
+-- everything inside its rectangle, and an icon is a child object the firmware does not
+-- redraw afterwards -- so any touch blanks whichever button has focus, and re-asserting
+-- from the handler is too early because the repaint comes after it. The frame calls this
+-- at the peak cadence, which is late enough and costs 0.1 ms a second.
+function fftsa.icons_reassert()
+  fftsa.lock_icon()
+  fftsa.icon_redraw(fftsa.optimg)
+  return true
 end
 
 -- Re-pinning here as well as in the frame snaps a dragged view back on the press rather
 -- than a frame later, and is the whole mechanism while the app is halted.
 function fftsa.toggle_lock()
   fftsa.sg_lock = not fftsa.sg_lock
+  fftsa.sg_lock_hook(fftsa.sg_lock)
   if fftsa.sg_lock then fftsa.sg_relock() end
   fftsa.lock_icon()
   return fftsa.sg_lock
@@ -2647,6 +2757,7 @@ function fftsa.build()
     "if fftsa ~= nil then fftsa.guard(fftsa.toggle_lock) end",
     fftsa.lock_img_w, fftsa.lock_img_h, fftsa.img_lock_c, fftsa.img_lock_o)
   fftsa.lock_icon()
+  fftsa.sg_lock_hook(fftsa.sg_lock)
   fftsa.optbtn, fftsa.optimg = fftsa.icon_button(
     fftsa.btn_opt_x, fftsa.btn_opt_w,
     "if fftsa ~= nil then fftsa.guard(fftsa.options) end",

@@ -98,6 +98,9 @@ display = {
   OBJ_IMAGE = 'image',
   EVENT_PRESS = 'press', EVENT_ENDAPP = 'endapp',
   EVENT_DRAG = 'drag', EVENT_CURSOR = 'cursor',
+  -- A graph reports its own pan and zoom with this, confirmed on the instrument: about
+  -- ten fires a drag, and our own pin fires it too, asynchronously.
+  EVENT_SCALE = 'scale',
   -- Fonts, at the firmware's own values from its registration table. SMALL through HUGE
   -- are the documented four; FONT_1..FONT_10 continue the same enum and are in the table
   -- but not in the display API reference, so their sizes are a panel measurement.
@@ -229,7 +232,14 @@ function display.getvalue(h)     return use(h, 'getvalue').value end
 function display.setevent(h, ev, cmd)
   use(h, 'setevent')
   display.events[h] = display.events[h] or {}
-  display.events[h][ev] = cmd
+  -- A command string registers a handler; the boolean form turns the event on or off for
+  -- display.waitevent(). Either way 0 means off, and off is what takes the object's event
+  -- generation back down -- which is what the scale read-back's validity depends on.
+  if cmd == 0 or cmd == '' then
+    display.events[h][ev] = nil
+  else
+    display.events[h][ev] = cmd
+  end
 end
 display.graph = {}
 -- `traces` is the live trace count; `adds` and `removes` count the CALLS. The
@@ -297,6 +307,15 @@ local function pin_targets(g)
   end
   return {OBJ[g].selected or OBJ[g].buffer}
 end
+-- A scale read-back answers only on an object with event generation enabled, so the
+-- mock hands back nil until something has called display.setevent on the graph.
+local function readback(g, lo, hi)
+  local ev = display.events[g]
+  if ev == nil then return nil, nil end
+  local k
+  for k in pairs(ev) do return lo, hi end        -- any live registration will do
+  return nil, nil
+end
 function display.graph.scaley(g, ...)
   use(g, 'graph.scaley')
   local a = arg
@@ -308,9 +327,13 @@ function display.graph.scaley(g, ...)
     OBJ[g].ymin, OBJ[g].ymax = a[3], a[4]
     OBJ[g].ypins = (OBJ[g].ypins or 0) + 1  -- counted, like the x pin
   end
-  -- With no limits this is a read: it answers with the current ones and repaints
-  -- nothing, which is what lets the lock test an axis without costing a redraw.
-  return OBJ[g].ymin, OBJ[g].ymax
+  -- With no limits this is a read, and it answers ONLY when the object has event
+  -- generation enabled: "return values are only valid when the objects event generation
+  -- is set to ALL and the only argument passed in is the id", and non-button objects
+  -- have none by default. Modelled, because an unconditional read-back here let a view
+  -- lock that never pinned anything pass the whole suite and then do nothing on the
+  -- glass. On the instrument it answered nil with no event posted.
+  return readback(g, OBJ[g].ymin, OBJ[g].ymax)
 end
 function display.setcolor(h, ...)       use(h, 'setcolor') end
 function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h].fills or 0) + 1 end
@@ -332,7 +355,7 @@ function display.graph.scalex(g, ...)
     -- between the clear and the last write repaints a half-filled trace.
     OBJ[g].pin_at_writes = WRITES
   end
-  return OBJ[g].xmin, OBJ[g].xmax
+  return readback(g, OBJ[g].xmin, OBJ[g].xmax)
 end
 -- scaletrace is counted, not acted on: what the firmware does with it is the open
 -- question the instrument has to answer. select() is modelled above, where the marker
@@ -1724,8 +1747,11 @@ check('and an unlocked frame makes no graph call whatsoever', (function()
                        (o.pins or 0), pin0, (o.selects or 0), sel0,
                        (o.scaletraces or 0), st0, (o.drawstyles or 0), ds0)
 end)())
-check('the view lock is off, so that is the default cost of a frame',
-      fftsa.sg_lock == false, tostring(fftsa.sg_lock))
+-- The lock is ON by default and the frame above still made no graph call, which is the
+-- point of the event-driven design: the cost is paid per gesture, not per frame.
+check('and that holds with the view lock on, which is the default',
+      fftsa.sg_lock == true and (fftsa.sg_ev or 0) == 0,
+      'lock=' .. tostring(fftsa.sg_lock) .. ' ev=' .. tostring(fftsa.sg_ev))
 
 -- The yield is the only thing feeding the display task, so a zero or missing
 -- one is a silent regression into the jumpy behaviour. Assert the value too.
@@ -1791,49 +1817,56 @@ check('each icon centred on its button', (function()
                        c.x, c.y, o.x, o.y, g.x, lx, ly, ox)
 end)())
 -- The state on the glass is which padlock is visible, so exactly one of the pair can be.
-check('unlocked shows the open padlock and only that one',
-      OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true,
-      'open hidden=' .. tostring(OBJ[fftsa.lockimg_o].hidden)
-      .. ' closed hidden=' .. tostring(OBJ[fftsa.lockimg_c].hidden))
+check('locked by default, showing the closed padlock and only that one',
+      fftsa.sg_lock == true and OBJ[fftsa.lockimg_c].hidden == false
+      and OBJ[fftsa.lockimg_o].hidden == true,
+      'lock=' .. tostring(fftsa.sg_lock) .. ' closed hidden='
+      .. tostring(OBJ[fftsa.lockimg_c].hidden) .. ' open hidden='
+      .. tostring(OBJ[fftsa.lockimg_o].hidden))
+check('and the graph reports its own pan and zoom, which is what the lock runs on',
+      display.events[gh] ~= nil
+      and display.events[gh][display.EVENT_SCALE] ~= nil
+      and string.find(display.events[gh][display.EVENT_SCALE], 'sg_ev', 1, true) ~= nil,
+      tostring(display.events[gh] and display.events[gh][display.EVENT_SCALE]))
 
--- Snapshotted rather than compared against sg_flo_hz: sg_xwant() moves a sub-pixel Start
--- down to DC so the firmware's tick labels read +00.00kHz, and a test that re-derived
--- that would be asserting its own copy of the rule instead of the restore.
 local wx0, wx1 = OBJ[gh].xmin, OBJ[gh].xmax
 local wy0, wy1 = OBJ[gh].ymin, OBJ[gh].ymax
--- The gesture, as the firmware leaves it: a pan moves the axis limits, nothing else.
+-- A pan, as the firmware delivers it: the limits move AND EVENT_SCALE fires. Moving the
+-- limits without the fire is not a thing the widget does, and a test that did only that
+-- would be asserting against a mechanism the app cannot see.
 local function drag_axes()
   OBJ[gh].xmin, OBJ[gh].xmax = 12345, 23456
   OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
+  fftsa.sg_ev = (fftsa.sg_ev or 0) + 10      -- about ten fires a drag, measured
+end
+-- The lock and the icons act on the once-a-second tick, not on every frame, and os.clock()
+-- barely moves inside this suite -- so a test that wants the tick to fire has to say so.
+local function tick_due()
+  fftsa.sg_tick_last = nil
 end
 
-local pin1, ypin1 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
-check('a press locks the view', fftsa.toggle_lock() == true and fftsa.sg_lock == true)
--- Writing a limit repaints the widget. Locking a view nobody has moved must therefore
--- write nothing at all, or the press itself flickers the trace.
-check('and writes nothing, because nothing had moved',
-      (OBJ[gh].pins or 0) == pin1 and (OBJ[gh].ypins or 0) == ypin1,
-      string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin1,
-                    (OBJ[gh].ypins or 0), ypin1))
-check('and swaps the padlock to closed',
-      OBJ[fftsa.lockimg_c].hidden == false and OBJ[fftsa.lockimg_o].hidden == true)
-
--- The frame-rate requirement: a locked view nobody is touching costs the frame no
--- graph write whatsoever. This is the check that fails if the lock ever goes back to
--- re-asserting the limits unconditionally.
+-- The frame-rate requirement, and the whole reason the lock is event-driven: a pin costs
+-- 60 ms an axis and the frame has about 1 ms of headroom at 512 samples, so a locked view
+-- nobody has touched must make no graph write whatsoever. This is the check that fails if
+-- the lock ever goes back to re-asserting the limits every frame.
 local pinq, ypinq = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+fftsa.sg_ev = 0
+tick_due()
 fftsa.frame_body()
+tick_due()
 fftsa.frame_body()
-check('two locked frames on an untouched view write no limit at all',
+check('three locked ticks on an untouched view write no limit at all',
       (OBJ[gh].pins or 0) == pinq and (OBJ[gh].ypins or 0) == ypinq,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pinq,
                     (OBJ[gh].ypins or 0), ypinq))
-check('and sg_relock() says so', fftsa.sg_relock() == false)
+check('and sg_lock_check() reports it had nothing to do',
+      fftsa.sg_lock_check() == false)
 
 local pin2, ypin2 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+tick_due()
 drag_axes()
 fftsa.frame_body()
-check('a locked frame restores the window a drag moved',
+check('a locked tick restores the window a reported pan moved',
       OBJ[gh].xmin == wx0 and OBJ[gh].xmax == wx1
       and OBJ[gh].ymin == wy0 and OBJ[gh].ymax == wy1,
       string.format('x %s..%s y %s..%s, wanted %s..%s and %s..%s',
@@ -1844,48 +1877,80 @@ check('writing each axis exactly once', (OBJ[gh].pins or 0) == pin2 + 1
       and (OBJ[gh].ypins or 0) == ypin2 + 1,
       string.format('pins %d/%d ypins %d/%d', (OBJ[gh].pins or 0), pin2,
                     (OBJ[gh].ypins or 0), ypin2))
--- One axis moving must not drag the other into a repaint it does not need.
-check('a drag on X alone writes X alone', (function()
-  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
-  OBJ[gh].xmin = wx0 + (wx1 - wx0) * 0.25
-  local moved = fftsa.sg_relock()
-  return moved == true and (OBJ[gh].pins or 0) == p + 1
-         and (OBJ[gh].ypins or 0) == yp,
-         string.format('moved=%s pins %d/%d ypins %d/%d', tostring(moved),
-                       (OBJ[gh].pins or 0), p, (OBJ[gh].ypins or 0), yp)
-end)())
--- Below the tolerance is rounding in the round trip, not a finger: a one-pixel pan is
--- span/680, and sg_notol is well under that.
-check('a difference far below one pixel of pan is left alone', (function()
-  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
-  OBJ[gh].xmin = wx0 + (wx1 - wx0) / (fftsa.sg_notol * 10)
-  local moved = fftsa.sg_relock()
-  return moved == false and (OBJ[gh].pins or 0) == p and (OBJ[gh].ypins or 0) == yp,
-         'moved=' .. tostring(moved)
-end)())
-check('but one pixel of pan is a finger, and is undone', (function()
-  local p = (OBJ[gh].pins or 0)
-  OBJ[gh].xmin = wx0 + (wx1 - wx0) / fftsa.sg_plotpx
-  local moved = fftsa.sg_relock()
-  return moved == true and (OBJ[gh].pins or 0) == p + 1 and OBJ[gh].xmin == wx0,
-         'moved=' .. tostring(moved) .. ' xmin=' .. tostring(OBJ[gh].xmin)
-end)())
-drag_axes()
-fftsa.frame_body()
--- A pin between the clear and the last write would repaint a half-filled trace, which
--- is the blank-plot window the frame is built to keep short.
+-- A pin between the clear and the last write would repaint a half-filled trace, which is
+-- the blank-plot window the frame is built to keep short.
 check('and the pin lands after the last write, never inside the refill window',
       OBJ[gh].pin_at_writes == WRITES and WRITES > CLEAR_AT_WRITES,
       'pin at ' .. tostring(OBJ[gh].pin_at_writes) .. ' writes, frame ended at '
       .. tostring(WRITES) .. ', cleared at ' .. tostring(CLEAR_AT_WRITES))
+check('and the fire count is consumed, so the next frame is free again',
+      fftsa.sg_ev == 0, tostring(fftsa.sg_ev))
 
-check('a second press unlocks it', fftsa.toggle_lock() == false and fftsa.sg_lock == false)
+-- The echo. Our own write fires EVENT_SCALE too, asynchronously, so fires arrive after a
+-- restore with nothing having moved. They need no special case: the read-back answers
+-- with the limits we just wrote, so there is nothing to write again. Acting on the fire
+-- alone would pin, fire, and never stop.
+check('fires with nothing moved write nothing, however many arrive', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  local i
+  for i = 1, 7 do                      -- seven is what ten pin calls produced
+    fftsa.sg_ev = (fftsa.sg_ev or 0) + 1
+    tick_due()
+    fftsa.frame_body()
+  end
+  return (OBJ[gh].pins or 0) == p and (OBJ[gh].ypins or 0) == yp
+         and fftsa.sg_ev == 0,
+         string.format('pins %d/%d ypins %d/%d ev=%s', (OBJ[gh].pins or 0), p,
+                       (OBJ[gh].ypins or 0), yp, tostring(fftsa.sg_ev))
+end)())
+-- Only the axis that moved. Each write repaints the widget, so a Y pin for an X-only pan
+-- is a second repaint for nothing.
+check('a pan on X alone writes X alone', (function()
+  local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+  OBJ[gh].xmin = wx0 + (wx1 - wx0) * 0.25
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  return (OBJ[gh].pins or 0) == p + 1 and (OBJ[gh].ypins or 0) == yp
+         and OBJ[gh].xmin == wx0,
+         string.format('pins %d/%d ypins %d/%d xmin=%s', (OBJ[gh].pins or 0), p,
+                       (OBJ[gh].ypins or 0), yp, tostring(OBJ[gh].xmin))
+end)())
+-- The tolerance has to survive a narrow window a long way from DC. A span-relative test
+-- alone goes to nothing there: Start 498999.9 / Stop 499010 is a 10.1 Hz span on 499 kHz
+-- endpoints, reachable from the form, where the rounding on an endpoint is larger than
+-- the whole span and the lock would write on every tick for ever.
+check('a limit counts as moved only past the tolerance, span or endpoint', (function()
+  local span, want = 10.1, 499010
+  local eps = want * 1.2e-7            -- about a float32 step at that magnitude
+  local rounding = fftsa.sg_moved(want + eps, want, span)
+  local real = fftsa.sg_moved(want + span * 0.5, want, span)
+  -- and a pixel of pan on a wide span is still a pan
+  local pixel = fftsa.sg_moved(50000 / fftsa.sg_plotpx, 0, 50000)
+  return rounding == false and real == true and pixel == true,
+         string.format('rounding=%s realpan=%s pixel=%s', tostring(rounding),
+                       tostring(real), tostring(pixel))
+end)())
+check('and a nil read-back is treated as moved, so the lock is never silently dead',
+      fftsa.sg_moved(nil, 0, 50000) == false and (function()
+        local g = fftsa.sg_graph
+        local saved = display.events[g]
+        display.events[g] = nil          -- read-back answers nil now
+        local p = (OBJ[g].pins or 0)
+        fftsa.sg_ev = 1
+        local wrote = fftsa.sg_restore()
+        display.events[g] = saved
+        return wrote == true and (OBJ[g].pins or 0) == p + 1
+      end)())
+
+check('a press unlocks it', fftsa.toggle_lock() == false and fftsa.sg_lock == false)
 check('and shows the open padlock again',
       OBJ[fftsa.lockimg_o].hidden == false and OBJ[fftsa.lockimg_c].hidden == true)
 local pin3, ypin3 = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
+tick_due()
 drag_axes()
 fftsa.frame_body()
-check('an unlocked frame leaves a panned view alone', OBJ[gh].xmin == 12345
+check('an unlocked tick leaves a panned view alone', OBJ[gh].xmin == 12345
       and OBJ[gh].ymin == -77 and (OBJ[gh].pins or 0) == pin3
       and (OBJ[gh].ypins or 0) == ypin3,
       string.format('x from %s, pins %d/%d', tostring(OBJ[gh].xmin),
@@ -1894,8 +1959,42 @@ check('an unlocked frame leaves a panned view alone', OBJ[gh].xmin == 12345
 -- next Apply or zoom re-pins anyway.
 check('unlocking leaves the panned view where the finger left it', OBJ[gh].xmax == 23456,
       tostring(OBJ[gh].xmax))
-fftsa.sg_pin_x()
-fftsa.sg_pin_y()
+-- Locking re-pins at once, so a view dragged while free snaps back on the press rather
+-- than at the next frame -- and that is the whole mechanism while the app is halted.
+check('locking again restores it immediately, without waiting for a frame', (function()
+  local p = (OBJ[gh].pins or 0)
+  local on = fftsa.toggle_lock()
+  return on == true and (OBJ[gh].pins or 0) == p + 1 and OBJ[gh].xmin == wx0,
+         string.format('on=%s pins %d/%d xmin=%s', tostring(on),
+                       (OBJ[gh].pins or 0), p, tostring(OBJ[gh].xmin))
+end)())
+
+-- The icons, which a focus repaint covers. The frame puts them back at the peak cadence,
+-- so the assertion is that a frame redraws them at all -- setstate to a state the object
+-- already holds may be taken as nothing to do, hence the invisible-then-enable pair.
+check('a frame redraws both icons, so a focus repaint cannot leave one blank', (function()
+  local im = img_children(fftsa.sg_scr)
+  local cog = im[fftsa.img_cog]
+  local c0 = (cog.hides or 0)
+  tick_due()
+  fftsa.frame_body()
+  return (cog.hides or 0) > c0, string.format('cog hides %d, was %d',
+                                              (cog.hides or 0), c0)
+end)())
+check('and the hidden padlock stays hidden through that redraw',
+      OBJ[fftsa.lockimg_o].hidden == true and OBJ[fftsa.lockimg_c].hidden == false,
+      'open hidden=' .. tostring(OBJ[fftsa.lockimg_o].hidden)
+      .. ' closed hidden=' .. tostring(OBJ[fftsa.lockimg_c].hidden))
+-- Gated, or it is three setstate pairs every frame instead of one a second.
+check('but not on every frame', (function()
+  local im = img_children(fftsa.sg_scr)
+  local cog = im[fftsa.img_cog]
+  local c0 = (cog.hides or 0)
+  fftsa.frame_body()
+  fftsa.frame_body()
+  return (cog.hides or 0) == c0, string.format('cog hides %d, was %d',
+                                               (cog.hides or 0), c0)
+end)())
 
 -- A press after the screen is gone. The handles are nil by then and a nil handed to the
 -- firmware is a modal dialog per call, so both halves have to test for one.
@@ -2042,21 +2141,46 @@ end)())
 -- Pinned IN HERTZ, which is what makes the firmware's own labels read as frequency.
 -- Scaled limits would still draw a trace -- the data is in the extra field -- but the
 -- axis would be labelled in the wrong units, and that is invisible from inside Lua.
+-- Read off what the WRITE recorded, not through display.graph.scalex's read-back: that
+-- answers only on a graph with event generation enabled, so a test using it is asserting
+-- the precondition as much as the pin, and gets nil the moment the app stops enabling it.
+--
+-- The wanted low edge comes from fftsa.sg_xwant(), the app's own function, rather than
+-- being re-derived here. A copy of the rule in the test is a second rule: this check
+-- carried `sg_flo_hz < binhz`, the bin-width test the source explicitly rejects in favour
+-- of the plot-width one, and it agreed only because the suite runs at Start = 10 Hz.
 check('the X axis is pinned to the window in hertz, not auto-ranged', (function()
-  local lo, hi = display.graph.scalex(fftsa.sg_graph)
-  local want_lo = fftsa.sg_flo_hz
-  if fftsa.sg_flo_hz < fftsa.binhz then want_lo = 0 end
-  return near(lo, want_lo, 1e-9) and near(hi, fftsa.sg_fhi_hz, 1e-9),
-         string.format('pinned %g..%g, wanted %g..%g', lo, hi, want_lo, fftsa.sg_fhi_hz)
+  local lo, hi = OBJ[fftsa.sg_graph].xmin, OBJ[fftsa.sg_graph].xmax
+  local want_lo, want_hi = fftsa.sg_xwant()
+  if lo == nil or want_lo == nil then return false, 'no pin recorded' end
+  return near(lo, want_lo, 1e-9) and near(hi, want_hi, 1e-9),
+         string.format('pinned %g..%g, wanted %g..%g', lo, hi, want_lo, want_hi)
 end)())
 check('a changed span re-pins in hertz', (function()
+  local g = fftsa.sg_graph
   fftsa.sg_set_xrange(8000, 16000)
-  local lo, hi = display.graph.scalex(fftsa.sg_graph)
-  local ok1 = near(lo, 8000, 1e-9) and near(hi, 16000, 1e-9)
+  local ok1 = near(OBJ[g].xmin, 8000, 1e-9) and near(OBJ[g].xmax, 16000, 1e-9)
   fftsa.sg_set_xrange(8000, 8200)
-  lo, hi = display.graph.scalex(fftsa.sg_graph)
-  return ok1 and near(lo, 8000, 1e-9) and near(hi, 8200, 1e-9),
-         string.format('narrow pinned to %g..%g', lo, hi)
+  return ok1 and near(OBJ[g].xmin, 8000, 1e-9) and near(OBJ[g].xmax, 8200, 1e-9),
+         string.format('narrow pinned to %g..%g', OBJ[g].xmin, OBJ[g].xmax)
+end)())
+-- The read-back and its precondition: "return values are only valid when the objects
+-- event generation is set to ALL". The app registers EVENT_SCALE on the graph, so it
+-- answers here; stripped of events it answers nil, and on the instrument -- before
+-- anything was ever registered -- nil is exactly what it gave, with no event posted.
+-- A view lock that skipped its pin on that nil did nothing at all on the glass and the
+-- suite could not see it, because this mock used to answer unconditionally.
+check('a scale read-back answers only while event generation is on', (function()
+  local g = fftsa.sg_graph
+  local x1 = display.graph.scalex(g)
+  local saved = display.events[g]
+  display.events[g] = nil
+  local x2, y2 = display.graph.scalex(g), display.graph.scaley(g)
+  display.events[g] = saved
+  local x3 = display.graph.scalex(g)
+  return x1 ~= nil and x2 == nil and y2 == nil and x3 ~= nil,
+         string.format('with events %s, without %s, restored %s',
+                       tostring(x1), tostring(x2), tostring(x3))
 end)())
 -- Re-pinning makes the firmware redraw its own axis labels, which shows as flicker on
 -- hardware. The pin survives a re-add, which is what lets a rebind skip it; sg_bind_min()

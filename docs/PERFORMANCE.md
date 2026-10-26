@@ -266,16 +266,35 @@ frame and a 5.3 s Apply are the reasons 32768 is not on the Options list.
 | `buffer.write.reading` with 3 arguments | 67 µs | no cheaper than 2 |
 | `bufferVar.clear()` | 0.2 ms | effectively free |
 | `display.graph.add(graph, buffer)` | **4 ms** | one call, any number of points |
+| `display.graph.scalex(g, m, t, lo, hi)` -- a write | **59.3 ms** | 50 calls, frame loop parked |
+| `display.graph.scaley(g, m, t, lo, hi)` -- a write | **60.8 ms** | same; the pair is 121.1 ms |
+| `display.graph.scalex(g)` -- a read | **0.0094 ms** | 50 calls; nil unless events are on |
+| `display.setstate(image, state)` | 0.020 ms | 50 calls, state unchanged |
+| same, `STATE_INVISIBLE` then `STATE_ENABLE` | 0.034 ms a pair | what forces an icon to redraw |
 | `display.setpixel(...)` | 10.8 - 14.6 µs | 2,500 and 60,000 call runs |
 | `display.flush(obj)` | **0.203 s** for an 800x480 surface | see the surface note below |
 
-**Writing an axis limit repaints the whole widget**, label text included, and on the glass that is a
-visible flicker and a drop in frame rate -- measured by eye with the view lock re-asserting both
-limits every frame. Reading them back does not: `scalex` and `scaley` called with the id alone answer
-with the current limits and repaint nothing. So the lock reads first and writes only when a pan has
-actually moved something, which makes an untouched locked view two reads a frame and no write at all.
-Neither call is in the table above yet; `graph.add`'s 4 ms is the warning that a graph *write* is
-milliseconds, not microseconds.
+**Writing an axis limit is the most expensive call in this table** -- 60 ms, fifteen times
+`graph.add`, and it repaints the whole widget including its axis label text. Both figures were taken
+with the frame loop parked; an earlier run that left frames running measured the same 60-67 ms and
+would have been contaminated either way, so the park is what makes them comparable. Cross-checked
+from the host at 139.9 ms for the pair against a 7.3 ms bare round trip.
+
+That number is why the view lock is driven by `display.EVENT_SCALE` rather than by re-asserting the
+limits each frame. **At 512 samples the margin is about 1 ms.** The frame is 81.0 ms and
+`tick_period()`'s 10 fps bucket ends at 82.0 ms, so 121 ms of pinning per frame does not shave the
+rate, it collapses it -- and on the glass it read as a flickering trace, which is what the operator
+reported. One pin per gesture is 121 ms once; an untouched locked frame makes no graph call at all.
+
+The read-back is affordable at 0.0094 ms and is what the lock tests with -- **but its return values
+"are only valid when the objects event generation is set to ALL"**, and non-button objects have no
+events enabled by default. On a graph nobody had registered an event on, `scalex(g)` and `scaley(g)`
+answered nil and posted no event, so a lock that skipped its pin on nil did nothing whatsoever and
+every offline test passed, because the mock answered unconditionally. Registering `EVENT_SCALE`
+supplies the precondition, so the registration is not an optimisation: without it the read-back does
+not work. It costs nothing per frame -- frame work measured 74.7 ms minimum with it on and with it
+off, at 512 samples -- and it reports the gesture as well, which lets a tick that saw no report skip
+even the reads.
 
 A reading-buffer element costs **16x a plain Lua table element**. That is the single most important
 number in this file: it is why the load phase is what it is, and why copying a buffer into a plain
