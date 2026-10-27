@@ -171,7 +171,7 @@ fftsa.thd_mains_fmax = 1000        -- above this a tone on a mains multiple is a
 -- clip wants several passes. Measured on the instrument, all 8192 bins at 16384 samples
 -- cost 0.498 s a call and took the frame from 1.67 s to 2.17 s -- 30% of it, for a figure
 -- that updates once a second. Striding holds it to a few per cent.
-fftsa.thd_nsample = 2048
+fftsa.thd_nsample = 1024
 
 fftsa.thd_clip  = 4
 fftsa.thd_clips = 6
