@@ -1909,10 +1909,25 @@ local function drag_axes()
   OBJ[gh].ymin, OBJ[gh].ymax = -77, -33
   fftsa.sg_ev = (fftsa.sg_ev or 0) + 10      -- about ten fires a drag, measured
 end
--- The lock and the icons act on the once-a-second tick, not on every frame, and os.clock()
--- barely moves inside this suite -- so a test that wants the tick to fire has to say so.
+-- The lock and the icons act on a tick, not on every frame, and os.clock() barely moves
+-- inside this suite -- so a test that wants the tick to fire has to say so. Both clocks:
+-- the gesture check and the icon re-assert run on their own periods.
 local function tick_due()
-  fftsa.sg_tick_last = nil
+  fftsa.sg_tick_last  = nil
+  fftsa.sg_scale_last = nil
+end
+
+-- A gesture is adopted only once the axis has STOPPED moving, so a drag that has ended
+-- takes two checks: the first records the pair it read, the second finds it unchanged and
+-- adopts. That is what the real tick does while a finger rests, and it is why checking
+-- often does not cost a retune per check.
+local function settle_gesture()
+  local i
+  for i = 1, 2 do
+    fftsa.sg_ev = 1
+    tick_due()
+    fftsa.frame_body()
+  end
 end
 
 -- The frame-rate requirement, and the whole reason the lock is event-driven: a pin costs
@@ -2113,9 +2128,7 @@ end)())
 -- write and a settings line and no capture at all.
 check('an unlocked pan retunes the FFT to the range on the glass', (function()
   OBJ[gh].xmin, OBJ[gh].xmax = 12000, 40000
-  fftsa.sg_ev = 1
-  tick_due()
-  fftsa.frame_body()
+  settle_gesture()
   local wlo, whi = fftsa.sg_xwant()
   return fftsa.flo == 12000 and fftsa.fhi == 40000
          and fftsa.sg_flo_hz == 12000 and fftsa.sg_fhi_hz == 40000
@@ -2236,9 +2249,7 @@ end)())
 -- number and re-apply another, losing the gesture's span at the next Apply.
 check('an adopted span is whole hertz, whatever the widget reports', (function()
   OBJ[gh].xmin, OBJ[gh].xmax = 9000.4, 33000.6
-  fftsa.sg_ev = 1
-  tick_due()
-  fftsa.frame_body()
+  settle_gesture()
   return fftsa.flo == 9000 and fftsa.fhi == 33001,
          string.format('%s..%s, wanted 9000..33001', tostring(fftsa.flo),
                        tostring(fftsa.fhi))
@@ -2255,9 +2266,7 @@ end)())
 check('a drag below DC snaps the start up and keeps the stop it dragged to', (function()
   local span = fftsa.fhi - fftsa.flo
   OBJ[gh].xmin, OBJ[gh].xmax = -9000, span - 9000
-  fftsa.sg_ev = 1
-  tick_due()
-  fftsa.frame_body()
+  settle_gesture()
   return fftsa.flo == fftsa.flomin and fftsa.fhi == span - 9000,
          string.format('%g..%g, wanted %g..%g', fftsa.flo, fftsa.fhi,
                        fftsa.flomin, span - 9000)
@@ -2265,9 +2274,7 @@ end)())
 -- The same rule at the other end: the stop clamps and the start stays where it was dragged.
 check('a zoom past the top clamps the stop and keeps the start', (function()
   OBJ[gh].xmin, OBJ[gh].xmax = 300000, 900000
-  fftsa.sg_ev = 1
-  tick_due()
-  fftsa.frame_body()
+  settle_gesture()
   return fftsa.flo == 300000 and fftsa.fhi == fftsa.fhi_max,
          string.format('%g..%g, wanted 300000..%g', fftsa.flo, fftsa.fhi, fftsa.fhi_max)
 end)())
@@ -2287,6 +2294,30 @@ check('and fftsa.frame() installs it once, between frames', (function()
                        tostring(rate0), tostring(after),
                        tostring(fftsa.pick_fs(fftsa.fhi)),
                        tostring(fftsa.retune_pending), tostring(fftsa.halted))
+end)())
+-- Checking often is only affordable because a MOVING axis is not adopted. A finger still on
+-- the glass fires EVENT_SCALE every check, and adopting each time would retune -- a whole
+-- capture -- several times a drag. So a check records the pair it read and acts only when
+-- the next one finds it unchanged.
+check('a check while the axis is still moving records but does not adopt', (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
+  local p = (OBJ[gh].pins or 0)
+  OBJ[gh].xmin, OBJ[gh].xmax = 100000, 200000
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()                        -- one check: records, writes nothing
+  local midlo, midhi, midp = fftsa.flo, fftsa.fhi, (OBJ[gh].pins or 0)
+  OBJ[gh].xmin, OBJ[gh].xmax = 110000, 190000   -- the finger has moved again
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  local movlo, movhi = fftsa.flo, fftsa.fhi
+  settle_gesture()                          -- and now it has stopped
+  return midlo == lo0 and midhi == hi0 and midp == p
+         and movlo == lo0 and movhi == hi0
+         and fftsa.flo == 110000 and fftsa.fhi == 190000,
+         string.format('one check %g..%g, still moving %g..%g, stopped %g..%g',
+                       midlo, midhi, movlo, movhi, fftsa.flo, fftsa.fhi)
 end)())
 -- Through apply(), because putting back only the numbers would leave the hardware
 -- describing the gesture's span while every later check read the file's.
@@ -2338,9 +2369,7 @@ check('a gesture that re-plans writes the frequency axis once, not twice', (func
   local lo0, hi0 = fftsa.flo, fftsa.fhi
   local p = (OBJ[gh].pins or 0)
   OBJ[gh].xmin, OBJ[gh].xmax = 10, 120000    -- past the Nyquist of the rate in force
-  fftsa.sg_ev = 1
-  tick_due()
-  fftsa.frame_body()
+  settle_gesture()
   local afteradopt, pending = (OBJ[gh].pins or 0), fftsa.retune_pending
   fftsa.frame()                              -- services the re-plan
   local afterapply = (OBJ[gh].pins or 0)
@@ -2351,6 +2380,79 @@ check('a gesture that re-plans writes the frequency axis once, not twice', (func
          and fftsa.flo == lo0 and fftsa.fhi == hi0,
          string.format('pins %d -> %d adopted -> %d applied, pending=%s',
                        p, afteradopt, afterapply, tostring(pending))
+end)())
+-- A failed Apply that changed the sample count left fftsa.halted set, and nothing clears
+-- it but another Apply: the trace froze and the app looked dead until the operator went
+-- back into Options and pressed Apply again. The count now goes back and apply() runs on
+-- the pair that was in force a moment ago, so frames resume -- while the Apply is still
+-- reported as failed, because the setting asked for did not take.
+check('a failed Apply that changed the sample count reverts and keeps running', (function()
+  local n0 = fftsa.n
+  local i0 = fftsa.sample_to_idx(n0)
+  local i1 = i0 + 1
+  if i1 > table.getn(fftsa.sample_counts) then i1 = i0 - 1 end
+  local real = fftsa.measure_fs
+  -- Raises only while the NEW count is in force, so the revert's apply() gets through.
+  fftsa.measure_fs = function(buf)
+    if fftsa.n ~= n0 then error('forced', 0) end
+    return real(buf)
+  end
+  display.setvalue(fftsa.opt_n, i1)
+  local ok = fftsa.options_apply()
+  fftsa.measure_fs = real
+  local halted, n1, err = fftsa.halted, fftsa.n, tostring(fftsa.lasterr)
+  display.setvalue(fftsa.opt_n, i0)
+  fftsa.options_apply()                     -- back to what the rest of the file expects
+  return ok == false and halted == false and n1 == n0
+         and string.find(err, 'kept', 1, true) ~= nil,
+         string.format('ok=%s halted=%s n=%s/%s err=%s', tostring(ok), tostring(halted),
+                       tostring(n1), tostring(n0), err)
+end)())
+-- The settings line is cosmetic and both writers sit inside apply() AFTER the hardware is
+-- configured, so nothing that builds it may raise: a rate that is not a number, a zero
+-- sample count or a range index the labels do not hold would otherwise fail an Apply that
+-- had already taken effect.
+check('the settings line builders are total', (function()
+  local cases = {
+    function() return fftsa.sample_rate_text(nil) end,
+    function() return fftsa.sample_rate_text('x') end,
+    function() return fftsa.sample_rate_text(0 / 0) end,
+    function() return fftsa.sample_rate_text(1 / 0) end,
+    function() return fftsa.opt_info_text(nil, nil) end,
+    function() return fftsa.opt_info_text(0, 0) end,
+    function() return fftsa.opt_info_text('x', 'y') end,
+    function() return fftsa.opt_info_text(1 / 0, 0) end,
+    function()
+      local n0 = fftsa.n
+      fftsa.n = nil
+      local ok, r = pcall(fftsa.sg_xunit_text)
+      fftsa.n = n0
+      if not ok then error(tostring(r), 0) end
+      return r
+    end,
+  }
+  local i, bad = nil, nil
+  for i = 1, table.getn(cases) do
+    local ok, r = pcall(cases[i])
+    if not ok then
+      bad = string.format('case %d raised: %s', i, tostring(r))
+    elseif type(r) ~= 'string' then
+      bad = string.format('case %d gave a %s', i, type(r))
+    end
+  end
+  return bad == nil, bad or (table.getn(cases) .. ' cases, every one a string')
+end)())
+-- And the guard behind all of them: if building the line raises for a reason none of those
+-- cases covers, an Apply whose hardware configuration succeeded must still report success.
+check('an Apply survives a settings line that cannot be built', (function()
+  local real = fftsa.sg_xunit_text
+  fftsa.sg_xunit_text = function() error('forced', 0) end
+  local ok = fftsa.options_apply()
+  fftsa.sg_xunit_text = real
+  local err = tostring(fftsa.lasterr)
+  fftsa.options_apply()                     -- and the real line comes back
+  return ok == true and string.find(err, 'settings line', 1, true) ~= nil,
+         string.format('ok=%s err=%s', tostring(ok), err)
 end)())
 -- arm() deletes the timer and creates a replacement, so re-arming restarts the period and
 -- churns the object pool. The period is derived from the sample count and nothing else, and

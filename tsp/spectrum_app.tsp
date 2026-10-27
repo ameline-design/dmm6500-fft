@@ -327,7 +327,7 @@ function fftsa.apply()
   -- The LEGEND again, not the axis. What the measured rate refined is binhz, and so the bin
   -- count the legend reports for a narrow span; fftsa.flo and fftsa.fhi have not moved since
   -- the pin above, so re-pinning would be a second 60 ms write of identical limits.
-  fftsa.settxt(fftsa.sg_xunit, fftsa.sg_xunit_text())
+  fftsa.sg_write_xunit()
 end
 
 -- One frame: acquire, transform, plot. Runs under pcall from fftsa.frame().
@@ -781,7 +781,11 @@ function fftsa.about_back()
   return true
 end
 
+-- Total by construction. This feeds the settings line and the Options readback, both
+-- cosmetic, and both are built inside apply() after the hardware has been configured: a
+-- rate that is not a number has to read as a gap, not abort the Apply around it.
 function fftsa.sample_rate_text(fs)
+  if type(fs) ~= "number" then return "?" end
   if fs >= 1000000 then return string.format("%g MS/s", fs / 1000000) end
   if fs >= 1000 then return string.format("%g kS/s", fs / 1000) end
   return string.format("%g S/s", fs)
@@ -813,9 +817,17 @@ end
 function fftsa.opt_info_text(fs, n, wi, bi, acq)
   fs, n = fs or fftsa.fs, n or fftsa.n
   if acq == nil then acq = fftsa.fs_acq or fs end
+  -- Every input can be nil or zero while the app is part-built or part-torn-down, and a
+  -- raise here would abort an Apply over a text line. The bin and record length are the
+  -- two that need arithmetic, so they are the two that get withheld; tostring() covers
+  -- the window label, which is a table lookup and can miss.
+  local wl = tostring(fftsa.win_label(wi, bi))
+  if type(fs) ~= "number" or type(n) ~= "number" or n == 0 or fs == 0 then
+    return string.format("fs %s   bin ? Hz   acq ? ms   %s",
+                         fftsa.sample_rate_text(acq), wl)
+  end
   return string.format("fs %s   bin %.2f Hz   acq %.2f ms   %s",
-                       fftsa.sample_rate_text(acq), fs / n, 1000 * n / fs,
-                       fftsa.win_label(wi, bi))
+                       fftsa.sample_rate_text(acq), fs / n, 1000 * n / fs, wl)
 end
 
 -- Read a field, or answer the fallback if the handle was never built. The firmware
@@ -980,6 +992,20 @@ function fftsa.options_apply()
   -- force, which is exactly the case the frames should keep running through.
   fftsa.halted = (fftsa.n ~= nold)
   local ok, err = pcall(function() fftsa.apply() end)
+  -- A failure with the count changed leaves the FFT tables and the capture buffer possibly
+  -- sized apart, which is what halted above guards -- but leaving it set is an app that
+  -- never draws again and that only another Apply can revive. So the count goes back and
+  -- apply() runs once more on the pair that was in force a moment ago. Frames resume if
+  -- that works. The Apply is still reported as failed, because the setting asked for did
+  -- not take, and fftsa.n now holds what did, so the form reopens on it.
+  if not ok and fftsa.n ~= nold then
+    fftsa.n = nold
+    if pcall(function() fftsa.apply() end) then
+      err = tostring(err) .. "  [kept " .. tostring(nold) .. " samples]"
+      fftsa.halted, fftsa.errrun = false, 0
+      if mkchanged then fftsa.sg_bind() end
+    end
+  end
   fftsa.show_main()
   if not ok then
     fftsa.lasterr = tostring(err)
@@ -991,7 +1017,11 @@ function fftsa.options_apply()
     -- the next frame.
     fftsa.retune_pending = false
     if mkchanged then fftsa.sg_bind() end
-    display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
+    -- Through the guarded writer, like the two inside apply(): this one is past every
+    -- commit, so a raise building the text would report a failed Apply that had in fact
+    -- succeeded -- and it is outside the pcall above, so it would escape options_apply
+    -- altogether and take the button handler with it.
+    fftsa.sg_write_xunit()
   end
   return ok
 end

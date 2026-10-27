@@ -160,9 +160,12 @@ end
 -- span nor the dB range is repeated. Written twice per Apply, before the capture and again
 -- after, so the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
-   local t = string.format("%d pts   %s   %s", fftsa.n,
-                          fftsa.opt_info_text(fftsa.fs, fftsa.n),
-                          fftsa.range_labels[fftsa.range_to_idx(fftsa.range)])
+  -- Total for the same reason opt_info_text is: apply() builds this line after the
+  -- hardware is already configured, so a nil count or a range index the labels do not
+  -- hold has to read as a gap rather than abort the Apply.
+  local t = string.format("%d pts   %s   %s", fftsa.n or 0,
+                          tostring(fftsa.opt_info_text(fftsa.fs, fftsa.n)),
+                          tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]))
   local bptxt = fftsa.bp_text()
   if bptxt ~= "" then t = t .. "   " .. bptxt end
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
@@ -447,12 +450,25 @@ end
 -- The window and the settings line, without the pin. Split out for the one caller that must
 -- not pin: an adopted gesture about to re-plan has fftsa.apply() pinning from the same pair
 -- a moment later, and an axis write is 60 ms.
+-- The settings line, written so a raise cannot escape. Everything the line describes is
+-- committed before it is built, and both writers sit inside apply() after the hardware is
+-- configured, so a failure here is a stale line that says so in fftsa.lasterr rather than
+-- an Apply that reports failure over cosmetics. The one place that writes it, so the two
+-- callers cannot disagree about that. Not on the frame path: twice an Apply and once a
+-- gesture, which is where a closure per call is affordable.
+function fftsa.sg_write_xunit()
+  if fftsa.sg_xunit == nil then return false end
+  local ok, err = pcall(function()
+    display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
+  end)
+  if not ok then fftsa.lasterr = "settings line: " .. tostring(err) end
+  return ok
+end
+
 function fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
-  if fftsa.sg_xunit ~= nil then
-    display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
-  end
+  fftsa.sg_write_xunit()
 end
 
 -- The one place a zoom touches: it stores the window, rewrites the settings line and
@@ -536,6 +552,11 @@ fftsa.sg_ev = 0        -- EVENT_SCALE fires since the tick last looked
 -- read-back's actual precision, which is unmeasured: if it round-trips a fractional limit
 -- exactly, the scale can be the span alone and the dead zone goes.
 fftsa.sg_tol = 1e-6
+
+-- The limits the previous gesture check read, or nil when nothing is in flight. What tells
+-- a finger still moving from one that has stopped, in sg_settle_x.
+fftsa.sg_seen_lo = nil
+fftsa.sg_seen_hi = nil
 
 -- Turn the graph's pan-and-zoom reporting on. Unconditional, not tied to the lock: the dB
 -- axis is restored either way and an unlocked frequency gesture has to be read before it
@@ -641,12 +662,25 @@ function fftsa.sg_settle_x(g)
   end
   if not (fftsa.sg_moved(x1, wlo, whi - wlo)
           or fftsa.sg_moved(x2, whi, whi - wlo)) then
+    fftsa.sg_seen_lo, fftsa.sg_seen_hi = nil, nil
     return false
   end
   if fftsa.sg_lock then
+    fftsa.sg_seen_lo, fftsa.sg_seen_hi = nil, nil
     fftsa.sg_pin_x()
     return true
   end
+  -- Unlocked, adopt only once the gesture has STOPPED moving. A pair that differs from the
+  -- last check is a finger still on the glass: it is remembered and left alone, and the
+  -- next check with the same pair adopts it. That is what pays for checking often -- one
+  -- drag costs one retune rather than one per check, and a retune is a whole capture.
+  if fftsa.sg_seen_lo == nil
+     or fftsa.sg_moved(x1, fftsa.sg_seen_lo, whi - wlo)
+     or fftsa.sg_moved(x2, fftsa.sg_seen_hi, whi - wlo) then
+    fftsa.sg_seen_lo, fftsa.sg_seen_hi = x1, x2
+    return false
+  end
+  fftsa.sg_seen_lo, fftsa.sg_seen_hi = nil, nil
   return fftsa.sg_adopt_x(x1, x2)
 end
 
@@ -670,23 +704,35 @@ function fftsa.sg_scale_check()
   return fftsa.sg_settle()
 end
 
--- Both jobs, on their own gate at the same period as the peak table -- the constant is
--- shared, the clock is not, since sg_show_peaks re-stamps only when a peak moves. Each
--- answers a touch, so neither needs the frame rate, and at 60 ms an axis write the settle
--- must not have it. A tick with nothing to do costs one os.clock() and the icons' five
--- setstate calls. Driven from the frame, so a halted app settles only on a Lock press.
-fftsa.sg_tick_last = nil
+-- Two jobs on two clocks. The icons only have to be re-asserted often enough that a focus
+-- repaint does not sit there, which is the peak table's period. A gesture has to be
+-- answered while the finger is still near where it stopped, and a second of that period on
+-- top of a frame is what made a drag at 2048 samples feel ignored -- 1.3 s before the app
+-- even looked. A check with nothing reported costs one os.clock() and no graph call, so
+-- the shorter period is free whenever nothing is moving.
+--
+-- Driven from the frame, so the frame period is the floor: 0.3 s at 2048 samples, 0.08 s
+-- at 512. A halted app settles only on a Lock press.
+fftsa.sg_scale_period = 0.15    -- seconds between gesture checks
+fftsa.sg_tick_last  = nil
+fftsa.sg_scale_last = nil
 
 function fftsa.sg_slow_tick()
   local now = os.clock()
-  if fftsa.sg_tick_last ~= nil
-     and (now - fftsa.sg_tick_last) < fftsa.sg_pk_period then
-    return false
+  local did = false
+  if fftsa.sg_scale_last == nil
+     or (now - fftsa.sg_scale_last) >= fftsa.sg_scale_period then
+    fftsa.sg_scale_last = now
+    fftsa.sg_scale_check()
+    did = true
   end
-  fftsa.sg_tick_last = now
-  fftsa.sg_scale_check()
-  if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
-  return true
+  if fftsa.sg_tick_last == nil
+     or (now - fftsa.sg_tick_last) >= fftsa.sg_pk_period then
+    fftsa.sg_tick_last = now
+    if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
+    did = true
+  end
+  return did
 end
 
 -- The recovery path after a failed frame, and the same binding as the build.

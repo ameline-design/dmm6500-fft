@@ -45,8 +45,13 @@ means, and a **cog**, which opens Options.
 
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So every gesture is settled after the
-fact, about a second later: the check runs once a second rather than once a frame, so at 16384
-samples it lands on the next frame instead, about two seconds.
+fact. The check runs every 0.15 s, floored by the frame period because it is driven from the frame:
+about 0.08 s at 512 samples and 0.3 s at 2048, so the settle follows the finger by roughly twice
+that. A check that has had no gesture reported costs one clock read and no graph call.
+
+**A frequency gesture is adopted only once the axis stops moving.** A finger still on the glass is
+reported on every check, and retuning to each reading would mean several captures during one drag,
+so a pair that has changed since the last check is noted and left alone. One drag, one retune.
 
 **The dB axis always goes back**, whatever the padlock says. The scale is fixed at -120 to +20 dBV
 and there is no setting behind it, so a dragged dB axis is only a worse view of the same data.
@@ -54,14 +59,14 @@ and there is no setting behind it, so a dragged dB axis is only a worse view of 
 **The padlock decides what a horizontal gesture means.** It is closed when the app starts.
 
 - **Closed** — the frequency axis goes back to the span in force. Pan or zoom and the trace snaps
-  back within about a second.
+  back on the next check, without waiting for the gesture to stop.
 - **Open** — the span follows the axis. Drag or pinch and the analyser **retunes** to the range you
   have brought into view: Start and Stop in Options change to match, the firmware relabels the axis,
   and the next frame measures that range.
 
 Pressing the padlock closed settles the view at once rather than waiting for the next check, so a
-drag within the same second snaps back instead of being adopted. Pressing it open settles nothing,
-and the span already in force stays in force until something is dragged.
+drag that has not yet been adopted snaps back instead. Pressing it open settles nothing, and the
+span already in force stays in force until something is dragged.
 
 **What a retune costs depends on whether the sample rate has to change.** The digitizer runs at the
 lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency, so:
