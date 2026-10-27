@@ -511,7 +511,11 @@ end
 
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
 local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false}
-dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', digitize = {}}
+-- The terminal selection is a front-panel button, so the mock carries it as state the
+-- tests can move under the app, which is what the panel does.
+dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', digitize = {},
+       TERMINALS_FRONT = 'front', TERMINALS_REAR = 'rear'}
+dmm.terminals = dmm.TERMINALS_FRONT
 function dmm.digitize.read(b)
   local count = dmm.digitize.count or 512
   local fs    = dmm.digitize.samplerate or 100000
@@ -2454,6 +2458,53 @@ check('an Apply survives a settings line that cannot be built', (function()
   return ok == true and string.find(err, 'settings line', 1, true) ~= nil,
          string.format('ok=%s err=%s', tostring(ok), err)
 end)())
+-- FRONT/REAR is a front-panel button the app does not own and cannot refuse. The pair not
+-- selected is an open input, so a signal on the front with the switch on REAR reads as a
+-- dead signal -- which on the trace alone is indistinguishable from a broken transform.
+-- The line names the selection, and keeps naming it correctly when the button is pressed
+-- with the app running.
+check('the settings line names the terminal selection, last on the line', (function()
+  local was = dmm.terminals
+  dmm.terminals = dmm.TERMINALS_FRONT
+  local front = fftsa.sg_xunit_text()
+  dmm.terminals = dmm.TERMINALS_REAR
+  local rear = fftsa.sg_xunit_text()
+  dmm.terminals = nil                      -- an answer neither enum matches
+  local unknown = fftsa.sg_xunit_text()
+  dmm.terminals = was
+  return string.sub(front, -5) == 'FRONT' and string.sub(rear, -4) == 'REAR'
+         and string.sub(unknown, -5) == 'TERM?',
+         string.format('[%s] / [%s] / [%s]', front, rear, unknown)
+end)())
+-- Written only when the answer changes: a text write every tick for the life of the app
+-- would be the lazy way to keep it true, and this tick is shared with the peak table.
+check('a terminal change reaches the line without an Apply, and only on a change',
+      (function()
+  local h = fftsa.sg_xunit
+  local was = dmm.terminals
+  dmm.terminals = dmm.TERMINALS_FRONT
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()                       -- settles on FRONT
+  local before, s0 = OBJ[h].text, (OBJ[h].sets or 0)
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()                       -- nothing moved
+  local s1 = (OBJ[h].sets or 0)
+  dmm.terminals = dmm.TERMINALS_REAR       -- the button is pressed, mid-run
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()
+  local after, s2 = OBJ[h].text, (OBJ[h].sets or 0)
+  dmm.terminals = was
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()
+  return string.sub(before, -5) == 'FRONT' and string.sub(after, -4) == 'REAR'
+         and s1 == s0 and s2 == s1 + 1,
+         string.format('[%s] -> [%s], sets %d idle %d changed %d',
+                       tostring(before), tostring(after), s0, s1, s2)
+end)())
 -- arm() deletes the timer and creates a replacement, so re-arming restarts the period and
 -- churns the object pool. The period is derived from the sample count and nothing else, and
 -- a gesture cannot change it, so apply() re-arms only when the count has actually moved.
@@ -2721,14 +2772,17 @@ end)())
 check('the legend carries the settings, not the axis units', (function()
   local fs, n, r, w = fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  local term = dmm.terminals
   fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = 100000, 512, 10, 1
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 10, 50000
+  dmm.terminals = dmm.TERMINALS_FRONT
   local t = fftsa.sg_xunit_text()
   fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = fs, n, r, w
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = lo, hi
+  dmm.terminals = term
   -- No band-pass figure: the field is withheld, and the line only mentions it when
-  -- something has set fftsa.bp_on over the socket.
-  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V', t
+  -- something has set fftsa.bp_on over the socket. The terminal selection is last.
+  return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V   FRONT', t
 end)())
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
       'gy=' .. fftsa.sg_gy)

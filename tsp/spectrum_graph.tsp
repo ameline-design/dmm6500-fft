@@ -181,7 +181,9 @@ function fftsa.sg_xunit_text()
       t = t .. string.format("   only %d bin%s in the span", n, plural)
     end
   end
-  return t
+  -- Last on the line, and always present: the selection is only useful if its absence
+  -- cannot be read as FRONT.
+  return t .. "   " .. fftsa.terminal_text()
 end
 
 -- The trace buffer: WRITABLE_FULL carries value, extra and timestamp per point, the value
@@ -707,15 +709,17 @@ end
 -- Two jobs on two clocks. The icons only have to be re-asserted often enough that a focus
 -- repaint does not sit there, which is the peak table's period. A gesture has to be
 -- answered while the finger is still near where it stopped, and a second of that period on
--- top of a frame is what made a drag at 2048 samples feel ignored -- 1.3 s before the app
--- even looked. A check with nothing reported costs one os.clock() and no graph call, so
--- the shorter period is free whenever nothing is moving.
+-- top of a frame is what makes a drag at 2048 samples feel ignored -- 1.3 s before the app
+-- even looks. A check with no gesture reported costs one os.clock() and no graph call --
+-- measured at 16384 samples, 1.6723 s a frame with this period against 1.686 s recorded
+-- for the one-second period -- so the shorter period is free whenever nothing is moving.
 --
 -- Driven from the frame, so the frame period is the floor: 0.3 s at 2048 samples, 0.08 s
 -- at 512. A halted app settles only on a Lock press.
 fftsa.sg_scale_period = 0.15    -- seconds between gesture checks
 fftsa.sg_tick_last  = nil
 fftsa.sg_scale_last = nil
+fftsa.sg_term_last  = nil       -- the terminal selection the line currently names
 
 function fftsa.sg_slow_tick()
   local now = os.clock()
@@ -730,6 +734,16 @@ function fftsa.sg_slow_tick()
      or (now - fftsa.sg_tick_last) >= fftsa.sg_pk_period then
     fftsa.sg_tick_last = now
     if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
+    -- The FRONT/REAR button is pressed on the panel, not through Options, so nothing else
+    -- rewrites the line when it moves -- and the pair not selected is an open input. On
+    -- this clock rather than the gesture one: the change is a human pressing a button, so
+    -- a second of latency costs nothing and it is one attribute read a second instead of
+    -- seven. The text write happens only when the answer actually changes.
+    local term = fftsa.terminal_text()
+    if term ~= fftsa.sg_term_last then
+      fftsa.sg_term_last = term
+      fftsa.sg_write_xunit()
+    end
     did = true
   end
   return did

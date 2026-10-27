@@ -41,6 +41,17 @@ capture further down resolves them exactly.
 Two buttons sit to the right of the peak table: a **padlock**, which decides what a sideways drag
 means, and a **cog**, which opens Options.
 
+**The line along the bottom reads back what is applied** — sample count, digitizer rate, bin width,
+record length, window, input range, and the terminal selection last. It describes the settings in
+force, not the fields being edited.
+
+**`FRONT` or `REAR` at the end of that line is the terminal selection.** FRONT/REAR is a front-panel
+button the app cannot refuse, and the pair that is not selected is an open input: a signal wired to
+the front with the switch on REAR reads as a *dead signal* rather than as a wrong setting, which on
+the trace alone is indistinguishable from a broken transform. The selection is checked once a second
+and the line rewritten when it moves, so pressing that button with the app running is visible
+immediately and without opening Options.
+
 ## Dragging and zooming the trace
 
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`

@@ -781,6 +781,19 @@ function fftsa.about_back()
   return true
 end
 
+-- Which pair of terminals the ADC is on. FRONT/REAR is a front-panel button the app does
+-- not own and cannot refuse, and the pair not selected is an open input: a signal on the
+-- front with the switch on REAR reads as a dead signal rather than as a wrong setting,
+-- which is indistinguishable from a broken transform. Named on the settings line so the
+-- selection is always visible, and watched by the tick so pressing the button mid-session
+-- shows up without an Apply. Total, like every other builder feeding that line.
+function fftsa.terminal_text()
+  local t = dmm.terminals
+  if t == dmm.TERMINALS_REAR then return "REAR" end
+  if t == dmm.TERMINALS_FRONT then return "FRONT" end
+  return "TERM?"
+end
+
 -- Total by construction. This feeds the settings line and the Options readback, both
 -- cosmetic, and both are built inside apply() after the hardware has been configured: a
 -- rate that is not a number has to read as a gap, not abort the Apply around it.
