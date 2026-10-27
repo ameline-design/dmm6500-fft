@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 3.3
+-- $Version: 3.4
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -838,8 +838,41 @@ fftsa.thd_minratio = 1000
 --
 -- Each pass tightens the threshold and the loop stops when one removes nothing. On noise
 -- with no outliers the clip trims the top few per cent and costs 0.5 dB.
+-- Mains pickup is not the signal under test. A floating input reads 60 Hz at -25.4 dBV
+-- with harmonics out to 540, which made the hum the fundamental and reported its own
+-- distortion as the instrument's: 11.04% measured, over a -105.2 dBV floor. A candidate at
+-- a multiple of 50 or 60 Hz, below thd_mains_fmax and at or under -22 dBV, is passed over
+-- so the search moves on -- and with nothing else there the margin then answers NoSig.
+--
+-- The harmonics have to go too, or discounting 60 Hz alone promotes 120 at -46.3 dBV,
+-- which still clears the margin by 59 dB.
+fftsa.thd_mains      = {50, 60}
+fftsa.thd_mains_pwr  = 0.0063096   -- -22 dBV expressed as power
+fftsa.thd_mains_fmax = 1000        -- above this a tone on a mains multiple is a tone
+
 fftsa.thd_clip  = 4
 fftsa.thd_clips = 6
+
+-- Is this candidate mains pickup rather than the signal? Level first, because it is the
+-- cheap test and the common answer. Called only when a candidate beats the running
+-- maximum, which happens a handful of times over a spectrum, not once a bin.
+function fftsa.thd_is_mains(fhz, p, binhz)
+  if not (p <= fftsa.thd_mains_pwr) then return false end
+  if not (fhz < fftsa.thd_mains_fmax) then return false end
+  local tol = binhz
+  if not (tol > 2) then tol = 2 end
+  local i
+  for i = 1, 2 do
+    local f = fftsa.thd_mains[i]
+    local n = math.floor(fhz / f + 0.5)
+    if n >= 1 then
+      local d = fhz - n * f
+      if d < 0 then d = -d end
+      if d <= tol then return true end
+    end
+  end
+  return false
+end
 
 -- Sum and count the bins that are neither a line nor a skirt and do not exceed ceil. The
 -- exclusion list is walked alongside the bins: one comparison a bin, not one a line a bin,
@@ -888,7 +921,10 @@ function fftsa.thd_noise(nb, binhz)
   for k = kmin, kmax do
     local p = pwr[k]
     -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
-    if p ~= nil and p > pf then kf, pf = k, p end
+    -- Strict > rejects a NaN correctly on this firmware where >= does not.
+    if p ~= nil and p > pf and not fftsa.thd_is_mains((k - 1) * binhz, p, binhz) then
+      kf, pf = k, p
+    end
   end
   if kf == nil or not (pf > 0) then return nil, nil, 0 end
   local df, vf = fftsa.peak_interp(kf, nb)

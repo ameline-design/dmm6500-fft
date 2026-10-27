@@ -98,6 +98,14 @@ at all: the plain mean of a windowed spectrum is set by whichever few bins carry
 skirt, not by the floor. Bins above four times the running mean are dropped and the mean retaken,
 repeating until a pass drops nothing. On noise with no outliers that costs 0.5 dB, measured.
 
+**Mains pickup is passed over, not measured.** A floating input picks up 50 or 60 Hz and its
+harmonics — disconnected, this reads 60 Hz at −25.4 dBV with harmonics out to 540 — and without a
+rule the hum becomes the fundamental and the display reports the *hum's* distortion as though it were
+the instrument's, which measured 11.04%. A candidate at any multiple of 50 or 60 Hz, below 1 kHz and
+at or under −22 dBV, is skipped and the search moves on; with nothing else present the signal margin
+then answers `NoSig`. A loud mains-frequency tone is still a tone — above −22 dBV it is taken at face
+value — and so is a quiet one above 1 kHz, even on a mains multiple.
+
 Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
 plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
 frame at that size, once a second.

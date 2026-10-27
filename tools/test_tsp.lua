@@ -3041,6 +3041,50 @@ check('a NaN bin does not take the noise figures down with it', (function()
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
   return bad == nil, bad or 'a NaN bin and an infinite bin, both survived'
 end)())
+-- Mains pickup is not the signal. A floating input read 60 Hz at -25.4 dBV with harmonics
+-- out to 540, and reported the hum's own distortion as 11.04% over a -105.2 dBV floor.
+-- Bins at 10 Hz here, so 50 and 60 Hz and their multiples all land on bin centres.
+check('mains and its harmonics do not become the fundamental', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local bad = nil
+  local function spectrum(fill)
+    local p, i = {}, nil
+    for i = 1, 256 do p[i] = 1e-12 end
+    fill(p)
+    fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 10
+    fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 2550, 0
+    return p
+  end
+  -- 60 Hz hum with harmonics, every one under -22 dBV: nothing here is a signal.
+  spectrum(function(p) p[7], p[13], p[19], p[55] = 1e-3, 1e-5, 1e-6, 1e-7 end)
+  local t, nd, nh, s = fftsa.thd_noise(256, 10)
+  if t ~= nil or s ~= nil then
+    bad = string.format('60 Hz hum read as a signal: thd=%s snr=%s', tostring(t), tostring(s))
+  elseif nd == nil then bad = '60 Hz hum lost the floor' end
+  -- 50 Hz, for Europe, with its harmonics.
+  spectrum(function(p) p[6], p[11], p[16] = 1e-3, 1e-5, 1e-6 end)
+  local t2, nd2, _, s2 = fftsa.thd_noise(256, 10)
+  if bad == nil and (t2 ~= nil or s2 ~= nil) then
+    bad = string.format('50 Hz hum read as a signal: thd=%s snr=%s', tostring(t2), tostring(s2))
+  end
+  -- A real tone WEAKER than the hum still wins, because the hum is passed over.
+  spectrum(function(p) p[7], p[13], p[124] = 1e-3, 1e-5, 1e-4 end)
+  local t3, _, _, s3 = fftsa.thd_noise(256, 10)
+  local f3 = fftsa.thd_f0_hz
+  if bad == nil and s3 == nil then bad = 'a 1230 Hz tone under the hum was missed' end
+  -- A LOUD mains-frequency tone is a tone: -22 dBV is the line, and 0 dBV is over it.
+  spectrum(function(p) p[7] = 1.0 end)
+  local _, _, _, s4 = fftsa.thd_noise(256, 10)
+  if bad == nil and s4 == nil then bad = 'a 0 dBV 60 Hz tone was discounted as hum' end
+  -- And a quiet tone on a mains multiple ABOVE the cutoff is a tone: 1200 Hz is 20 x 60.
+  spectrum(function(p) p[121] = 1e-4 end)
+  local _, _, _, s5 = fftsa.thd_noise(256, 10)
+  if bad == nil and s5 == nil then bad = 'a 1200 Hz tone was discounted as a mains multiple' end
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  return bad == nil, bad or 'hum at 50 and 60 discounted, real tones kept'
+end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the
 -- feature: this is the only place the applied settings read back without opening Options.
