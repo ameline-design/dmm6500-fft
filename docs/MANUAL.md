@@ -8,7 +8,7 @@ screen and buffer the app made.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 1.0014 V tone reading 0.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -100 dB. A padlock button, open, and a cog button sit to the right of the peak table](manual-spectrum.png)
+![The spectrum screen: a 12.5 kHz 4.0020 V tone reading 12.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -95 dB. Between the graph and the peak table a line reads THD 0.01%, S/N 78.4 dB and a noise floor of -89.7 dBV. A padlock button, closed, and a cog button sit to the right of the peak table](manual-spectrum.png)
 
 +20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
 Options offers larger records for finer bin spacing, at a slower update rate.
@@ -84,6 +84,11 @@ at −100, because three bins of pure signal each side were averaged in as noise
 beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelobes are 30 and 40 dB
 down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
 telling you about the window rather than the instrument.
+
+![The same capture with Kaiser beta 18: the 12.5 kHz tone at 12.0 dBV with visibly narrower skirts than
+Hann, and a distortion line reading THD 0.01%, S/N 77.0 dB and a noise floor of -103.9 dBV -- within
+two decibels of what Hann reports, where before the leakage outliers were clipped the two windows
+disagreed by 23](manual-spectrum-kaiser18.png)
 
 **For the most accurate S/N and noise floor, use Kaiser with beta = 18 at 16,384 samples.** Both
 figures are limited by the window before they are limited by the instrument, and Kaiser 18 is the
@@ -416,9 +421,11 @@ Three consequences, and the first is the point of it:
 | bins in a 50 kHz span | 255 | 511 | 1023 | 2047 | 4095 | 8191 |
 | points drawn | 255 | 380 | 441 | 475 | 496 | 502 |
 
-![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 0.0 dBV, its second
-and third harmonics resolved as separate spikes at 25.000 and 37.500 kHz, and the noise floor drawn
-as a single line near -100 dB, with the padlock and cog buttons right of the peak table. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
+![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 12.0 dBV, its second
+and third harmonics resolved as separate spikes at 25.002 and 37.501 kHz, and the noise floor drawn
+as a single line near -100 dB, with the padlock and cog buttons right of the peak table. The
+distortion line reads THD 0.02%, S/N 78.9 dB and a noise floor of -105.8 dBV -- 16 dB below the
+512-sample figure, which is the 3 dB a doubling a per-bin level gives. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
 +40.00kHz](manual-spectrum-16384.png)
 
 Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
