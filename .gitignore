@@ -42,3 +42,9 @@ out/
 **/.DS_Store
 __pycache__/
 *.pyc
+
+# DSP proposal work -- kept locally, deliberately not tracked
+csrc/
+docs/NATIVE-DSP-PROPOSAL.md
+docs/NATIVE-DSP-PROPOSAL.pdf
+tools/make_pdf.py
