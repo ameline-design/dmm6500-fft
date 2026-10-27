@@ -110,6 +110,13 @@ fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410       -- settings line, below the peak rows
 fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview line
 
+-- Distortion and noise, between the graph (ends at sg_gy + sg_gh = 312) and the first
+-- peak row (sg_pky = 350). Pale amber, the dB column's colour, since both are levels.
+fftsa.sg_thd_x = 8
+fftsa.sg_thd_y = 326
+fftsa.sg_thd_c = 16769184
+fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
+
 -- The nil test is the point: display.create answers nil on an exhausted pool, and the app
 -- module deletes handles it may never have built. No pcall -- a refused delete posts an
 -- event and returns, so a wrapper can never be false; the suite's live-object counts
@@ -313,6 +320,10 @@ function fftsa.sg_build(title, nbins, npoints)
     fftsa.sg_pk_d[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_d[col], y, "", fftsa.sg_pk_cd, small, display.JUST_LEFT)
   end
 
+  fftsa.sg_thd_last = nil
+  fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
+                        fftsa.sg_thd_text(nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
+
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
@@ -331,7 +342,7 @@ function fftsa.sg_destroy()
     fftsa.del_obj(fftsa.sg_scr)
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_stat = nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
   -- Deleted, not just dropped: a buffer whose handle is dropped is stranded and still
   -- counts against the instrument's capacity.
   if fftsa.sg_buf ~= nil then
@@ -471,6 +482,30 @@ function fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
   fftsa.sg_write_xunit()
+end
+
+-- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
+-- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
+function fftsa.sg_thd_text(thd, ndb)
+  local t
+  if thd == nil then t = "THD: ---"
+  -- Past 100% -- a clipped input -- two decimals are three digits of noise.
+  elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+  else t = string.format("THD: %.2f%%", thd) end
+  if ndb == nil then return t .. "    Noise Floor: --- dBV" end
+  return t .. string.format("    Noise Floor: %.1f dBV", ndb)
+end
+
+-- Written only when the text changes, like the terminal selection. On the peak table's
+-- clock, not the frame.
+function fftsa.sg_show_thd(nb, binhz)
+  if fftsa.sg_thd == nil then return false end
+  local thd, ndb = fftsa.thd_noise(nb, binhz)
+  local t = fftsa.sg_thd_text(thd, ndb)
+  if t == fftsa.sg_thd_last then return false end
+  fftsa.sg_thd_last = t
+  display.settext(fftsa.sg_thd, t)
+  return true
 end
 
 -- The one place a zoom touches: it stores the window, rewrites the settings line and
@@ -744,6 +779,10 @@ function fftsa.sg_slow_tick()
       fftsa.sg_term_last = term
       fftsa.sg_write_xunit()
     end
+    -- Distortion and noise: the noise mean is a pass over every plotted bin, measured at
+    -- 4.3 us a bin -- 1.1 ms at 512 samples, 35 ms at 16384, 2.1% of one frame there.
+    -- That is why it is on this clock and not the frame's.
+    fftsa.sg_show_thd(fftsa.sg_nbins, fftsa.binhz)
     did = true
   end
   return did

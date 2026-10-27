@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 2.5
+-- $Version: 2.6
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -793,6 +793,91 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
   return bi, bv
 end
 
+-- A harmonic is h times an INTERPOLATED fundamental, so it misses the bin centre and the
+-- window spreads it: halfw is the search radius, skirt what stays out of the noise mean.
+fftsa.thd_halfw = 2
+fftsa.thd_skirt = 3
+fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops it first
+
+-- THD and the noise floor over the plotted bins, as a percentage and dBV.
+--
+-- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
+-- tone between bins. The noise floor is the MEAN POWER of every bin that is not a line or
+-- its skirt: averaging decibels instead lets one deep null drag it down several dB.
+--
+-- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
+-- which is not a clean signal and must not read as 0.00%.
+function fftsa.thd_noise(nb, binhz)
+  local pwr = fftsa.fft_pwr
+  if pwr == nil or nb == nil or nb < 8 then return nil, nil, 0 end
+  if binhz == nil or not (binhz > 0) then return nil, nil, 0 end
+  local sqrt, floor, log10 = math.sqrt, math.floor, math.log10
+  local k0 = 2 + (fftsa.fft_kdc or 0)
+  local kmin, kmax = fftsa.sg_window_bins(nb, binhz)
+  if kmin < k0 then kmin = k0 end
+  if kmax > nb then kmax = nb end
+  if kmax - kmin < 4 then return nil, nil, 0 end
+
+  local k, kf, pf = nil, nil, 0
+  for k = kmin, kmax do
+    local p = pwr[k]
+    -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
+    if p ~= nil and p > pf then kf, pf = k, p end
+  end
+  if kf == nil or not (pf > 0) then return nil, nil, 0 end
+  local df, vf = fftsa.peak_interp(kf, nb)
+  if vf == nil then df, vf = 0, sqrt(pf) end
+  if not (vf > 0) then return nil, nil, 0 end
+
+  -- Line centres, ascending by construction. Reused: the house rule is to allocate once.
+  local ex = fftsa.thd_ex
+  if ex == nil then ex = {}; fftsa.thd_ex = ex end
+  ex[1] = kf
+  local nex, hsum, nh = 1, 0, 0
+  local halfw, skirt = fftsa.thd_halfw, fftsa.thd_skirt
+  local fb = kf - 1 + df                  -- the fundamental, in bins from DC
+  local h
+  for h = 2, fftsa.thd_hmax do
+    local c = fb * h + 1                  -- the h'th harmonic's predicted 1-based bin
+    if c + halfw > kmax then break end
+    local a, b = floor(c - halfw + 0.5), floor(c + halfw + 0.5)
+    if a < kmin then a = kmin end
+    local bk, bp = nil, -1
+    for k = a, b do
+      local p = pwr[k]
+      if p ~= nil and p > bp then bk, bp = k, p end
+    end
+    if bk ~= nil and bp > 0 and bk > ex[nex] + skirt then
+      local hd, hv = fftsa.peak_interp(bk, nb)
+      if hv == nil then hv = sqrt(bp) end
+      hsum = hsum + hv * hv
+      nh, nex = nh + 1, nex + 1
+      ex[nex] = bk
+    end
+  end
+
+  -- The exclusion list is walked alongside the bins: one comparison a bin, not one a
+  -- line a bin, which at 8192 bins and twenty harmonics is what keeps this free.
+  local sum, cnt, e = 0, 0, 1
+  for k = kmin, kmax do
+    while e <= nex and ex[e] + skirt < k do e = e + 1 end
+    if e > nex or k < ex[e] - skirt then
+      local p = pwr[k]
+      if p ~= nil then sum = sum + p; cnt = cnt + 1 end
+    end
+  end
+
+  local thd = nil
+  if nh > 0 then thd = 100 * sqrt(hsum) / vf end
+  local ndb = nil
+  if cnt > 0 and sum > 0 then
+    ndb = 10 * log10(sum / cnt)
+    -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
+    if not (ndb > fftsa.sg_dbmin) then ndb = fftsa.sg_dbmin end
+  end
+  return thd, ndb, nh
+end
+
 
 -- ================= tsp/spectrum_graph.tsp =================
 -- spectrum_graph.tsp -- spectrum display built on the instrument's own graph object
@@ -906,6 +991,13 @@ fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
 fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410       -- settings line, below the peak rows
 fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview line
+
+-- Distortion and noise, between the graph (ends at sg_gy + sg_gh = 312) and the first
+-- peak row (sg_pky = 350). Pale amber, the dB column's colour, since both are levels.
+fftsa.sg_thd_x = 8
+fftsa.sg_thd_y = 326
+fftsa.sg_thd_c = 16769184
+fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
 -- The nil test is the point: display.create answers nil on an exhausted pool, and the app
 -- module deletes handles it may never have built. No pcall -- a refused delete posts an
@@ -1110,6 +1202,10 @@ function fftsa.sg_build(title, nbins, npoints)
     fftsa.sg_pk_d[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_d[col], y, "", fftsa.sg_pk_cd, small, display.JUST_LEFT)
   end
 
+  fftsa.sg_thd_last = nil
+  fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
+                        fftsa.sg_thd_text(nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
+
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
@@ -1128,7 +1224,7 @@ function fftsa.sg_destroy()
     fftsa.del_obj(fftsa.sg_scr)
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_stat = nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
   -- Deleted, not just dropped: a buffer whose handle is dropped is stranded and still
   -- counts against the instrument's capacity.
   if fftsa.sg_buf ~= nil then
@@ -1268,6 +1364,30 @@ function fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
   fftsa.sg_write_xunit()
+end
+
+-- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
+-- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
+function fftsa.sg_thd_text(thd, ndb)
+  local t
+  if thd == nil then t = "THD: ---"
+  -- Past 100% -- a clipped input -- two decimals are three digits of noise.
+  elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+  else t = string.format("THD: %.2f%%", thd) end
+  if ndb == nil then return t .. "    Noise Floor: --- dBV" end
+  return t .. string.format("    Noise Floor: %.1f dBV", ndb)
+end
+
+-- Written only when the text changes, like the terminal selection. On the peak table's
+-- clock, not the frame.
+function fftsa.sg_show_thd(nb, binhz)
+  if fftsa.sg_thd == nil then return false end
+  local thd, ndb = fftsa.thd_noise(nb, binhz)
+  local t = fftsa.sg_thd_text(thd, ndb)
+  if t == fftsa.sg_thd_last then return false end
+  fftsa.sg_thd_last = t
+  display.settext(fftsa.sg_thd, t)
+  return true
 end
 
 -- The one place a zoom touches: it stores the window, rewrites the settings line and
@@ -1541,6 +1661,10 @@ function fftsa.sg_slow_tick()
       fftsa.sg_term_last = term
       fftsa.sg_write_xunit()
     end
+    -- Distortion and noise: the noise mean is a pass over every plotted bin, measured at
+    -- 4.3 us a bin -- 1.1 ms at 512 samples, 35 ms at 16384, 2.1% of one frame there.
+    -- That is why it is on this clock and not the frame's.
+    fftsa.sg_show_thd(fftsa.sg_nbins, fftsa.binhz)
     did = true
   end
   return did

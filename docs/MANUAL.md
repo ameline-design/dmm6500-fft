@@ -41,6 +41,28 @@ capture further down resolves them exactly.
 Two buttons sit to the right of the peak table: a **padlock**, which decides what a sideways drag
 means, and a **cog**, which opens Options.
 
+**Between the graph and the peak table** sits distortion and noise:
+
+```
+THD: 0.42%    Noise Floor: -102.3 dBV
+```
+
+**THD** is the root of the summed harmonic powers over the fundamental's amplitude, as a percentage.
+The fundamental is the strongest bin in the plotted window; harmonics are taken at 2f, 3f and so on
+for as many as fall inside that window, each measured with the same sub-bin estimator the peak table
+uses. A harmonic too close to the line below it is not counted, because the two are not resolvable.
+`THD: ---` means no harmonic fits in the window at all — which is not the same as a clean signal, and
+is why it is not shown as `0.00%`. Widen the span or lower the fundamental to get a reading.
+
+**Noise Floor** is the mean power of every bin that is not a harmonic line or its skirt, in dBV —
+the same reference the peak table's dB column uses, so the two are directly comparable. It is a mean
+of powers, not of decibels: averaging decibels lets one deep null drag the figure down several dB.
+Being a per-bin level it improves as you raise the sample count, since the bins get narrower.
+
+Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
+plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
+frame at that size, once a second.
+
 **The line along the bottom reads back what is applied** — sample count, digitizer rate, bin width,
 record length, window, input range, and the terminal selection last. It describes the settings in
 force, not the fields being edited.

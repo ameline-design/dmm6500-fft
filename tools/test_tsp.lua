@@ -2753,8 +2753,9 @@ check('X is bound to the extra field, not the timestamp',
       'xelem=' .. tostring(OBJ[fftsa.sg_graph].xelem) .. ' time would be '
       .. tostring(display.ELEMENT_TIME))
 -- Counted, not probed by name: the firmware labels both axes, so the spectrum screen's
--- only text children are the peak table and the settings line. Eighteen peak fields and
--- one line at the shipped sg_npeak, and a row of tick labels coming back breaks it.
+-- only text children are the peak table, the distortion line and the settings line --
+-- eighteen peak fields and two lines at the shipped sg_npeak. A row of tick labels coming
+-- back breaks it.
 check('no label row is created at all', (function()
   local n = 0
   for _, o in pairs(OBJ) do
@@ -2762,9 +2763,106 @@ check('no label row is created at all', (function()
       n = n + 1
     end
   end
-  return n == fftsa.sg_npeak * 3 + 1,
+  return n == fftsa.sg_npeak * 3 + 2,
          string.format('%d text objects on the spectrum screen, want %d',
-                       n, fftsa.sg_npeak * 3 + 1)
+                       n, fftsa.sg_npeak * 3 + 2)
+end)())
+-- THD and the noise floor against a spectrum built here, so both answers are arithmetic
+-- rather than whatever the mock's generator happens to produce. Every bin is the floor
+-- except two lines: 1.0 V at 6 kHz and 0.05 V at 12 kHz, which is 5.00% by definition, and
+-- the floor is 1e-10 in power, which is exactly -100.0 dBV. The window stops at 13 kHz so
+-- the third harmonic does not fit -- that is what keeps the harmonic set to one line.
+print('\nTHD and the noise floor (real code)')
+check('THD and the noise floor are the ratio and the mean put in', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local F = 1e-10
+  local p, i = {}, nil
+  for i = 1, 256 do p[i] = F end
+  p[61]  = 1.0        -- 6 kHz at 100 Hz bins: bin 61 is (61-1)*100
+  p[121] = 0.0025     -- 12 kHz, 0.05 V
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+  local thd, ndb, nh = fftsa.thd_noise(256, 100)
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  return thd ~= nil and ndb ~= nil and nh == 1
+         and near(thd, 5.0, 0.01) and near(ndb, -100.0, 0.01),
+         string.format('thd=%s want 5.00, noise=%s want -100.0, harmonics=%s',
+                       tostring(thd), tostring(ndb), tostring(nh))
+end)())
+-- The floor must not be the lines. A fundamental twelve orders of magnitude over the floor
+-- would drag a mean that included it up by 20 dB, so the skirt is what makes the figure
+-- mean anything.
+check('the lines and their skirts stay out of the noise mean', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local p, i = {}, nil
+  for i = 1, 256 do p[i] = 1e-10 end
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+  local _, flat = fftsa.thd_noise(256, 100)       -- no line at all
+  p[61] = 1.0                                     -- and now a very loud one
+  local _, withline = fftsa.thd_noise(256, 100)
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  -- Both -100 dBV: the only bins that changed are excluded ones.
+  return near(flat, -100.0, 0.01) and near(withline, -100.0, 0.05),
+         string.format('flat=%s with a 1 V line=%s, both want -100.0',
+                       tostring(flat), tostring(withline))
+end)())
+-- A fundamental above half the window has no harmonic inside it, so there is no THD to
+-- report. Reporting 0.00% there would read as a clean signal.
+check('no harmonic in the window is --- and not zero per cent', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local p, i = {}, nil
+  for i = 1, 256 do p[i] = 1e-10 end
+  p[101] = 1.0                                    -- 10 kHz, window stops at 13 kHz
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+  local thd, ndb, nh = fftsa.thd_noise(256, 100)
+  local txt = fftsa.sg_thd_text(thd, ndb)
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  return thd == nil and nh == 0 and ndb ~= nil
+         and string.find(txt, 'THD: ---', 1, true) == 1
+         and string.find(txt, 'Noise Floor: -100.0 dBV', 1, true) ~= nil,
+         string.format('thd=%s harmonics=%s [%s]', tostring(thd), tostring(nh), txt)
+end)())
+-- The two formats the operator asked for, and the clipped case the n.nn one cannot carry.
+check('the line reads n.nn%% and -nnn.n dBV', (function()
+  local a = fftsa.sg_thd_text(0.4237, -102.34)
+  local b = fftsa.sg_thd_text(143.7, -98.0)
+  local c = fftsa.sg_thd_text(nil, nil)
+  return a == 'THD: 0.42%    Noise Floor: -102.3 dBV'
+         and b == 'THD: 144%    Noise Floor: -98.0 dBV'
+         and c == 'THD: ---    Noise Floor: --- dBV',
+         string.format('[%s] / [%s] / [%s]', a, b, c)
+end)())
+-- Nothing to measure must not raise: thd_noise runs inside the tick, and the tick runs
+-- inside the frame.
+check('thd_noise is total against a missing or useless spectrum', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local cases = {
+    function() fftsa.fft_pwr = nil  return fftsa.thd_noise(256, 100) end,
+    function() return fftsa.thd_noise(nil, 100) end,
+    function() return fftsa.thd_noise(256, nil) end,
+    function() return fftsa.thd_noise(256, 0) end,
+    function() return fftsa.thd_noise(4, 100) end,
+    function() fftsa.fft_pwr = {} return fftsa.thd_noise(256, 100) end,
+    function() local p, i = {}, nil
+               for i = 1, 256 do p[i] = 0 end
+               fftsa.fft_pwr = p return fftsa.thd_noise(256, 100) end,
+  }
+  local i, bad = nil, nil
+  for i = 1, table.getn(cases) do
+    local ok, t, n = pcall(cases[i])
+    if not ok then bad = string.format('case %d raised: %s', i, tostring(t)) end
+    fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  end
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  return bad == nil, bad or (table.getn(cases) .. ' cases, none raised')
 end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the

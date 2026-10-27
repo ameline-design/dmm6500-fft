@@ -101,3 +101,88 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
   end
   return bi, bv
 end
+
+-- A harmonic is h times an INTERPOLATED fundamental, so it misses the bin centre and the
+-- window spreads it: halfw is the search radius, skirt what stays out of the noise mean.
+fftsa.thd_halfw = 2
+fftsa.thd_skirt = 3
+fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops it first
+
+-- THD and the noise floor over the plotted bins, as a percentage and dBV.
+--
+-- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
+-- tone between bins. The noise floor is the MEAN POWER of every bin that is not a line or
+-- its skirt: averaging decibels instead lets one deep null drag it down several dB.
+--
+-- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
+-- which is not a clean signal and must not read as 0.00%.
+function fftsa.thd_noise(nb, binhz)
+  local pwr = fftsa.fft_pwr
+  if pwr == nil or nb == nil or nb < 8 then return nil, nil, 0 end
+  if binhz == nil or not (binhz > 0) then return nil, nil, 0 end
+  local sqrt, floor, log10 = math.sqrt, math.floor, math.log10
+  local k0 = 2 + (fftsa.fft_kdc or 0)
+  local kmin, kmax = fftsa.sg_window_bins(nb, binhz)
+  if kmin < k0 then kmin = k0 end
+  if kmax > nb then kmax = nb end
+  if kmax - kmin < 4 then return nil, nil, 0 end
+
+  local k, kf, pf = nil, nil, 0
+  for k = kmin, kmax do
+    local p = pwr[k]
+    -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
+    if p ~= nil and p > pf then kf, pf = k, p end
+  end
+  if kf == nil or not (pf > 0) then return nil, nil, 0 end
+  local df, vf = fftsa.peak_interp(kf, nb)
+  if vf == nil then df, vf = 0, sqrt(pf) end
+  if not (vf > 0) then return nil, nil, 0 end
+
+  -- Line centres, ascending by construction. Reused: the house rule is to allocate once.
+  local ex = fftsa.thd_ex
+  if ex == nil then ex = {}; fftsa.thd_ex = ex end
+  ex[1] = kf
+  local nex, hsum, nh = 1, 0, 0
+  local halfw, skirt = fftsa.thd_halfw, fftsa.thd_skirt
+  local fb = kf - 1 + df                  -- the fundamental, in bins from DC
+  local h
+  for h = 2, fftsa.thd_hmax do
+    local c = fb * h + 1                  -- the h'th harmonic's predicted 1-based bin
+    if c + halfw > kmax then break end
+    local a, b = floor(c - halfw + 0.5), floor(c + halfw + 0.5)
+    if a < kmin then a = kmin end
+    local bk, bp = nil, -1
+    for k = a, b do
+      local p = pwr[k]
+      if p ~= nil and p > bp then bk, bp = k, p end
+    end
+    if bk ~= nil and bp > 0 and bk > ex[nex] + skirt then
+      local hd, hv = fftsa.peak_interp(bk, nb)
+      if hv == nil then hv = sqrt(bp) end
+      hsum = hsum + hv * hv
+      nh, nex = nh + 1, nex + 1
+      ex[nex] = bk
+    end
+  end
+
+  -- The exclusion list is walked alongside the bins: one comparison a bin, not one a
+  -- line a bin, which at 8192 bins and twenty harmonics is what keeps this free.
+  local sum, cnt, e = 0, 0, 1
+  for k = kmin, kmax do
+    while e <= nex and ex[e] + skirt < k do e = e + 1 end
+    if e > nex or k < ex[e] - skirt then
+      local p = pwr[k]
+      if p ~= nil then sum = sum + p; cnt = cnt + 1 end
+    end
+  end
+
+  local thd = nil
+  if nh > 0 then thd = 100 * sqrt(hsum) / vf end
+  local ndb = nil
+  if cnt > 0 and sum > 0 then
+    ndb = 10 * log10(sum / cnt)
+    -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
+    if not (ndb > fftsa.sg_dbmin) then ndb = fftsa.sg_dbmin end
+  end
+  return thd, ndb, nh
+end
