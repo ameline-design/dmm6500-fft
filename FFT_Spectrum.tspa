@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 3.5
+-- $Version: 3.6
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -824,10 +824,17 @@ function fftsa.thd_skirt()
 end
 fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops it first
 
--- The fundamental must clear the per-bin noise mean by this ratio before THD and S/N
--- mean anything: 30 dB. Measured at 16384 samples, a shorted input's strongest bin stood
--- 17.1 dB over the mean and a 4 V tone stood 92, so the margin goes between them.
-fftsa.thd_minratio = 1000
+-- The fundamental must clear the per-bin noise mean by this ratio before THD and S/N mean
+-- anything: 45 dB. Measured at 16384 samples -- a shorted input's strongest bin stood
+-- 17.1 dB over the mean, a FLOATING input's best surviving candidate stood 38.8 (a mains
+-- harmonic at 1019 Hz, past the cutoff below), and an 8 Vp-p tone stood 117.9. The margin
+-- goes between the floating case and the tone, which is where the useful gap is.
+--
+-- The cost is that a tone under 45 dB over the per-bin floor reads NoSig -- about 0.9 mV at
+-- 16384 samples -- and its distortion would have been noise anyway. Raising the mains
+-- cutoff instead has no natural stopping point, the harmonic series being endless, and
+-- would discount legitimate quiet tones landing on multiples of 50.
+fftsa.thd_minratio = 31623
 
 -- A noise bin above this multiple of the running mean is an outlier, not noise. The plain
 -- mean of a windowed spectrum is set by whichever few bins carry a line's leakage skirt:
@@ -929,24 +936,43 @@ function fftsa.thd_noise(nb, binhz)
     local p = pwr[k]
     -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
     -- Strict > rejects a NaN correctly on this firmware where >= does not.
-    if p ~= nil and p > pf and not fftsa.thd_is_mains((k - 1) * binhz, p, binhz) then
-      kf, pf = k, p
+    if p ~= nil and p > pf then
+      -- A LOCAL MAXIMUM, or the shoulder of a louder line qualifies. Measured with the
+      -- inputs floating: the 60 Hz line sat in bin 11 and was discounted as mains, but
+      -- bin 12 at 67.1 Hz -- its own skirt, 8 dB down -- missed the mains tolerance by
+      -- 1 Hz and became the fundamental, giving 21.4% distortion on no signal at all.
+      -- A monotonic skirt has no local maximum; a real tone is one.
+      local l, r = pwr[k - 1], pwr[k + 1]
+      if (l == nil or p > l) and (r == nil or (r == r and p >= r))
+         and not fftsa.thd_is_mains((k - 1) * binhz, p, binhz) then
+        kf, pf = k, p
+      end
     end
   end
-  if kf == nil or not (pf > 0) then return nil, nil, 0 end
-  local df, vf = fftsa.peak_interp(kf, nb)
-  if vf == nil then df, vf = 0, sqrt(pf) end
-  if not (vf > 0) then return nil, nil, 0 end
+  -- No fundamental is NOT the end of it: the floor is the useful number with the inputs
+  -- disconnected, and a flat spectrum has no local maximum at all. vf nil carries that
+  -- through to the noise pass with nothing excluded.
+  local df, vf = 0, nil
+  if kf ~= nil and pf > 0 then
+    df, vf = fftsa.peak_interp(kf, nb)
+    if vf == nil then df, vf = 0, sqrt(pf) end
+    if not (vf > 0) then vf = nil end
+  end
 
   -- Line centres, ascending by construction. Reused: the house rule is to allocate once.
   local ex = fftsa.thd_ex
   if ex == nil then ex = {}; fftsa.thd_ex = ex end
-  ex[1] = kf
-  local nex, hsum, nh = 1, 0, 0
+  local nex, hsum, nh = 0, 0, 0
+  if vf ~= nil then
+    ex[1] = kf
+    nex = 1
+  end
   local halfw, skirt = fftsa.thd_halfw, fftsa.thd_skirt()
-  local fb = kf - 1 + df                  -- the fundamental, in bins from DC
+  local fb = 0
+  if vf ~= nil then fb = kf - 1 + df end  -- the fundamental, in bins from DC
   local h
   for h = 2, fftsa.thd_hmax do
+    if vf == nil then break end
     local c = fb * h + 1                  -- the h'th harmonic's predicted 1-based bin
     if c + halfw > kmax then break end
     local a, b = floor(c - halfw + 0.5), floor(c + halfw + 0.5)
@@ -991,7 +1017,7 @@ function fftsa.thd_noise(nb, binhz)
     -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
     -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.
     -- The floor still reports: shorted, it is the instrument's own and the useful number.
-    if vf * vf > mean * fftsa.thd_minratio then
+    if vf ~= nil and vf * vf > mean * fftsa.thd_minratio then
       -- Against the INTEGRATED noise, not the per-bin mean, so it holds still when the
       -- sample count changes. Harmonics are out of the sum, so this is not THD restated.
       -- The halves of both mean squares cancel in the ratio.
