@@ -2783,13 +2783,15 @@ check('THD and the noise floor are the ratio and the mean put in', (function()
   p[121] = 0.0025     -- 12 kHz, 0.05 V
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
-  local thd, ndb, nh = fftsa.thd_noise(256, 100)
+  local thd, ndb, nh, snr = fftsa.thd_noise(256, 100)
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
-  return thd ~= nil and ndb ~= nil and nh == 1
-         and near(thd, 5.0, 0.01) and near(ndb, -100.0, 0.01),
-         string.format('thd=%s want 5.00, noise=%s want -100.0, harmonics=%s',
-                       tostring(thd), tostring(ndb), tostring(nh))
+  -- 116 bins survive the two skirts, each 1e-10, so the integrated noise is 1.16e-8
+  -- against a fundamental of 1.0: 79.36 dB. S/N is NOT the floor figure negated.
+  return thd ~= nil and ndb ~= nil and nh == 1 and snr ~= nil
+         and near(thd, 5.0, 0.01) and near(ndb, -100.0, 0.01) and near(snr, 79.36, 0.05),
+         string.format('thd=%s want 5.00, noise=%s want -100.0, s/n=%s want 79.36, harmonics=%s',
+                       tostring(thd), tostring(ndb), tostring(snr), tostring(nh))
 end)())
 -- The floor must not be the lines. A fundamental twelve orders of magnitude over the floor
 -- would drag a mean that included it up by 20 dB, so the skirt is what makes the figure
@@ -2821,8 +2823,8 @@ check('no harmonic in the window is --- and not zero per cent', (function()
   p[101] = 1.0                                    -- 10 kHz, window stops at 13 kHz
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
-  local thd, ndb, nh = fftsa.thd_noise(256, 100)
-  local txt = fftsa.sg_thd_text(thd, ndb)
+  local thd, ndb, nh, snr = fftsa.thd_noise(256, 100)
+  local txt = fftsa.sg_thd_text(thd, snr, ndb)
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
   return thd == nil and nh == 0 and ndb ~= nil
@@ -2831,13 +2833,14 @@ check('no harmonic in the window is --- and not zero per cent', (function()
          string.format('thd=%s harmonics=%s [%s]', tostring(thd), tostring(nh), txt)
 end)())
 -- The two formats the operator asked for, and the clipped case the n.nn one cannot carry.
-check('the line reads n.nn%% and -nnn.n dBV', (function()
-  local a = fftsa.sg_thd_text(0.4237, -102.34)
-  local b = fftsa.sg_thd_text(143.7, -98.0)
-  local c = fftsa.sg_thd_text(nil, nil)
-  return a == 'THD: 0.42%    Noise Floor: -102.3 dBV'
-         and b == 'THD: 144%    Noise Floor: -98.0 dBV'
-         and c == 'THD: ---    Noise Floor: --- dBV',
+check('the line reads n.nn%%, S/N and -nnn.n dBV', (function()
+  -- 86.27, not 86.25: a half-way value makes the test depend on how %.1f breaks ties.
+  local a = fftsa.sg_thd_text(0.4237, 86.27, -102.34)
+  local b = fftsa.sg_thd_text(143.7, 12.04, -98.0)
+  local c = fftsa.sg_thd_text(nil, nil, nil)
+  return a == 'THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
+         and b == 'THD: 144%    S/N: 12.0 dB    Noise Floor: -98.0 dBV'
+         and c == 'THD: ---    S/N: --- dB    Noise Floor: --- dBV',
          string.format('[%s] / [%s] / [%s]', a, b, c)
 end)())
 -- Nothing to measure must not raise: thd_noise runs inside the tick, and the tick runs

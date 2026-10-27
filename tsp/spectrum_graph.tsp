@@ -322,7 +322,7 @@ function fftsa.sg_build(title, nbins, npoints)
 
   fftsa.sg_thd_last = nil
   fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
-                        fftsa.sg_thd_text(nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
+                        fftsa.sg_thd_text(nil, nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
 
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
@@ -486,12 +486,14 @@ end
 
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
 -- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
-function fftsa.sg_thd_text(thd, ndb)
+function fftsa.sg_thd_text(thd, snr, ndb)
   local t
   if thd == nil then t = "THD: ---"
   -- Past 100% -- a clipped input -- two decimals are three digits of noise.
   elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
   else t = string.format("THD: %.2f%%", thd) end
+  if snr == nil then t = t .. "    S/N: --- dB"
+  else t = t .. string.format("    S/N: %.1f dB", snr) end
   if ndb == nil then return t .. "    Noise Floor: --- dBV" end
   return t .. string.format("    Noise Floor: %.1f dBV", ndb)
 end
@@ -500,8 +502,8 @@ end
 -- clock, not the frame.
 function fftsa.sg_show_thd(nb, binhz)
   if fftsa.sg_thd == nil then return false end
-  local thd, ndb = fftsa.thd_noise(nb, binhz)
-  local t = fftsa.sg_thd_text(thd, ndb)
+  local thd, ndb, nh, snr = fftsa.thd_noise(nb, binhz)
+  local t = fftsa.sg_thd_text(thd, snr, ndb)
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)

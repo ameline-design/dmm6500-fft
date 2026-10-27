@@ -178,11 +178,16 @@ function fftsa.thd_noise(nb, binhz)
 
   local thd = nil
   if nh > 0 then thd = 100 * sqrt(hsum) / vf end
-  local ndb = nil
+  local ndb, snr = nil, nil
   if cnt > 0 and sum > 0 then
     ndb = 10 * log10(sum / cnt)
     -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
     if not (ndb > fftsa.sg_dbmin) then ndb = fftsa.sg_dbmin end
+    -- S/N is the fundamental against the INTEGRATED noise, not against the per-bin mean,
+    -- so it does not move when the sample count does -- narrower bins, more of them, the
+    -- same total. Harmonics are excluded from the sum, which is what makes this the ratio
+    -- THD is not already reporting. The halves of both mean squares cancel in the ratio.
+    snr = 10 * log10(vf * vf / sum)
   end
-  return thd, ndb, nh
+  return thd, ndb, nh, snr
 end

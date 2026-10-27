@@ -44,7 +44,7 @@ means, and a **cog**, which opens Options.
 **Between the graph and the peak table** sits distortion and noise:
 
 ```
-THD: 0.42%    Noise Floor: -102.3 dBV
+THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV
 ```
 
 **THD** is the root of the summed harmonic powers over the fundamental's amplitude, as a percentage.
@@ -53,6 +53,12 @@ for as many as fall inside that window, each measured with the same sub-bin esti
 uses. A harmonic too close to the line below it is not counted, because the two are not resolvable.
 `THD: ---` means no harmonic fits in the window at all — which is not the same as a clean signal, and
 is why it is not shown as `0.00%`. Widen the span or lower the fundamental to get a reading.
+
+**S/N** is the fundamental against the **integrated** noise — the total power of every non-harmonic
+bin, not the per-bin mean. That distinction matters: S/N does not move when you change the sample
+count, because narrower bins and more of them come to the same total, whereas the noise floor
+improves by 3 dB each time you double the count. Harmonics are excluded from the sum, which is what
+keeps S/N from re-reporting what THD already says.
 
 **Noise Floor** is the mean power of every bin that is not a harmonic line or its skirt, in dBV —
 the same reference the peak table's dB column uses, so the two are directly comparable. It is a mean
