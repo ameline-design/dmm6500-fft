@@ -73,6 +73,18 @@ stood 17.1 dB over the mean where an 8 Vp-p tone stood 92, so the margin sits be
 floor is still shown, because shorted it is the instrument's own floor and the one useful number
 there — about −110 dBV, some 30 dB better than with a generator connected.
 
+**The skirt follows the window.** Inside the window's main lobe the bins hold signal, not noise, so
+the number of bins withheld either side of each line is the window's own first null plus one: 3 for
+Hann, 4 for Blackman, 5 for Blackman-Harris, and up to 7 for Kaiser at beta 18, whose lobe reaches
+5.8 bins. A fixed 3 instead reported a −65.2 dBV floor on Kaiser 18 against a trace plainly sitting
+at −100, because three bins of pure signal each side were averaged in as noise.
+
+**Every window puts a ceiling on S/N**, measured on a pure tone with no noise in it at all: about
+102 dB for Hann at 16,384 samples, 114 for Blackman, 133 for Blackman-Harris, and 125 for Kaiser
+beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelobes are 30 and 40 dB
+down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
+telling you about the window rather than the instrument.
+
 Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
 plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
 frame at that size, once a second.

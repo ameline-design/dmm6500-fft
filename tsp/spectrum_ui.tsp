@@ -103,9 +103,31 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
 end
 
 -- A harmonic is h times an INTERPOLATED fundamental, so it misses the bin centre and the
--- window spreads it: halfw is the search radius, skirt what stays out of the noise mean.
+-- window spreads it: halfw is the search radius.
 fftsa.thd_halfw = 2
-fftsa.thd_skirt = 3
+
+-- Bins either side of a line that hold the WINDOW's main lobe rather than noise. Counting
+-- them as noise puts a floor under every figure: a fixed 3 capped reportable S/N at 38.5 dB
+-- on Kaiser 18, against the 124.9 dB the window itself allows, measured on a pure tone at
+-- 16384 samples. The first null in bins is 2 for Hann, 3 for Blackman, 4 for Blk-Harris
+-- and sqrt(1 + (beta/pi)^2) for Kaiser -- 5.82 at beta 18 -- plus one bin of guard.
+--
+-- Sidelobes are NOT covered and cannot be: Kaiser 4's are 30 dB down and integrate to a
+-- 36.7 dB ceiling whatever the skirt does. That is the window, not a measurement error.
+fftsa.thd_lobes = {2, 3, 4}      -- Hann, Blackman, Blk-Harris
+
+function fftsa.thd_skirt()
+  local wi = fftsa.win_i
+  local l = fftsa.thd_lobes[wi]
+  if l == nil then
+    -- Kaiser, the one window whose lobe moves with a setting.
+    local b = fftsa.kbetas[fftsa.kbeta_i]
+    if b == nil then b = 0 end
+    l = math.ceil(math.sqrt(1 + (b / math.pi) * (b / math.pi)))
+    if l < 2 then l = 2 end
+  end
+  return l + 1
+end
 fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops it first
 
 -- The fundamental must clear the per-bin noise mean by this ratio before THD and S/N
@@ -148,7 +170,7 @@ function fftsa.thd_noise(nb, binhz)
   if ex == nil then ex = {}; fftsa.thd_ex = ex end
   ex[1] = kf
   local nex, hsum, nh = 1, 0, 0
-  local halfw, skirt = fftsa.thd_halfw, fftsa.thd_skirt
+  local halfw, skirt = fftsa.thd_halfw, fftsa.thd_skirt()
   local fb = kf - 1 + df                  -- the fundamental, in bins from DC
   local h
   for h = 2, fftsa.thd_hmax do

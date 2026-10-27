@@ -2902,6 +2902,57 @@ check('a spectrum with no tone in it reports NoSig, and still the floor', (funct
          string.format('[%s]; with a tone thd=%s snr=%s harmonics=%s', txt,
                        tostring(thd2), tostring(snr2), tostring(nh2))
 end)())
+-- The skirt follows the WINDOW, because inside the main lobe the bins hold signal. A fixed
+-- 3 capped reportable S/N at 38.5 dB on Kaiser 18 against the 124.9 dB the window allows,
+-- measured in the C suite over the same arithmetic.
+check('the skirt is the window lobe plus a guard bin', (function()
+  local w0, b0 = fftsa.win_i, fftsa.kbeta_i
+  local got, want, bad = {}, {2 + 1, 3 + 1, 4 + 1}, nil
+  local i
+  for i = 1, 3 do
+    fftsa.win_i = i
+    got[i] = fftsa.thd_skirt()
+    if got[i] ~= want[i] then
+      bad = string.format('window %d gave %d, want %d', i, got[i], want[i])
+    end
+  end
+  -- Kaiser: ceil(sqrt(1 + (beta/pi)^2)) + 1, which is 7 at beta 18 and 3 at beta 4.
+  fftsa.win_i = 4
+  local kw = {3, 4, 5, 5, 6, 7}
+  for i = 1, 6 do
+    fftsa.kbeta_i = i
+    local k = fftsa.thd_skirt()
+    if k ~= kw[i] then
+      bad = string.format('Kaiser beta %d gave %d, want %d', fftsa.kbetas[i], k, kw[i])
+    end
+  end
+  fftsa.win_i, fftsa.kbeta_i = w0, b0
+  return bad == nil, bad or string.format('%d %d %d then Kaiser 3..7', got[1], got[2], got[3])
+end)())
+-- And the skirt actually reaches thd_noise: a wider window must exclude more bins, which
+-- shows up as a different noise mean over the same spectrum.
+check('a wider window lobe keeps more bins out of the noise mean', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local w0, b0 = fftsa.win_i, fftsa.kbeta_i
+  local p, i = {}, nil
+  for i = 1, 256 do p[i] = 1e-10 end
+  p[60] = 1.0
+  -- The bins just outside a narrow skirt but inside a wide one, loud enough that counting
+  -- them moves the mean a long way.
+  p[65], p[66] = 1e-6, 1e-6
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+  fftsa.win_i = 1                            -- Hann, skirt 3: bins 65 and 66 are noise
+  local _, narrow = fftsa.thd_noise(256, 100)
+  fftsa.win_i, fftsa.kbeta_i = 4, 6          -- Kaiser 18, skirt 7: both are inside it
+  local _, wide = fftsa.thd_noise(256, 100)
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  fftsa.win_i, fftsa.kbeta_i = w0, b0
+  return narrow ~= nil and wide ~= nil and wide < narrow - 10,
+         string.format('Hann %.1f dBV, Kaiser 18 %.1f dBV', narrow, wide)
+end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the
 -- feature: this is the only place the applied settings read back without opening Options.
