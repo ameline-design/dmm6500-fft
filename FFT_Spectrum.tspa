@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 3.2
+-- $Version: 3.3
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -768,7 +768,10 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
       -- flank of an out-of-window tone does not read as a peak.
       if ml == nil then ml = -1 end
       if mr == nil then mr = -1 end
-      if m > ml and m >= mr then
+      -- m == m and mr == mr ARE THE NaN TESTS. This firmware implements a >= b as
+      -- not (a < b), so m >= mr is TRUE when mr is a NaN and a bin beside one would be
+      -- reported as a peak. Strict > needs no guard; >= does.
+      if m == m and mr == mr and m > ml and m >= mr then
         -- A tone inside the DC region leaks enough into the first reportable bin to
         -- make it a local maximum, which then reports the tone a whole bin and 16 dB
         -- out. The estimator saturates at -0.5 there, saying the three bins are not one
@@ -848,9 +851,12 @@ function fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, ceil)
     while e <= nex and ex[e] + skirt < k do e = e + 1 end
     if e > nex or k < ex[e] - skirt then
       local p = pwr[k]
-      -- Positive tests, so a nil bin after a short read and a NaN are both skipped
-      -- rather than poisoning the sum.
-      if p ~= nil and p >= 0 and p <= ceil then
+      -- p == p IS THE NaN TEST. Measured on this firmware, nan >= 0 and nan <= 1/0 are
+      -- both TRUE -- it implements a >= b as not (a < b), which inverts the unordered
+      -- case -- so neither ordered guard rejects one. Strict > and < are correct, which
+      -- is why the searches above can rely on them. Unguarded, one NaN bin makes the sum
+      -- NaN and the whole readout degrades to NoSig; one infinity reads "inf dBV".
+      if p ~= nil and p == p and p >= 0 and p <= ceil then
         sum = sum + p
         cnt = cnt + 1
       end
@@ -916,7 +922,9 @@ function fftsa.thd_noise(nb, binhz)
     end
   end
 
-  local sum, cnt = fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, 1 / 0)
+  -- A finite ceiling, not 1/0: inf <= 1/0 is true and inf <= 1e308 is not, so this is
+  -- what keeps an infinite bin out of the first pass.
+  local sum, cnt = fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, 1e308)
   -- Again with the outliers clipped. See fftsa.thd_clip for why the plain mean is not the
   -- floor the trace shows.
   for h = 1, fftsa.thd_clips do

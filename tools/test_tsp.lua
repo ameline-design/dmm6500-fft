@@ -3010,6 +3010,37 @@ check('the skirt is the window lobe plus a guard bin', (function()
   fftsa.win_i, fftsa.kbeta_i = w0, b0
   return bad == nil, bad or string.format('%d %d %d then Kaiser 3..7', got[1], got[2], got[3])
 end)())
+-- The firmware implements a >= b as not (a < b), so every NON-STRICT comparison with a NaN
+-- comes out TRUE: measured, nan >= 0 and nan <= 1/0 are both true while nan > 0 is false.
+-- Host Lua is IEEE and cannot reproduce that, so these cases pass here either way -- they
+-- pin the intended behaviour, and the explicit p == p guards are what deliver it on the
+-- instrument.
+check('a NaN bin does not take the noise figures down with it', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local nan, inf = 0 / 0, 1 / 0
+  local bad, which = nil, nil
+  for which = 1, 2 do
+    local p, i = {}, nil
+    for i = 1, 256 do p[i] = 1e-10 end
+    p[60] = 1.0
+    p[120] = 0.0025
+    p[90] = (which == 1) and nan or inf
+    fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+    fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+    local thd, ndb, nh, snr = fftsa.thd_noise(256, 100)
+    -- The other 115 good bins must still give a floor, and none of the three may be a
+    -- NaN or an infinity on the glass.
+    if ndb == nil then bad = 'case ' .. which .. ': one bad bin lost the floor entirely'
+    elseif ndb ~= ndb or ndb >= 1e308 then bad = 'case ' .. which .. ': floor is ' .. tostring(ndb)
+    elseif not near(ndb, -100.0, 0.5) then bad = 'case ' .. which .. ': floor ' .. tostring(ndb)
+    elseif snr ~= nil and snr ~= snr then bad = 'case ' .. which .. ': snr is a NaN'
+    elseif thd ~= nil and thd ~= thd then bad = 'case ' .. which .. ': thd is a NaN' end
+  end
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  return bad == nil, bad or 'a NaN bin and an infinite bin, both survived'
+end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the
 -- feature: this is the only place the applied settings read back without opening Options.
