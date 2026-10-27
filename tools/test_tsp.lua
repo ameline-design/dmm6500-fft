@@ -3085,6 +3085,42 @@ check('mains and its harmonics do not become the fundamental', (function()
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
   return bad == nil, bad or 'hum at 50 and 60 discounted, real tones kept'
 end)())
+-- A NaN must not reach the glass as "nan". This firmware's >= is true for a NaN, so every
+-- formatter that branches on a magnitude takes its first branch and prints one; the
+-- explicit v == v tests are what give dashes instead. Host Lua is IEEE and takes the LAST
+-- branch, which prints "nan" too, so this case is meaningful in both.
+check('a NaN never reaches a formatted field', (function()
+  local nan = 0 / 0
+  local bad = nil
+  local t = fftsa.sg_thd_text(nan, nan, nan)
+  if string.find(t, 'nan', 1, true) ~= nil then bad = 'thd line: ' .. t end
+  if bad == nil and string.find(t, 'THD: ---', 1, true) ~= 1 then bad = 'thd not dashed: ' .. t end
+  -- The peak table's own two formatters, through the real draw.
+  local h = fftsa.sg_pk_f[1]
+  local bi, bv = {1}, {nan}
+  local ok, err = pcall(function() fftsa.sg_show_peaks_now(bi, bv, 1, nan) end)
+  if bad == nil and not ok then bad = 'the peak draw raised: ' .. tostring(err) end
+  if bad == nil and string.find(OBJ[h].text or '', 'nan', 1, true) ~= nil then
+    bad = 'peak field: ' .. tostring(OBJ[h].text)
+  end
+  return bad == nil, bad or string.format('[%s] and peak [%s]', t, tostring(OBJ[h].text))
+end)())
+-- The settings line records every input when it fails, so a recurrence of the format error
+-- that could not be explained comes with the values attached.
+check('a failed settings line records the state, not just the message', (function()
+  local real = fftsa.sg_xunit_text
+  fftsa.sg_xunit_text = function() error('forced', 0) end
+  fftsa.sg_write_xunit()
+  fftsa.sg_xunit_text = real
+  local e = tostring(fftsa.lasterr)
+  fftsa.sg_write_xunit()
+  local want = {'forced', 'n=', 'fs=', 'fs_acq=', 'range=', 'binhz=', 'term='}
+  local i, bad = nil, nil
+  for i = 1, table.getn(want) do
+    if string.find(e, want[i], 1, true) == nil then bad = 'missing ' .. want[i] .. ': ' .. e end
+  end
+  return bad == nil, bad or e
+end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the
 -- feature: this is the only place the applied settings read back without opening Options.

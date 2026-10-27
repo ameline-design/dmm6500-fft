@@ -474,7 +474,18 @@ function fftsa.sg_write_xunit()
   local ok, err = pcall(function()
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end)
-  if not ok then fftsa.lasterr = "settings line: " .. tostring(err) end
+  if not ok then
+    -- EVERY INPUT, not just the message. A "bad argument #2 to format (string expected,
+    -- got nil)" was seen here once and could not be reproduced or explained: the call it
+    -- names cannot return nil for any value this records. If it recurs, the values come
+    -- with it rather than needing another afternoon.
+    fftsa.lasterr = string.format(
+      "settings line: %s [n=%s fs=%s fs_acq=%s bp_d=%s range=%s rangetxt=%s win=%s "
+      .. "binhz=%s nbins=%s term=%s]", tostring(err), tostring(fftsa.n), tostring(fftsa.fs),
+      tostring(fftsa.fs_acq), tostring(fftsa.bp_d), tostring(fftsa.range),
+      tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]), tostring(fftsa.win_i),
+      tostring(fftsa.binhz), tostring(fftsa.sg_nbins), tostring(fftsa.terminal_text()))
+  end
   return ok
 end
 
@@ -496,12 +507,15 @@ function fftsa.sg_thd_text(thd, snr, ndb)
   else
     if thd == nil then t = "THD: ---"
     -- Past 100% -- a clipped input -- two decimals are three digits of noise.
-    elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+    -- thd == thd is the NaN test: this firmware's >= is true for a NaN, so the branch below
+  -- would print "nan%" rather than the dashes that mean "not measured".
+  elseif thd ~= thd then t = "THD: ---"
+  elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
     else t = string.format("THD: %.2f%%", thd) end
-    if snr == nil then s = "S/N: --- dB"
+    if snr == nil or snr ~= snr then s = "S/N: --- dB"
     else s = string.format("S/N: %.1f dB", snr) end
   end
-  if ndb == nil then return t .. "    " .. s .. "    Noise Floor: --- dBV" end
+  if ndb == nil or ndb ~= ndb then return t .. "    " .. s .. "    Noise Floor: --- dBV" end
   return t .. "    " .. s .. string.format("    Noise Floor: %.1f dBV", ndb)
 end
 
@@ -933,10 +947,12 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
       if iv == nil then dk, iv = 0, sqrt(bv[p]) end     -- no estimate: root of the power bin
       local f, v = (k - 1 + dk) * binhz, iv
       local ftxt
-      if f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)
+      if f ~= f then ftxt = string.format("%d  ---", p)
+      elseif f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)
       else ftxt = string.format("%d  %.1f Hz", p, f) end
       local vtxt
-      if v >= 1 then vtxt = string.format("%.4f V", v)
+      if v ~= v then vtxt = ""
+      elseif v >= 1 then vtxt = string.format("%.4f V", v)
       elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
       else vtxt = string.format("%.0f uV", v * 1e6) end
       -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against
