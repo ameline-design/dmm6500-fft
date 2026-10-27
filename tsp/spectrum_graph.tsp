@@ -113,7 +113,7 @@ fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview l
 -- Distortion and noise, between the graph (ends at sg_gy + sg_gh = 312) and the first
 -- peak row (sg_pky = 350). Pale amber, the dB column's colour, since both are levels.
 fftsa.sg_thd_x = 8
-fftsa.sg_thd_y = 326
+fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
