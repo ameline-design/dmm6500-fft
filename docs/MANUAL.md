@@ -85,6 +85,19 @@ beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelo
 down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
 telling you about the window rather than the instrument.
 
+**For the most accurate S/N and noise floor, use Kaiser with beta = 18 at 16,384 samples.** Both
+figures are limited by the window before they are limited by the instrument, and Kaiser 18 is the
+only shipped window whose leakage is both tiny and independent of where the tone falls between bins:
+measured on a pure tone, it reads the same within 0.1 dB at any offset, where Hann swings 62 dB.
+Hann at 16k reports about -80 dBV against a trace sitting at -100; Kaiser 18 reports -102.9 dBV, and
+75.8 dB S/N that is genuinely the instrument rather than the window. 16,384 samples because the
+floor is a per-bin level, so it improves 3 dB every time the count doubles.
+
+**Outliers are clipped before the mean is taken**, which is what lets a figure like that be quoted
+at all: the plain mean of a windowed spectrum is set by whichever few bins carry a line's leakage
+skirt, not by the floor. Bins above four times the running mean are dropped and the mean retaken,
+repeating until a pass drops nothing. On noise with no outliers that costs 0.5 dB, measured.
+
 Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
 plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
 frame at that size, once a second.

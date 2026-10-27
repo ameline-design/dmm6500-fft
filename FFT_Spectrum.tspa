@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 3.1
+-- $Version: 3.2
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -826,6 +826,39 @@ fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops 
 -- 17.1 dB over the mean and a 4 V tone stood 92, so the margin goes between them.
 fftsa.thd_minratio = 1000
 
+-- A noise bin above this multiple of the running mean is an outlier, not noise. The plain
+-- mean of a windowed spectrum is set by whichever few bins carry a line's leakage skirt:
+-- measured at 16384 samples with the tone off a bin centre, Hann's skirt put the reported
+-- floor at -80.2 dBV over a trace sitting at -100, and swung it 62 dB purely on where the
+-- tone fell between bins. Widening the skirt cannot reach it -- Hann is still 45 dB down
+-- four bins out -- but clipping can, since those bins are orders of magnitude up.
+--
+-- Each pass tightens the threshold and the loop stops when one removes nothing. On noise
+-- with no outliers the clip trims the top few per cent and costs 0.5 dB.
+fftsa.thd_clip  = 4
+fftsa.thd_clips = 6
+
+-- Sum and count the bins that are neither a line nor a skirt and do not exceed ceil. The
+-- exclusion list is walked alongside the bins: one comparison a bin, not one a line a bin,
+-- which at 8192 bins and twenty harmonics is what keeps this affordable. Module level, not
+-- a local closure, because the house rule is to allocate once.
+function fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, ceil)
+  local sum, cnt, e, k = 0, 0, 1, nil
+  for k = kmin, kmax do
+    while e <= nex and ex[e] + skirt < k do e = e + 1 end
+    if e > nex or k < ex[e] - skirt then
+      local p = pwr[k]
+      -- Positive tests, so a nil bin after a short read and a NaN are both skipped
+      -- rather than poisoning the sum.
+      if p ~= nil and p >= 0 and p <= ceil then
+        sum = sum + p
+        cnt = cnt + 1
+      end
+    end
+  end
+  return sum, cnt
+end
+
 -- THD and the noise floor over the plotted bins, as a percentage and dBV.
 --
 -- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
@@ -883,15 +916,16 @@ function fftsa.thd_noise(nb, binhz)
     end
   end
 
-  -- The exclusion list is walked alongside the bins: one comparison a bin, not one a
-  -- line a bin, which at 8192 bins and twenty harmonics is what keeps this free.
-  local sum, cnt, e = 0, 0, 1
-  for k = kmin, kmax do
-    while e <= nex and ex[e] + skirt < k do e = e + 1 end
-    if e > nex or k < ex[e] - skirt then
-      local p = pwr[k]
-      if p ~= nil then sum = sum + p; cnt = cnt + 1 end
-    end
+  local sum, cnt = fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, 1 / 0)
+  -- Again with the outliers clipped. See fftsa.thd_clip for why the plain mean is not the
+  -- floor the trace shows.
+  for h = 1, fftsa.thd_clips do
+    if not (cnt > 0 and sum > 0) then break end
+    local csum, ccnt = fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt,
+                                            (sum / cnt) * fftsa.thd_clip)
+    -- Converged: a pass that removed nothing means the next would too.
+    if ccnt == cnt or ccnt < 1 or not (csum > 0) then break end
+    sum, cnt = csum, ccnt
   end
 
   local ndb, snr = nil, nil
