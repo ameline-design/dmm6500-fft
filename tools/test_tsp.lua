@@ -2842,10 +2842,10 @@ check('the line reads n.nn%%, S/N and -nnn.n dBV', (function()
   local f = fftsa.sg_thd_text(nil, 53.1, -80.2)
   return a == 'THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
          and b == 'THD: 144%    S/N: 12.0 dB    Noise Floor: -98.0 dBV'
-         and c == 'No Signal    Noise Floor: --- dBV'
-         -- Neither ratio is "No Signal"; a signal with no harmonic in the window keeps
-         -- its S/N and dashes the THD alone.
-         and e == 'No Signal    Noise Floor: -110.2 dBV'
+         and c == 'THD: NoSig    S/N: NoSig    Noise Floor: --- dBV'
+         -- Neither ratio reads NoSig; a signal with no harmonic in the window keeps its
+         -- S/N and dashes the THD alone. The labels never move.
+         and e == 'THD: NoSig    S/N: NoSig    Noise Floor: -110.2 dBV'
          and f == 'THD: ---    S/N: 53.1 dB    Noise Floor: -80.2 dBV',
          string.format('[%s] / [%s] / [%s]', a, b, c)
 end)())
@@ -2877,7 +2877,7 @@ end)())
 -- built on it are arithmetic about nothing -- 31.84% and -22.0 dB were measured on the
 -- instrument at 16384 samples before the margin went in. The floor still reports, because
 -- shorted it is the instrument's own.
-check('a spectrum with no tone in it reports No Signal, and still the floor', (function()
+check('a spectrum with no tone in it reports NoSig, and still the floor', (function()
   local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
   local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
   local p, i = {}, nil
@@ -2895,7 +2895,8 @@ check('a spectrum with no tone in it reports No Signal, and still the floor', (f
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
   return thd == nil and snr == nil and nh == 0 and ndb ~= nil
-         and string.find(txt, 'No Signal', 1, true) == 1
+         and string.find(txt, 'THD: NoSig', 1, true) == 1
+         and string.find(txt, 'S/N: NoSig', 1, true) ~= nil
          and string.find(txt, 'Noise Floor: -100.0 dBV', 1, true) ~= nil
          and thd2 ~= nil and snr2 ~= nil and nh2 == 1,
          string.format('[%s]; with a tone thd=%s snr=%s harmonics=%s', txt,

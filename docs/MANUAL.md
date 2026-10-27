@@ -65,7 +65,7 @@ the same reference the peak table's dB column uses, so the two are directly comp
 of powers, not of decibels: averaging decibels lets one deep null drag the figure down several dB.
 Being a per-bin level it improves as you raise the sample count, since the bins get narrower.
 
-**`No Signal` replaces both ratios when there is no tone to take them against.** With the inputs
+**`NoSig` replaces both numbers when there is no tone to take them against**, the labels staying put. With the inputs
 shorted the strongest bin is just the largest noise bin, and both ratios built on it are arithmetic
 about nothing — measured at 16,384 samples, that read `THD: 31.84%` and `S/N: -22.0 dB`. The
 fundamental has to clear the per-bin noise mean by 30 dB before either is reported: that shorted peak

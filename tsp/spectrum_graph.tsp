@@ -487,21 +487,22 @@ end
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
 -- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
 function fftsa.sg_thd_text(thd, snr, ndb)
+  local t, s
   -- Neither ratio means there is no fundamental to take them against, which is what a
-  -- shorted input looks like. Named, not dashed: the reason is the useful part.
+  -- shorted input looks like. Named, not dashed, and the labels stay so the fields hold
+  -- their places.
   if thd == nil and snr == nil then
-    if ndb == nil then return "No Signal    Noise Floor: --- dBV" end
-    return string.format("No Signal    Noise Floor: %.1f dBV", ndb)
+    t, s = "THD: NoSig", "S/N: NoSig"
+  else
+    if thd == nil then t = "THD: ---"
+    -- Past 100% -- a clipped input -- two decimals are three digits of noise.
+    elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+    else t = string.format("THD: %.2f%%", thd) end
+    if snr == nil then s = "S/N: --- dB"
+    else s = string.format("S/N: %.1f dB", snr) end
   end
-  local t
-  if thd == nil then t = "THD: ---"
-  -- Past 100% -- a clipped input -- two decimals are three digits of noise.
-  elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
-  else t = string.format("THD: %.2f%%", thd) end
-  if snr == nil then t = t .. "    S/N: --- dB"
-  else t = t .. string.format("    S/N: %.1f dB", snr) end
-  if ndb == nil then return t .. "    Noise Floor: --- dBV" end
-  return t .. string.format("    Noise Floor: %.1f dBV", ndb)
+  if ndb == nil then return t .. "    " .. s .. "    Noise Floor: --- dBV" end
+  return t .. "    " .. s .. string.format("    Noise Floor: %.1f dBV", ndb)
 end
 
 -- Written only when the text changes, like the terminal selection. On the peak table's
