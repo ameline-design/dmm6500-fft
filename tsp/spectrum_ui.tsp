@@ -108,6 +108,11 @@ fftsa.thd_halfw = 2
 fftsa.thd_skirt = 3
 fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops it first
 
+-- The fundamental must clear the per-bin noise mean by this ratio before THD and S/N
+-- mean anything: 30 dB. Measured at 16384 samples, a shorted input's strongest bin stood
+-- 17.1 dB over the mean and a 4 V tone stood 92, so the margin goes between them.
+fftsa.thd_minratio = 1000
+
 -- THD and the noise floor over the plotted bins, as a percentage and dBV.
 --
 -- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
@@ -176,18 +181,25 @@ function fftsa.thd_noise(nb, binhz)
     end
   end
 
-  local thd = nil
-  if nh > 0 then thd = 100 * sqrt(hsum) / vf end
   local ndb, snr = nil, nil
   if cnt > 0 and sum > 0 then
-    ndb = 10 * log10(sum / cnt)
+    local mean = sum / cnt
+    ndb = 10 * log10(mean)
     -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
     if not (ndb > fftsa.sg_dbmin) then ndb = fftsa.sg_dbmin end
-    -- S/N is the fundamental against the INTEGRATED noise, not against the per-bin mean,
-    -- so it does not move when the sample count does -- narrower bins, more of them, the
-    -- same total. Harmonics are excluded from the sum, which is what makes this the ratio
-    -- THD is not already reporting. The halves of both mean squares cancel in the ratio.
-    snr = 10 * log10(vf * vf / sum)
+    -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
+    -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.
+    -- The floor still reports: shorted, it is the instrument's own and the useful number.
+    if vf * vf > mean * fftsa.thd_minratio then
+      -- Against the INTEGRATED noise, not the per-bin mean, so it holds still when the
+      -- sample count changes. Harmonics are out of the sum, so this is not THD restated.
+      -- The halves of both mean squares cancel in the ratio.
+      snr = 10 * log10(vf * vf / sum)
+    else
+      nh = 0
+    end
   end
+  local thd = nil
+  if nh > 0 then thd = 100 * sqrt(hsum) / vf end
   return thd, ndb, nh, snr
 end

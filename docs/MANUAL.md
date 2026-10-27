@@ -65,6 +65,14 @@ the same reference the peak table's dB column uses, so the two are directly comp
 of powers, not of decibels: averaging decibels lets one deep null drag the figure down several dB.
 Being a per-bin level it improves as you raise the sample count, since the bins get narrower.
 
+**`No Signal` replaces both ratios when there is no tone to take them against.** With the inputs
+shorted the strongest bin is just the largest noise bin, and both ratios built on it are arithmetic
+about nothing — measured at 16,384 samples, that read `THD: 31.84%` and `S/N: -22.0 dB`. The
+fundamental has to clear the per-bin noise mean by 30 dB before either is reported: that shorted peak
+stood 17.1 dB over the mean where an 8 Vp-p tone stood 92, so the margin sits between them. The noise
+floor is still shown, because shorted it is the instrument's own floor and the one useful number
+there — about −110 dBV, some 30 dB better than with a generator connected.
+
 Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
 plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
 frame at that size, once a second.

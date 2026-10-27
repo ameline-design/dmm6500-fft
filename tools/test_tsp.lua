@@ -2838,9 +2838,15 @@ check('the line reads n.nn%%, S/N and -nnn.n dBV', (function()
   local a = fftsa.sg_thd_text(0.4237, 86.27, -102.34)
   local b = fftsa.sg_thd_text(143.7, 12.04, -98.0)
   local c = fftsa.sg_thd_text(nil, nil, nil)
+  local e = fftsa.sg_thd_text(nil, nil, -110.23)
+  local f = fftsa.sg_thd_text(nil, 53.1, -80.2)
   return a == 'THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
          and b == 'THD: 144%    S/N: 12.0 dB    Noise Floor: -98.0 dBV'
-         and c == 'THD: ---    S/N: --- dB    Noise Floor: --- dBV',
+         and c == 'No Signal    Noise Floor: --- dBV'
+         -- Neither ratio is "No Signal"; a signal with no harmonic in the window keeps
+         -- its S/N and dashes the THD alone.
+         and e == 'No Signal    Noise Floor: -110.2 dBV'
+         and f == 'THD: ---    S/N: 53.1 dB    Noise Floor: -80.2 dBV',
          string.format('[%s] / [%s] / [%s]', a, b, c)
 end)())
 -- Nothing to measure must not raise: thd_noise runs inside the tick, and the tick runs
@@ -2866,6 +2872,34 @@ check('thd_noise is total against a missing or useless spectrum', (function()
   end
   fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
   return bad == nil, bad or (table.getn(cases) .. ' cases, none raised')
+end)())
+-- A shorted input has no fundamental: the strongest bin is a noise peak, and both ratios
+-- built on it are arithmetic about nothing -- 31.84% and -22.0 dB were measured on the
+-- instrument at 16384 samples before the margin went in. The floor still reports, because
+-- shorted it is the instrument's own.
+check('a spectrum with no tone in it reports No Signal, and still the floor', (function()
+  local pwr, nb, bh = fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz
+  local lo, hi, kdc = fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc
+  local p, i = {}, nil
+  for i = 1, 256 do p[i] = 1e-10 end
+  -- A noise peak 17 dB over the mean, which is what 8192 bins of noise actually produce.
+  p[77] = 1e-10 * 50
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = p, 256, 100
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = 0, 13000, 0
+  local thd, ndb, nh, snr = fftsa.thd_noise(256, 100)
+  local txt = fftsa.sg_thd_text(thd, snr, ndb)
+  -- And a real tone in the same spectrum must still be measured.
+  p[60] = 1.0
+  p[120] = 0.0025
+  local thd2, ndb2, nh2, snr2 = fftsa.thd_noise(256, 100)
+  fftsa.fft_pwr, fftsa.sg_nbins, fftsa.binhz = pwr, nb, bh
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz, fftsa.fft_kdc = lo, hi, kdc
+  return thd == nil and snr == nil and nh == 0 and ndb ~= nil
+         and string.find(txt, 'No Signal', 1, true) == 1
+         and string.find(txt, 'Noise Floor: -100.0 dBV', 1, true) ~= nil
+         and thd2 ~= nil and snr2 ~= nil and nh2 == 1,
+         string.format('[%s]; with a tone thd=%s snr=%s harmonics=%s', txt,
+                       tostring(thd2), tostring(snr2), tostring(nh2))
 end)())
 -- The whole line, against a literal, for a state pinned here. Probing for the pieces one
 -- at a time passes on a line that has them in any arrangement, and the arrangement is the

@@ -487,6 +487,12 @@ end
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
 -- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
 function fftsa.sg_thd_text(thd, snr, ndb)
+  -- Neither ratio means there is no fundamental to take them against, which is what a
+  -- shorted input looks like. Named, not dashed: the reason is the useful part.
+  if thd == nil and snr == nil then
+    if ndb == nil then return "No Signal    Noise Floor: --- dBV" end
+    return string.format("No Signal    Noise Floor: %.1f dBV", ndb)
+  end
   local t
   if thd == nil then t = "THD: ---"
   -- Past 100% -- a clipped input -- two decimals are three digits of noise.
