@@ -34,17 +34,7 @@ and a touchscreen, which is enough to resolve the second and third harmonics of 
   setting behind it. The **padlock** decides what a sideways drag means: closed, the frequency axis
   snaps back to the span in force; open, the span follows the axis, so dragging or pinching
   **retunes** the analyser to the range you brought into view, Options fields and all, clamped
-  through the same function the form uses. Free until you touch it: the graph reports its own pan, and
-  a check without a report does nothing. One that has a report reads the limits back at 0.0094 ms and
-  writes only an axis that really moved — a write costs 60 ms, so doing it per frame collapses the
-  update rate. The check runs every 0.15 s, and a frequency gesture is adopted only once the axis
-  stops moving, so one drag costs one retune rather than one per check. A retune that needs a new
-  sample rate re-plans between frames, never inside one. The cog beside the padlock opens Options.
-
-The span windows the display and may only *raise* the sample rate, never lower it: zooming in leaves
-acquisition at 100 kS/s and, with the default 512 samples, 195.3 Hz bins. Widening past 50 kHz steps 
-the rate up to 1 MS/s and coarsens the bins with it. There is no anti-alias filter, so a rate chosen 
-below the signal's own content folds it into view.
+  through the same function the form uses.  The cog beside the padlock opens Options.
 
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
 6.10 Hz spacing. Larger sizes cost update rate. `docs/PERFORMANCE.md` has every size measured.
