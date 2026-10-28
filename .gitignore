@@ -45,6 +45,5 @@ __pycache__/
 
 # DSP proposal work -- kept locally, deliberately not tracked
 csrc/
-docs/NATIVE-DSP-PROPOSAL.md
-docs/NATIVE-DSP-PROPOSAL.pdf
+docs/NATIVE-DSP-*
 tools/make_pdf.py
