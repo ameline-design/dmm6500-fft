@@ -4,15 +4,17 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the instrument computes the transform in
 Lua, and the firmware's own graph object draws the trace. No host, no PC software.
 
-![The spectrum screen at 16,384 samples: a 12.5 kHz 4.0024 V tone reading 12.0 dBV as a narrow spike, its 
-second and third harmonics resolved as separate lines at 25.002 and 37.501 kHz, 78 and 81 dB down, over a 10 Hz 
-to 50 kHz span with 6.1 Hz bins. Between the graph and the peak table, THD 0.02%, S/N 78.9 dB and a noise floor 
-of -105.8 dBV. The firmware labels the axes itself, +020.0dB down to -120.0dB and 
-+00.00kHz across to +40.00kHz](docs/manual-spectrum-16384.png)
+![The spectrum screen at 16,384 samples: a 10 kHz 5.0061 V tone reading 14.0 dBV as a narrow spike, with its 
+harmonics resolved as separate lines every 10 kHz out to 70 kHz -- the second at 20.000 kHz and 63.9 dB down, the 
+third at 30.000 kHz and 71.6 dB down -- all of them well clear of a -100 dB floor, at 200 kS/s with 12.21 Hz 
+bins. Between the graph and the peak table, THD 0.015%, S/N 81.8 dB and a noise floor of -105.4 dBV. The 
+firmware labels the axes itself, +020.0dB down to -120.0dB and +00.00kHz across to 
++64.00kHz](docs/manual-spectrum-harmonics.png)
 
 A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
-and a touchscreen, which is enough to resolve the second and third harmonics of a 12.5 kHz tone at
-−83.5 and −84.1 dBV — 6.1 Hz bins at 16,384 samples, or 195 Hz bins at 10 frames a second.
+and a touchscreen, which is enough to resolve six harmonics of a 10 kHz tone as separate lines — the
+second and third at −63.9 and −71.6 dBV — in 12.2 Hz bins at 16,384 samples, or 195 Hz bins at 10
+frames a second.
 
 `docs/MANUAL.md` is the user manual. Start there to operate it; read on for how it works.
 
@@ -49,13 +51,25 @@ below the signal's own content folds it into view.
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
 6.10 Hz spacing. Larger sizes cost update rate. `docs/PERFORMANCE.md` has every size measured.
 
+One signal at both ends of that trade, a 12.5 kHz 4.0 V tone over the same 10 Hz to 50 kHz span.
+At 16,384 samples the second and third harmonics stand as separate lines:
+
+![The spectrum screen at 16,384 samples: a 12.5 kHz 4.0024 V tone reading 12.0 dBV as a narrow spike, its 
+second and third harmonics resolved as separate lines at 25.002 and 37.501 kHz, 78 and 81 dB down, over a 10 Hz 
+to 50 kHz span with 6.1 Hz bins. Between the graph and the peak table, THD 0.02%, S/N 78.9 dB and a noise floor 
+of -105.8 dBV. The firmware labels the axes itself, +020.0dB down to -120.0dB and 
++00.00kHz across to +40.00kHz](docs/manual-spectrum-16384.png)
+
+At the default 512 they are in the floor, for 195 Hz bins at 10 frames a second:
+
 ![The same tone at the default 512 samples: one 195 Hz-wide lump and the harmonics barely clear of the 
 noise floor, at 10 frames a second. S/N reads 78.4 dB, within a decibel of the 16,384-sample figure, while the 
 noise floor reads -89.7 dBV against -105.8: the floor is a per-bin level and narrows with the bins, where S/N is 
 against the integrated noise and does not move](docs/manual-spectrum.png)
 
-The same signal at the default 512 samples, for comparison: 195 Hz bins at 10 frames a second, where
-the harmonics are in the floor. 
+S/N barely moves between the two — 78.9 against 78.4 dB — while the noise floor reads 16 dB better at
+16,384. The floor is a per-bin level and narrows with the bins; S/N is against the integrated noise,
+which does not.
 
 ## Choosing a window
 

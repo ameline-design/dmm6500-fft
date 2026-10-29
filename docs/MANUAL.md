@@ -54,6 +54,10 @@ uses. A harmonic too close to the line below it is not counted, because the two 
 `THD: ---` means no harmonic fits in the window at all — which is not the same as a clean signal, and
 is why it is not shown as `0.00%`. Widen the span or lower the fundamental to get a reading.
 
+The reading carries **two decimals below 8,192 samples and three at 8,192 or above**: 0.016 % and
+0.019 % are the same number at two decimals, and the third digit is only offered on a record long
+enough to hold a harmonic in one bin. Past 100 % — a clipped input — it carries none.
+
 **S/N** is the fundamental against the **integrated** noise — the total power of every non-harmonic
 bin, not the per-bin mean. That distinction matters: S/N does not move when you change the sample
 count, because narrower bins and more of them come to the same total, whereas the noise floor
@@ -209,7 +213,7 @@ works either way.
 
 ## Options
 
-![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Apply and Cancel along the bottom. Start Freq reads 10.0000 Hz, Stop Freq 50.0000 kHz, Input Range 10 V, Window Hann, Kaiser Beta 12 -90dB and FFT Samples 512](manual-options.png)
+![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Reset, Apply and Cancel along the bottom. Start Freq reads 10.0000 Hz, Stop Freq 50.0000 kHz, Input Range 10 V, Window Hann, Kaiser Beta 12 -90dB and FFT Samples 512](manual-options.png)
 
 | Field | |
 |---|---|
@@ -227,7 +231,13 @@ trace*. Apply supersedes a gesture the app has not finished acting on.
 The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
 **bin spacing** (`fs / N`) and **acquisition
 duration** (`N / fs`, in milliseconds). It refreshes as you edit the stop frequency or sample count,
-without changing acquisition until you press Apply. Cancel discards the edits. On reopening Options,
+without changing acquisition until you press Apply. Cancel discards the edits.
+
+**Reset** puts all six fields back to their shipped values — 10 Hz, 50 kHz, 10 V, Hann, beta 12 and
+512 samples — and does nothing else. Acquisition is untouched until you press Apply, so Cancel after
+Reset leaves the analyser exactly as it was and a mis-press costs a press.
+
+On reopening Options,
 the readout uses the rate measured from the active capture's timestamps. For an unapplied change to
 the sampling rate, it uses the rate the app will request: 100, 200, 500 or 1000 kS/s.
 
