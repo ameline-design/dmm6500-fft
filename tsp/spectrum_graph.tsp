@@ -117,6 +117,12 @@ fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
+-- Three decimals from 8,192 samples up, two below: 0.016 % and 0.019 % both read 0.02 % at
+-- two, and the third digit is only worth printing once the record is long enough to hold a
+-- harmonic in one bin. Gated on the committed sample count, so the line cannot offer a
+-- precision the plan in force did not deliver.
+fftsa.sg_thd_fine_n = 8192
+
 -- The nil test is the point: display.create answers nil on an exhausted pool, and the app
 -- module deletes handles it may never have built. No pcall -- a refused delete posts an
 -- event and returns, so a wrapper can never be false; the suite's live-object counts
@@ -407,8 +413,9 @@ function fftsa.sg_store_xrange(flo_hz, fhi_hz)
 end
 
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
--- harmonic in the window means no figure at all. dBV, as the peak table's dB column.
-function fftsa.sg_thd_text(thd, snr, ndb)
+-- harmonic in the window means no figure at all. dBV, as the peak table's dB column. n is
+-- the sample count, and it chooses the THD decimal count and nothing else.
+function fftsa.sg_thd_text(thd, snr, ndb, n)
   local t, s
   -- Neither ratio means there is no fundamental to take them against, which is what a
   -- shorted input looks like. Named, not dashed, and the labels stay so the fields hold
@@ -417,11 +424,13 @@ function fftsa.sg_thd_text(thd, snr, ndb)
     t, s = "THD: NoSig", "S/N: NoSig"
   else
     if thd == nil then t = "THD: ---"
-    -- Past 100% -- a clipped input -- two decimals are three digits of noise.
+    -- Past 100% -- a clipped input -- three decimals are four digits of noise.
     -- thd == thd is the NaN test: this firmware's >= is true for a NaN, so the branch below
   -- would print "nan%" rather than the dashes that mean "not measured".
   elseif thd ~= thd then t = "THD: ---"
   elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+    -- A missing count takes the short form: it is the one that cannot overstate the plan.
+    elseif n ~= nil and n >= fftsa.sg_thd_fine_n then t = string.format("THD: %.3f%%", thd)
     else t = string.format("THD: %.2f%%", thd) end
     if snr == nil or snr ~= snr then s = "S/N: --- dB"
     else s = string.format("S/N: %.1f dB", snr) end
@@ -434,14 +443,14 @@ end
 -- clock, not the frame.
 --
 -- The figures come from the primitive, over the bins it reduced, and it reports thd as a
--- FRACTION where this line prints a percentage. No bin count or bin width is passed: the
--- plan in force is the primitive's own, and handing it a second opinion is how the line and
--- the trace end up describing different frames.
+-- fraction where this line prints a percentage. The sample count is read off the primitive
+-- too, dsp.fft.samples and not fftsa.n: the plan in force is the primitive's own, and a
+-- second opinion on it is how the line and the trace end up describing different frames.
 function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
   local thd, snr, ndb = dsp.distortion()
   if thd ~= nil then thd = thd * 100 end
-  local t = fftsa.sg_thd_text(thd, snr, ndb)
+  local t = fftsa.sg_thd_text(thd, snr, ndb, dsp.fft.samples)
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)

@@ -105,6 +105,14 @@ fftsa.errrun  = 0           -- consecutive dropped frames
 fftsa.errmax  = 20          -- give up (and say so) after this many in a row
 fftsa.shortreads = 0        -- captures rejected for returning fewer than n samples
 
+-- What the Reset button restores, captured from the assignments that set the six form
+-- fields rather than restating their values: one owner per setting, so a changed default
+-- cannot disagree with what the button offers. The capture is sound because every one of
+-- those assignments is unconditional -- fftsa = fftsa or {} inherits the previous launch's
+-- table, and an `or` on any of them would make this the last session's settings.
+fftsa.defaults = {flo = fftsa.flo, fhi = fftsa.fhi, range = fftsa.range,
+                  win_i = fftsa.win_i, kbeta_i = fftsa.kbeta_i, n = fftsa.n}
+
 -- The legal span, for anything that asks for one: the Options form and an unlocked graph
 -- gesture both come through here, or the form would offer a range a gesture could not
 -- reach. Each end clamps to its own field's declared range, then the pair is ordered -- a
@@ -704,6 +712,10 @@ function fftsa.build_options()
   display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_cancel) end")
   local b_about = create(fftsa.optscr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "About", 140)
   display.setevent(b_about, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.about) end")
+  -- Left of centre, 20 px off About and well clear of Apply at 470: the two that change
+  -- what is measured stay together on the right, away from a thumb reaching for About.
+  local b_rst = create(fftsa.optscr, display.OBJ_BUTTON, 168, fftsa.opt_btn_y, "Reset", 140)
+  display.setevent(b_rst, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_reset) end")
   -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
   -- the visible screen, and leaving from the form must still tear down.
   display.setevent(fftsa.optscr, display.EVENT_ENDAPP,
@@ -974,24 +986,40 @@ function fftsa.show_main()
   return false
 end
 
+-- The six fields from one set of values, and the readback line that follows from them. The
+-- single filler, so what Options shows and what Reset offers cannot drift apart.
+--
+-- A nil handle is what an exhausted pool leaves, so every field goes through the nil-testing
+-- setters: the cost is then the fields the pool refused, not the Options button and Apply
+-- together. Callers run under fftsa.guard for the same reason -- unguarded, a refusal at the
+-- end of the create list leaves the button dead for the life of the app.
+function fftsa.opt_fill(flo, fhi, range, win_i, kbeta_i, n)
+  fftsa.setval(fftsa.opt_flo, flo)
+  fftsa.setval(fftsa.opt_fhi, fhi)
+  fftsa.setval(fftsa.opt_rng, fftsa.range_to_idx(range))
+  fftsa.setval(fftsa.opt_win, win_i)
+  fftsa.setval(fftsa.opt_beta, kbeta_i)
+  fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(n))
+  fftsa.options_preview()
+end
+
 -- A press only switches. Everything is built in fftsa.start(), so a nil handle
 -- means the object pool refused and building it now would fail the same way.
 function fftsa.options()
   if fftsa.optscr == nil then return false end
-  -- A nil handle is what an exhausted pool leaves, so every field goes through the
-  -- nil-testing setters: the cost is then the fields the pool refused, not the Options
-  -- button and Apply together.
-  fftsa.setval(fftsa.opt_flo, fftsa.flo)
-  fftsa.setval(fftsa.opt_fhi, fftsa.fhi)
-  fftsa.setval(fftsa.opt_rng, fftsa.range_to_idx(fftsa.range))
-  fftsa.setval(fftsa.opt_win, fftsa.win_i)
-  fftsa.setval(fftsa.opt_beta, fftsa.kbeta_i)
-  fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(fftsa.n))
-  -- Guarded like its neighbours: five field reads on handles the pool may have refused,
-  -- and changescreen is the next line. Unguarded, a refusal at the end of the create list
-  -- leaves the Options button dead for the life of the app.
-  fftsa.options_preview()
+  fftsa.opt_fill(fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i, fftsa.kbeta_i, fftsa.n)
   display.changescreen(fftsa.optscr)
+  return true
+end
+
+-- The shipped settings back into the form, and nothing else: Apply commits them and Cancel
+-- abandons them, like every other control here, so a mis-press costs a press. Acquisition is
+-- untouched until Apply, which is what keeps this off the 2.667 s commit a changed sample
+-- count would otherwise charge for a button nobody meant to hit.
+function fftsa.options_reset()
+  if fftsa.optscr == nil then return false end
+  local d = fftsa.defaults
+  fftsa.opt_fill(d.flo, d.fhi, d.range, d.win_i, d.kbeta_i, d.n)
   return true
 end
 

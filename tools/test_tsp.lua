@@ -2719,22 +2719,56 @@ check('no harmonic in the window is --- and not zero per cent', (function()
          and string.find(txt, 'Noise Floor: -100.0 dBV', 1, true) ~= nil,
          string.format('thd=%s harmonics=%s [%s]', tostring(thd), tostring(nh), txt)
 end)())
--- The two formats the operator asked for, and the clipped case the n.nn one cannot carry.
-check('the line reads n.nn%%, S/N and -nnn.n dBV', (function()
+-- Each format with the sample count that selects it, and the clipped case that carries no
+-- decimals at all.
+check('the THD decimals follow the sample count', (function()
   -- 86.27, not 86.25: a half-way value makes the test depend on how %.1f breaks ties.
-  local a = fftsa.sg_thd_text(0.4237, 86.27, -102.34)
-  local b = fftsa.sg_thd_text(143.7, 12.04, -98.0)
+  local a = fftsa.sg_thd_text(0.4237, 86.27, -102.34, 4096)
+  local a3 = fftsa.sg_thd_text(0.4237, 86.27, -102.34, fftsa.sg_thd_fine_n)
+  local b = fftsa.sg_thd_text(143.7, 12.04, -98.0, 16384)
   local c = fftsa.sg_thd_text(nil, nil, nil)
   local e = fftsa.sg_thd_text(nil, nil, -110.23)
   local f = fftsa.sg_thd_text(nil, 53.1, -80.2)
+  -- The pair the third decimal exists for, and the same pair below the threshold, where it
+  -- collapses -- without that half the gate is not a gate.
+  local lo = fftsa.sg_thd_text(0.016, 90.0, -100.0, 16384)
+  local hi = fftsa.sg_thd_text(0.019, 90.0, -100.0, 16384)
   return a == 'THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
+         and a3 == 'THD: 0.424%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
          and b == 'THD: 144%    S/N: 12.0 dB    Noise Floor: -98.0 dBV'
          and c == 'THD: NoSig    S/N: NoSig    Noise Floor: --- dBV'
          -- Neither ratio reads NoSig; a signal with no harmonic in the window keeps its
          -- S/N and dashes the THD alone. The labels never move.
          and e == 'THD: NoSig    S/N: NoSig    Noise Floor: -110.2 dBV'
-         and f == 'THD: ---    S/N: 53.1 dB    Noise Floor: -80.2 dBV',
-         string.format('[%s] / [%s] / [%s]', a, b, c)
+         and f == 'THD: ---    S/N: 53.1 dB    Noise Floor: -80.2 dBV'
+         and string.find(lo, 'THD: 0.016%', 1, true) == 1
+         and string.find(hi, 'THD: 0.019%', 1, true) == 1
+         and fftsa.sg_thd_text(0.016, 90.0, -100.0, 4096)
+             == fftsa.sg_thd_text(0.019, 90.0, -100.0, 4096),
+         string.format('[%s] / [%s] / [%s] / [%s] / [%s]', a, a3, b, lo, hi)
+end)())
+-- The gate has to be wired to the primitive and not only to the formatter: sg_show_thd reads
+-- dsp.fft.samples, so a plan at the threshold prints the third decimal on the glass and one
+-- below it does not.
+check('the drawn line takes its decimals from the committed plan', (function()
+  if fftsa.sg_thd == nil then return false, 'no THD object on the screen' end
+  local savedist, saven = dsp.distortion, dsp.fft.samples
+  local sd, st, sf = dsp.dirty, dsp.dirty_tables, dsp.dirty_filter
+  dsp.distortion = function() return 0.00016, 90.0, -100.0 end
+  local function draw(n)
+    dsp.fft.samples = n
+    fftsa.sg_thd_last = nil
+    fftsa.sg_show_thd()
+    return OBJ[fftsa.sg_thd].text
+  end
+  local short, long = draw(4096), draw(fftsa.sg_thd_fine_n)
+  dsp.distortion, dsp.fft.samples = savedist, saven
+  -- The sample count is a plan attribute, so the writes above dirtied it. Put the
+  -- bookkeeping back as well as the value, or the next test commits when it should not.
+  dsp.dirty, dsp.dirty_tables, dsp.dirty_filter = sd, st, sf
+  return string.find(short, 'THD: 0.02%', 1, true) == 1
+         and string.find(long, 'THD: 0.016%', 1, true) == 1,
+         string.format('[%s] / [%s]', short, long)
 end)())
 -- Nothing to measure must not raise: thd_noise runs inside the tick, and the tick runs
 -- inside the frame.
@@ -3468,6 +3502,77 @@ end)())
 display.setvalue(fftsa.opt_win, 1)
 fftsa.options_apply()
 check('the form returns to Hann', fftsa.win_name() == 'Hann')
+
+-- Reset. Every field is moved off its shipped value first: a check that starts at the
+-- default passes whether the button works or does nothing at all.
+check('Reset restores every field the form offers', (function()
+  fftsa.options()
+  display.setvalue(fftsa.opt_flo, 4000)
+  display.setvalue(fftsa.opt_fhi, 20000)
+  display.setvalue(fftsa.opt_rng, 1)
+  display.setvalue(fftsa.opt_win, 2)
+  display.setvalue(fftsa.opt_beta, 1)
+  display.setvalue(fftsa.opt_n, 3)
+  local moved = obj_at(fftsa.opt_flo).value == 4000 and obj_at(fftsa.opt_n).value == 3
+  fftsa.options_reset()
+  local d = fftsa.defaults
+  local got = string.format('%s..%s rng=%s win=%s beta=%s n=%s moved=%s',
+                            tostring(obj_at(fftsa.opt_flo).value),
+                            tostring(obj_at(fftsa.opt_fhi).value),
+                            tostring(obj_at(fftsa.opt_rng).value),
+                            tostring(obj_at(fftsa.opt_win).value),
+                            tostring(obj_at(fftsa.opt_beta).value),
+                            tostring(obj_at(fftsa.opt_n).value), tostring(moved))
+  return moved
+         and obj_at(fftsa.opt_flo).value == d.flo
+         and obj_at(fftsa.opt_fhi).value == d.fhi
+         and obj_at(fftsa.opt_rng).value == fftsa.range_to_idx(d.range)
+         and obj_at(fftsa.opt_win).value == d.win_i
+         and obj_at(fftsa.opt_beta).value == d.kbeta_i
+         and obj_at(fftsa.opt_n).value == fftsa.sample_to_idx(d.n), got
+end)())
+-- The press writes the form and leaves the instrument alone. A Reset that reconfigured
+-- acquisition would charge a mis-press the full commit, which is 2.667 s at 16,384 samples.
+check('Reset changes the form and not what is in force', (function()
+  fftsa.options()
+  display.setvalue(fftsa.opt_n, 5)
+  display.setvalue(fftsa.opt_flo, 1234)
+  local n, flo, fhi, rng, wi = fftsa.n, fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i
+  local cnt, fs = dmm.digitize.count, dmm.digitize.samplerate
+  local before = live()
+  local ok = fftsa.options_reset()
+  return ok and fftsa.n == n and fftsa.flo == flo and fftsa.fhi == fhi
+         and fftsa.range == rng and fftsa.win_i == wi
+         and dmm.digitize.count == cnt and dmm.digitize.samplerate == fs
+         and live() == before and display.active == fftsa.optscr,
+         string.format('%g..%g %gV n=%d, count=%s rate=%s, live %d -> %d',
+                       fftsa.flo, fftsa.fhi, fftsa.range, fftsa.n,
+                       tostring(dmm.digitize.count), tostring(dmm.digitize.samplerate),
+                       before, live())
+end)())
+-- And it is abandonable, because it only writes fields: Cancel after Reset is Cancel.
+check('Cancel after Reset keeps what was in force', (function()
+  fftsa.options()
+  display.setvalue(fftsa.opt_fhi, 23000)
+  fftsa.options_apply()                       -- a span that is not the default
+  local flo, fhi = fftsa.flo, fftsa.fhi
+  fftsa.options()
+  fftsa.options_reset()
+  fftsa.options_cancel()
+  return fhi == 23000 and fftsa.flo == flo and fftsa.fhi == fhi
+         and display.active == fftsa.sg_scr,
+         string.format('%g..%g, wanted %g..%g', fftsa.flo, fftsa.fhi, flo, fhi)
+end)())
+-- opt_nf is what opt_layout() lays the form out for, so it is also the count of fields the
+-- button has to reach. A seventh field added without a seventh default would quietly keep
+-- whatever was in it.
+check('the defaults cover every field the form offers', (function()
+  local n, k = 0, nil
+  for k in pairs(fftsa.defaults) do n = n + 1 end
+  return n == fftsa.opt_nf, n .. ' defaults, opt_nf ' .. fftsa.opt_nf
+end)())
+fftsa.options()        -- the form back to what is in force, so nothing below inherits a
+fftsa.show_main()      -- field left at a default the hardware was never given
 
 print('\nFFT sample selection and preview (real code)')
 check('sample-rate labels use SI prefixes', (function()

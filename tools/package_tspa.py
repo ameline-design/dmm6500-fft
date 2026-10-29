@@ -68,9 +68,9 @@ MANIFEST = [
                     'with a live graph, top-6 peaks, and a touch options form '
                     '(start/stop frequency, input range).'),
     # Identifies which tree is installed in MENU > Manage Apps, so it has to move with the
-    # tree or an install cannot be told from the one it replaced. 4.0 and not 3.10 because
-    # the field may be compared as a STRING, where "3.10" sorts BELOW "3.9".
-    ('Version', '4.1'),
+    # tree or an install cannot be told from the one it replaced. One decimal digit only,
+    # because the field may be compared as a STRING, where "3.10" sorts below "3.9".
+    ('Version', '4.2'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was
