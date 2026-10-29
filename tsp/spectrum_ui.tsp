@@ -324,10 +324,16 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
   local ndb, snr = nil, nil
   if cnt > 0 and sum > 0 then
     local mean = sum / cnt
-    -- Not clamped to the plot's floor. The floor is a measurement, not a plotted point, so
-    -- clamping it to the axis reports the axis: with a quiet input, and on the DMM7510 whose
-    -- front end is the 12 to 14 dB lower one the -120 axis exists for, the clamp was all
-    -- that was being read. log10 is safe without a guard here: cnt > 0 and sum > 0 above.
+    -- Not clamped to the plot's floor. The floor is a measurement, not a plotted point, and
+    -- clamping it to the axis reports the axis. Measured here at -110 to -111 dBV, averaging
+    -- about -110.6 and best -111.2, at 16,384 samples on Hann -- all four inputs shorted,
+    -- weeks of continuous uptime, 22 C +/- 1 and 40 to 45 % RH. The conditions qualify it: a
+    -- shorting block makes this the instrument's own noise rather than pickup, and a cold
+    -- start reads worse, so a figure taken any other way is not this one. All of it clears
+    -- the -120 axis the clamp used to pin to. A DMM7510 is expected nearer -122, where the
+    -- clamp would pin it about 2 dB high; expected rather than measured, nobody having one.
+    --
+    -- log10 is safe without a guard: this branch needs cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)
     -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
     -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.

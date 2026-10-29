@@ -1,25 +1,31 @@
--- dsp_lua.tsp -- the Lua implementation of the dsp.* primitives docs/NATIVE-DSP-PROPOSAL.md
--- specifies, over the shipped TSP transform. Lua 5.0.2.
+-- dsp_lua.tsp -- the app's signal-processing math, in a table of its own. Lua 5.0.2.
 --
--- The app's data path calls dsp.* and nothing else. This file is what binds those names on
--- firmware that has no native primitives; the gate at the head of tsp/spectrum_app.tsp
--- decides. Both implementations ship in the archive for ever, there being no runtime module
--- loading on this instrument, so the gate chooses rather than loads.
+-- The division this file exists for: the transform, the reduction, the peak search and the
+-- distortion figures are reached through one table, dsp, and the app's data path calls
+-- nothing else. Attributes to configure and one call to run, in the style of dmm.digitize --
+-- commit, spectrum, plan, peak, distortion, release and lastevent, over the attribute groups
+-- dsp.fft, dsp.filter, dsp.out, dsp.peaks and dsp.thd.
 --
--- Nothing here is installed at load time: the body is a function, so the gate can decline to
--- call it and leave a native dsp untouched.
+-- Keeping the math behind one table is what makes it replaceable: the app cannot reach past
+-- it, so an implementation bound under the same names behaves the same or not at all.
 --
--- The arithmetic underneath is fftsa's, already pinned by tools/test_tsp.lua, so a figure
--- that moves after the switch is the native implementation and not this adapter. Everything
--- the proposal says the primitives must REFUSE is refused here: an implementation kinder
--- than the specification hides the defect the specification exists to catch.
+-- Nothing is installed at load time: the body is a function, so the gate at the head of
+-- tsp/spectrum_app.tsp can decline to call it and leave a dsp this instrument already has.
+-- There is no runtime module loading here, so the gate chooses between what the archive
+-- already carries rather than loading either.
+--
+-- The arithmetic underneath is fftsa's own, pinned by tools/test_tsp.lua, so a figure that
+-- moves is whatever replaced this table and not the table. Every argument the interface
+-- says is illegal is refused here too: an implementation kinder than its own rules hides
+-- the defect the rules exist to catch.
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
 function fftsa.dsp_install()
   dsp = {}
 
-  -- Return codes, the values notes/dsp-private/csrc/dsp.h defines.
+  -- Return codes. Negative, so a caller can test one answer for failure, and fixed values
+  -- rather than an enum the firmware might number differently.
   dsp.OK, dsp.EARG, dsp.EPOW2, dsp.ENOMEM = 0, -1, -2, -3
   dsp.EUNSUPPORTED, dsp.ESHORT, dsp.EBETA = -4, -5, -6
   dsp.EDECLINE, dsp.EALIGN, dsp.EZONE = -7, -8, -9
@@ -34,7 +40,7 @@ function fftsa.dsp_install()
 
   dsp.version = 1
 
-  -- Posted rather than raised, which is the convention the proposal asks for: a raise inside
+  -- Posted rather than raised, which is the convention throughout: a raise inside
   -- a timer or button callback posts -286 and leaves the app on screen and dead. The list
   -- stands in for the instrument's event log so a test can assert that a refusal posted AND
   -- returned a code.
