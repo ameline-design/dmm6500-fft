@@ -47,8 +47,8 @@ function fftsa.win_to_dsp(wi)
   return k
 end
 
--- THE HARMONIC RULES ARE THE APP'S, not an implementation default. Their own names because
--- fftsa.thd_hmax, thd_nsample and thd_mains are where the primitive PUTS the ones it used.
+-- The harmonic rules are the app's, not an implementation default. Their own names because
+-- fftsa.thd_hmax, thd_nsample and thd_mains are where the primitive puts the ones it used.
 -- After the gate, the mains selection being one of its enums.
 fftsa.thd_hmax_want  = 20              -- harmonics counted; the window top usually stops first
 fftsa.thd_bins_want  = 1024            -- bins sampled for the floor; 0 means every bin
@@ -254,10 +254,10 @@ function fftsa.measure_fs(buf)
   return (n - 1) / (tN - t1)
 end
 
--- EVERY FRAME-CLASS ATTRIBUTE THE DISPLAY OWNS, written every frame: all are settable while
+-- Every frame-class attribute the display owns, written every frame: all are settable while
 -- the app runs and an unchanged write costs a comparison, so syncing one and not the rest is
 -- what makes sg_ncol live and sg_dbmin dead with nothing to say which. Both counts are clamped
--- to what was built, being REFUSED above it. The peak count is RETURNED so the display loops
+-- to what was built, being refused above it. The peak count is returned so the display loops
 -- ask for the same number -- read separately, a raised sg_npeak asks dsp.peak() for a peak it
 -- never found, and that posts an event per peak per frame.
 function fftsa.dsp_live()
@@ -285,10 +285,10 @@ function fftsa.dsp_live()
   return npk
 end
 
--- THE PLOTTED WINDOW, PER FRAME. An adopted gesture moves the axis without re-planning, so a
+-- The plotted window, written per frame. An adopted gesture moves the axis without re-planning, so a
 -- window written only at Apply leaves the trace, the peaks and the THD figures on the span
 -- before it -- every frequency on the plot mislabelled. Frame attributes, so this dirties
--- nothing. From the STORED axis range, which is what the widget was pinned to.
+-- nothing. From the stored axis range, which is what the widget was pinned to.
 function fftsa.dsp_window()
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if lo == nil or hi == nil or not (hi > lo) then return false end
@@ -312,7 +312,6 @@ function fftsa.apply()
   dsp.fft.samples    = fftsa.n
   dsp.fft.window     = fftsa.win_to_dsp(fftsa.win_i)
   dsp.fft.beta       = fftsa.kbeta(fftsa.kbeta_i)
-  dsp.fft.unit       = dsp.UNIT_DBV
   -- The rate the digitizer is ABOUT to be set to. commit() needs it before any capture
   -- exists, because the bin width and srclength follow from it.
   dsp.fft.samplerate = fftsa.fs_acq

@@ -771,15 +771,14 @@ end
 --
 -- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
 -- which is not a clean signal and must not read as 0.00%.
--- flo, fhi and dbfloor are the analysis window and the floor the figure is clamped at. All
--- three default to the display module's fields, which is where the shipped callers keep
--- them; dsp.* passes its own, because reading the display's span and dB window from inside
--- the signal path is the seam crossed backwards and holds only while both halves are Lua.
-function fftsa.thd_noise(nb, binhz, flo, fhi, dbfloor)
+-- flo and fhi are the analysis window, defaulting to the display module's fields where the
+-- shipped callers keep them; dsp.* passes its own, because reading the display's span from
+-- inside the signal path is the seam crossed backwards and holds only while both halves are
+-- Lua. No dB floor goes in: see the noise figure below.
+function fftsa.thd_noise(nb, binhz, flo, fhi)
   local pwr = fftsa.fft_pwr
   if pwr == nil or nb == nil or nb < 8 then return nil, nil, 0 end
   if binhz == nil or not (binhz > 0) then return nil, nil, 0 end
-  if dbfloor == nil then dbfloor = fftsa.sg_dbmin end
   local sqrt, floor, log10 = math.sqrt, math.floor, math.log10
   local k0 = 2 + (fftsa.fft_kdc or 0)
   local kmin, kmax = fftsa.sg_window_bins(nb, binhz, flo, fhi)
@@ -867,9 +866,11 @@ function fftsa.thd_noise(nb, binhz, flo, fhi, dbfloor)
   local ndb, snr = nil, nil
   if cnt > 0 and sum > 0 then
     local mean = sum / cnt
+    -- Not clamped to the plot's floor. The floor is a measurement, not a plotted point, so
+    -- clamping it to the axis reports the axis: with a quiet input, and on the DMM7510 whose
+    -- front end is the 12 to 14 dB lower one the -120 axis exists for, the clamp was all
+    -- that was being read. log10 is safe without a guard here: cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)
-    -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
-    if not (ndb > dbfloor) then ndb = dbfloor end
     -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
     -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.
     -- The floor still reports: shorted, it is the instrument's own and the useful number.
@@ -1826,7 +1827,6 @@ function fftsa.dsp_install()
 
   dsp.WINDOW_RECT, dsp.WINDOW_HANN, dsp.WINDOW_BLACKMAN = 0, 1, 2
   dsp.WINDOW_BLACKMAN_HARRIS, dsp.WINDOW_KAISER = 3, 4
-  dsp.UNIT_DBV, dsp.UNIT_VOLT, dsp.UNIT_VRMS = 0, 1, 2
   dsp.OFF, dsp.ON = 0, 1
   -- Negative, because every real selection is a frequency and so positive.
   dsp.MAINS_BOTH = -1
@@ -1859,13 +1859,13 @@ function fftsa.dsp_install()
     return dsp.events[1]
   end
 
-  -- THREE ATTRIBUTE CLASSES, not two, and which one an attribute is in is the whole of what
+  -- Three attribute classes, not two, and which one an attribute is in is the whole of what
   -- a commit costs:
   --
   --   'tables'  fft.samples, fft.window, fft.beta, filter.decimate -- the window, the
   --             twiddles and the interpolation tables, or the size of the arena. 0.163 ms a
   --             sample: 83 ms at 512 and a measured 2.667 s at 16384.
-  --   'filter'  fft.samplerate, fft.unit, filter.state/lowcutoff/highcutoff/order -- no
+  --   'filter'  fft.samplerate, filter.state/lowcutoff/highcutoff/order -- no
   --             table depends on them, so a commit that only moved these builds nothing.
   --   'frame'   out.*, peaks.*, thd.* -- nothing is built from them, so they are read per
   --             call and a span gesture or a mains setting costs no rebuild at all.
@@ -1913,17 +1913,15 @@ function fftsa.dsp_install()
   end
 
   local fft_s, filter_s, out_s, peaks_s, thd_s, filter_req
-  -- fft.samplerate and fft.unit are CHEAP: the rate places the taps and the band, and the
-  -- unit only picks which arithmetic the reduction does. Neither reaches the window or the
-  -- twiddles. filter.decimate is EXPENSIVE despite sitting among the filter's attributes,
-  -- because it sizes the arena -- srclength follows from it and dsp_plan_bytes takes it.
+  -- fft.samplerate is cheap: the rate places the taps and the band, reaching neither the
+  -- window nor the twiddles. filter.decimate is expensive despite sitting among the filter's
+  -- attributes, because it sizes the arena -- srclength follows from it, and so does
+  -- dsp_plan_bytes.
   dsp.fft, fft_s = group(
-    {samples = 512, window = dsp.WINDOW_HANN, beta = 12, unit = dsp.UNIT_DBV,
-     samplerate = 0},
+    {samples = 512, window = dsp.WINDOW_HANN, beta = 12, samplerate = 0},
     {srclength = 0, binwidth = 0, binzerohz = 0, binsense = 1, zone = 0,
      spectrumtime = 0, committime = 0},
-    {samples = 'tables', window = 'tables', beta = 'tables',
-     unit = 'filter', samplerate = 'filter'})
+    {samples = 'tables', window = 'tables', beta = 'tables', samplerate = 'filter'})
   dsp.filter, filter_s, filter_req = group(
     {state = dsp.OFF, lowcutoff = 0, highcutoff = 0, order = 0, decimate = 0},
     {ntaps = 0},
@@ -2004,7 +2002,7 @@ function fftsa.dsp_install()
   -- chooser compares two candidate rates by the bin each would give. commit() cannot stand in
   -- for either -- it is 2.667 s at 16,384 samples.
   --
-  -- NO FILTER HERE, so the decimation is always 1 and the taps 0: nothing beats fs/n for bin
+  -- No filter here, so the decimation is always 1 and the taps 0: nothing beats fs/n for bin
   -- width. Still the four answers the API specifies, so a caller written against a native
   -- dsp.* that does decimate needs no change.
   function dsp.plan(fs, flo, fhi, n)
@@ -2037,10 +2035,6 @@ function fftsa.dsp_install()
     end
     local wi = win_of[kind]
     if wi == nil then return post(dsp.EARG, 'unknown window ' .. tostring(kind)) end
-    local unit = fft_s.unit
-    if unit < dsp.UNIT_DBV or unit > dsp.UNIT_VRMS then
-      return post(dsp.EARG, 'unknown unit ' .. tostring(unit))
-    end
     local bi = 4
     if kind == dsp.WINDOW_KAISER then
       bi = beta_index(fft_s.beta)
@@ -2059,7 +2053,7 @@ function fftsa.dsp_install()
       return post(dsp.EARG, 'fft.samplerate is needed to place the band and the taps')
     end
 
-    -- REFUSED, NOT IGNORED: a filter silently left out reads as a flat passband that is
+    -- Refused rather than ignored: a filter silently left out reads as a flat passband that is
     -- really the unfiltered record aliased into the band.
     if filter_s.state ~= dsp.OFF and filter_s.state ~= false then
       return post(dsp.EUNSUPPORTED, 'no filter in this implementation')
@@ -2108,17 +2102,10 @@ function fftsa.dsp_install()
     return ((cap.n - 1) / (tn - t1)) / n
   end
 
-  -- One point, in the unit asked for. Used for the marker trace, where there are as many
-  -- calls as peaks; the segment loop inlines the same arithmetic because there are 255 of
-  -- them and a call is about 12 us on the instrument.
+  -- One point in dB. Used for the marker trace, where there are as many calls as peaks;
+  -- the segment loop inlines the same arithmetic because there are 255 of them and a call
+  -- is about 12 us on the instrument.
   local function seg_value(hi)
-    local unit = fft_s.unit
-    if unit == dsp.UNIT_VOLT or unit == dsp.UNIT_VRMS then
-      local v = 0
-      if hi ~= nil and hi > 0 then v = math.sqrt(hi) end
-      if unit == dsp.UNIT_VRMS then v = v / 1.4142135623731 end
-      return v
-    end
     local vfl = out_s.vfloor * out_s.vfloor
     local db = out_s.dbfloor
     if hi ~= nil and hi > vfl then
@@ -2177,12 +2164,8 @@ function fftsa.dsp_install()
     local npts = kmax - kmin + 1
     local ncol = out_s.segments
     local floor, log10 = math.floor, math.log10
-    local unit = fft_s.unit
-    local as_db = (unit ~= dsp.UNIT_VOLT and unit ~= dsp.UNIT_VRMS)
     local dbmin, dbmax = out_s.dbfloor, out_s.dbceil
     local vfl = out_s.vfloor * out_s.vfloor
-    local vdiv = 1
-    if unit == dsp.UNIT_VRMS then vdiv = 1.4142135623731 end
     local fstep = (npts / ncol) * binhz
     local f0 = (kmin - 1) * binhz
     local st_v, st_f = dsp.st_v, dsp.st_f
@@ -2198,25 +2181,19 @@ function fftsa.dsp_install()
         local v = pwr[k]
         if v ~= nil and (hi == nil or v > hi) then hi = v end
       end
-      -- INLINE, not a call per segment: the unit, the two dB limits, the squared voltage
-      -- floor and math.log10 are hoisted above the loop, and at a measured 1.4 us a table
-      -- read that is about 1.8 ms of an 81.8 ms frame over 255 segments.
+      -- Inlined rather than a call per segment: the two dB limits, the squared voltage floor and
+      -- math.log10 are hoisted above the loop, and at a measured 1.4 us a table read that
+      -- is about 1.8 ms of an 81.8 ms frame over 255 segments.
       --
       -- nil (a sparse power array after a short read) and anything at or below the floor
       -- land on the floor, so log10 is never handed a zero. The range tests are positives
       -- because every comparison with a NaN is false, so `db < dbmin` would pass one through
       -- to buffer.write.reading and a refused parameter is event 1131.
-      local val
-      if as_db then
-        val = dbmin
-        if hi ~= nil and hi > vfl then
-          val = 10 * log10(hi)
-          if not (val > dbmin) then val = dbmin
-          elseif not (val < dbmax) then val = dbmax end
-        end
-      else
-        val = 0
-        if hi ~= nil and hi > 0 then val = math.sqrt(hi) / vdiv end
+      local val = dbmin
+      if hi ~= nil and hi > vfl then
+        val = 10 * log10(hi)
+        if not (val > dbmin) then val = dbmin
+        elseif not (val < dbmax) then val = dbmax end
       end
       nseg = nseg + 1
       -- The segment's own frequency, not the winning bin's: segments can be narrower than a
@@ -2314,11 +2291,10 @@ function fftsa.dsp_install()
       post(dsp.EARG, 'thd.mains must be MAINS_BOTH, 50, 60 or 0')
       return nil
     end
-    -- The span and the dB floor go in as arguments. Reading fftsa.sg_flo_hz and
-    -- fftsa.sg_dbmin out of the display module instead is the seam crossed backwards, and it
-    -- works only while both halves are Lua.
-    local thd, ndb, nh, snr = fftsa.thd_noise(nb, binhz, out_s.lowfreq, out_s.highfreq,
-                                              out_s.dbfloor)
+    -- The span goes in as arguments. Reading fftsa.sg_flo_hz out of the display module
+    -- instead is the seam crossed backwards, and works only while both halves are Lua.
+    -- out.dbfloor is not passed: it bounds the trace, not the measured noise floor.
+    local thd, ndb, nh, snr = fftsa.thd_noise(nb, binhz, out_s.lowfreq, out_s.highfreq)
     local f0 = nil
     if thd ~= nil then thd = thd / 100 end        -- percent in the TSP, a fraction here
     if snr ~= nil and dsp.pk_hz[1] ~= nil then f0 = dsp.pk_hz[1] end
@@ -2402,8 +2378,8 @@ function fftsa.win_to_dsp(wi)
   return k
 end
 
--- THE HARMONIC RULES ARE THE APP'S, not an implementation default. Their own names because
--- fftsa.thd_hmax, thd_nsample and thd_mains are where the primitive PUTS the ones it used.
+-- The harmonic rules are the app's, not an implementation default. Their own names because
+-- fftsa.thd_hmax, thd_nsample and thd_mains are where the primitive puts the ones it used.
 -- After the gate, the mains selection being one of its enums.
 fftsa.thd_hmax_want  = 20              -- harmonics counted; the window top usually stops first
 fftsa.thd_bins_want  = 1024            -- bins sampled for the floor; 0 means every bin
@@ -2609,10 +2585,10 @@ function fftsa.measure_fs(buf)
   return (n - 1) / (tN - t1)
 end
 
--- EVERY FRAME-CLASS ATTRIBUTE THE DISPLAY OWNS, written every frame: all are settable while
+-- Every frame-class attribute the display owns, written every frame: all are settable while
 -- the app runs and an unchanged write costs a comparison, so syncing one and not the rest is
 -- what makes sg_ncol live and sg_dbmin dead with nothing to say which. Both counts are clamped
--- to what was built, being REFUSED above it. The peak count is RETURNED so the display loops
+-- to what was built, being refused above it. The peak count is returned so the display loops
 -- ask for the same number -- read separately, a raised sg_npeak asks dsp.peak() for a peak it
 -- never found, and that posts an event per peak per frame.
 function fftsa.dsp_live()
@@ -2640,10 +2616,10 @@ function fftsa.dsp_live()
   return npk
 end
 
--- THE PLOTTED WINDOW, PER FRAME. An adopted gesture moves the axis without re-planning, so a
+-- The plotted window, written per frame. An adopted gesture moves the axis without re-planning, so a
 -- window written only at Apply leaves the trace, the peaks and the THD figures on the span
 -- before it -- every frequency on the plot mislabelled. Frame attributes, so this dirties
--- nothing. From the STORED axis range, which is what the widget was pinned to.
+-- nothing. From the stored axis range, which is what the widget was pinned to.
 function fftsa.dsp_window()
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if lo == nil or hi == nil or not (hi > lo) then return false end
@@ -2667,7 +2643,6 @@ function fftsa.apply()
   dsp.fft.samples    = fftsa.n
   dsp.fft.window     = fftsa.win_to_dsp(fftsa.win_i)
   dsp.fft.beta       = fftsa.kbeta(fftsa.kbeta_i)
-  dsp.fft.unit       = dsp.UNIT_DBV
   -- The rate the digitizer is ABOUT to be set to. commit() needs it before any capture
   -- exists, because the bin width and srclength follow from it.
   dsp.fft.samplerate = fftsa.fs_acq

@@ -229,15 +229,14 @@ end
 --
 -- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
 -- which is not a clean signal and must not read as 0.00%.
--- flo, fhi and dbfloor are the analysis window and the floor the figure is clamped at. All
--- three default to the display module's fields, which is where the shipped callers keep
--- them; dsp.* passes its own, because reading the display's span and dB window from inside
--- the signal path is the seam crossed backwards and holds only while both halves are Lua.
-function fftsa.thd_noise(nb, binhz, flo, fhi, dbfloor)
+-- flo and fhi are the analysis window, defaulting to the display module's fields where the
+-- shipped callers keep them; dsp.* passes its own, because reading the display's span from
+-- inside the signal path is the seam crossed backwards and holds only while both halves are
+-- Lua. No dB floor goes in: see the noise figure below.
+function fftsa.thd_noise(nb, binhz, flo, fhi)
   local pwr = fftsa.fft_pwr
   if pwr == nil or nb == nil or nb < 8 then return nil, nil, 0 end
   if binhz == nil or not (binhz > 0) then return nil, nil, 0 end
-  if dbfloor == nil then dbfloor = fftsa.sg_dbmin end
   local sqrt, floor, log10 = math.sqrt, math.floor, math.log10
   local k0 = 2 + (fftsa.fft_kdc or 0)
   local kmin, kmax = fftsa.sg_window_bins(nb, binhz, flo, fhi)
@@ -325,9 +324,11 @@ function fftsa.thd_noise(nb, binhz, flo, fhi, dbfloor)
   local ndb, snr = nil, nil
   if cnt > 0 and sum > 0 then
     local mean = sum / cnt
+    -- Not clamped to the plot's floor. The floor is a measurement, not a plotted point, so
+    -- clamping it to the axis reports the axis: with a quiet input, and on the DMM7510 whose
+    -- front end is the 12 to 14 dB lower one the -120 axis exists for, the clamp was all
+    -- that was being read. log10 is safe without a guard here: cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)
-    -- Floored at the plot's floor, like the peak column: 1e-26 reads -260 dBV.
-    if not (ndb > dbfloor) then ndb = dbfloor end
     -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
     -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.
     -- The floor still reports: shorted, it is the instrument's own and the useful number.

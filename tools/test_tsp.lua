@@ -2461,7 +2461,7 @@ check('dragging into a wall converges, and never leaves the legal range', (funct
   return bad == nil, bad
 end)())
 
--- A RAISED PEAK COUNT MUST NOT ASK FOR PEAKS THE PRIMITIVE NEVER FOUND. dsp.peak() refuses an
+-- A raised peak count must not ask for peaks the primitive never found. dsp.peak() refuses an
 -- index above dsp.peaks.count and POSTS for it, so a count read straight from sg_npeak while
 -- the attribute stayed at its Apply value costs one event per extra peak on every frame.
 check('a raised peak count is clamped, and posts nothing', (function()
@@ -2495,7 +2495,7 @@ check('and reading sg_npeak directly instead would post one per extra peak', (fu
   return posted == 2, posted .. ' posted for two peaks past the count'
 end)())
 
--- AN ADOPTED GESTURE HAS TO REACH THE DATA, not just the axis. The output window is a frame
+-- An adopted gesture has to reach the data, not just the axis. The output window is a frame
 -- attribute and the app writes it per frame; written only at Apply, the axis would redraw on
 -- the gesture while the trace, the peak table and the three THD figures stayed on the span
 -- before it -- every frequency on the plot mislabelled, which is what this reproduced on the
