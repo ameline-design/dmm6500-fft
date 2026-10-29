@@ -13,6 +13,63 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
+-- Capability gate. The whole of the change when native dsp.* ships: the
+-- firmware's own primitives are used when they are there, and the Lua
+-- implementation is installed when they are not.
+fftsa.dsp_native = (dsp ~= nil and dsp.version ~= nil and dsp.version >= 1)
+if not fftsa.dsp_native then fftsa.dsp_install() end
+
+-- Here and not in fft_core.tsp because tools/package_tspa.py concatenates the modules into
+-- one loadscript chunk in a fixed order and there is no runtime module loading on this
+-- instrument: both implementations are in the archive for ever and this only decides which
+-- binds the name. tsp/dsp_lua.tsp sits ahead of this file in that order, so the installer
+-- exists before the gate runs.
+
+-- THE WINDOW ENUM IS NOT THE PICKER INDEX. It currently coincides -- dsp.WINDOW_HANN is 1
+-- and fftsa.win_names[1] is "Hann", with WINDOW_RECT at 0 excluded, which is the only reason
+-- the off-by-one never shows. Twenty-five call sites drive the options form and the settings
+-- line off the index, so an enum numbered differently in the firmware would select the wrong
+-- window with nothing on the glass to say so: every amplitude out by a scalloping factor.
+-- Mapped rather than assumed, in both directions, one map each side of the seam. Built from
+-- whatever dsp.WINDOW_* turn out to be, which is why it sits after the gate.
+--
+-- Index-parallel to fftsa.win_names: a window added to one and not the other falls back to
+-- Hann without saying so, which is what the length check in the proto suite is for.
+fftsa.win_dsp = {}
+fftsa.win_dsp[1] = dsp.WINDOW_HANN
+fftsa.win_dsp[2] = dsp.WINDOW_BLACKMAN
+fftsa.win_dsp[3] = dsp.WINDOW_BLACKMAN_HARRIS
+fftsa.win_dsp[4] = dsp.WINDOW_KAISER
+
+function fftsa.win_to_dsp(wi)
+  local k = fftsa.win_dsp[wi or fftsa.win_i]
+  if k == nil then k = fftsa.win_dsp[1] end
+  return k
+end
+
+-- THE HARMONIC RULES ARE THE APP'S, not an implementation default. Their own names because
+-- fftsa.thd_hmax, thd_nsample and thd_mains are where the primitive PUTS the ones it used.
+-- After the gate, the mains selection being one of its enums.
+fftsa.thd_hmax_want  = 20              -- harmonics counted; the window top usually stops first
+fftsa.thd_bins_want  = 1024            -- bins sampled for the floor; 0 means every bin
+fftsa.thd_mains_want = dsp.MAINS_BOTH  -- hum discounted at 50 and at 60 Hz
+
+-- A refusal as something that can go on the glass. The primitives post an event and return a
+-- negative code, and "-2" tells an operator nothing; dsp.lastevent() carries the reason the
+-- implementation posted. fftsa.options_apply writes this behind "APPLY FAILED:" and
+-- fftsa.frame puts its first 60 characters behind the HALTED banner.
+--
+-- The code is compared as well as read: an older event still in the log is not this
+-- refusal's reason, and a wrong reason reads exactly like a right one.
+function fftsa.dsp_why(what, code)
+  local msg = tostring(what) .. " refused (" .. tostring(code) .. ")"
+  local e = dsp.lastevent()
+  if e ~= nil and e.why ~= nil and e.code == code then
+    msg = msg .. ": " .. tostring(e.why)
+  end
+  return msg
+end
+
 -- Every table, window and twiddle is sized from the selected power-of-two count.
 -- 512 remains the default; larger records trade update speed for finer bins.
 fftsa.n       = 512
@@ -105,62 +162,9 @@ end
 --
 -- The floor is 100 kS/s, 195.3 Hz bins at the default 512 samples. A higher rate coarsens
 -- the bins in proportion, which is the price of the wider view.
--- Band-pass, off by default: low-pass the capture at the stop frequency and decimate to
--- match, so the bin becomes fs/(D*N) and a narrow span reaches a resolution that would
--- otherwise need a transform D times longer. The filter is what makes the decimation
--- safe. It cannot undo folding that already happened at the ADC.
-fftsa.bp_on = false
-
 fftsa.fs_min = 100000
 -- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
 fftsa.rates  = {100000, 200000, 500000, 1000000}
-
--- One rate up, which is what the band-pass is given: sampling faster raises the Nyquist
--- so the filter can remove a band that would otherwise already be folded into the record.
--- The next rate in fftsa.rates rather than literally twice, because the hardware has
--- 100k, 200k, 500k and 1M and nothing between.
---
--- The cost is read budget: the bin is fs_acq/M, so holding resolution means doubling M
--- with the rate, and where bp_maxm caps the decimation the bin comes out coarser instead.
-function fftsa.bp_rate(fs)
-  local r = fftsa.rates
-  local n = table.getn(r)
-  local i
-  for i = 1, n do
-    if r[i] > fs then return r[i] end
-  end
-  return r[n]
-end
-
--- Rate and decimation chosen together, by the bin width they produce: stepping the rate
--- up gains only where the decimation can absorb it. At a 50 kHz span the decimation is 1
--- either way and stepping up doubles the bin for nothing, 390.63 Hz against 195.31. The
--- finer bin wins; on a tie the higher rate does, its Nyquist being further from the span.
-function fftsa.bp_plan(fhi, n)
-  local base = fftsa.pick_fs(fhi)
-  -- ONE STEP UP AT MOST. Searching every rate the hardware has finds a plan for a 50 kHz
-  -- span -- 500 kS/s at /3 -- but 51 taps over 512 outputs is around 135 ms of
-  -- multiply-accumulate, and the frame goes from 0.08 s to a quarter of a second for a
-  -- bin COARSER than the unfiltered one. Not worth it: at a span that wide the filter is
-  -- left out and the line says so.
-  local cand = {base, fftsa.bp_rate(base)}
-  local bestfs, bestd = nil, nil
-  local i
-  for i = 1, 2 do
-    local fs = cand[i]
-    if fs >= base then
-      local d = fftsa.bp_pick_d(fs, fhi, n)
-      -- A decimation of 1 is the filter bypassed, so only plans that can actually run
-      -- are candidates; among those the finest bin wins.
-      if d > 1 and (bestfs == nil or (fs / d) < (bestfs / bestd)) then
-        bestfs, bestd = fs, d
-      end
-    end
-  end
-  -- Neither rate could decimate: run at the rate the span needs and leave the filter out.
-  if bestfs == nil then return base, 1 end
-  return bestfs, bestd
-end
 
 -- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
 function fftsa.pick_fs(fhi)
@@ -174,17 +178,9 @@ end
 
 -- Does a new stop frequency need the hardware re-planned? The digitizer runs at the lowest
 -- rate whose Nyquist covers the stop, so a stop inside the rate in force changes only which
--- bins are plotted: one axis write, no capture. With the band-pass on the stop sets the
--- filter's cutoff too, so a change re-plans -- but only where a filter is actually in the
--- path: bp_plan answers d == 1 for a span too wide to decimate and bp_build then builds
--- none, which puts that case back on the rate alone. Plan against plan, never against
--- fs_acq, which holds the rate MEASURED off the timestamps and never equals a planned one.
+-- bins are plotted: one axis write, no capture. Planned rate against planned rate, never
+-- against fs_acq, which holds the rate MEASURED off the timestamps and never equals one.
 function fftsa.plan_changed(fhi_new)
-  if fftsa.bp_on then
-    local newfs, newd = fftsa.bp_plan(fhi_new, fftsa.n)
-    local oldfs, oldd = fftsa.bp_plan(fftsa.fhi, fftsa.n)
-    return newfs ~= oldfs or newd ~= oldd or newd > 1
-  end
   return fftsa.pick_fs(fhi_new) ~= fftsa.pick_fs(fftsa.fhi)
 end
 
@@ -258,26 +254,82 @@ function fftsa.measure_fs(buf)
   return (n - 1) / (tN - t1)
 end
 
+-- EVERY FRAME-CLASS ATTRIBUTE THE DISPLAY OWNS, written every frame: all are settable while
+-- the app runs and an unchanged write costs a comparison, so syncing one and not the rest is
+-- what makes sg_ncol live and sg_dbmin dead with nothing to say which. Both counts are clamped
+-- to what was built, being REFUSED above it. The peak count is RETURNED so the display loops
+-- ask for the same number -- read separately, a raised sg_npeak asks dsp.peak() for a peak it
+-- never found, and that posts an event per peak per frame.
+function fftsa.dsp_live()
+  local ncol = fftsa.sg_ncol
+  local cap = nil
+  if fftsa.sg_buf ~= nil then cap = fftsa.sg_buf.capacity end
+  if cap ~= nil and ncol ~= nil and ncol > cap then ncol = cap end
+  if ncol == nil or ncol < 2 then ncol = 2 end
+  dsp.out.segments = ncol
+  -- The plot's own axis, so trace, peak column and noise figure share one floor.
+  dsp.out.dbfloor = fftsa.sg_dbmin
+  dsp.out.dbceil  = fftsa.sg_dbmax
+  dsp.out.vfloor  = fftsa.sg_vfloor
+  -- Ceiling is the rows build() made: a row that does not exist cannot be written.
+  local npk = fftsa.sg_npeak
+  local rows = nil
+  if fftsa.sg_pk_f ~= nil then rows = table.getn(fftsa.sg_pk_f) end
+  if rows ~= nil and rows > 0 and npk > rows then npk = rows end
+  if npk == nil or npk < 1 then npk = 1 end
+  dsp.peaks.count = npk
+  -- The harmonic rules, or a native dsp's own defaults move all three figures on switch day.
+  dsp.thd.harmonics = fftsa.thd_hmax_want
+  dsp.thd.bins      = fftsa.thd_bins_want
+  dsp.thd.mains     = fftsa.thd_mains_want
+  return npk
+end
+
+-- THE PLOTTED WINDOW, PER FRAME. An adopted gesture moves the axis without re-planning, so a
+-- window written only at Apply leaves the trace, the peaks and the THD figures on the span
+-- before it -- every frequency on the plot mislabelled. Frame attributes, so this dirties
+-- nothing. From the STORED axis range, which is what the widget was pinned to.
+function fftsa.dsp_window()
+  local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  if lo == nil or hi == nil or not (hi > lo) then return false end
+  dsp.out.lowfreq  = lo
+  dsp.out.highfreq = hi
+  return true
+end
+
 -- Apply the current settings to the hardware and the graph. Safe to repeat: the
 -- capture buffer is resized when needed; the graph keeps its original buffer.
--- fftsa.fft_init() rebuilds the window and its interpolation tables, which
--- is the slow part of a press -- 0.163 ms a sample, so 83 ms at 512 and a measured 2.667 s
--- at 16384 -- hence the cover. It rebuilds nothing when neither the count nor the window
--- moved, which is every adopted gesture and most presses.
+-- dsp.commit() rebuilds the window and its interpolation tables, which is the slow part of a
+-- press -- 0.163 ms a sample, so 83 ms at 512 and a measured 2.667 s at 16384 -- hence the
+-- cover. It rebuilds nothing when neither the count, the window nor the beta moved, which is
+-- every adopted gesture and most presses: every attribute below is rewritten
+-- unconditionally, and a write that does not CHANGE the value dirties nothing.
 function fftsa.apply()
-  -- TWO RATES from here on. fs_acq is what the digitizer runs at; fftsa.fs is what the
-  -- transform sees, which is fs_acq/bp_d once the band-pass is decimating. Everything
-  -- downstream reads fftsa.fs -- binhz, the settings line, the span arithmetic -- so the
-  -- decimation is invisible to it, which is the point.
+  -- fs_acq is the digitizer's rate and fftsa.fs the rate the transform sees. They are equal
+  -- with no filter in the path, and kept separate because everything downstream -- binhz,
+  -- the settings line, the span arithmetic -- reads fftsa.fs.
   fftsa.fs_acq = fftsa.pick_fs(fftsa.fhi)
-  local d = 1
-  if fftsa.bp_on then
-    fftsa.fs_acq, d = fftsa.bp_plan(fftsa.fhi, fftsa.n)
-  end
-  fftsa.bp_build(fftsa.fs_acq, fftsa.fhi, fftsa.n, d)
-  local need = fftsa.bp_m
-  fftsa.fs = fftsa.fs_acq / fftsa.bp_d
-  fftsa.fft_init(fftsa.n)
+  dsp.fft.samples    = fftsa.n
+  dsp.fft.window     = fftsa.win_to_dsp(fftsa.win_i)
+  dsp.fft.beta       = fftsa.kbeta(fftsa.kbeta_i)
+  dsp.fft.unit       = dsp.UNIT_DBV
+  -- The rate the digitizer is ABOUT to be set to. commit() needs it before any capture
+  -- exists, because the bin width and srclength follow from it.
+  dsp.fft.samplerate = fftsa.fs_acq
+  -- Written every Apply, not left at the default: the app offers no filter, and something
+  -- setting it over the socket would otherwise survive the next press.
+  dsp.filter.state = dsp.OFF
+  -- From fftsa.flo/fhi, not the stored axis dsp_window() reads: the pin below is what puts
+  -- the axis on this pair, so the stored one still holds the previous span here.
+  dsp.out.lowfreq  = fftsa.flo
+  dsp.out.highfreq = fftsa.fhi
+  -- -120 dBV, not -100: the DMM7510's front end sits 12 to 14 dB below the DMM6500's and at
+  -- -100 its noise floor was off the bottom of the plot.
+  fftsa.dsp_live()
+  local rc = dsp.commit()
+  if rc ~= dsp.OK then error(fftsa.dsp_why("commit", rc), 0) end
+  local need = dsp.fft.srclength
+  fftsa.fs = fftsa.fs_acq
   -- Before the sg_set_xrange() below, which reads it: the settings line counts the bins
   -- inside the span, and that count is computed from sg_nbins.
   fftsa.sg_nbins = fftsa.n / 2
@@ -293,7 +345,8 @@ function fftsa.apply()
   -- the capture rather than after it.
   fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
   dmm.digitize.aperture   = 1e-6
-  -- The capture is bp_m long, which is fftsa.n unless the filter is decimating.
+  -- srclength read back rather than assumed to be fftsa.n: it is the primitive that decides
+  -- how long a record it consumes, and under-acquiring would short-read every frame.
   dmm.digitize.count      = need
   if fftsa.cap ~= nil and fftsa.cap_n ~= need then
     fftsa.del_buf(fftsa.cap)
@@ -305,10 +358,9 @@ function fftsa.apply()
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
-  -- Measured from the timestamps, which are the DIGITIZER's: the readback is unreliable,
-  -- and the decimation is arithmetic afterwards, so it divides the measured rate.
+  -- Measured from the capture's own timestamps: the samplerate read-back is unreliable.
   fftsa.fs_acq = fftsa.measure_fs(fftsa.cap)
-  fftsa.fs     = fftsa.fs_acq / fftsa.bp_d
+  fftsa.fs     = fftsa.fs_acq
   fftsa.binhz  = fftsa.fs / fftsa.n
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
@@ -330,7 +382,23 @@ function fftsa.apply()
   fftsa.sg_write_xunit()
 end
 
--- One frame: acquire, transform, plot. Runs under pcall from fftsa.frame().
+-- The peaks the primitive reported, into two tables the display reads. Allocated once: the
+-- house rule is to allocate at Apply and never in a frame.
+--
+-- Through dsp.peak() rather than the implementation's own arrays, which are not API -- a
+-- native primitive has none to reach into. Resolved once here, where the three display users
+-- between them used to call fftsa.peak_interp eighteen times a frame.
+function fftsa.dsp_peaks(count)
+  if fftsa.pk_hz == nil then fftsa.pk_hz, fftsa.pk_v = {}, {} end
+  local hz, v = fftsa.pk_hz, fftsa.pk_v
+  local i
+  for i = 1, count do
+    hz[i], v[i] = dsp.peak(i)
+  end
+  return hz, v
+end
+
+-- One frame: acquire, one primitive call, plot. Runs under pcall from fftsa.frame().
 -- docs/PERFORMANCE.md has the measured phase costs.
 function fftsa.frame_body()
   -- A frame can be dispatched while the app is half-built (a failed startup) or
@@ -341,30 +409,44 @@ function fftsa.frame_body()
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
-  -- A short capture is rejected, not transformed: zero-padding the tail would give
-  -- a convincing but false broadband spectrum. The previous frame stays on screen.
-  -- The length needed is bp_m, which is fftsa.n unless the filter is decimating -- and
-  -- the filter's inner loop has no nil test, so this is what makes that safe.
-  if fftsa.cap.n < fftsa.bp_m then
-    fftsa.shortreads = (fftsa.shortreads or 0) + 1
+  local npk = fftsa.dsp_live()
+  fftsa.dsp_window()
+  -- FILTER, WINDOW, TRANSFORM, POWER, REDUCE, PEAKS, and the trace written and counted. The
+  -- primitive clears the destination itself: a clear-then-refill from out here opens a
+  -- window in which the graph paints a half-filled trace.
+  --
+  -- marks = nil deliberately. One point a peak on a STYLE_LINE trace draws a polyline
+  -- joining the peaks across the plot, and drawstyle is per graph, so the spectrum's own 255
+  -- points would get markers too. fftsa.sg_update_markers draws needles instead -- three
+  -- points a peak, a pixel either side -- from the same resolved table.
+  local nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+  if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
+  -- ZERO SEGMENTS IS A SHORT RECORD, not a failure: nothing was written, the previous
+  -- spectrum is still on screen, and a trigger timeout is the ordinary cause. Counted by the
+  -- primitive, mirrored here because the settings line and the suite read this name.
+  if nseg == 0 then
+    fftsa.shortreads = dsp.shortreads
     return
   end
-  if fftsa.bp_d > 1 then
-    fftsa.fft_load_rd(fftsa.bp_filter(fftsa.cap.readings))
-  else
-    fftsa.fft_load(fftsa.cap)
-  end
-  fftsa.fft_run()
-  fftsa.fft_power()
-  local nb = fftsa.fft_m
-  -- Peaks are searched in the window the graph plots, so the table matches the trace.
-  local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
-  local bi, bv = fftsa.find_peaks(nb, fftsa.sg_npeak, kmin, kmax)
-  -- Before the spectrum refill, so the yield at the end of that refill is the first
-  -- paint either buffer sees after both are complete.
-  fftsa.sg_update_markers(bi, bv, fftsa.sg_npeak, fftsa.binhz)
-  fftsa.sg_update(nb, fftsa.binhz)
-  fftsa.sg_show_peaks(bi, bv, fftsa.sg_npeak, fftsa.binhz)
+  -- MEASURED PER FRAME now, off the capture's own timestamps, where it used to be committed
+  -- once an Apply and refined once more. At the 0.01 % timebase wander that is a dither far
+  -- inside sg_pk_ftol, so the peak block does not redraw on it.
+  fftsa.binhz = dsp.fft.binwidth
+  -- Segments the widget was actually handed, from the primitive's own count rather than
+  -- inferred from the buffer: clamped or overrun, the buffer's n ends at capacity either
+  -- way, so only a counter can tell the two apart.
+  fftsa.sg_nwrote = nseg
+  local pk_hz, pk_v = fftsa.dsp_peaks(npk)
+  -- After the trace rather than before it: the peaks come out of the same call that writes
+  -- the trace, so the markers cannot be filled first. What the ordering was for still holds
+  -- -- the yield below is the first paint after BOTH buffers are complete -- and the window
+  -- in which one of them is incomplete is now the 18 marker points rather than 255 trace
+  -- points.
+  fftsa.sg_update_markers(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  -- Display work the primitive does not do: outside any write window, then the paint.
+  fftsa.sg_slow_tick()
+  delay(fftsa.sg_yield)
+  fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
 end
 
 -- Reentrancy-guarded frame. The body runs under pcall so an error cannot leave
@@ -382,19 +464,20 @@ fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged s
 -- busy_max breaks a guard a host abort left set, and the app looks dead until it expires,
 -- so it has to clear a legitimate frame and not much more. Three times the model does
 -- that at every count; a multiple of the sample count does not.
+-- STATED BY THE PRIMITIVE, not modelled here: dsp.fft.spectrumtime is filled by commit() for
+-- the plan in force, and every coefficient belongs to whichever implementation is bound.
+--
+-- Both callers ask about the count just committed: busy_max at the end of apply(), and the
+-- first timer arm immediately after it. So the floor below is reached only by a question
+-- about a plan that does not exist, and it answers one tick rather than a second copy of a
+-- model free to drift from the primitive's.
 function fftsa.frame_estimate(n)
   if n == nil or n < 2 then n = 512 end
-  local log2n = math.log(n) / 0.69314718055995
-  local est = n * 46.6e-6 + 3.593e-6 * n * log2n + 0.04
-  -- The band-pass adds the reads it does not share with the plain path and one
-  -- multiply-accumulate per tap per output. Derived from the documented per-operation
-  -- costs -- 22 us a buffer reading, and two table reads plus a multiply and an add at
-  -- 1.4 and 1.2 us -- not measured on this loop, so it is a starting point: frame()
-  -- replaces the period with one measured from real frames after eight of them.
-  if fftsa.bp_d ~= nil and fftsa.bp_d > 1 then
-    est = est + (fftsa.bp_m - n) * 22e-6 + n * fftsa.bp_l * 5.2e-6
+  if dsp.fft.samples == n then
+    local t = dsp.fft.spectrumtime
+    if type(t) == "number" and t > 0 then return t end
   end
-  return est
+  return 0.05
 end
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
@@ -498,7 +581,7 @@ function fftsa.destroy_options()
   fftsa.optscr, fftsa.opt_flo, fftsa.opt_fhi, fftsa.opt_rng, fftsa.opt_info =
     nil, nil, nil, nil, nil
   fftsa.opt_win, fftsa.opt_beta, fftsa.opt_n = nil, nil, nil
-  fftsa.opt_mk, fftsa.opt_bp = nil, nil
+  fftsa.opt_mk = nil
   fftsa.opt_info_last = nil
 end
 
@@ -506,7 +589,7 @@ end
 -- and the gap that buys is what makes each box a touch target. display.create takes
 -- no width for an OBJ_EDIT_*, so the second column's x is the one number to check on
 -- the glass. Labels are right-aligned and end at the column x.
--- Six: Peak Markers and Band-Pass are both withheld. See fftsa.opt_mk and fftsa.opt_bp.
+-- Six: Peak Markers is withheld. See fftsa.opt_mk.
 fftsa.opt_nf      = 6
 fftsa.opt_cols    = 2
 fftsa.opt_x       = 185
@@ -585,12 +668,6 @@ function fftsa.build_options()
                        fftsa.range_labels[1], fftsa.range_labels[2], fftsa.range_labels[3])
   -- Spelled out rather than built from the table: display.create takes the options as
   -- separate arguments and Lua 5.0.2 has no unpack() worth using here.
-  --
-  -- Band-pass is not offered, so fftsa.opt_bp stays nil and the read falls back to
-  -- fftsa.bp_on, leaving it settable over the socket. It is flat to 0.02 dB across the
-  -- span with 61 dB of rejection, and not worth the frame: 51 taps over 512 outputs takes
-  -- the frame from 0.08 s to about a quarter of a second for nothing an operator can
-  -- see, and from 4096 samples up the read budget leaves no room for it at all.
   local x5, y5 = nextpos()
   fftsa.opt_win = create(fftsa.optscr, display.OBJ_EDIT_OPTION, x5, y5,
                        "Window", "lobe vs sidelobe",
@@ -804,29 +881,7 @@ function fftsa.sample_rate_text(fs)
   return string.format("%g S/s", fs)
 end
 
--- Acquisition duration is N/fs, not the first-to-last interval (N-1)/fs. With the
--- band-pass decimating, fs is the rate the transform sees, so N/fs is still the record
--- length in time, and the decimation is named rather than left implicit.
--- The band-pass line, on or off. When on, the decimation says whether the filter is
--- actually in the path: no decimation means the span is too wide for any. Its own
--- function because the two readback lines want it in different places.
-function fftsa.bp_text(d, on)
-  if d == nil then d = fftsa.bp_d end
-  if on == nil then on = fftsa.bp_on end
-  -- NOTHING when it is off, which is the only state the form can produce: the field is
-  -- withheld, so "BP:Off" on every line would be a permanent label for a feature that is
-  -- not there. It still speaks up when something sets fftsa.bp_on over the socket, or the
-  -- decimation would be invisible.
-  if not on then return "" end
-  if d ~= nil and d > 1 then return string.format("BP:On /%d", d) end
-  return "BP:On (" .. fftsa.bp_why(fftsa.fs_acq, fftsa.fhi, fftsa.n) .. ")"
-end
-
--- fs IS THE DIGITIZER'S RATE, never the decimated one. The decimated rate is a derived
--- figure -- 200 kS/s over /3 is 66.667 -- and printing that as "fs" reads as the hardware
--- running below its own 100 kS/s floor, which it never does. The bin and the record
--- length are computed from the decimated rate, where they belong: the bin is fs_eff/N, and
--- N/fs_eff is the same record duration as N*D/fs_acq.
+-- Acquisition duration is N/fs, not the first-to-last interval (N-1)/fs.
 function fftsa.opt_info_text(fs, n, wi, bi, acq)
   fs, n = fs or fftsa.fs, n or fftsa.n
   if acq == nil then acq = fftsa.fs_acq or fs end
@@ -873,26 +928,13 @@ function fftsa.options_preview()
   local fs = fftsa.pick_fs(hi)
   -- Reuse the timestamp-measured rate when previewing the active acquisition rate.
   if fs == fftsa.pick_fs(fftsa.fhi) then fs = fftsa.fs_acq or fftsa.fs end
-  -- The decimation the pending fields would get, so the previewed bin width is the one
-  -- Apply will actually produce rather than the undecimated one.
-  local d = 1
-  local bp = (fftsa.opt_index(fftsa.getval(fftsa.opt_bp), fftsa.onoff_labels,
-                              fftsa.onoff_to_idx(fftsa.bp_on)) == 2)
-  if bp then
-    -- The same plan Apply will make, or the preview promises a bin width it cannot
-    -- produce: the rate and the decimation are chosen together.
-    fs, d = fftsa.bp_plan(hi, n)
-  end
   local acq = fs
-  fs = fs / d
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
   local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
   local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
                              fftsa.kbeta_i)
   local text = fftsa.opt_info_text(fs, n, wi, bi, acq)
-  local bptxt = fftsa.bp_text(d, bp)
-  if bptxt ~= "" then text = text .. "   " .. bptxt end
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
     fftsa.opt_info_last = text
@@ -978,9 +1020,6 @@ function fftsa.options_apply()
   local mki = fftsa.opt_index(fftsa.getval(fftsa.opt_mk),
                               fftsa.onoff_labels,
                               fftsa.onoff_to_idx(fftsa.sg_markers))
-  local bpi = fftsa.opt_index(fftsa.getval(fftsa.opt_bp),
-                              fftsa.onoff_labels,
-                              fftsa.onoff_to_idx(fftsa.bp_on))
   local nnew = fftsa.options_samples()
   local nlo, nhi = fftsa.options_span()
   fftsa.flo, fftsa.fhi = nlo, nhi
@@ -994,7 +1033,6 @@ function fftsa.options_apply()
   local mknew = (mki == 2)
   local mkchanged = (mknew ~= fftsa.sg_markers)
   fftsa.sg_markers = mknew
-  fftsa.bp_on = (bpi == 2)
   -- Under the cover: fftsa.apply() rebuilds the window tables and takes a capture,
   -- and the frame timer does not run while its screen is off show, so no frame can
   -- meet half-rebuilt tables.
@@ -1283,6 +1321,16 @@ function fftsa.stop()
   fftsa.timer = nil
   fftsa.optbtn, fftsa.optimg = nil, nil       -- children of the spectrum screen
   fftsa.lockbtn, fftsa.lockimg_c, fftsa.lockimg_o = nil, nil, nil
+  -- THE PLAN GOES WITH THE APP. Natively it is one arena, and the app is relaunchable --
+  -- every module opens with `fftsa = fftsa or {}` and fftsa.start() opens with this -- so an
+  -- arena nobody releases is leaked per launch for the rest of the power cycle, which is the
+  -- failure class this app is already careful about for buffers and for the 463-object
+  -- display pool. Under pcall for the same reason sg_destroy is: a stop that raises leaves
+  -- the rest of the teardown undone.
+  --
+  -- The cost is that the next launch rebuilds the tables, 0.163 ms a sample. It is paid
+  -- behind the loading cover, start() running apply() before it switches away.
+  pcall(function() dsp.release() end)
   pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
   fftsa.destroy_options()
   fftsa.destroy_about()

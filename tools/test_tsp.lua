@@ -533,10 +533,22 @@ function collectgarbage() end   -- no-op; the real one is fine, this keeps it qu
 
 -- ---------- load the REAL modules ----------
 for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
-                   'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp'}) do
+                   'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp',
+                   'tsp/spectrum_app.tsp'}) do
   local chunk, err = loadfile(m)
   if chunk == nil then print('LOAD FAILED ' .. m .. ': ' .. tostring(err)); os.exit(1) end
   chunk()
+end
+
+-- One frame's reduce into the trace buffer, through the primitive that owns it now.
+-- fftsa.fft_power is stubbed for the call so bins a test has put in fftsa.fft_pwr survive
+-- the pipeline; everything either side of it is the shipped path.
+function refill()
+  local savepow = fftsa.fft_power
+  fftsa.fft_power = function() end
+  local ok, err = pcall(function() dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil) end)
+  fftsa.fft_power = savepow
+  return ok, err
 end
 
 print('module load')
@@ -1139,239 +1151,13 @@ check('still exactly two timers after rebuild', live('timer') == 2,
 check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
 
-print('\nband-pass: filter and decimate to the span (real code)')
--- Unit DC gain, odd length, symmetric. The gain matters most: a filter that did not sum
--- to 1 would scale every reading, and the amplitude would be wrong by a constant nobody
--- would attribute to the filter.
--- The band-pass is given one rate up, so the filter can remove a band that would
--- otherwise have folded at the ADC. The hardware has four exact rates and nothing
--- between, so "double" means the next one, and 1 MS/s is the ceiling.
-check('the band-pass steps the acquisition rate up one, and stops at 1 MS/s', (function()
-  local got = {}
-  local i
-  for i = 1, table.getn(fftsa.rates) do got[i] = fftsa.bp_rate(fftsa.rates[i]) end
-  return got[1] == 200000 and got[2] == 500000 and got[3] == 1000000
-         and got[4] == 1000000,
-         string.format('100k->%g 200k->%g 500k->%g 1M->%g', got[1], got[2], got[3],
-                       got[4])
-end)())
--- The digitizer runs at the rate the plan chose -- not necessarily the stepped one, since
--- the filter length limits the decimation and the base rate can give the finer bin. What
--- has to hold is that the rate is one the hardware has, is never under the floor, and is
--- what was actually programmed.
-check('a band-pass Apply runs the digitizer at the rate it planned', (function()
-  display.setvalue(fftsa.opt_flo, 10)
-  display.setvalue(fftsa.opt_fhi, 10000)
-  display.setvalue(fftsa.opt_n, 1)
-  fftsa.bp_on = true
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local rate, acq, d = dmm.digitize.samplerate, fftsa.fs_acq, fftsa.bp_d
-  fftsa.bp_on = false
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local plain = dmm.digitize.samplerate
-  display.setvalue(fftsa.opt_fhi, 50000)
-  fftsa.options_apply()
-  local exact = false
-  local i
-  for i = 1, table.getn(fftsa.rates) do
-    if fftsa.rates[i] == acq then exact = true end
-  end
-  return rate == acq and exact and acq >= fftsa.fs_min and plain == 100000 and d > 1,
-         string.format('band-pass at %g /%d, plain at %g', rate, d, plain)
-end)())
--- The rate on the readback line is the DIGITIZER's. With the band-pass decimating, the
--- rate the transform sees is lower -- 200 kS/s over /3 is 66.667 -- and printing that as
--- "fs" reads as the hardware running under its own 100 kS/s floor. A 20 kHz span is the
--- case that produced it.
-check('the readback line reports the digitizer rate, not the decimated one', (function()
-  display.setvalue(fftsa.opt_flo, 10)
-  display.setvalue(fftsa.opt_fhi, 20000)
-  display.setvalue(fftsa.opt_n, 1)
-  fftsa.bp_on = true
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local line = fftsa.sg_xunit_text()
-  local acq, eff, d = fftsa.fs_acq, fftsa.fs, fftsa.bp_d
-  fftsa.bp_on = false
-  display.setvalue(fftsa.opt_fhi, 50000)
-  fftsa.options_apply()
-  if d < 2 then return false, 'no decimation at a 20 kHz span, nothing to tell apart' end
-  -- The acquisition rate is in the line and the decimated one is NOT, while the bin
-  -- width is computed from the decimated rate.
-  local named = string.find(line, string.format('BP:On /%d', d), 1, true) ~= nil
-  if not named then return false, 'the line does not name the decimation: ' .. line end
-  local shown = string.find(line, fftsa.sample_rate_text(acq), 1, true) ~= nil
-  local hidden = string.find(line, fftsa.sample_rate_text(eff), 1, true) == nil
-  local bin = string.find(line, string.format('bin %.2f Hz', eff / 512), 1, true) ~= nil
-  return shown and hidden and bin and acq >= fftsa.fs_min,
-         string.format('%s | acq %s eff %s /%d', line, fftsa.sample_rate_text(acq),
-                       fftsa.sample_rate_text(eff), d)
-end)())
-check('the taps sum to one, are odd in number and symmetric', (function()
-  fftsa.bp_build(100000, 10000, 512, 4)
-  local h, l = fftsa.bp_h, fftsa.bp_l
-  if h == nil then return false, 'no taps built' end
-  local sum, worst = 0, 0
-  local i
-  for i = 1, l do sum = sum + h[i] end
-  for i = 1, l do
-    local d = math.abs(h[i] - h[l + 1 - i])
-    if d > worst then worst = d end
-  end
-  return math.mod(l, 2) == 1 and math.abs(sum - 1) < 1e-12 and worst < 1e-15,
-         string.format('%d taps, sum %.15f, worst asymmetry %g', l, sum, worst)
-end)())
--- THE POINT OF THE FILTER. Decimating by 4 at 100 kS/s leaves a 12.5 kHz Nyquist, so a
--- 20 kHz tone -- which the hardware samples perfectly well -- folds to 5 kHz if the
--- record is simply thinned. Driven through the real filter it must not survive to be
--- folded. Both tones measured through the same path, so the in-band one is the control:
--- a filter that killed everything would pass the alias test and fail this.
-check('an out-of-band tone is stopped before it can fold in', (function()
-  local fs, fhi, n, d = 100000, 10000, 512, 4
-  fftsa.bp_build(fs, fhi, n, d)
-  local function peak_of(hz)
-    local rd = {}
-    local i
-    for i = 1, fftsa.bp_m do
-      rd[i] = math.sin(2 * math.pi * hz * (i - 1) / fs)
-    end
-    local out = fftsa.bp_filter(rd)
-    local mx = 0
-    -- The first taps are still filling, so the steady state starts after the group delay.
-    for i = math.ceil(fftsa.bp_l / d) + 1, n do
-      local v = math.abs(out[i])
-      if v > mx then mx = v end
-    end
-    return mx
-  end
-  local inband = peak_of(2000)
-  local alias  = peak_of(20000)
-  return inband > 0.9 and alias < 0.05,
-         string.format('2 kHz through at %.3f, 20 kHz down to %.4f (%.1f dB)',
-                       inband, alias, 20 * math.log10(alias / inband))
-end)())
--- THE TWO NUMBERS THAT WERE WRONG. The filter has to be flat across the displayed span
--- and down by the time the decimated Nyquist arrives. The old design was neither: its
--- cutoff sat on the span top so the band was inside the roll-off, and 13 taps where 51
--- were needed left the near stopband barely attenuated. Measured on the glass against the
--- same stimulus, that read 3.5 dB low at 16.6 kHz of a 20 kHz span.
---
--- Driven through the real taps at the real plan for a 20 kHz span, which is the case that
--- showed it.
-check('the filter is flat across the span and down past the Nyquist', (function()
-  local fs, fhi, n = 200000, 20000, 512
-  local d = fftsa.bp_pick_d(fs, fhi, n)
-  if d < 2 then return false, 'no decimation to test at /1' end
-  fftsa.bp_build(fs, fhi, n, d)
-  local nyq = fs / (2 * d)
-  local function gain(hz)
-    local rd, i = {}, nil
-    for i = 1, fftsa.bp_m do rd[i] = math.sin(2 * math.pi * hz * (i - 1) / fs) end
-    local out = fftsa.bp_filter(rd)
-    local mx = 0
-    for i = math.ceil(fftsa.bp_l / d) + 1, n do
-      local v = math.abs(out[i])
-      if v > mx then mx = v end
-    end
-    return mx
-  end
-  local dc    = gain(100)
-  local mid   = gain(fhi / 2)
-  local edge  = gain(fhi * 0.98)
-  local above = gain(nyq * 1.15)
-  local function db(x) return 20 * math.log10(x / dc) end
-  -- Flat to half a dB across the span, and 30 dB down above the Nyquist.
-  return math.abs(db(mid)) < 0.5 and math.abs(db(edge)) < 0.5 and db(above) < -30,
-         string.format('%d taps at /%d: mid %.2f dB, span edge %.2f dB, %.0f Hz %.1f dB',
-                       fftsa.bp_l, d, db(mid), db(edge), nyq * 1.15, db(above))
-end)())
--- The decimation is chosen, not fixed: a narrow span can afford more of it, and a large
--- sample count cannot afford any because the read is what it costs.
--- TWO CAPS, and the filter is usually the tighter: a decimation leaves a transition from
--- the span top to the decimated Nyquist, and the taps that transition needs grow fast as
--- it narrows. Every chosen decimation must have a filter that fits the ceiling.
-check('the decimation is capped by the filter length as well as the read cost', (function()
-  local wide   = fftsa.bp_pick_d(100000, 50000, 512)
-  local mid    = fftsa.bp_pick_d(100000, 10000, 512)
-  local narrow = fftsa.bp_pick_d(100000, 2000, 512)
-  local big    = fftsa.bp_pick_d(100000, 2000, 16384)
-  local read   = math.floor((fftsa.bp_maxm - fftsa.bp_lmax) / (512 - 1))
-  -- every one of them has a filter that fits
-  local hi
-  for hi = 2000, 50000, 500 do
-    local d = fftsa.bp_pick_d(100000, hi, 512)
-    if d > 1 and fftsa.bp_taps_for(100000, hi, d) == nil then
-      return false, string.format('stop %d Hz chose /%d, which needs more than %d taps',
-                                  hi, d, fftsa.bp_lmax)
-    end
-  end
-  return wide == 1 and mid == 3 and narrow > 1 and narrow < read and big == 1,
-         string.format('50k->%d 10k->%d 2k->%d (read cap %d), 2k at 16384->%d',
-                       wide, mid, narrow, read, big)
-end)())
--- Every decimation has to keep the stop frequency inside the decimated Nyquist, or the
--- span the operator asked for would be partly folded -- which is the failure this whole
--- feature exists to avoid.
-check('no chosen decimation puts the stop frequency past its own Nyquist', (function()
-  local fs = 100000
-  local hi
-  for hi = 2000, 50000, 500 do
-    local d = fftsa.bp_pick_d(fs, hi, 512)
-    if (fs / d) / 2 < hi then
-      return false, string.format('stop %d Hz at /%d leaves Nyquist %.0f', hi, d,
-                                  (fs / d) / 2)
-    end
-  end
-  return true, 'every stop from 2 kHz to 50 kHz stays inside its Nyquist'
-end)())
--- Off is off: no decimation, the capture is the sample count, and the loader is the
--- buffer one.
-check('band-pass off leaves the record and the rate alone', (function()
-  fftsa.bp_on = false
-  display.setvalue(fftsa.opt_n, 1)
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  return fftsa.bp_on == false and fftsa.bp_d == 1 and fftsa.bp_m == fftsa.n
-         and dmm.digitize.count == fftsa.n
-         and math.abs(fftsa.binhz - fftsa.fs_acq / fftsa.n) < 1e-9,
-         string.format('d=%d m=%d count=%d binhz=%.4f',
-                       fftsa.bp_d, fftsa.bp_m, dmm.digitize.count, fftsa.binhz)
-end)())
--- On: the bin is finer by exactly the decimation, the capture grows to match, and the
--- rate the transform sees is the digitizer's divided by it.
-check('band-pass on narrows the bin by the decimation', (function()
-  display.setvalue(fftsa.opt_flo, 10)
-  display.setvalue(fftsa.opt_fhi, 10000)
-  display.setvalue(fftsa.opt_n, 1)
-  fftsa.bp_on = false
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local plain = fftsa.binhz
-  fftsa.bp_on = true
-  if not fftsa.options_apply() then return false, fftsa.lasterr end
-  -- Everything read at the SAME moment: the rate the transform sees is the digitizer's
-  -- divided by the decimation, which is the relationship the whole feature rests on.
-  local d = fftsa.bp_d
-  local fine, eff, acq = fftsa.binhz, fftsa.fs, fftsa.fs_acq
-  local m, count, taps = fftsa.bp_m, dmm.digitize.count, fftsa.bp_l
-  fftsa.bp_on = false
-  display.setvalue(fftsa.opt_fhi, 50000)
-  fftsa.options_apply()
-  -- The bin is fs_acq/(d*n), and fs_acq is the STEPPED-UP rate, so the improvement over
-  -- the plain path is d divided by the rate step rather than d itself. Both relationships
-  -- asserted: the bin against the rate actually used, and that it is still an improvement.
-  return d > 1 and math.abs(fine - acq / (d * 512)) < 1e-6 and fine < plain
-         and m == (512 - 1) * d + taps and count == m
-         and math.abs(eff * d - acq) < 1e-6,
-         string.format('/%d: %.2f Hz against %.2f, fs %.1f of %.1f, capture %d of %d',
-                       d, fine, plain, eff, acq, count, m)
-end)())
-
 print('\npeak markers (real code)')
 -- NOT OFFERED IN THE FORM YET, so these drive fftsa.sg_markers directly: the field is
 -- withheld until the second trace can be pinned, and setvalue on its nil handle raises.
 -- The machinery stays tested so it does not rot while it waits.
-check('the form offers neither peak markers nor band-pass', fftsa.opt_mk == nil
-      and fftsa.opt_bp == nil and fftsa.sg_markers == false,
-      'opt_mk=' .. tostring(fftsa.opt_mk) .. ' opt_bp=' .. tostring(fftsa.opt_bp)
-      .. ' markers=' .. tostring(fftsa.sg_markers))
+check('the form offers no peak markers field', fftsa.opt_mk == nil
+      and fftsa.sg_markers == false,
+      'opt_mk=' .. tostring(fftsa.opt_mk) .. ' markers=' .. tostring(fftsa.sg_markers))
 -- Off means ONE trace drawn as a line: the marker buffer exists but is not bound, so
 -- drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
 check('markers off binds one trace and draws a line', (function()
@@ -1536,22 +1322,36 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
   return true, string.format('%.0f Hz %.1f dB, %.0f Hz %.1f dB, %.0f Hz %.1f dB',
                              hz[1], db[1], hz[2], db[2], hz[3], db[3])
 end)())
-check('the marker refill happens before the trace refill', (function()
-  -- The trace's clear is the last notify in a frame, so its write count has to be the
-  -- one that moves last: markers filled after it would leave the spectrum short of a
-  -- trace at the yield.
+-- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought and
+-- is the part that still has to hold. The markers cannot be filled first any more: the peaks
+-- come out of the same dsp.spectrum() call that writes the trace. So the order is no longer
+-- the invariant and the yield's position is -- and the window in which one of the two is
+-- incomplete is now the 18 marker points rather than the 255 trace points.
+check('both buffers are complete before the frame yields for the paint', (function()
   local order = {}
   local realwr = buffer.write.reading
-  local realclear = fftsa.sg_mk.clear
+  local realdelay = delay
+  local function mark(tag)
+    if order[table.getn(order)] ~= tag then order[table.getn(order) + 1] = tag end
+  end
   buffer.write.reading = function(b, ...)
     local tag = 'other'
     if b == fftsa.sg_mk then tag = 'marker' elseif b == fftsa.sg_buf then tag = 'trace' end
-    if order[table.getn(order)] ~= tag then order[table.getn(order) + 1] = tag end
+    mark(tag)
     return realwr(b, unpack(arg))
   end
+  delay = function(s) mark('yield') return realdelay(s) end
   fftsa.frame()
   buffer.write.reading = realwr
-  return table.getn(order) >= 2 and order[1] == 'marker' and order[2] == 'trace',
+  delay = realdelay
+  local n = table.getn(order)
+  local trace_at, marker_at, i = nil, nil, nil
+  for i = 1, n do
+    if order[i] == 'trace' then trace_at = i end
+    if order[i] == 'marker' then marker_at = i end
+  end
+  return n >= 3 and order[n] == 'yield' and trace_at ~= nil and marker_at ~= nil
+         and trace_at < n and marker_at < n,
          table.concat(order, ' then ')
 end)())
 check('switching markers off again leaves one trace and a line', (function()
@@ -2108,6 +1908,11 @@ check('and shows the open padlock again',
 -- The span sets the sample rate, the bin width and the peak search window, so a check
 -- down here that left it moved would rewrite the premise of every later one in the file.
 -- Put back through fftsa.apply() at the end of the section, not by assignment.
+-- Set here rather than inherited: the premise of this section is a span the FORM can
+-- reproduce, and opt_flo clamps at fftsa.flomin, so a start frequency an earlier check left
+-- below it comes back raised through options_apply() and reads as a gesture that moved.
+fftsa.flo, fftsa.fhi = fftsa.flomin, 50000
+fftsa.apply()
 local SPAN_LO, SPAN_HI = fftsa.flo, fftsa.fhi
 local RATE0 = dmm.digitize.samplerate
 
@@ -2144,27 +1949,19 @@ check('and asks for no re-plan, the rate in force already covering it',
       fftsa.retune_pending == false and dmm.digitize.samplerate == RATE0,
       'pending=' .. tostring(fftsa.retune_pending) .. ' rate='
       .. tostring(dmm.digitize.samplerate) .. '/' .. tostring(RATE0))
--- With the band-pass ON the stop sets the filter's cutoff as well, so a change re-plans --
--- but only where a filter is in the path. At a span too wide to decimate, bp_plan answers
--- d == 1 and bp_build builds none, which puts that span back on the rate alone. Asked of
--- plan_changed directly: it is pure, where provoking it through a frame would mean applying
--- the band-pass and paying for a filtered capture to assert an arithmetic answer.
-check('with the band-pass on, a span too wide to decimate re-plans on the rate alone',
-      (function()
-  local was, lo0, hi0 = fftsa.bp_on, fftsa.flo, fftsa.fhi
-  fftsa.bp_on = true
+-- The rate ladder is the whole of it: a stop the rate in force already covers changes which
+-- bins are plotted and nothing else. Asked of plan_changed directly, which is pure, where
+-- provoking it through a frame would pay for a capture to assert an arithmetic answer.
+check('a re-plan is asked for only when the stop crosses the rate ladder', (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
   fftsa.flo, fftsa.fhi = 10, 50000
-  local _, dwide = fftsa.bp_plan(50000, fftsa.n)
-  local samerate = fftsa.plan_changed(49000)     -- same rate, still d == 1
-  local steps = fftsa.plan_changed(120000)       -- crosses the rate ladder
-  local narrow = fftsa.plan_changed(4000)        -- narrow enough for the filter to run
-  local _, dnarrow = fftsa.bp_plan(4000, fftsa.n)
-  fftsa.bp_on, fftsa.flo, fftsa.fhi = was, lo0, hi0
-  return dwide == 1 and samerate == false and steps == true
-         and dnarrow > 1 and narrow == true,
-         string.format('d at 50k=%s: 49k=%s 120k=%s; d at 4k=%s: %s', tostring(dwide),
-                       tostring(samerate), tostring(steps), tostring(dnarrow),
-                       tostring(narrow))
+  local samerate = fftsa.plan_changed(49000)     -- inside 100 kS/s
+  local steps = fftsa.plan_changed(120000)       -- needs 500 kS/s
+  local down = fftsa.plan_changed(4000)          -- still 100 kS/s, the floor
+  fftsa.flo, fftsa.fhi = lo0, hi0
+  return samerate == false and steps == true and down == false,
+         string.format('49k=%s 120k=%s 4k=%s', tostring(samerate), tostring(steps),
+                       tostring(down))
 end)())
 -- The form is the other half of "the range of the FFT". A gesture the Options fields never
 -- heard about would be undone by the next Apply, silently and a second later.
@@ -2564,9 +2361,12 @@ end)())
 -- gesture waiting in the flag would restart the loop that had just stopped itself and
 -- write a settings line over the HALTED message.
 check('a pending re-plan does not resurrect a halted app', (function()
-  local realupd = fftsa.sg_update
+  -- dsp.spectrum() IS the refill now, so that is what is made to raise: fftsa.sg_update no
+  -- longer runs in a frame and stubbing it would make this check pass on a frame that never
+  -- failed at all.
+  local realupd = dsp.spectrum
   fftsa.errcount, fftsa.errrun, fftsa.retune_pending = 0, 0, false
-  fftsa.sg_update = function() error('raised for the halt test', 0) end
+  dsp.spectrum = function() error('raised for the halt test', 0) end
   -- Taken to one short of the limit with no gesture waiting, because the flag has to be
   -- set for the frame that gives up: that is the only frame where the two can collide.
   local i
@@ -2574,7 +2374,7 @@ check('a pending re-plan does not resurrect a halted app', (function()
   local before = fftsa.halted
   fftsa.retune_pending = true
   fftsa.frame()
-  fftsa.sg_update = realupd
+  dsp.spectrum = realupd
   local halted, pending = fftsa.halted, fftsa.retune_pending
   fftsa.halted, fftsa.errrun, fftsa.errcount, fftsa.lasterr = false, 0, 0, nil
   fftsa.retune_pending = false
@@ -2661,6 +2461,93 @@ check('dragging into a wall converges, and never leaves the legal range', (funct
   return bad == nil, bad
 end)())
 
+-- A RAISED PEAK COUNT MUST NOT ASK FOR PEAKS THE PRIMITIVE NEVER FOUND. dsp.peak() refuses an
+-- index above dsp.peaks.count and POSTS for it, so a count read straight from sg_npeak while
+-- the attribute stayed at its Apply value costs one event per extra peak on every frame.
+check('a raised peak count is clamped, and posts nothing', (function()
+  local was = fftsa.sg_npeak
+  local rows = table.getn(fftsa.sg_pk_f)
+  fftsa.sg_npeak = rows + 2
+  dsp.nevents, dsp.events = 0, {}
+  local npk = fftsa.dsp_live()
+  refill()
+  local hz = fftsa.dsp_peaks(npk)
+  local posted = dsp.nevents
+  fftsa.sg_npeak = was
+  fftsa.dsp_live()
+  -- A nil WITHIN the count is legitimate: fewer tones than rows is the quiet-input case.
+  -- What must not happen is a read past it, or a post.
+  return npk == rows and posted == 0 and hz[rows + 1] == nil,
+         string.format('asked %d of %d rows, %d posted, over=%s', npk, rows, posted,
+                       tostring(hz[rows + 1]))
+end)())
+-- Expected-fail: reading sg_npeak directly, which is what the fault was, has to post.
+check('and reading sg_npeak directly instead would post one per extra peak', (function()
+  local was = fftsa.sg_npeak
+  fftsa.sg_npeak = table.getn(fftsa.sg_pk_f) + 2
+  fftsa.dsp_live()
+  refill()
+  dsp.nevents, dsp.events = 0, {}
+  fftsa.dsp_peaks(fftsa.sg_npeak)          -- the unclamped count
+  local posted = dsp.nevents
+  fftsa.sg_npeak = was
+  fftsa.dsp_live()
+  return posted == 2, posted .. ' posted for two peaks past the count'
+end)())
+
+-- AN ADOPTED GESTURE HAS TO REACH THE DATA, not just the axis. The output window is a frame
+-- attribute and the app writes it per frame; written only at Apply, the axis would redraw on
+-- the gesture while the trace, the peak table and the three THD figures stayed on the span
+-- before it -- every frequency on the plot mislabelled, which is what this reproduced on the
+-- panel at 16,384 samples before fftsa.dsp_window() existed.
+--
+-- Asserted against the STORED axis range rather than the numbers passed in: span_clamp sits
+-- between them, so comparing with the request would fail on a clamp instead of on the fault.
+check('a frame moves the output window onto an adopted span', (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
+  fftsa.sg_set_xrange(lo0, hi0)
+  fftsa.retune_pending = false
+  -- Inside the rate in force -- the suite runs at the 512-sample default, so 40 kHz keeps
+  -- pick_fs at 100 kS/s -- which is the case where nothing else ever rewrites the window.
+  local adopted = fftsa.sg_adopt_x(5000, 40000)
+  local replan = fftsa.retune_pending
+  dsp.out.lowfreq, dsp.out.highfreq = 1, 2      -- stale on purpose
+  fftsa.frame_body()
+  local got_lo, got_hi = dsp.out.lowfreq, dsp.out.highfreq
+  -- The axis read BEFORE the restore below, or the comparison is against the span put back.
+  local axis_lo, axis_hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  fftsa.sg_set_xrange(lo0, hi0)
+  fftsa.flo, fftsa.fhi = lo0, hi0
+  fftsa.retune_pending = false
+  fftsa.frame_body()
+  return adopted == true and replan == false
+         and got_lo == axis_lo and got_hi == axis_hi and got_lo ~= lo0
+         and dsp.out.lowfreq == lo0 and dsp.out.highfreq == hi0,
+         string.format('adopted=%s replan=%s window %s..%s against axis %s..%s, restored %s..%s',
+                       tostring(adopted), tostring(replan), tostring(got_lo), tostring(got_hi),
+                       tostring(axis_lo), tostring(axis_hi),
+                       tostring(dsp.out.lowfreq), tostring(dsp.out.highfreq))
+end)())
+-- Expected-fail the other way: with the per-frame write gone the check above has to go red,
+-- or it is pinning nothing. Restored before anything else runs.
+check('and that check fails when the per-frame write is removed', (function()
+  local real = fftsa.dsp_window
+  fftsa.dsp_window = function() return false end
+  fftsa.sg_set_xrange(fftsa.flo, fftsa.fhi)
+  fftsa.retune_pending = false
+  fftsa.sg_adopt_x(5000, 40000)
+  dsp.out.lowfreq, dsp.out.highfreq = 1, 2
+  fftsa.frame_body()
+  local stale = (dsp.out.lowfreq == 1 and dsp.out.highfreq == 2)
+  fftsa.dsp_window = real
+  fftsa.sg_set_xrange(10, 50000)
+  fftsa.flo, fftsa.fhi = 10, 50000
+  fftsa.retune_pending = false
+  fftsa.frame_body()
+  return stale, string.format('window %s..%s with the write stubbed out',
+                              tostring(dsp.out.lowfreq), tostring(dsp.out.highfreq))
+end)())
+
 -- The icons, which a focus repaint covers. The frame puts them back at the peak cadence,
 -- so the assertion is that a frame redraws them at all -- setstate to a state the object
 -- already holds may be taken as nothing to do, hence the invisible-then-enable pair.
@@ -2732,11 +2619,11 @@ check('and the lock is back off for the frames below, report still registered',
       .. tostring(display.events[gh] and display.events[gh][display.EVENT_SCALE]))
 
 -- A frame that raises part way through must still leave a usable graph.
-local realupd = fftsa.sg_update
-fftsa.sg_update = function() error('raised mid-refill', 0) end
+local realupd = dsp.spectrum
+dsp.spectrum = function() error('raised mid-refill', 0) end
 fftsa.errcount, fftsa.errrun = 0, 0
 fftsa.frame()
-fftsa.sg_update = realupd
+dsp.spectrum = realupd
 check('a frame raising mid-refill still leaves a trace attached',
       OBJ[gh].traces == 1, 'traces=' .. tostring(OBJ[gh].traces))
 check('and the failure was counted rather than swallowed', fftsa.errcount == 1,
@@ -3135,8 +3022,7 @@ check('the legend carries the settings, not the axis units', (function()
   fftsa.fs, fftsa.n, fftsa.range, fftsa.win_i = fs, n, r, w
   fftsa.sg_flo_hz, fftsa.sg_fhi_hz = lo, hi
   dmm.terminals = term
-  -- No band-pass figure: the field is withheld, and the line only mentions it when
-  -- something has set fftsa.bp_on over the socket. The terminal selection is last.
+  -- The terminal selection is last on the line.
   return t == '512 pts   fs 100 kS/s   bin 195.31 Hz   acq 5.12 ms   Hann   10 V   FRONT', t
 end)())
 check('the graph starts at the top of the object area', fftsa.sg_gy == 0,
@@ -3158,7 +3044,7 @@ check('a bin under the floor is plotted AT the floor, not dropped', (function()
   local save = fftsa.fft_pwr
   fftsa.fft_pwr = {}
   for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-30 end   -- -300 dBV
-  fftsa.sg_update(fftsa.sg_nbins, 195.3125)
+  refill()
   local lo = nil
   for i = 1, fftsa.sg_buf.n do
     local v = fftsa.sg_buf.readings[i]
@@ -3175,7 +3061,7 @@ check('a NaN power bin is plotted at the floor, not written as a NaN', (function
   fftsa.fft_pwr = {}
   for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-4 end
   fftsa.fft_pwr[40] = 0 / 0
-  local ok = pcall(function() fftsa.sg_update(fftsa.sg_nbins, 195.3125) end)
+  local ok = refill()
   local bad, seen = 0, nil
   for i = 1, fftsa.sg_buf.n do
     local v = fftsa.sg_buf.readings[i]
@@ -3627,7 +3513,7 @@ check('the preview uses the timestamp-measured rate for the active rate', (funct
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_preview()
   local text = obj_at(fftsa.opt_info).text
-  local expected = fftsa.opt_info_text(fftsa.fs_acq / fftsa.bp_d, 512)
+  local expected = fftsa.opt_info_text(fftsa.fs_acq, 512)
   fftsa.fs_acq = acq
   return text == expected, tostring(text) .. ' | wanted ' .. tostring(expected)
 end)())
@@ -3992,7 +3878,7 @@ check('the refill stages every value before clearing, so only writes are in the 
       (function()
   local buf = fftsa.sg_buf
   local w0 = WRITES
-  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
+  refill()
   local staged_after = LOG10S - LOG10_AT_CLEAR
   local wrote_before = CLEAR_AT_WRITES - w0
   local wrote_after  = WRITES - CLEAR_AT_WRITES
@@ -4208,7 +4094,7 @@ check('a tone survives decimation whatever bin it lands in', (function()
     local k = kmin + 97 + off
     if k <= kmax then
       pwr[k] = 1.0                                     -- a lone 1 V^2 tone
-      fftsa.sg_update(nb, fftsa.binhz)
+      refill()
       pwr[k] = 1e-18
       local want = (k - 1) * fftsa.binhz
       -- Within one column: the trace carries each column's own frequency, so a tone is
@@ -4318,8 +4204,8 @@ check('repeated refills rewrite the same buffer, with no rebinding', (function()
   local buf = fftsa.sg_buf
   local o = OBJ[fftsa.sg_graph]
   local adds, removes = (o.adds or 0), (o.removes or 0)
-  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
-  fftsa.sg_update(fftsa.sg_nbins, fftsa.binhz)
+  refill()
+  refill()
   return fftsa.sg_buf == buf
          and (o.adds or 0) == adds and (o.removes or 0) == removes
          and o.buffer == buf and buf.n == fftsa.sg_ncol,
@@ -4495,7 +4381,8 @@ local live_one, bufs_one = live(), livebufs()
 check('first launch is live', live_one > 0 and live('timer') == 2)
 -- Leave by HOME / another App: EVENT_ENDAPP never fires, nothing is torn down.
 for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
-                    'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp'}) do
+                    'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp',
+                    'tsp/spectrum_app.tsp'}) do
   loadfile(m)()
 end
 check('a script reload keeps the live handles reachable',

@@ -33,8 +33,13 @@ LUA502_LUAC = os.environ.get('LUA502_LUAC',
 NAME = 'FFT_Spectrum'          # internal script name (loadscript <NAME>)
 ICON = 'fft_icon'              # icon name (matches -- $Icon and loadimage)
 OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
+# ORDER MATTERS, and this is the only place it is stated: there is no runtime module loading
+# on this instrument, so these are concatenated into one loadscript chunk and the capability
+# gate at the head of spectrum_app.tsp calls fftsa.dsp_install() while that chunk runs.
+# dsp_lua.tsp has to come before it or the call reaches a nil and the whole archive dies at
+# load with -286.
 MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
-           'tsp/spectrum_graph.tsp', 'tsp/spectrum_app.tsp']
+           'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp', 'tsp/spectrum_app.tsp']
 
 # Panel icons: assets/<name>.png, embedded as their own loadimage block. The names are
 # NOT listed here -- script_images() reads them out of the modules' `fftsa.img_* = "name"`
@@ -62,10 +67,10 @@ MANIFEST = [
     ('Description', 'On-instrument FFT spectrum analyser: digitize mode + FFT '
                     'with a live graph, top-6 peaks, and a touch options form '
                     '(start/stop frequency, input range).'),
-    # Tracks the repo's git tag, so the version in MENU > Manage Apps identifies which
-    # tree is installed. Bump it with the tag, or an install cannot be told from the one
-    # it replaced.
-    ('Version', '3.9'),
+    # Identifies which tree is installed in MENU > Manage Apps, so it has to move with the
+    # tree or an install cannot be told from the one it replaced. 4.0 and not 3.10 because
+    # the field may be compared as a STRING, where "3.10" sorts BELOW "3.9".
+    ('Version', '4.0'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was

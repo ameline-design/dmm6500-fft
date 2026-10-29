@@ -55,8 +55,8 @@ end
 -- handle, so a relaunch resets it.
 fftsa.sg_lock = true
 
--- Visible frequency window (Hz): fftsa.sg_update() writes only the bins inside it
--- and fftsa.sg_pin_x() pins the axis to it. fftsa.apply() narrows the defaults.
+-- Visible frequency window (Hz): fftsa.dsp_window() hands it to the primitive, which plots
+-- only the bins inside it, and fftsa.sg_pin_x() pins the axis to it.
 fftsa.sg_flo_hz  = 0
 fftsa.sg_fhi_hz  = 1e9
 
@@ -173,8 +173,6 @@ function fftsa.sg_xunit_text()
   local t = string.format("%d pts   %s   %s", fftsa.n or 0,
                           tostring(fftsa.opt_info_text(fftsa.fs, fftsa.n)),
                           tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]))
-  local bptxt = fftsa.bp_text()
-  if bptxt ~= "" then t = t .. "   " .. bptxt end
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
   -- trace is a dot, five peak rows read ---, and this count is the only thing that says
   -- why. The width is already in the line, so the count alone is enough.
@@ -230,18 +228,10 @@ function fftsa.sg_make_buffer(nbins, npoints)
   local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
   fftsa.sg_mk = fftsa.sg_mkbuf(mkcap)
-  -- The staging arrays sg_update() fills before it clears the buffer. Made here, once,
-  -- at the ceiling and never resized: a frame writes slots 1..sg_ncol and reads back the
-  -- same, so growing a table mid-frame would allocate inside the window it exists to
-  -- shrink. Seeded so every slot is a store rather than a rehash on the first frame.
-  fftsa.sg_st_db, fftsa.sg_st_hz = {}, {}
-  local j
-  for j = 1, want do
-    fftsa.sg_st_db[j], fftsa.sg_st_hz[j] = fftsa.sg_dbmin, 0
-  end
   -- The marker sort's own slots, one more than the peak count because the insertion
   -- writes j+1 before n has grown.
   fftsa.sg_mk_db, fftsa.sg_mk_hz = {}, {}
+  local j
   for j = 1, fftsa.sg_npeak + 1 do
     fftsa.sg_mk_db[j], fftsa.sg_mk_hz[j] = fftsa.sg_dbmin, 0
   end
@@ -249,9 +239,9 @@ function fftsa.sg_make_buffer(nbins, npoints)
 end
 
 -- One trace buffer: FILL_ONCE, formatted, seeded full. Capacity is sg_maxpts, so a frame
--- writing sg_ncol points always fits and sg_update's clamp is what keeps a raised sg_ncol
--- from writing past it -- one write past capacity is event 4915. Seeded because an empty buffer binds no trace at all, and sg_build() binds this
--- before the first frame has run.
+-- writing sg_ncol points always fits, and fftsa.dsp_live() clamps a raised sg_ncol to it
+-- -- one write past capacity is event 4915. Seeded because an empty buffer binds no trace at
+-- all, and sg_build() binds this before the first frame has run.
 function fftsa.sg_mkbuf(want)
   local b = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
   -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the
@@ -358,106 +348,27 @@ end
 
 -- Bin index range covering the visible window, clamped into 1..nbins. Shared by
 -- the plot and the peak search, so the table describes what is on screen.
-function fftsa.sg_window_bins(nbins, binhz)
+--
+-- THE SINGLE OWNER of the ceil/floor convention. Both halves of the app need it -- the peak
+-- search, the noise pass, and the "only N bins in the span" line that is the only thing
+-- saying why a one-dot trace has five empty peak rows -- and a second copy is free to round
+-- the other way, which is one bin of disagreement in exactly that message. flo/fhi default
+-- to the window the display has stored; dsp.* passes its own span instead, so the
+-- primitives never write a display field to make this read the right one.
+function fftsa.sg_window_bins(nbins, binhz, flo, fhi)
   if binhz == nil or binhz <= 0 then return 1, nbins end
+  if flo == nil then flo = fftsa.sg_flo_hz end
+  if fhi == nil then fhi = fftsa.sg_fhi_hz end
   local floor, ceil = math.floor, math.ceil
   -- ceil, not floor, for the low edge: floor() maps every start below one bin
   -- width (195 Hz at 100 kS/s) back to bin 1, the DC bin.
-  local kmin = ceil(fftsa.sg_flo_hz / binhz) + 1
-  local kmax = floor(fftsa.sg_fhi_hz / binhz) + 1
+  local kmin = ceil(flo / binhz) + 1
+  local kmax = floor(fhi / binhz) + 1
   if kmin < 1 then kmin = 1 end
   if kmin > nbins then kmin = nbins end
   if kmax > nbins then kmax = nbins end
   if kmax < kmin then kmax = kmin end
   return kmin, kmax
-end
-
--- Refill the trace from fftsa.fft_pwr. Columns are staged into sg_st_db and sg_st_hz
--- first, so only the writes sit inside the window where the buffer holds less than a full
--- trace. The display task shares this core with the interpreter and runs only while Lua
--- is blocked, so the delay at the end is what gets the trace painted.
-function fftsa.sg_update(nbins, binhz)
-  if binhz == nil or binhz <= 0 then return end   -- no usable frequency scale yet
-  local g     = fftsa.sg_graph
-  local pwr   = fftsa.fft_pwr
-  local wr    = buffer.write.reading
-  local log10 = math.log10
-  local vfl   = fftsa.sg_vfloor * fftsa.sg_vfloor   -- squared: the bins are power
-  local dbmin = fftsa.sg_dbmin
-  local dbmax = fftsa.sg_dbmax
-  local floor = math.floor
-  local kmin, kmax = fftsa.sg_window_bins(nbins, binhz)
-  local npts = kmax - kmin + 1
-  local buf = fftsa.sg_buf
-  if buf == nil then return end
-  -- Points this frame writes, CLAMPED TO CAPACITY: one write past it is event 4915, a
-  -- modal dialog, and sg_ncol is settable while the app runs. Writing fewer than capacity
-  -- is fine because the buffer is FILL_ONCE and cleared -- n follows the writes, so the
-  -- trace simply has that many points. That is what makes sg_ncol a live knob without
-  -- reallocating anything: the buffer stays at the 680 it was made with.
-  local ncol = fftsa.sg_ncol
-  local cap  = buf.capacity
-  if cap ~= nil and ncol > cap then ncol = cap end
-  if ncol == nil or ncol < 2 then ncol = 2 end
-  local nwrote = 0
-  -- Stage everything, then clear and write. The buffer is empty from the clear until the
-  -- last write and a paint landing in there draws a blank or partial trace, so the window
-  -- holds nothing but a tight loop of buffer.write.reading. At 255 points that is 20.3 ms
-  -- inside the window against 30 ms interleaved, with 7.6 ms of staging outside.
-  local st_db, st_hz = fftsa.sg_st_db, fftsa.sg_st_hz
-  -- Hoisted out of the loop: the column's frequency advances by a constant, so the
-  -- per-point divide and two multiplies become one add.
-  local fstep = (npts / ncol) * binhz
-  local f0    = (kmin - 1) * binhz
-  local c
-  for c = 0, ncol - 1 do
-    -- The column's bin range. One bin wide at the default, where capacity equals the
-    -- bins in the span; wider when the span holds more bins than the cap allows.
-    local a = kmin + floor(c * npts / ncol)
-    local b = kmin + floor((c + 1) * npts / ncol) - 1
-    if b < a then b = a end
-    if b > kmax then b = kmax end
-    local hi, hik = nil, a
-    local k
-    for k = a, b do
-      local v = pwr[k]
-      if v ~= nil and (hi == nil or v > hi) then hi = v; hik = k end
-    end
-    -- nil (sparse power array) and anything at or below the floor plot at the floor,
-    -- so log10 is never handed a zero. The range tests are positives because every
-    -- comparison with a NaN is false, so `db < dbmin` would pass one through to
-    -- buffer.write.reading and a refused parameter is event 1131 again.
-    local db = dbmin
-    if hi ~= nil and hi > vfl then
-      db = 10 * log10(hi)
-      if not (db > dbmin) then db = dbmin
-      elseif not (db < dbmax) then db = dbmax end
-    end
-    -- The column's frequency, not the winning bin's: columns can be narrower than a bin
-    -- and several would then share one, so only the column's own frequency is strictly
-    -- increasing. A peak is then drawn within one column of its bin, 2.7 px of 680.
-    nwrote = nwrote + 1
-    st_db[nwrote], st_hz[nwrote] = db, f0 + c * fstep
-  end
-  fftsa.sg_nwrote = nwrote                   -- segments the widget was actually handed
-  -- THE WINDOW. Everything above this line ran against the previous frame's trace, which
-  -- was complete and on screen the whole time. From here the buffer is empty until the
-  -- loop ends, so there is nothing in it but the writes.
-  -- Declared out here on purpose: nothing but the clear and the writes belongs inside
-  -- the window, not even a local slot.
-  local i
-  buf.clear()
-  for i = 1, nwrote do
-    wr(buf, st_db[i], st_hz[i], i, 0)
-  end
-  -- No notify call. The clear above is the notify, and the trace stays bound to the
-  -- same buffer for the life of the app.
-  -- Outside the write window above, where the repaint a graph call triggers would draw a
-  -- half-filled trace, and ahead of the paint below.
-  fftsa.sg_slow_tick()
-  -- The paint. The bound buffer is complete and the next fill has not begun, so this is
-  -- the window in which a copy is correct by construction.
-  delay(fftsa.sg_yield)
 end
 
 -- The window and the settings line, without the pin. Split out for the one caller that must
@@ -480,9 +391,9 @@ function fftsa.sg_write_xunit()
     -- names cannot return nil for any value this records. If it recurs, the values come
     -- with it rather than needing another afternoon.
     fftsa.lasterr = string.format(
-      "settings line: %s [n=%s fs=%s fs_acq=%s bp_d=%s range=%s rangetxt=%s win=%s "
+      "settings line: %s [n=%s fs=%s fs_acq=%s range=%s rangetxt=%s win=%s "
       .. "binhz=%s nbins=%s term=%s]", tostring(err), tostring(fftsa.n), tostring(fftsa.fs),
-      tostring(fftsa.fs_acq), tostring(fftsa.bp_d), tostring(fftsa.range),
+      tostring(fftsa.fs_acq), tostring(fftsa.range),
       tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]), tostring(fftsa.win_i),
       tostring(fftsa.binhz), tostring(fftsa.sg_nbins), tostring(fftsa.terminal_text()))
   end
@@ -521,9 +432,15 @@ end
 
 -- Written only when the text changes, like the terminal selection. On the peak table's
 -- clock, not the frame.
-function fftsa.sg_show_thd(nb, binhz)
+--
+-- The figures come from the primitive, over the bins it reduced, and it reports thd as a
+-- FRACTION where this line prints a percentage. No bin count or bin width is passed: the
+-- plan in force is the primitive's own, and handing it a second opinion is how the line and
+-- the trace end up describing different frames.
+function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
-  local thd, ndb, nh, snr = fftsa.thd_noise(nb, binhz)
+  local thd, snr, ndb = dsp.distortion()
+  if thd ~= nil then thd = thd * 100 end
   local t = fftsa.sg_thd_text(thd, snr, ndb)
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
@@ -805,7 +722,7 @@ function fftsa.sg_slow_tick()
     -- Distortion and noise: the noise mean is a pass over every plotted bin, measured at
     -- 4.3 us a bin -- 1.1 ms at 512 samples, 35 ms at 16384, 2.1% of one frame there.
     -- That is why it is on this clock and not the frame's.
-    fftsa.sg_show_thd(fftsa.sg_nbins, fftsa.binhz)
+    fftsa.sg_show_thd()
     did = true
   end
   return did
@@ -838,24 +755,42 @@ fftsa.sg_pk_lv     = {}
 
 fftsa.sg_peaks_off = false      -- disables the peak table, to attribute display traffic
 
+-- One peak as (frequency in hertz, volts), or nil where there is none.
+--
+-- pk_hz/pk_v are what the primitive already resolved -- sub-bin corrected in both axes, once
+-- per frame inside dsp.spectrum() instead of the eighteen fftsa.peak_interp calls a frame the
+-- three display users below used to make between them. Without them it falls back to the bin
+-- index and does its own interpolation, which is the form tools/test_tsp.lua drives directly
+-- and the one that survives if the primitive ever reports bins rather than frequencies.
+function fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
+  if pk_hz ~= nil then
+    local f = pk_hz[p]
+    if f == nil then return nil end
+    return f, pk_v[p]
+  end
+  if bi == nil or bv == nil then return nil end
+  local k = bi[p]
+  if k == nil or k <= 0 or not (bv[p] > 0) then return nil end
+  local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)
+  if iv == nil then dk, iv = 0, math.sqrt(bv[p]) end
+  return (k - 1 + dk) * binhz, iv
+end
+
 -- Refill the marker trace: one point a peak, at the frequency the peak table reports
 -- rather than the column the trace drew. Sorted by frequency, because the peaks arrive
 -- strongest-first and the trace is drawn with a line through it -- in amplitude order that
 -- line zigzags across the plot. Filled before the spectrum refill, so the paint at the
 -- frame's yield sees both buffers complete.
-function fftsa.sg_update_markers(bi, bv, count, binhz)
+function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
   local mk = fftsa.sg_mk
   if mk == nil or not fftsa.sg_markers then return 0 end
-  local log10, sqrt = math.log10, math.sqrt
+  local log10 = math.log10
   local hz, db = fftsa.sg_mk_hz, fftsa.sg_mk_db
   local n = 0
   local p
   for p = 1, count do
-    local k = bi[p]
-    if k ~= nil and k > 0 and bv[p] > 0 then
-      local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)
-      if iv == nil then dk, iv = 0, sqrt(bv[p]) end
-      local f = (k - 1 + dk) * binhz
+    local f, iv = fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
+    if f ~= nil then
       local d = 20 * log10(iv)
       if not (d > fftsa.sg_dbmin) then d = fftsa.sg_dbmin end
       if not (d < fftsa.sg_dbmax) then d = fftsa.sg_dbmax end
@@ -900,23 +835,18 @@ end
 
 -- Gated at fftsa.sg_pk_period and skipped when no peak moved beyond the tolerances,
 -- so a dithering last digit does not redraw the block on a steady signal.
-function fftsa.sg_show_peaks(bi, bv, count, binhz)
+function fftsa.sg_show_peaks(bi, bv, count, binhz, pk_hz, pk_v)
   if fftsa.sg_peaks_off then return false end
   local now = os.clock()
   if fftsa.sg_pk_last ~= nil
      and (now - fftsa.sg_pk_last) < fftsa.sg_pk_period then
     return false
   end
-  local abs, sqrt = math.abs, math.sqrt
+  local abs = math.abs
   local moved = false
   for p = 1, count do
-    local k = bi[p]
-    local f, v = -1, -1
-    if k ~= nil and k > 0 and bv[p] > 0 then
-      local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)
-      if iv == nil then dk, iv = 0, sqrt(bv[p]) end     -- bv is power; iv is volts either way
-      f, v = (k - 1 + dk) * binhz, iv
-    end
+    local f, v = fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
+    if f == nil then f, v = -1, -1 end
     local lf, lv = fftsa.sg_pk_lf[p], fftsa.sg_pk_lv[p]
     if lf == nil then
       moved = true
@@ -933,19 +863,15 @@ function fftsa.sg_show_peaks(bi, bv, count, binhz)
   end
   if not moved then return false end
   fftsa.sg_pk_last = now
-  return fftsa.sg_show_peaks_now(bi, bv, count, binhz)
+  return fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
 end
 
 -- The unconditional draw; the gate above is the only thing deciding when it runs.
-function fftsa.sg_show_peaks_now(bi, bv, count, binhz)
-  local log10, settext, sqrt = math.log10, display.settext, math.sqrt
-  local nb = fftsa.sg_nbins
+function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
+  local log10, settext = math.log10, display.settext
   for p = 1, count do
-    local k = bi[p]
-    if k ~= nil and k > 0 and bv[p] > 0 then
-      local dk, iv = fftsa.peak_interp(k, nb)
-      if iv == nil then dk, iv = 0, sqrt(bv[p]) end     -- no estimate: root of the power bin
-      local f, v = (k - 1 + dk) * binhz, iv
+    local f, v = fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
+    if f ~= nil then
       local ftxt
       if f ~= f then ftxt = string.format("%d  ---", p)
       elseif f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)

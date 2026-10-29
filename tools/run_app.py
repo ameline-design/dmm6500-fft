@@ -15,9 +15,13 @@ from screenshot import capture               # noqa: E402
 from siglent import SDG                       # noqa: E402
 
 ROOT = __file__.rsplit('/', 2)[0]
+# Loaded and run in this order, one named script each. dsplua has to precede specapp: the
+# capability gate at the head of spectrum_app.tsp calls fftsa.dsp_install() as that module
+# runs, and the installer is defined by this one.
 MODULES = [('fftcore', 'tsp/fft_core.tsp'),
            ('specui', 'tsp/spectrum_ui.tsp'),
            ('specgr', 'tsp/spectrum_graph.tsp'),
+           ('dsplua', 'tsp/dsp_lua.tsp'),
            ('specapp', 'tsp/spectrum_app.tsp')]
 
 
