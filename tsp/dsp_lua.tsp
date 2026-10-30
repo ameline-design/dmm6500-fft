@@ -134,8 +134,11 @@ function fftsa.dsp_install()
     {ntaps = 0},
     {state = 'filter', lowcutoff = 'filter', highcutoff = 'filter', order = 'filter',
      decimate = 'tables'})
+  -- dbfloor defaults to -140, not -120: the default has to clear the quietest front end in
+  -- the family, and a DMM7510 measures -134 dBV on its 0.1 V range. A caller that sets it --
+  -- which the app does every frame, from its own axis -- is unaffected.
   dsp.out, out_s = group({segments = 255, lowfreq = 10, highfreq = 50000,
-                          dbfloor = -120, dbceil = 20, vfloor = 1e-9}, {}, 'frame')
+                          dbfloor = -140, dbceil = 20, vfloor = 1e-9}, {}, 'frame')
   dsp.peaks, peaks_s = group({count = 6}, {}, 'frame')
   dsp.thd, thd_s = group({harmonics = 20, mains = dsp.MAINS_BOTH, bins = 1024}, {}, 'frame')
 
