@@ -203,23 +203,6 @@ function fftsa.dsp_install()
     return t == n
   end
 
-  -- PURE. Builds nothing, allocates nothing, touches no plan state, answers in microseconds.
-  -- It is the one call a keystroke can afford: fftsa.options_preview runs on every edit in
-  -- the form and has to promise the bin width Apply will actually produce, and the rate
-  -- chooser compares two candidate rates by the bin each would give. commit() cannot stand in
-  -- for either -- it is 2.667 s at 16,384 samples.
-  --
-  -- No filter here, so the decimation is always 1 and the taps 0: nothing beats fs/n for bin
-  -- width. Still the four answers the API specifies, so a caller written against a native
-  -- dsp.* that does decimate needs no change.
-  function dsp.plan(fs, flo, fhi, n)
-    if type(fs) ~= 'number' or type(fhi) ~= 'number' or type(n) ~= 'number'
-       or not (fs > 0) or not (fhi > 0) or n < 2 then
-      return 1, 0, n or 0, 0, 'off'
-    end
-    return 1, fs / n, n, 0, 'no filter in this implementation'
-  end
-
   -- The span, read per call rather than at commit. Passed on to the bin-window arithmetic
   -- rather than written into the display's own fields: fftsa.sg_window_bins is the single
   -- owner of the ceil/floor convention and takes the span as arguments, so nothing about the
