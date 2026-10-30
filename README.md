@@ -61,6 +61,18 @@ S/N barely moves between the two — 78.9 against 78.4 dB — while the noise fl
 16,384. The floor is a per-bin level and narrows with the bins; S/N is against the integrated noise,
 which does not.
 
+**The plot's own floor follows the instrument and the range.** −120 dBV, except on a DMM7510's 1 V
+and 0.1 V ranges, where the axis reaches −140: a 7510 measures a noise floor of −134 dBV on 0.1 V and
+−129 on 1 V, both of which sit under a −120 axis altogether. A DMM6500 reads −123 and −121 on the same
+two ranges, close enough to show, and keeps −120 everywhere. The axis, the trace's clamp and the peak
+table's dB column all take that one floor, which moves on Apply because that is where the range is
+committed. `localnode.model` picks it — matched on the digits, so a variant name still reads as a
+7510.
+
+The THD figure carries **two decimals below 8,192 samples, three at 8,192 and four at 16,384**, gated
+on the sample count the transform actually committed rather than on the form's. Each doubling halves
+the bin width, so each digit is only offered on a record long enough to earn it.
+
 ## Choosing a window
 
 | | peak sidelobe | scalloping loss | -20 dB peak width | skirt swing |

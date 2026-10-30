@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 4.2
+-- $Version: 4.3
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -871,9 +871,9 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     -- about -110.6 and best -111.2, at 16,384 samples on Hann -- all four inputs shorted,
     -- weeks of continuous uptime, 22 C +/- 1 and 40 to 45 % RH. The conditions qualify it: a
     -- shorting block makes this the instrument's own noise rather than pickup, and a cold
-    -- start reads worse, so a figure taken any other way is not this one. All of it clears
-    -- the -120 axis the clamp used to pin to. A DMM7510 is expected nearer -122, where the
-    -- clamp would pin it about 2 dB high; expected rather than measured, nobody having one.
+    -- start reads worse, so a figure taken any other way is not this one. A DMM7510 reads
+    -- -134 dBV on its 0.1 V range and -129 on 1 V, under what a -120 axis can show, which is
+    -- what fftsa.sg_dbmin_for() moves the floor to -140 for.
     --
     -- log10 is safe without a guard: this branch needs cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)
@@ -979,11 +979,20 @@ fftsa.sg_gy      = 0
 fftsa.sg_gw      = 784
 fftsa.sg_gh      = 312
 
--- -120 dBV is the floor because the DMM7510's front end sits 12 to 14 dB below the
--- DMM6500's, and at -100 its noise floor was off the bottom of the plot.
-fftsa.sg_dbmin   = -120
-fftsa.sg_dbmax   = 20
-fftsa.sg_vfloor  = 1e-9
+-- The dB axis floor: -120 dBV, and -140 on a DMM7510's 1 V and 0.1 V ranges. Measured floors,
+-- which is what picks both numbers -- a DMM7510 reads -134 dBV on 0.1 V and -129 on 1 V, so
+-- -120 leaves its two quiet ranges off the bottom of the plot and -140 clears them by 6 dB. A
+-- DMM6500 reads -123 and -121 on the same ranges and stays at -120 everywhere, its floor
+-- being within a few dB of the axis rather than under it. sg_dbmin is the floor in force and
+-- fftsa.sg_dbmin_set() is the only thing that moves it, from the range apply() commits.
+fftsa.sg_dbmin_std       = -120
+fftsa.sg_dbmin_7510      = -140
+fftsa.sg_dbmin_7510_vmax = 1     -- the largest range the deeper floor covers
+fftsa.sg_dbmin           = fftsa.sg_dbmin_std   -- the floor in force
+fftsa.sg_dbmax           = 20
+fftsa.sg_vfloor          = 1e-9
+
+fftsa.model_str = nil        -- localnode.model, read once by fftsa.model_name()
 
 -- Plotted width in pixels, measured off a panel capture: the vertical grid rules land at
 -- x = 100, 168 ... 780, eleven of them 68 px apart. Used to decide when an axis limit can
@@ -1017,11 +1026,13 @@ fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
--- Three decimals from 8,192 samples up, two below: 0.016 % and 0.019 % both read 0.02 % at
--- two, and the third digit is only worth printing once the record is long enough to hold a
--- harmonic in one bin. Gated on the committed sample count, so the line cannot offer a
--- precision the plan in force did not deliver.
-fftsa.sg_thd_fine_n = 8192
+-- Decimals follow the record length: two below 8,192 samples, three from 8,192 and four from
+-- 16,384. 0.016 % and 0.019 % both read 0.02 % at two, and a digit is only worth printing once
+-- the record is long enough to hold a harmonic in one bin -- each doubling halves the bin
+-- width and so the power leaking into its neighbours. Gated on the committed sample count, so
+-- the line cannot offer a precision the plan in force did not deliver.
+fftsa.sg_thd_n3 = 8192     -- samples the third decimal needs
+fftsa.sg_thd_n4 = 16384    -- and the fourth
 
 -- The nil test is the point: display.create answers nil on an exhausted pool, and the app
 -- module deletes handles it may never have built. No pcall -- a refused delete posts an
@@ -1324,13 +1335,15 @@ function fftsa.sg_thd_text(thd, snr, ndb, n)
     t, s = "THD: NoSig", "S/N: NoSig"
   else
     if thd == nil then t = "THD: ---"
-    -- Past 100% -- a clipped input -- three decimals are four digits of noise.
-    -- thd == thd is the NaN test: this firmware's >= is true for a NaN, so the branch below
-  -- would print "nan%" rather than the dashes that mean "not measured".
-  elseif thd ~= thd then t = "THD: ---"
-  elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
-    -- A missing count takes the short form: it is the one that cannot overstate the plan.
-    elseif n ~= nil and n >= fftsa.sg_thd_fine_n then t = string.format("THD: %.3f%%", thd)
+    -- thd == thd is the NaN test: this firmware's >= is true for a NaN, so the branches
+    -- below would print "nan%" rather than the dashes that mean "not measured".
+    elseif thd ~= thd then t = "THD: ---"
+    -- Past 100% -- a clipped input -- any decimal is a digit of noise.
+    elseif thd >= 100 then t = string.format("THD: %.0f%%", thd)
+    -- Longest record first. A missing count takes the short form: it is the one that cannot
+    -- overstate the plan.
+    elseif n ~= nil and n >= fftsa.sg_thd_n4 then t = string.format("THD: %.4f%%", thd)
+    elseif n ~= nil and n >= fftsa.sg_thd_n3 then t = string.format("THD: %.3f%%", thd)
     else t = string.format("THD: %.2f%%", thd) end
     if snr == nil or snr ~= snr then s = "S/N: --- dB"
     else s = string.format("S/N: %.1f dB", snr) end
@@ -1394,6 +1407,50 @@ function fftsa.sg_bind()
   -- sg_rebind() reaches here from the failed-frame path, so without this one raised frame
   -- could leave a closed padlock over a view that still pans. Idempotent.
   fftsa.sg_hook_scale()
+  return true
+end
+
+-- The model, read once and kept: it cannot change while the app runs, and the floor rule
+-- below asks on every Apply. An instrument that will not say reads as "", which matches no
+-- model, so an absent attribute takes the DMM6500 floor rather than raising.
+function fftsa.model_name()
+  if fftsa.model_str == nil then
+    local m = nil
+    if localnode ~= nil then m = localnode.model end
+    if m == nil then m = "" end
+    fftsa.model_str = tostring(m)
+  end
+  return fftsa.model_str
+end
+
+-- The digits anywhere in the string, not the whole of it: the reference documents the
+-- attribute as the bare model number, and matching on the part that names the front end
+-- leaves a prefixed or suffixed form answering the same. Plain find, the fourth argument --
+-- the pattern metacharacters have no business in a model number. string.match would be the
+-- 5.1 spelling and is absent on this firmware; find is what 5.0.2 has.
+function fftsa.is_7510()
+  return string.find(fftsa.model_name(), "7510", 1, true) ~= nil
+end
+
+-- The floor a range wants, in dBV. The deeper one is the DMM7510's 1 V and 0.1 V ranges and
+-- nothing else: a range off the list and an unidentified instrument both take -120, which is
+-- the floor that cannot hide a trace.
+function fftsa.sg_dbmin_for(range)
+  if range ~= nil and range <= fftsa.sg_dbmin_7510_vmax and fftsa.is_7510() then
+    return fftsa.sg_dbmin_7510
+  end
+  return fftsa.sg_dbmin_std
+end
+
+-- Move the floor to what the range wants, answering whether it moved. One assignment is the
+-- whole move: every reader takes fftsa.sg_dbmin live -- the trace fill, the peak column, the
+-- marker needles, the restore's span and dsp.out.dbfloor through dsp_live(). The answer is
+-- what apply() pins the axis on, an axis write costing 60 ms and a full repaint, so an
+-- unchanged limit is never written.
+function fftsa.sg_dbmin_set(range)
+  local want = fftsa.sg_dbmin_for(range)
+  if want == fftsa.sg_dbmin then return false end
+  fftsa.sg_dbmin = want
   return true
 end
 
@@ -1790,8 +1847,8 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       elseif v >= 1 then vtxt = string.format("%.4f V", v)
       elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
       else vtxt = string.format("%.0f uV", v * 1e6) end
-      -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against
-      -- a -120 dBV axis, which the trace cannot show and the column has no room for.
+      -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against an axis
+      -- that stops at -120, which the trace cannot show and the column has no room for.
       local dbv = 20 * log10(v)
       if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
       settext(fftsa.sg_pk_f[p], ftxt)
@@ -2682,8 +2739,11 @@ function fftsa.apply()
   -- the axis on this pair, so the stored one still holds the previous span here.
   dsp.out.lowfreq  = fftsa.flo
   dsp.out.highfreq = fftsa.fhi
-  -- -120 dBV, not -100: the DMM7510's front end sits 12 to 14 dB below the DMM6500's and at
-  -- -100 its noise floor was off the bottom of the plot.
+  -- The axis floor follows the range: a DMM7510 plots to -140 dBV on 1 V and 0.1 V, where its
+  -- noise floor measures -129 and -134. Ahead of dsp_live(), which hands the floor to the
+  -- primitive, and ahead of the capture for the same reason the X pin is; the pin is
+  -- conditional because an axis write costs 60 ms.
+  if fftsa.sg_dbmin_set(fftsa.range) then fftsa.sg_pin_y() end
   fftsa.dsp_live()
   local rc = dsp.commit()
   if rc ~= dsp.OK then error(fftsa.dsp_why("commit", rc), 0) end

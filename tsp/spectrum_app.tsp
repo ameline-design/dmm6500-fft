@@ -330,8 +330,11 @@ function fftsa.apply()
   -- the axis on this pair, so the stored one still holds the previous span here.
   dsp.out.lowfreq  = fftsa.flo
   dsp.out.highfreq = fftsa.fhi
-  -- -120 dBV, not -100: the DMM7510's front end sits 12 to 14 dB below the DMM6500's and at
-  -- -100 its noise floor was off the bottom of the plot.
+  -- The axis floor follows the range: a DMM7510 plots to -140 dBV on 1 V and 0.1 V, where its
+  -- noise floor measures -129 and -134. Ahead of dsp_live(), which hands the floor to the
+  -- primitive, and ahead of the capture for the same reason the X pin is; the pin is
+  -- conditional because an axis write costs 60 ms.
+  if fftsa.sg_dbmin_set(fftsa.range) then fftsa.sg_pin_y() end
   fftsa.dsp_live()
   local rc = dsp.commit()
   if rc ~= dsp.OK then error(fftsa.dsp_why("commit", rc), 0) end

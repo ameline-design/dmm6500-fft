@@ -10,8 +10,9 @@ screen and buffer the app made.
 
 ![The spectrum screen: a 12.5 kHz 4.0020 V tone reading 12.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -95 dB. Between the graph and the peak table a line reads THD 0.01%, S/N 78.4 dB and a noise floor of -89.7 dBV. A padlock button, closed, and a cog button sit to the right of the peak table](manual-spectrum.png)
 
-+20 to −120 dBV against frequency. By default, 512 samples a frame, 256 bins, 10 frames a second.
-Options offers larger records for finer bin spacing, at a slower update rate.
++20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. By default, 512
+samples a frame, 256 bins, 10 frames a second. Options offers larger records for finer bin spacing,
+at a slower update rate.
 
 **Both axes are labelled in the units you want: kHz across, dB down.** That is worth a note only
 because it was not always so, and the two mechanisms are worth knowing if you read the source. The
@@ -54,9 +55,11 @@ uses. A harmonic too close to the line below it is not counted, because the two 
 `THD: ---` means no harmonic fits in the window at all — which is not the same as a clean signal, and
 is why it is not shown as `0.00%`. Widen the span or lower the fundamental to get a reading.
 
-The reading carries **two decimals below 8,192 samples and three at 8,192 or above**: 0.016 % and
-0.019 % are the same number at two decimals, and the third digit is only offered on a record long
-enough to hold a harmonic in one bin. Past 100 % — a clipped input — it carries none.
+The reading carries **two decimals below 8,192 samples, three at 8,192 and four at 16,384**: 0.016 %
+and 0.019 % are the same number at two decimals, 0.0163 % and 0.0165 % the same at three, and each
+digit is only offered on a record long enough to earn it — every doubling of the sample count halves
+the bin width and the power leaking out of a harmonic into its neighbours. Past 100 % — a clipped
+input — it carries none.
 
 **S/N** is the fundamental against the **integrated** noise — the total power of every non-harmonic
 bin, not the per-bin mean. That distinction matters: S/N does not move when you change the sample
@@ -144,8 +147,15 @@ that. A check that has had no gesture reported costs one clock read and no graph
 reported on every check, and retuning to each reading would mean several captures during one drag,
 so a pair that has changed since the last check is noted and left alone. One drag, one retune.
 
-**The dB axis always goes back**, whatever the padlock says. The scale is fixed at -120 to +20 dBV
-and there is no setting behind it, so a dragged dB axis is only a worse view of the same data.
+**The dB axis always goes back**, whatever the padlock says. The scale is fixed — +20 dBV at the top,
+and -120 at the bottom except on a DMM7510's 1 V and 0.1 V ranges, where it reaches -140 — and there
+is no setting behind it, so a dragged dB axis is only a worse view of the same data.
+
+**The floor follows the instrument and the range.** A DMM7510 measures a noise floor of -134 dBV on
+its 0.1 V range and -129 on 1 V, both of which sit under a -120 axis, so on those two ranges the plot
+goes to -140 and the peak table's dB column with it. Its 10 V range and every range on a DMM6500 keep
+-120: a DMM6500 reads -123 and -121 on 0.1 V and 1 V, close enough to the axis to show. The floor
+moves on Apply, since that is where the range is committed.
 
 **The padlock decides what a horizontal gesture means.** It is closed when the app starts.
 

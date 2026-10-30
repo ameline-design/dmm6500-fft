@@ -329,9 +329,9 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     -- about -110.6 and best -111.2, at 16,384 samples on Hann -- all four inputs shorted,
     -- weeks of continuous uptime, 22 C +/- 1 and 40 to 45 % RH. The conditions qualify it: a
     -- shorting block makes this the instrument's own noise rather than pickup, and a cold
-    -- start reads worse, so a figure taken any other way is not this one. All of it clears
-    -- the -120 axis the clamp used to pin to. A DMM7510 is expected nearer -122, where the
-    -- clamp would pin it about 2 dB high; expected rather than measured, nobody having one.
+    -- start reads worse, so a figure taken any other way is not this one. A DMM7510 reads
+    -- -134 dBV on its 0.1 V range and -129 on 1 V, under what a -120 axis can show, which is
+    -- what fftsa.sg_dbmin_for() moves the floor to -140 for.
     --
     -- log10 is safe without a guard: this branch needs cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)

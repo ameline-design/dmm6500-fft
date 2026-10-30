@@ -33,6 +33,17 @@ INCOMPAT = [
     # luac 5.0.2 only sometimes, but the instrument rejects it, and a parse error
     # anywhere in the archive leaves fftsa nil and every call raising -286.
     (r'0[xX][0-9a-fA-F]+', 'hex literal (the instrument rejects it -- use decimal)'),
+    # string.match and string.gmatch arrived in 5.1. 5.0.2 has string.find, which returns its
+    # captures after the two indices, and string.gfind. The host Lua has all four, so a module
+    # using string.match passes every offline suite and then dies on the instrument: measured
+    # in the serial-decode tree as '-286 attempt to call field `match` (a nil value)', which
+    # killed a run at its first line after 51 offline assertions had gone green.
+    (r'string\.match\s*\(', 'string.match (5.1+; 5.0.2 has string.find with captures)'),
+    (r'string\.gmatch\s*\(', 'string.gmatch (5.1+; 5.0.2 has string.gfind)'),
+    # Method syntax on a string value is 5.1 too, and reads naturally enough to write by
+    # accident.
+    (r'\)\s*:\s*(format|match|gmatch|gsub|find|sub|rep|byte|upper|lower)\s*\(',
+     'string method syntax s:format(...) (5.1+; 5.0.2 needs string.format(s, ...))'),
 ]
 
 

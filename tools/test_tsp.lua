@@ -509,6 +509,11 @@ function buffer.write.reading(b, val, extra, secs, frac)
   b.endindex = b.n
 end
 
+-- The instrument's own name, which is what picks the dB axis floor. A DMM6500 by default,
+-- that being the machine this app is developed against; the floor checks substitute a
+-- DMM7510 and put it back. The documented value of the attribute is the bare model number.
+localnode = {model = 'DMM6500'}
+
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
 local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false}
 -- The terminal selection is a front-panel button, so the mock carries it as state the
@@ -2319,6 +2324,30 @@ check('an Apply that keeps the sample count does not replace the timer', (functi
          string.format('kept=%s replaced=%s armed_n=%s n=%s', tostring(kept),
                        tostring(replaced), tostring(fftsa.armed_n), tostring(fftsa.n))
 end)())
+-- The floor rule has to reach the glass, and apply() is the one place a range is committed,
+-- so the pin lives there. Driven through apply() rather than by calling sg_dbmin_set: what
+-- this asserts is that the axis, the primitive's floor and the stored floor all move
+-- together, and that a second press with nothing changed writes no axis at all -- 60 ms and
+-- a full repaint.
+check('an Apply on a DMM7510 drops the axis floor, and only when it moves', (function()
+  local save, r0 = fftsa.model_str, fftsa.range
+  fftsa.model_str, fftsa.range = 'DMM7510', 1
+  local yp0 = (OBJ[gh].ypins or 0)
+  fftsa.apply()
+  local deep, pinned = fftsa.sg_dbmin, (OBJ[gh].ypins or 0) - yp0
+  local ymin, dbfloor = OBJ[gh].ymin, dsp.out.dbfloor
+  fftsa.apply()                                  -- the same range: nothing to write
+  local again = (OBJ[gh].ypins or 0) - yp0 - pinned
+  fftsa.model_str, fftsa.range = save, r0
+  fftsa.apply()                                  -- and back to what the rest of the file runs at
+  return deep == -140 and ymin == -140 and dbfloor == -140
+         and pinned == 1 and again == 0
+         and fftsa.sg_dbmin == fftsa.sg_dbmin_std and OBJ[gh].ymin == fftsa.sg_dbmin_std,
+         string.format('floor %s axis %s dbfloor %s, pins %d then %d, back to %s/%s',
+                       tostring(deep), tostring(ymin), tostring(dbfloor), pinned, again,
+                       tostring(fftsa.sg_dbmin), tostring(OBJ[gh].ymin))
+end)())
+
 -- A garbage read-back must not become a span. NaN survives every comparison in span_clamp,
 -- so without the refusal it would reach the axis write, pick_fs and both Options fields --
 -- and one NaN limit beside a real one that moved is enough to get here.
@@ -2719,22 +2748,27 @@ check('no harmonic in the window is --- and not zero per cent', (function()
          and string.find(txt, 'Noise Floor: -100.0 dBV', 1, true) ~= nil,
          string.format('thd=%s harmonics=%s [%s]', tostring(thd), tostring(nh), txt)
 end)())
--- Each format with the sample count that selects it, and the clipped case that carries no
--- decimals at all.
+-- Each format with the sample count that selects it, both gates asserted at the threshold and
+-- below it, and the clipped case that carries no decimals at all.
 check('the THD decimals follow the sample count', (function()
   -- 86.27, not 86.25: a half-way value makes the test depend on how %.1f breaks ties.
   local a = fftsa.sg_thd_text(0.4237, 86.27, -102.34, 4096)
-  local a3 = fftsa.sg_thd_text(0.4237, 86.27, -102.34, fftsa.sg_thd_fine_n)
+  local a3 = fftsa.sg_thd_text(0.4237, 86.27, -102.34, fftsa.sg_thd_n3)
+  local a4 = fftsa.sg_thd_text(0.4237, 86.27, -102.34, fftsa.sg_thd_n4)
   local b = fftsa.sg_thd_text(143.7, 12.04, -98.0, 16384)
   local c = fftsa.sg_thd_text(nil, nil, nil)
   local e = fftsa.sg_thd_text(nil, nil, -110.23)
   local f = fftsa.sg_thd_text(nil, 53.1, -80.2)
   -- The pair the third decimal exists for, and the same pair below the threshold, where it
   -- collapses -- without that half the gate is not a gate.
-  local lo = fftsa.sg_thd_text(0.016, 90.0, -100.0, 16384)
-  local hi = fftsa.sg_thd_text(0.019, 90.0, -100.0, 16384)
+  local lo = fftsa.sg_thd_text(0.016, 90.0, -100.0, fftsa.sg_thd_n3)
+  local hi = fftsa.sg_thd_text(0.019, 90.0, -100.0, fftsa.sg_thd_n3)
+  -- And the pair the fourth exists for: 0.0163 % and 0.0165 % are both 0.016 % at three.
+  local lo4 = fftsa.sg_thd_text(0.01632, 90.0, -100.0, fftsa.sg_thd_n4)
+  local hi4 = fftsa.sg_thd_text(0.01648, 90.0, -100.0, fftsa.sg_thd_n4)
   return a == 'THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
          and a3 == 'THD: 0.424%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
+         and a4 == 'THD: 0.4237%    S/N: 86.3 dB    Noise Floor: -102.3 dBV'
          and b == 'THD: 144%    S/N: 12.0 dB    Noise Floor: -98.0 dBV'
          and c == 'THD: NoSig    S/N: NoSig    Noise Floor: --- dBV'
          -- Neither ratio reads NoSig; a signal with no harmonic in the window keeps its
@@ -2744,11 +2778,16 @@ check('the THD decimals follow the sample count', (function()
          and string.find(lo, 'THD: 0.016%', 1, true) == 1
          and string.find(hi, 'THD: 0.019%', 1, true) == 1
          and fftsa.sg_thd_text(0.016, 90.0, -100.0, 4096)
-             == fftsa.sg_thd_text(0.019, 90.0, -100.0, 4096),
-         string.format('[%s] / [%s] / [%s] / [%s] / [%s]', a, a3, b, lo, hi)
+             == fftsa.sg_thd_text(0.019, 90.0, -100.0, 4096)
+         and string.find(lo4, 'THD: 0.0163%', 1, true) == 1
+         and string.find(hi4, 'THD: 0.0165%', 1, true) == 1
+         and fftsa.sg_thd_text(0.01632, 90.0, -100.0, fftsa.sg_thd_n3)
+             == fftsa.sg_thd_text(0.01648, 90.0, -100.0, fftsa.sg_thd_n3),
+         string.format('[%s] / [%s] / [%s] / [%s] / [%s] / [%s] / [%s]',
+                       a, a3, a4, b, lo, lo4, hi4)
 end)())
--- The gate has to be wired to the primitive and not only to the formatter: sg_show_thd reads
--- dsp.fft.samples, so a plan at the threshold prints the third decimal on the glass and one
+-- The gates have to be wired to the primitive and not only to the formatter: sg_show_thd reads
+-- dsp.fft.samples, so a plan at each threshold prints the extra decimal on the glass and one
 -- below it does not.
 check('the drawn line takes its decimals from the committed plan', (function()
   if fftsa.sg_thd == nil then return false, 'no THD object on the screen' end
@@ -2761,14 +2800,16 @@ check('the drawn line takes its decimals from the committed plan', (function()
     fftsa.sg_show_thd()
     return OBJ[fftsa.sg_thd].text
   end
-  local short, long = draw(4096), draw(fftsa.sg_thd_fine_n)
+  local short, mid = draw(4096), draw(fftsa.sg_thd_n3)
+  local long = draw(fftsa.sg_thd_n4)
   dsp.distortion, dsp.fft.samples = savedist, saven
   -- The sample count is a plan attribute, so the writes above dirtied it. Put the
   -- bookkeeping back as well as the value, or the next test commits when it should not.
   dsp.dirty, dsp.dirty_tables, dsp.dirty_filter = sd, st, sf
   return string.find(short, 'THD: 0.02%', 1, true) == 1
-         and string.find(long, 'THD: 0.016%', 1, true) == 1,
-         string.format('[%s] / [%s]', short, long)
+         and string.find(mid, 'THD: 0.016%', 1, true) == 1
+         and string.find(long, 'THD: 0.0160%', 1, true) == 1,
+         string.format('[%s] / [%s] / [%s]', short, mid, long)
 end)())
 -- Nothing to measure must not raise: thd_noise runs inside the tick, and the tick runs
 -- inside the frame.
@@ -3066,14 +3107,73 @@ check('the graph and the peak table both fit the panel',
       and fftsa.sg_pky + (fftsa.sg_npeak / 2 - 1) * fftsa.sg_pkdy < fftsa.sg_xunit_y,
       string.format('graph %d..%d, peaks %d, legend %d', fftsa.sg_gy,
                     fftsa.sg_gy + fftsa.sg_gh, fftsa.sg_pky, fftsa.sg_xunit_y))
--- -120 dBV, not -100: the DMM7510's noise floor is 12 to 14 dB below the DMM6500's
--- and at -100 it sat off the bottom of the plot.
-check('the dB floor reaches the DMM7510 noise floor', fftsa.sg_dbmin == -120,
-      'dbmin=' .. fftsa.sg_dbmin)
+-- Measured noise floors are what pick both numbers: a DMM7510 reads -134 dBV on its 0.1 V
+-- range and -129 on 1 V, where a DMM6500 reads -123 and -121. So -120 holds a DMM6500's own
+-- floor within a few dB of the axis, and would leave the 7510's two quiet ranges underneath
+-- it altogether.
+check('a DMM6500 plots to -120 dBV on every range', (function()
+  local save = fftsa.model_str
+  fftsa.model_str = 'DMM6500'
+  local a, b, c = fftsa.sg_dbmin_for(0.1), fftsa.sg_dbmin_for(1), fftsa.sg_dbmin_for(10)
+  fftsa.model_str = save
+  return a == -120 and b == -120 and c == -120,
+         string.format('0.1 V %g, 1 V %g, 10 V %g', a, b, c)
+end)())
+check('a DMM7510 plots to -140 on 1 V and below, and -120 on 10 V', (function()
+  local save = fftsa.model_str
+  fftsa.model_str = 'DMM7510'
+  local a, b, c = fftsa.sg_dbmin_for(0.1), fftsa.sg_dbmin_for(1), fftsa.sg_dbmin_for(10)
+  -- A range the list cannot produce takes the shallow floor, which is the one that cannot
+  -- hide a trace under the bottom of the plot.
+  local none, off = fftsa.sg_dbmin_for(nil), fftsa.sg_dbmin_for(100)
+  fftsa.model_str = save
+  return a == -140 and b == -140 and c == -120 and none == -120 and off == -120,
+         string.format('0.1 V %g, 1 V %g, 10 V %g, nil %g, 100 V %g', a, b, c, none, off)
+end)())
+-- The model comes off the instrument and is read once. Without the re-read half, a cache
+-- that never populated would pass the two checks above from their own assignments.
+check('the model is read from localnode, once', (function()
+  local save, node = fftsa.model_str, localnode
+  fftsa.model_str = nil
+  localnode = {model = 'DMM7510'}
+  local first = fftsa.is_7510()
+  localnode = {model = 'DMM6500'}
+  local cached = fftsa.is_7510()                 -- the attribute moved; the answer must not
+  fftsa.model_str = nil
+  local reread = fftsa.is_7510()
+  -- An instrument with no localnode at all must not raise: this runs inside apply().
+  localnode, fftsa.model_str = nil, nil
+  local ok, bare = pcall(function() return fftsa.sg_dbmin_for(0.1) end)
+  localnode, fftsa.model_str = node, save
+  return first == true and cached == true and reread == false
+         and ok == true and bare == -120,
+         string.format('7510 %s, cached %s, re-read %s, no localnode %s/%s',
+                       tostring(first), tostring(cached), tostring(reread),
+                       tostring(ok), tostring(bare))
+end)())
+-- Matched on the digits wherever they sit in the string, so a variant or a prefixed form is
+-- still a DMM7510. The empty name and '751' are the two that must not match: a name too short
+-- to hold the digits is what an instrument that answers oddly looks like.
+check('the model match finds the digits anywhere in the name', (function()
+  local save = fftsa.model_str
+  local function is(m) fftsa.model_str = m return fftsa.is_7510() end
+  local bare, pre, post = is('DMM7510'), is('MODEL DMM7510'), is('DMM7510-01')
+  local other, empty, short = is('DMM6500'), is(''), is('751')
+  fftsa.model_str = save
+  return bare == true and pre == true and post == true
+         and other == false and empty == false and short == false,
+         string.format('bare %s prefixed %s suffixed %s, 6500 %s empty %s 751 %s',
+                       tostring(bare), tostring(pre), tostring(post),
+                       tostring(other), tostring(empty), tostring(short))
+end)())
+-- Against the floor in force, whichever model set it: at -140 a vfloor above it would clamp
+-- every quiet bin 40 dB up and the deeper axis would be empty space.
 check('the voltage floor is below the dB floor, so log10 never sees a zero',
-      20 * math.log10(fftsa.sg_vfloor) < fftsa.sg_dbmin,
-      string.format('vfloor %g = %.0f dBV', fftsa.sg_vfloor,
-                    20 * math.log10(fftsa.sg_vfloor)))
+      20 * math.log10(fftsa.sg_vfloor) < fftsa.sg_dbmin_7510
+      and fftsa.sg_dbmin_7510 < fftsa.sg_dbmin_std,
+      string.format('vfloor %g = %.0f dBV against %g and %g', fftsa.sg_vfloor,
+                    20 * math.log10(fftsa.sg_vfloor), fftsa.sg_dbmin_7510,
+                    fftsa.sg_dbmin_std))
 check('a bin under the floor is plotted AT the floor, not dropped', (function()
   local save = fftsa.fft_pwr
   fftsa.fft_pwr = {}
