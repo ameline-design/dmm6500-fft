@@ -544,6 +544,24 @@ end
 -- DMM7510 and put it back. The documented value of the attribute is the bare model number.
 localnode = {model = 'DMM6500'}
 
+-- The undocumented service namespace, as much of it as the app touches. getchecksum is a
+-- region checksum on the instrument, 2.58 ms a call; here it answers from KI.sum so a test
+-- can put the help dialog's fingerprint under the app, and it records the rectangle it was
+-- handed so a test can assert the region rather than trust it. generate records each action
+-- in order, because dismissing a dialog needs BOTH halves of the key and a mock that only
+-- counted calls could not tell a press-only attempt from a working one.
+KI = {sum = 0, calls = 0, rect = nil, actions = {}}
+ki = {display = {ACTION_PRESS_ENTER = 'press_enter',
+                 ACTION_RELEASE_ENTER = 'release_enter'}}
+function ki.display.getchecksum(x1, y1, x2, y2)
+  KI.calls = KI.calls + 1
+  KI.rect = {x1, y1, x2, y2}
+  return KI.sum
+end
+function ki.display.generate(a)
+  table.insert(KI.actions, a)
+end
+
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
 local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false, over = false}
 -- The terminal selection is a front-panel button, so the mock carries it as state the
@@ -1176,9 +1194,14 @@ local ok, err = pcall(function() fftsa.start() end)
 check('start() succeeds', ok, tostring(err))
 local after1, bufs1 = live(), livebufs()
 check('start() created objects', after1 > 0, 'live=' .. after1 .. ' buffers=' .. bufs1)
-check('frame and preview timers are live', live('timer') == 2)
-check('exactly four screens are live', live('screen') == 4,
-      'screens=' .. live('screen') .. ' (cover + spectrum + options + about)')
+-- Five timers: the frame, the options preview, and one on each screen that has no help of
+-- its own -- about and the two help screens -- because a display timer fires only while its
+-- own screen shows, so without one a HELP press there leaves a modal nothing can clear.
+check('frame, preview and the three dismiss timers are live', live('timer') == 5,
+      'timers=' .. live('timer'))
+check('exactly six screens are live', live('screen') == 6,
+      'screens=' .. live('screen')
+      .. ' (cover + spectrum + options + about + main help + options help)')
 check('the graph has exactly one trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
@@ -1190,9 +1213,9 @@ check('rebuilding leaks NO display objects', live() == after1,
       'live=' .. live() .. ' vs ' .. after1)
 check('rebuilding leaks NO buffers', livebufs() == bufs1,
       'buffers=' .. livebufs() .. ' vs ' .. bufs1)
-check('still exactly two timers after rebuild', live('timer') == 2,
+check('still exactly five timers after rebuild', live('timer') == 5,
       'timers=' .. live('timer'))
-check('still exactly four screens after rebuild', live('screen') == 4,
+check('still exactly six screens after rebuild', live('screen') == 6,
       'screens=' .. live('screen'))
 
 print('\npeak markers (real code)')
@@ -1583,9 +1606,378 @@ check('About with no screen built answers false instead of raising', (function()
                                             tostring(ret))
 end)())
 
+-- ==================== the HELP key ====================
+-- The key is answered by recognising the dialog it raises, because nothing delivers it to a
+-- script. These fix the three things that make the recogniser work: the region it reads, that
+-- a non-matching screen costs one call and no action, and that dismissal sends both halves.
+local function help_reset(sum)
+  KI.sum, KI.calls, KI.rect, KI.actions = sum, 0, nil, {}
+  fftsa.help_shown = 0
+  display.active = fftsa.sg_scr
+  fftsa.help_probe()
+end
+local HSIG = fftsa.help_sigs[1]
+
+-- The capability check is resolved once at start, so these are about fftsa.help_probe, and
+-- the tick below is about it costing nothing once the answer is no.
+check('the probe finds the names this firmware has', (function()
+  local got = fftsa.help_probe()
+  return got == true and fftsa.help_ok == true,
+         tostring(got) .. ' / ' .. tostring(fftsa.help_ok)
+end)())
+
+check('a firmware without ki probes false rather than raising', (function()
+  local real = ki
+  ki = nil
+  local okc, got = pcall(function() return fftsa.help_probe() end)
+  ki = real
+  local flag = fftsa.help_ok
+  fftsa.help_probe()
+  return okc == true and got == false and flag == false,
+         tostring(okc) .. ' / ' .. tostring(got) .. ' / ' .. tostring(flag)
+end)())
+
+check('a firmware without generate probes false', (function()
+  local real = ki.display.generate
+  ki.display.generate = nil
+  local got = fftsa.help_probe()
+  ki.display.generate = real
+  local flag = fftsa.help_ok
+  fftsa.help_probe()
+  return got == false and flag == false,
+         tostring(got) .. ' / ' .. tostring(flag)
+end)())
+
+-- The whole point of resolving it once: a firmware that cannot do this pays no checksum call
+-- a second for the privilege of being told so again.
+check('a disabled recogniser costs no checksum call', (function()
+  help_reset(HSIG)
+  fftsa.help_ok = false
+  local got = fftsa.help_main()
+  fftsa.help_probe()
+  return got == false and KI.calls == 0 and table.getn(KI.actions) == 0,
+         'got ' .. tostring(got) .. ' calls=' .. KI.calls
+end)())
+
+-- The premise is asserted, not assumed: both sides of the screen comparisons below are nil
+-- once the app has been torn down, and nil == nil passes while proving nothing.
+check('the screens these tests compare against exist',
+      fftsa.sg_scr ~= nil and fftsa.aboutscr ~= nil and fftsa.optscr ~= nil
+      and fftsa.help_screens ~= nil and fftsa.help_screens.main ~= nil
+      and fftsa.help_screens.main.scr ~= nil and fftsa.help_screens.opt.scr ~= nil,
+      'sg_scr=' .. tostring(fftsa.sg_scr) .. ' about=' .. tostring(fftsa.aboutscr)
+      .. ' help=' .. tostring(fftsa.help_screens and fftsa.help_screens.main
+                              and fftsa.help_screens.main.scr))
+
+check('a screen that is not the help dialog is left alone', (function()
+  help_reset(HSIG + 1)
+  local got = fftsa.help_main()
+  return got == false and KI.calls == 1 and table.getn(KI.actions) == 0
+         and display.active == fftsa.sg_scr and fftsa.sg_scr ~= nil,
+         'got ' .. tostring(got) .. ' calls=' .. KI.calls
+         .. ' actions=' .. table.getn(KI.actions)
+         .. ' active=' .. tostring(display.active)
+end)())
+
+check('the checksum is taken over the declared title row', (function()
+  help_reset(0)
+  fftsa.help_main()
+  local r = KI.rect
+  return r ~= nil and r[1] == fftsa.help_x1 and r[2] == fftsa.help_y1
+         and r[3] == fftsa.help_x2 and r[4] == fftsa.help_y2,
+         r == nil and 'no rect' or (r[1] .. ',' .. r[2] .. ',' .. r[3] .. ',' .. r[4])
+end)())
+
+check('the help dialog is dismissed with both halves, in order', (function()
+  help_reset(HSIG)
+  local got = fftsa.help_main()
+  local a = KI.actions
+  return got == true and table.getn(a) == 2
+         and a[1] == ki.display.ACTION_PRESS_ENTER
+         and a[2] == ki.display.ACTION_RELEASE_ENTER,
+         'got ' .. tostring(got) .. ' actions=' .. table.getn(a)
+         .. ' [' .. tostring(a[1]) .. ',' .. tostring(a[2]) .. ']'
+end)())
+
+check('answering the key raises the main help screen and counts it', (function()
+  help_reset(HSIG)
+  fftsa.help_main()
+  local shown = display.active
+  fftsa.show_main()
+  local want = fftsa.help_screens and fftsa.help_screens.main
+                                  and fftsa.help_screens.main.scr
+  return shown == want and want ~= nil and fftsa.help_shown == 1,
+         'active=' .. tostring(shown) .. ' main help=' .. tostring(want)
+         .. ' shown=' .. tostring(fftsa.help_shown)
+end)())
+
+
+-- The fingerprint is a list so another language, or a firmware that redraws the dialog, is a
+-- number rather than a code change. A later entry has to work as well as the first.
+check('any checksum in the list is recognised', (function()
+  local keep = fftsa.help_sigs
+  fftsa.help_sigs = {HSIG, 424242}
+  help_reset(424242)
+  local got = fftsa.help_main()
+  local shown = display.active
+  fftsa.help_sigs = keep
+  fftsa.show_main()
+  return got == true and shown == fftsa.help_screens.main.scr,
+         'got ' .. tostring(got) .. ' active=' .. tostring(shown)
+end)())
+
+check('an empty list disables the feature at the probe', (function()
+  local keep = fftsa.help_sigs
+  fftsa.help_sigs = {}
+  local got = fftsa.help_probe()
+  fftsa.help_sigs = keep
+  fftsa.help_probe()
+  return got == false, tostring(got)
+end)())
+
+-- One check per call and no clock of its own: the caller's cadence is the rate, so two calls
+-- must spend two checksums. A floor here would silently halve the answer rate at 512 samples.
+check('each call spends exactly one checksum', (function()
+  help_reset(HSIG + 1)
+  fftsa.help_main()
+  local after_first = KI.calls
+  fftsa.help_main()
+  return after_first == 1 and KI.calls == 2,
+         'calls after one=' .. after_first .. ' after two=' .. KI.calls
+end)())
+
+-- The spectrum screen is answered from the end of the graph update, not from the slow tick,
+-- so the frame is what must drive it.
+check('a graph update answers the key', (function()
+  help_reset(HSIG)
+  fftsa.frame()
+  local shown = display.active
+  fftsa.show_main()
+  return fftsa.help_shown >= 1 and shown == fftsa.help_screens.main.scr,
+         'shown=' .. tostring(fftsa.help_shown) .. ' active=' .. tostring(shown)
+end)())
+
+-- Routing is by caller, not by tracking the visible screen, because a display timer fires
+-- only while its own screen shows -- measured: the frame timer freezes on Options and About.
+check('each caller routes to its own help screen', (function()
+  help_reset(HSIG)
+  fftsa.help_check("opt")
+  local opt = display.active
+  help_reset(HSIG)
+  fftsa.help_check("main")
+  local main = display.active
+  fftsa.show_main()
+  return opt == fftsa.help_screens.opt.scr and main == fftsa.help_screens.main.scr
+         and opt ~= main and opt ~= nil,
+         'opt=' .. tostring(opt) .. ' main=' .. tostring(main)
+end)())
+
+check('a nil target dismisses and stays put', (function()
+  help_reset(HSIG)
+  display.changescreen(fftsa.aboutscr)
+  local got = fftsa.help_stay()
+  local where = display.active
+  fftsa.show_main()
+  return got == true and table.getn(KI.actions) == 2 and where == fftsa.aboutscr
+         and fftsa.aboutscr ~= nil,
+         'got ' .. tostring(got) .. ' actions=' .. table.getn(KI.actions)
+         .. ' active=' .. tostring(where)
+end)())
+
+check('both help screens are built with paging', (function()
+  local h = fftsa.help_screens
+  if h == nil or h.main == nil or h.opt == nil then return false, 'not built' end
+  fftsa.help_open("main")
+  local up = fftsa.help_pgup()          -- already on page 1, so this clamps rather than raises
+  local dn = fftsa.help_pgdn()
+  local back = fftsa.help_back()
+  local home = display.active
+  fftsa.show_main()
+  return h.main.scr ~= nil and h.opt.scr ~= nil and h.main.scr ~= h.opt.scr
+         and table.getn(h.main.lines) == fftsa.help_rows
+         and up == true and dn == true and back == true and home == fftsa.sg_scr,
+         'rows=' .. table.getn(h.main.lines) .. '/' .. fftsa.help_rows
+         .. ' back landed on ' .. tostring(home)
+end)())
+
+-- The main screen's help reuses the button images as illustrations, so it must actually
+-- carry them -- and the options help must not, since its icons are a later step.
+check('the main help screen carries the button icons', (function()
+  local h = fftsa.help_screens
+  local n = table.getn(h.main.icons)
+  local kinds = ''
+  local i
+  for i = 1, n do kinds = kinds .. tostring(OBJ[h.main.icons[i]].type) .. ' ' end
+  return n == 3 and kinds == 'image image image ' and table.getn(h.opt.icons) == 0
+         and table.getn(h.main.icon_page) == 3,
+         'main icons=' .. n .. ' [' .. kinds .. '] opt icons='
+         .. table.getn(h.opt.icons)
+end)())
+
+check('the icons are the bright variants of the button art', (function()
+  local list = fftsa.help_icon_list("main")
+  local names = ''
+  local i
+  for i = 1, table.getn(list) do names = names .. tostring(list[i].name) .. ' ' end
+  return names == fftsa.img_help_cog .. ' ' .. fftsa.img_help_lkc .. ' '
+                  .. fftsa.img_help_lko .. ' '
+         and fftsa.help_icon_list("opt") == nil, names
+end)())
+
+-- An OBJ_IMAGE cannot be moved after it is made, so an icon belonging to another page has to
+-- be hidden. Unhidden, it sits beside text about something else entirely.
+check('paging hides the icons that belong to another page', (function()
+  local h = fftsa.help_screens.main
+  fftsa.help_open("main")
+  local on_one = ''
+  local i
+  for i = 1, table.getn(h.icons) do
+    on_one = on_one .. tostring(OBJ[h.icons[i]].hidden) .. ' '
+  end
+  fftsa.help_show_page(h, 2)
+  local on_two = ''
+  for i = 1, table.getn(h.icons) do
+    on_two = on_two .. tostring(OBJ[h.icons[i]].hidden) .. ' '
+  end
+  fftsa.help_show_page(h, 1)
+  fftsa.show_main()
+  return on_one == 'false false false ' and on_two == 'true true true ',
+         'page 1 hidden=[' .. on_one .. '] page 2 hidden=[' .. on_two .. ']'
+end)())
+
+-- The second page is the readouts under the trace, which is the whole reason it exists.
+check('the main help has two pages and the second covers the readouts', (function()
+  local h = fftsa.help_screens.main
+  local pages = fftsa.help_pages(h)
+  fftsa.help_show_page(h, 2)
+  local joined = ''
+  local i
+  for i = 1, fftsa.help_rows do joined = joined .. tostring(OBJ[h.lines[i]].text) .. ' ' end
+  fftsa.help_show_page(h, 1)
+  return pages == 2 and string.find(joined, 'THD', 1, true) ~= nil
+         and string.find(joined, 'S/N', 1, true) ~= nil
+         and string.find(joined, 'Noise Floor', 1, true) ~= nil
+         and string.find(joined, 'peaks', 1, true) ~= nil
+         and string.find(joined, 'bottom line', 1, true) ~= nil,
+         'pages=' .. pages .. ' page 2 mentions: THD/SN/floor/peaks/bottom'
+end)())
+
+-- The measured ceiling: a 14th row at this pitch puts its ink on the button row.
+-- Measured on the panel for FONT_3: ink starts 34 px below the y given and is 21 px tall.
+-- A row past this puts its ink on the button row, which nothing else here would notice.
+fftsa.help_ink_drop = 34
+fftsa.help_ink_h    = 21
+check('the rows fit above the button row', (function()
+  local last = fftsa.help_body_y + (fftsa.help_rows - 1) * fftsa.help_body_dy
+  local ink_bottom = last + fftsa.help_ink_drop + fftsa.help_ink_h
+  local one_more = ink_bottom + fftsa.help_body_dy
+  return ink_bottom < fftsa.opt_btn_y and one_more >= fftsa.opt_btn_y,
+         'last row ink ends at ' .. ink_bottom .. ', one more would end at ' .. one_more
+         .. ', buttons at ' .. fftsa.opt_btn_y
+end)())
+
+-- MEASURED on the panel: FONT_3 averages 10.2 px a character. The check uses 11 to leave
+-- room for a row of unusually wide glyphs. Both bounds matter: a row running off the panel
+-- is silently truncated, and rows wrapped far short of the width waste most of the screen,
+-- which is what the lower bound catches.
+check('the longest row fits the panel width', (function()
+  local worst, longest, k, t, i = 0, '', nil, nil, nil
+  for k, t in pairs(fftsa.help_text) do
+    local x = fftsa.help_text_x[k]
+    if x == nil then x = fftsa.about_x end
+    for i = 1, table.getn(t) do
+      local px = x + string.len(t[i]) * 11
+      if px > worst then worst, longest = px, t[i] end
+    end
+  end
+  return worst < 800 and worst > 600,
+         'widest row reaches ' .. worst .. ' px of 800: "' .. longest .. '"'
+end)())
+
+-- The icon column is 34 wide at x=12, so the text has to start clear of it or it overlaps.
+check('the main help text clears the icon column',
+      fftsa.help_text_x.main >= fftsa.help_icon_x + fftsa.cog_img_w,
+      'text x=' .. fftsa.help_text_x.main .. ' icons end at '
+      .. (fftsa.help_icon_x + fftsa.cog_img_w))
+
+-- Every screen's text must fill its pages exactly: a ragged tail silently becomes a page
+-- holding two lines and ten blanks, which nothing else here would notice.
+check('each help text fills whole pages', (function()
+  local bad, k, t = '', nil, nil
+  for k, t in pairs(fftsa.help_text) do
+    local n = table.getn(t)
+    if math.mod(n, fftsa.help_rows) ~= 0 then
+      bad = bad .. k .. '=' .. n .. ' '
+    end
+  end
+  return bad == '', 'rows a page ' .. fftsa.help_rows .. '; ragged: ' .. bad
+         .. '(main=' .. table.getn(fftsa.help_text.main)
+         .. ', opt=' .. table.getn(fftsa.help_text.opt) .. ')'
+end)())
+
+check('the options help now has a second page for the windows', (function()
+  local h = fftsa.help_screens.opt
+  fftsa.help_show_page(h, 2)
+  local joined, i = '', nil
+  for i = 1, fftsa.help_rows do joined = joined .. tostring(OBJ[h.lines[i]].text) .. ' ' end
+  fftsa.help_show_page(h, 1)
+  return fftsa.help_pages(h) == 2
+         and string.find(joined, 'Hann', 1, true) ~= nil
+         and string.find(joined, 'Blackman', 1, true) ~= nil
+         and string.find(joined, 'Blk-Harris', 1, true) ~= nil
+         and string.find(joined, 'Kaiser', 1, true) ~= nil,
+         'pages=' .. fftsa.help_pages(h) .. '; page 2 names all four windows'
+end)())
+
+-- A PgUp that can only clamp is a control that does nothing, and nothing on the glass says
+-- so. Both arms, because hiding them unconditionally would pass a one-sided check.
+-- Measured offsets, none of which are in the display API reference: a button's y is 50 px
+-- above its top edge, and a FONT_SMALL ink band starts 38 px below its y and runs 16 px.
+check('the page counter centres in the button row', (function()
+  local row_centre = fftsa.opt_btn_y + 50 + fftsa.btn_h / 2
+  local ink_centre = fftsa.help_pageno_y() + 38 + 8
+  return math.abs(ink_centre - row_centre) <= 2
+         and fftsa.help_pageno_y() > fftsa.opt_btn_y,
+         'counter ink centre ' .. ink_centre .. ' vs button row centre ' .. row_centre
+end)())
+
+check('the paging controls and counter appear only where there is paging', (function()
+  local m, o = fftsa.help_screens.main, fftsa.help_screens.opt
+  fftsa.help_open("main")
+  local m_up, m_dn, m_no = OBJ[m.b_up].hidden, OBJ[m.b_dn].hidden, OBJ[m.pageno].hidden
+  -- Both screens carry two pages now, so the one-page arm is made rather than found:
+  -- the text is shortened under the screen and put straight back.
+  local keep = o.text
+  o.text = {"only one page here"}
+  fftsa.help_show_page(o, 1)
+  local o_up, o_dn, o_no = OBJ[o.b_up].hidden, OBJ[o.b_dn].hidden, OBJ[o.pageno].hidden
+  o.text = keep
+  fftsa.help_show_page(o, 1)
+  fftsa.show_main()
+  return fftsa.help_pages(m) == 2 and m_up == false and m_dn == false and m_no == false
+         and o_up == true and o_dn == true and o_no == true,
+         'two-page hidden up/dn/counter=' .. tostring(m_up) .. '/' .. tostring(m_dn)
+         .. '/' .. tostring(m_no) .. '  one-page=' .. tostring(o_up) .. '/'
+         .. tostring(o_dn) .. '/' .. tostring(o_no)
+end)())
+
+check('options help returns to the options form, not the spectrum', (function()
+  help_reset(HSIG)
+  fftsa.help_open("opt")
+  fftsa.help_back()
+  local home = display.active
+  fftsa.show_main()
+  return home == fftsa.optscr and fftsa.optscr ~= nil, 'landed on ' .. tostring(home)
+end)())
+
+-- Left as the app found it: these tests move the visible screen and the recogniser's state,
+-- and everything after here reads both.
+help_reset(0)
+fftsa.show_main()
+
 -- arm() must never stack timers (two would double the frame rate and flood)
 fftsa.arm(0.3); fftsa.arm(0.3); fftsa.arm(0.3)
-check('arm() three more times still leaves two timers', live('timer') == 2,
+check('arm() three more times still leaves five timers', live('timer') == 5,
       'timers=' .. live('timer'))
 
 -- frames run clean
@@ -4770,7 +5162,8 @@ print('\ninstalled-App relaunch (real code)')
 fftsa.flo, fftsa.fhi, fftsa.range = 0, 50000, 10
 fftsa.start()
 local live_one, bufs_one = live(), livebufs()
-check('first launch is live', live_one > 0 and live('timer') == 2)
+check('first launch is live', live_one > 0 and live('timer') == 5,
+      'live=' .. live_one .. ' timers=' .. live('timer'))
 -- Leave by HOME / another App: EVENT_ENDAPP never fires, nothing is torn down.
 for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
                     'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp',
@@ -4784,7 +5177,7 @@ check('relaunching leaks NO display objects', live() == live_one,
       'live=' .. live() .. ' vs ' .. live_one)
 check('relaunching leaks NO buffers', livebufs() == bufs_one,
       'buffers=' .. livebufs() .. ' vs ' .. bufs_one)
-check('exactly two timers after a relaunch', live('timer') == 2, 'timers=' .. live('timer'))
+check('exactly five timers after a relaunch', live('timer') == 5, 'timers=' .. live('timer'))
 
 -- A REFUSED DELETE IS NOT A RAISE. The firmware posts an event and returns, and the
 -- buffer stays ALIVE -- which is what put 61 live buffers on the instrument when a bound

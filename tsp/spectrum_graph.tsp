@@ -855,6 +855,96 @@ fftsa.sg_tick_last  = nil
 fftsa.sg_scale_last = nil
 fftsa.sg_term_last  = nil       -- the terminal selection the line currently names
 
+-- The HELP key, answered by recognising the dialog it raises.
+--
+-- Nothing delivers the key to a script. display.setevent refuses a disp_key outright --
+-- "Parameter 1, expected type 'number', but found type 'key'" -- and display.setkeyenable
+-- takes only display.ON and display.OFF, where OFF substitutes a "help key is disabled"
+-- dialog rather than silence. The dialog itself is invisible to every event path: it fires
+-- no EVENT_HIDE on the screen it covers, never appears in ki.display.dump, and posts no
+-- event. Pixels are the only thing that sees it.
+--
+-- So the recogniser is a checksum over a patch of the dialog's own title text, which reads
+-- "You selected help on:" in yellow. Our objects always resolve to "No Topic" -- help topics
+-- key on an identity display.create does not grant -- so those pixels are constant, and the
+-- value below repeated exactly across presses on the instrument.
+--
+-- 80x16 rather than the whole title row, because the cost is area over a fixed call
+-- overhead: 1.394 ms for 600x27, 0.310 ms for 80x12, 0.184 ms for 4x4. So this is about a
+-- quarter the price of the row, and smaller still buys nothing. 1,280 pixels is specific
+-- enough that none of the app's own screens collide with it -- checked against the
+-- spectrum, options, about and help screens -- so the check needs no knowledge of which
+-- screen is up, and routing comes from which timer ran instead.
+-- A LIST, not one value. The patch is pixels of English text, so a panel in another language
+-- has its own checksum -- no front-panel localisation is documented for this instrument and
+-- the only language attribute in the API is sysinfo.lang, which selects TSP or SCPI rather
+-- than the UI, but a firmware revision that redraws the dialog and a DMM7510 whose metrics
+-- differ land in the same place. Adding one is adding a number here. Membership is a few
+-- integer compares against one checksum call, so the length costs nothing measurable.
+fftsa.help_x1,  fftsa.help_y1 = 28, 50
+fftsa.help_x2,  fftsa.help_y2 = 108, 66
+fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
+fftsa.help_shown = 0            -- times the key has been answered
+fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
+
+function fftsa.help_is_dialog(c)
+  if c == nil then return false end
+  local i
+  for i = 1, table.getn(fftsa.help_sigs) do
+    if fftsa.help_sigs[i] == c then return true end
+  end
+  return false
+end
+
+-- Resolved once, by fftsa.start(). ki is undocumented and absent from the display API
+-- reference, so every name is checked rather than assumed -- but checked here and not in the
+-- tick, which then costs one checksum call instead of six nil tests a second. A firmware
+-- without these loses the feature and nothing else.
+function fftsa.help_probe()
+  fftsa.help_ok = false
+  if fftsa.help_sigs == nil or table.getn(fftsa.help_sigs) == 0 then return false end
+  if ki == nil or ki.display == nil then return false end
+  local k = ki.display
+  if k.getchecksum == nil or k.generate == nil then return false end
+  if k.ACTION_PRESS_ENTER == nil or k.ACTION_RELEASE_ENTER == nil then return false end
+  fftsa.help_ok = true
+  return true
+end
+
+-- Both halves of the action, because press alone leaves the dialog up: the release is what
+-- activates its OK button. ki.display.generate takes a disp_action, which makes it the one
+-- consumer of the ki.display.ACTION_* enum.
+function fftsa.help_dismiss()
+  ki.display.generate(ki.display.ACTION_PRESS_ENTER)
+  ki.display.generate(ki.display.ACTION_RELEASE_ENTER)
+end
+
+-- target names the help screen to raise, or nil to dismiss the firmware's dialog and stay
+-- put -- which is what a screen with no help of its own wants, so a stray press does not
+-- leave a modal nobody can clear.
+--
+-- No clock of its own: the caller's cadence IS the rate. The spectrum screen calls this at
+-- the end of a graph update, the options form off its 200 ms timer, and the screens with no
+-- help of their own off theirs. A display timer fires only while its own screen shows, so
+-- none of those periods cost anything on a screen that is not up. The check is one
+-- getchecksum, 0.33 ms, against an 0.08 s frame at 512 samples -- 0.4% of the fastest frame
+-- the app runs, which is why it needs no floor.
+function fftsa.help_check(target)
+  if not fftsa.help_ok then return false end
+  if not fftsa.help_is_dialog(ki.display.getchecksum(
+        fftsa.help_x1, fftsa.help_y1, fftsa.help_x2, fftsa.help_y2)) then
+    return false
+  end
+  fftsa.help_dismiss()
+  fftsa.help_shown = (fftsa.help_shown or 0) + 1
+  if target ~= nil and fftsa.help_open ~= nil then fftsa.help_open(target) end
+  return true
+end
+
+-- One per caller, because a display event command names a function and passes it nothing.
+function fftsa.help_main() return fftsa.help_check("main") end
+function fftsa.help_stay() return fftsa.help_check(nil) end
+
 function fftsa.sg_slow_tick()
   local now = os.clock()
   local did = false
