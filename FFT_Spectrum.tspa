@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 4.5
+-- $Version: 4.6
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -994,6 +994,16 @@ fftsa.sg_vfloor          = 1e-9
 
 fftsa.model_str = nil        -- localnode.model, read once by fftsa.model_name()
 
+-- Past this, in volts, a reading is not a voltage. The digitizer answers 9.9e+37 for a reading
+-- beyond the selected range, where the front panel shows "Overflow", and a handful of those in
+-- a record makes the spectrum an impulse: flat against the ceiling at every frequency, with
+-- the real tone buried under its own clipped samples. 15 V clears the largest range this app
+-- offers, 10 V, and its headroom, while sitting 36 decades under the sentinel -- so the test
+-- cannot catch a real reading and cannot miss a sentinel.
+fftsa.sg_vmax_real = 15
+fftsa.overrange    = false   -- the frame's verdict; the peak table and the THD line read it
+fftsa.sg_pk_over   = false   -- whether the dashed table is the one on screen
+
 -- Plotted width in pixels, measured off a panel capture: the vertical grid rules land at
 -- x = 100, 168 ... 780, eleven of them 68 px apart. Used to decide when an axis limit can
 -- be moved without it showing.
@@ -1018,6 +1028,11 @@ fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
 fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410       -- settings line, below the peak rows
 fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview line
+-- Saturated red FF0000 for the over-range banner, against the pale palette the rest of the
+-- panel uses: this is the one line that is a warning rather than a reading. Decimal, which
+-- the display API requires -- "0x00rrggbb ... must be given as decimal".
+fftsa.sg_over_c  = 16711680
+fftsa.sg_xunit_c_now = nil   -- the colour the line is actually carrying
 
 -- Distortion and noise, between the graph (ends at sg_gy + sg_gh = 312) and the first
 -- peak row (sg_pky = 350). Pale amber, the dB column's colour, since both are levels.
@@ -1084,6 +1099,11 @@ end
 -- span nor the dB range is repeated. Written twice per Apply, before the capture and again
 -- after, so the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
+  -- Over-range replaces the line rather than appending to it: there is no room for both, and
+  -- a record the range could not represent makes the point count and the bin width beside the
+  -- point. The trace is left as it is -- flat against the ceiling, which is what the capture
+  -- actually was.
+  if fftsa.overrange then return fftsa.sg_overrange_text(fftsa.range) end
   -- Total for the same reason opt_info_text is: apply() builds this line after the
   -- hardware is already configured, so a nil count or a range index the labels do not
   -- hold has to read as a gap rather than abort the Apply.
@@ -1300,6 +1320,16 @@ end
 function fftsa.sg_write_xunit()
   if fftsa.sg_xunit == nil then return false end
   local ok, err = pcall(function()
+    -- The colour belongs with the text, in the one place that writes the line: over-range is
+    -- a warning and should read as one. Written only when it changes, like the text -- this
+    -- is called twice an Apply and once a gesture, but the over-range transition brings it
+    -- here from the tick, and a setcolor a second for an unchanged colour is waste.
+    local c = fftsa.sg_xunit_c
+    if fftsa.overrange then c = fftsa.sg_over_c end
+    if c ~= fftsa.sg_xunit_c_now then
+      fftsa.sg_xunit_c_now = c
+      display.setcolor(fftsa.sg_xunit, c)
+    end
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end)
   if not ok then
@@ -1326,12 +1356,18 @@ end
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
 -- harmonic in the window means no figure at all. dBV, as the peak table's dB column. n is
 -- the sample count, and it chooses the THD decimal count and nothing else.
-function fftsa.sg_thd_text(thd, snr, ndb, n)
+function fftsa.sg_thd_text(thd, snr, ndb, n, over)
   local t, s
+  -- Over-range first, and dashed rather than named: every figure here would be arithmetic
+  -- about 9.9e+37 instead of about volts. NoSig is the opposite diagnosis -- a quiet input --
+  -- so using it would point an operator the wrong way. The floor goes too, being the one
+  -- figure that is otherwise printed unclamped.
+  if over then
+    t, s, ndb = "THD: ---", "S/N: ---", nil
   -- Neither ratio means there is no fundamental to take them against, which is what a
   -- shorted input looks like. Named, not dashed, and the labels stay so the fields hold
   -- their places.
-  if thd == nil and snr == nil then
+  elseif thd == nil and snr == nil then
     t, s = "THD: NoSig", "S/N: NoSig"
   else
     if thd == nil then t = "THD: ---"
@@ -1363,7 +1399,7 @@ function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
   local thd, snr, ndb = dsp.distortion()
   if thd ~= nil then thd = thd * 100 end
-  local t = fftsa.sg_thd_text(thd, snr, ndb, dsp.fft.samples)
+  local t = fftsa.sg_thd_text(thd, snr, ndb, dsp.fft.samples, fftsa.overrange)
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)
@@ -1407,6 +1443,63 @@ function fftsa.sg_bind()
   -- sg_rebind() reaches here from the failed-frame path, so without this one raised frame
   -- could leave a closed padlock over a view that still pans. Idempotent.
   fftsa.sg_hook_scale()
+  return true
+end
+
+-- Did the capture hold a reading the range cannot represent? From the statistics the firmware
+-- maintains AS THE BUFFER FILLS -- "the instrument automatically updates reading buffer
+-- statistics as data is added" -- so getstats hands back an already-current table and this is
+-- one call a frame with no reading examined in Lua. A pass of our own would be 16,384
+-- comparisons for the same answer.
+--
+-- Both ends tested: a clipped sine saturates symmetrically and -9.9e+37 is as much a sentinel
+-- as +9.9e+37, so a test on the maximum alone would miss a negative-only clip.
+--
+-- n == 0 leaves every other field nil, which is an empty buffer rather than an over-range one.
+function fftsa.cap_overrange(buf)
+  if buf == nil then return false end
+  -- Guarded because this runs inside the frame: a firmware without getstats would raise here
+  -- on every frame and the twenty-failure halt would take the app down over a warning it
+  -- could simply not offer. Answering false loses the detection and nothing else.
+  if buffer.getstats == nil then return false end
+  local st = buffer.getstats(buf)
+  if st == nil or st.n == nil or st.n == 0 then return false end
+  local lim = fftsa.sg_vmax_real
+  if st.max ~= nil and st.max.reading ~= nil and st.max.reading > lim then return true end
+  if st.min ~= nil and st.min.reading ~= nil and st.min.reading < -lim then return true end
+  return false
+end
+
+-- What the settings line says instead when the capture held an unrepresentable reading. The
+-- wording is deliberate: "values in the signal", because only the peaks of a signal a little
+-- past the range are clipped and the rest of the record is real -- so this is not "no signal"
+-- and not "the signal is 9.9e+37". One owner for the text, as the panel numbers are.
+function fftsa.sg_overrange_text(range)
+  local i = fftsa.range_to_idx(range)
+  local lab = tostring(fftsa.range_labels[i])
+  -- The advice has to be possible: on the largest range there is nothing to raise to, and
+  -- telling an operator to raise it there sends them to a form that cannot help.
+  local fix = "raise the range"
+  if i >= table.getn(fftsa.ranges) then fix = "reduce the input" end
+  return "OVERRANGE: values in the signal exceed the " .. lab .. " range -- " .. fix
+end
+
+-- The peak table under over-range: every row dashed, and written once per transition rather
+-- than per frame. Every figure would be arithmetic about 9.9e+37, and a plausible-looking
+-- number is worse than a dash. sg_show_peaks clears the latch on the way back, so returning
+-- to range redraws the real block.
+function fftsa.sg_show_peaks_over()
+  if fftsa.sg_pk_over then return false end
+  if fftsa.sg_pk_f == nil then return false end
+  fftsa.sg_pk_over = true
+  local p
+  for p = 1, table.getn(fftsa.sg_pk_f) do
+    if fftsa.sg_pk_f[p] ~= nil then
+      display.settext(fftsa.sg_pk_f[p], string.format("%d  ---", p))
+      display.settext(fftsa.sg_pk_v[p], "")
+      display.settext(fftsa.sg_pk_d[p], "")
+    end
+  end
   return true
 end
 
@@ -1685,6 +1778,12 @@ function fftsa.sg_slow_tick()
       fftsa.sg_term_last = term
       fftsa.sg_write_xunit()
     end
+    -- The over-range banner replaces this same line, so it is written on the transition and
+    -- on the way back, by the same rule: only when the answer changes.
+    if fftsa.overrange ~= fftsa.sg_over_shown then
+      fftsa.sg_over_shown = fftsa.overrange
+      fftsa.sg_write_xunit()
+    end
     -- Distortion and noise: the noise mean is a pass over every plotted bin, measured at
     -- 4.3 us a bin -- 1.1 ms at 512 samples, 35 ms at 16384, 2.1% of one frame there.
     -- That is why it is on this clock and not the frame's.
@@ -1803,6 +1902,12 @@ end
 -- so a dithering last digit does not redraw the block on a steady signal.
 function fftsa.sg_show_peaks(bi, bv, count, binhz, pk_hz, pk_v)
   if fftsa.sg_peaks_off then return false end
+  -- Coming back from over-range the dashed block is on screen and the move gate has no
+  -- memory of it, so the gate would hold the dashes until a peak happened to move. Clearing
+  -- sg_pk_last forces one redraw of the real figures.
+  if fftsa.sg_pk_over then
+    fftsa.sg_pk_over, fftsa.sg_pk_last = false, nil
+  end
   local now = os.clock()
   if fftsa.sg_pk_last ~= nil
      and (now - fftsa.sg_pk_last) < fftsa.sg_pk_period then
@@ -1842,18 +1947,28 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       if f ~= f then ftxt = string.format("%d  ---", p)
       elseif f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)
       else ftxt = string.format("%d  %.1f Hz", p, f) end
-      local vtxt
-      if v ~= v then vtxt = ""
-      elseif v >= 1 then vtxt = string.format("%.4f V", v)
-      elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
-      else vtxt = string.format("%.0f uV", v * 1e6) end
-      -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against an axis
-      -- that stops at -120, which the trace cannot show and the column has no room for.
-      local dbv = 20 * log10(v)
-      if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
+      -- An amplitude past the largest range is not a voltage, so both columns dash rather
+      -- than one of them stating a figure. The volt field is also a WIDTH matter: %.4f of
+      -- the 9.9e+37 sentinel is 45 characters where the column holds 8, and at a fixed x it
+      -- overwrites the dB column and the whole second column with it. The over-range check
+      -- upstream means neither is reached in the case this exists for; it bounds the fields
+      -- so that no value can take the layout apart.
+      local vtxt, dtxt
+      if v ~= v then vtxt, dtxt = "", ""
+      elseif v > fftsa.sg_vmax_real then vtxt, dtxt = "---", "--- dBV"
+      else
+        if v >= 1 then vtxt = string.format("%.4f V", v)
+        elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
+        else vtxt = string.format("%.0f uV", v * 1e6) end
+        -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against an axis
+        -- that stops at -120, which the trace cannot show and the column has no room for.
+        local dbv = 20 * log10(v)
+        if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
+        dtxt = string.format("%.1f dBV", dbv)
+      end
       settext(fftsa.sg_pk_f[p], ftxt)
       settext(fftsa.sg_pk_v[p], vtxt)
-      settext(fftsa.sg_pk_d[p], string.format("%.1f dBV", dbv))
+      settext(fftsa.sg_pk_d[p], dtxt)
     else
       settext(fftsa.sg_pk_f[p], string.format("%d  ---", p))
       settext(fftsa.sg_pk_v[p], "")
@@ -2814,6 +2929,9 @@ function fftsa.frame_body()
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
+  -- Asked of the capture before anything is computed from it, and free: the firmware keeps the
+  -- buffer's min and max current as the readings land, so this is one call rather than a pass.
+  fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
   local npk = fftsa.dsp_live()
   fftsa.dsp_window()
   -- FILTER, WINDOW, TRANSFORM, POWER, REDUCE, PEAKS, and the trace written and counted. The
@@ -2851,7 +2969,13 @@ function fftsa.frame_body()
   -- Display work the primitive does not do: outside any write window, then the paint.
   fftsa.sg_slow_tick()
   delay(fftsa.sg_yield)
-  fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  -- Dashes rather than the figures, which are all arithmetic about the sentinel: the peak
+  -- frequencies in particular are arbitrary picks from a spectrum whose bins are equal.
+  if fftsa.overrange then
+    fftsa.sg_show_peaks_over()
+  else
+    fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  end
 end
 
 -- Reentrancy-guarded frame. The body runs under pcall so an error cannot leave

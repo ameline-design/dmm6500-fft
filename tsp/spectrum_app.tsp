@@ -419,6 +419,9 @@ function fftsa.frame_body()
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
+  -- Asked of the capture before anything is computed from it, and free: the firmware keeps the
+  -- buffer's min and max current as the readings land, so this is one call rather than a pass.
+  fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
   local npk = fftsa.dsp_live()
   fftsa.dsp_window()
   -- FILTER, WINDOW, TRANSFORM, POWER, REDUCE, PEAKS, and the trace written and counted. The
@@ -456,7 +459,13 @@ function fftsa.frame_body()
   -- Display work the primitive does not do: outside any write window, then the paint.
   fftsa.sg_slow_tick()
   delay(fftsa.sg_yield)
-  fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  -- Dashes rather than the figures, which are all arithmetic about the sentinel: the peak
+  -- frequencies in particular are arbitrary picks from a spectrum whose bins are equal.
+  if fftsa.overrange then
+    fftsa.sg_show_peaks_over()
+  else
+    fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  end
 end
 
 -- Reentrancy-guarded frame. The body runs under pcall so an error cannot leave

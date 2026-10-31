@@ -346,7 +346,14 @@ function display.graph.scaley(g, ...)
   -- its absence.
   return readback(g, OBJ[g].ymin, OBJ[g].ymax)
 end
-function display.setcolor(h, ...)       use(h, 'setcolor') end
+-- The COLOUR is recorded, not just the call: a banner that goes up in the wrong colour is
+-- invisible to a mock that only counts setcolor, and the colour is the whole point of the
+-- over-range line.
+function display.setcolor(h, c, ...)
+  use(h, 'setcolor')
+  OBJ[h].color = c
+  OBJ[h].colors = (OBJ[h].colors or 0) + 1
+end
 function display.setfill(h, ...)        use(h, 'setfill'); OBJ[h].fills = (OBJ[h].fills or 0) + 1 end
 -- Records the pinned range so tests can assert the axis is not auto-ranging, and
 -- returns it when called with the id alone, like the real readback.
@@ -390,6 +397,29 @@ buffer = {
   FILL_ONCE = 0, FILL_CONTINUOUS = 1,
   write = {},
 }
+-- buffer.getstats(buf) returns the statistics the firmware keeps current as readings land.
+-- Modelled on the documented table, including the part the app guards against: "if n equals
+-- zero (0), all other values are nil", so an empty buffer answers a table with n and nothing
+-- else rather than a table of zeros. Counted, because the app's claim is that it asks once a
+-- frame and never walks the record itself -- a test can only check that by counting calls.
+GETSTATS_CALLS = 0
+function buffer.getstats(b)
+  GETSTATS_CALLS = GETSTATS_CALLS + 1
+  local n = b.n or 0
+  if n == 0 then return {n = 0} end
+  local lo, hi, sum, i = nil, nil, 0, nil
+  for i = 1, n do
+    local v = b.readings[i]
+    if v ~= nil then
+      if lo == nil or v < lo then lo = v end
+      if hi == nil or v > hi then hi = v end
+      sum = sum + v
+    end
+  end
+  return {n = n, mean = sum / n,
+          min = {reading = lo, timestamp = 0},
+          max = {reading = hi, timestamp = 0}}
+end
 -- buffer.unit(unit, label) names a custom unit. The firmware uses only the first TWO
 -- characters and posts 4933, "Reading buffer custom unit truncated to two characters",
 -- when handed more -- so the mock stores what the instrument would keep, not what it was
@@ -515,7 +545,7 @@ end
 localnode = {model = 'DMM6500'}
 
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
-local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false}
+local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false, over = false}
 -- The terminal selection is a front-panel button, so the mock carries it as state the
 -- tests can move under the app, which is what the panel does.
 dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', digitize = {},
@@ -530,6 +560,15 @@ function dmm.digitize.read(b)
     b.n = i
     b.readings[i] = SIG.dc + SIG.amp * math.sin(2 * math.pi * SIG.f * (i - 1) / fs)
     b.relativetimestamps[i] = (i - 1) / fs
+  end
+  -- SIG.over clips the peaks the way the instrument does: a signal a little past the range is
+  -- in range for most of each cycle, and the firmware substitutes 9.9e+37 only where it is
+  -- not -- "the front panel displays Overflow and the remote interface returns 9.9e+37".
+  -- A handful among the record, not the whole of it, which is what makes the spectrum an
+  -- impulse rather than obviously broken.
+  if SIG.over and count >= 8 then
+    local k
+    for k = 1, 5 do b.readings[k * 3] = 9.9e37 end
   end
   return b.readings[1]
 end
@@ -2346,6 +2385,148 @@ check('an Apply on a DMM7510 drops the axis floor, and only when it moves', (fun
          string.format('floor %s axis %s dbfloor %s, pins %d then %d, back to %s/%s',
                        tostring(deep), tostring(ymin), tostring(dbfloor), pinned, again,
                        tostring(fftsa.sg_dbmin), tostring(OBJ[gh].ymin))
+end)())
+
+-- ---------- over-range: a reading the selected range cannot represent ----------
+-- The digitizer answers 9.9e+37 past the range, and a few of those in a record make the
+-- spectrum an impulse: flat at the ceiling, every bin equal, the real tone buried under its
+-- own clipped samples. Measured on the glass at 2.4 V p-p into the 1 V range, where the volt
+-- column printed a 45-character field over the dB column and the noise floor read 624 dBV.
+check('a capture past the range is detected from the buffer statistics', (function()
+  local b = buffer.make(64, buffer.STYLE_WRITABLE_FULL)
+  local i
+  for i = 1, 20 do b.n = i  b.readings[i] = 0.5 end
+  local clean = fftsa.cap_overrange(b)
+  b.readings[7] = 9.9e37                      -- one clipped peak among twenty
+  local hi = fftsa.cap_overrange(b)
+  b.readings[7] = -9.9e37                     -- and the negative half of the same clip
+  local lo = fftsa.cap_overrange(b)
+  -- 15 V has to clear the 10 V range and its headroom without reaching the sentinel.
+  b.readings[7] = 11.0
+  local inrange = fftsa.cap_overrange(b)
+  -- The threshold itself, both ends, so it is a tested value and not an incidental one. The
+  -- comparison is exclusive: 15.0 exactly is still a reading, 15.5 is not.
+  b.readings[7] = 15.0
+  local at_hi = fftsa.cap_overrange(b)
+  b.readings[7] = 15.5
+  local over_hi = fftsa.cap_overrange(b)
+  b.readings[7] = -15.0
+  local at_lo = fftsa.cap_overrange(b)
+  b.readings[7] = -15.5
+  local over_lo = fftsa.cap_overrange(b)
+  b.readings[7] = 0.5
+  b.n = 0                                     -- getstats leaves every field nil at n = 0
+  local empty = fftsa.cap_overrange(b)
+  buffer.delete(b)
+  return clean == false and hi == true and lo == true
+         and inrange == false and empty == false and fftsa.cap_overrange(nil) == false
+         and at_hi == false and over_hi == true
+         and at_lo == false and over_lo == true,
+         string.format('clean=%s +sentinel=%s -sentinel=%s 11V=%s empty=%s; '
+                       .. '+15.0=%s +15.5=%s -15.0=%s -15.5=%s',
+                       tostring(clean), tostring(hi), tostring(lo),
+                       tostring(inrange), tostring(empty), tostring(at_hi),
+                       tostring(over_hi), tostring(at_lo), tostring(over_lo))
+end)())
+-- The claim is that detection is free. It is only free because it asks the firmware for
+-- statistics it already keeps current, so the call count is what the test can check.
+check('detection is one getstats call, not a pass over the record', (function()
+  local b = buffer.make(64, buffer.STYLE_WRITABLE_FULL)
+  local i
+  for i = 1, 40 do b.n = i  b.readings[i] = 0.1 end
+  local before = GETSTATS_CALLS
+  fftsa.cap_overrange(b)
+  local used = GETSTATS_CALLS - before
+  buffer.delete(b)
+  return used == 1, 'getstats calls = ' .. used
+end)())
+-- A firmware without getstats must lose the warning, not the app: this runs inside the frame,
+-- and a raise here would halt it after twenty failures over a feature it could not offer.
+check('a firmware without getstats loses the warning, not the frame', (function()
+  local real = buffer.getstats
+  buffer.getstats = nil
+  local ok, got = pcall(function() return fftsa.cap_overrange(fftsa.cap) end)
+  buffer.getstats = real
+  return ok == true and got == false, tostring(ok) .. ' / ' .. tostring(got)
+end)())
+check('the banner names the range in force', (function()
+  local r0 = fftsa.range
+  fftsa.range = 1
+  local one = fftsa.sg_overrange_text(fftsa.range)
+  fftsa.range = 0.1
+  local tenth = fftsa.sg_overrange_text(fftsa.range)
+  fftsa.range = r0
+  -- Short enough for the settings line it replaces, which runs to about 74 characters.
+  -- And the advice has to be possible: on the top range there is nothing to raise to.
+  fftsa.range = 10
+  local top = fftsa.sg_overrange_text(fftsa.range)
+  fftsa.range = r0
+  return string.find(one, '1 V range', 1, true) ~= nil
+         and string.find(tenth, '0.1 V range', 1, true) ~= nil
+         and string.find(one, 'OVERRANGE', 1, true) == 1
+         and string.find(one, 'raise the range', 1, true) ~= nil
+         and string.find(top, 'reduce the input', 1, true) ~= nil
+         and string.find(top, 'raise', 1, true) == nil
+         and string.len(one) <= 78 and string.len(top) <= 78,
+         string.format('[%s] %d chars / [%s] / top [%s]', one, string.len(one), tenth, top)
+end)())
+-- NoSig is the opposite diagnosis -- a quiet input -- so reusing it here would send an
+-- operator looking for a missing signal rather than a clipped one.
+check('the distortion line dashes under over-range rather than reading NoSig', (function()
+  local over = fftsa.sg_thd_text(0.42, 86.3, -102.3, 16384, true)
+  local nosig = fftsa.sg_thd_text(nil, nil, nil, 16384, false)
+  return over == 'THD: ---    S/N: ---    Noise Floor: --- dBV'
+         and string.find(nosig, 'NoSig', 1, true) ~= nil,
+         string.format('[%s] vs the NoSig case [%s]', over, nosig)
+end)())
+-- The defect that garbled the panel: the volt column sits at a fixed x with the dB field 82
+-- px away, so an unbounded %.4f overwrites it and the whole second column with it.
+check('the volt column cannot print a 45-character field', (function()
+  -- Through pk_hz/pk_v, which is the frame's own path into the formatter, so the amplitude
+  -- under test is the one the table would really be handed.
+  fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, {12500}, {9.9e37})
+  local vtxt = obj_at(fftsa.sg_pk_v[1]).text
+  local dtxt = obj_at(fftsa.sg_pk_d[1]).text
+  fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
+  -- Unbounded, %.4f of the sentinel is 45 characters and the dB field 759.9 dBV. Both
+  -- dash, so the two columns cannot disagree about whether the figure means anything.
+  return vtxt == '---' and dtxt == '--- dBV',
+         string.format('volt [%s] %d chars, dB [%s]', tostring(vtxt),
+                       string.len(tostring(vtxt)), tostring(dtxt))
+end)())
+-- End to end, through a real frame: the capture is clipped the way the instrument clips it,
+-- and the banner, its colour, the dashed table and the dashed distortion line all follow.
+check('a clipped capture reports over-range on every field it should', (function()
+  local xh, th = fftsa.sg_xunit, fftsa.sg_thd
+  if xh == nil or th == nil then return false, 'no settings line or THD object' end
+  SIG.over = true
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()
+  local flag = fftsa.overrange
+  local banner, colour = OBJ[xh].text, OBJ[xh].color
+  local thd = OBJ[th].text
+  local row1 = obj_at(fftsa.sg_pk_f[1]).text
+  local row1v = obj_at(fftsa.sg_pk_v[1]).text
+  -- And back: the latch has to let the real block and the cyan line return.
+  SIG.over = false
+  fftsa.sg_ev = 0
+  tick_due()
+  fftsa.frame_body()
+  tick_due()
+  fftsa.frame_body()
+  local back_flag, back_colour = fftsa.overrange, OBJ[xh].color
+  local back_banner = OBJ[xh].text
+  return flag == true
+         and string.find(banner, 'OVERRANGE', 1, true) == 1
+         and colour == fftsa.sg_over_c
+         and thd == 'THD: ---    S/N: ---    Noise Floor: --- dBV'
+         and row1 == '1  ---' and row1v == ''
+         and back_flag == false and back_colour == fftsa.sg_xunit_c
+         and string.find(back_banner, 'pts', 1, true) ~= nil,
+         string.format('over: flag=%s colour=%s [%s] [%s] [%s/%s] | back: flag=%s colour=%s [%s]',
+                       tostring(flag), tostring(colour), banner, thd, row1, row1v,
+                       tostring(back_flag), tostring(back_colour), back_banner)
 end)())
 
 -- A garbage read-back must not become a span. NaN survives every comparison in span_clamp,
