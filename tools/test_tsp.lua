@@ -2401,9 +2401,14 @@ check('a capture past the range is detected from the buffer statistics', (functi
   local hi = fftsa.cap_overrange(b)
   b.readings[7] = -9.9e37                     -- and the negative half of the same clip
   local lo = fftsa.cap_overrange(b)
-  -- 15 V has to clear the 10 V range and its headroom without reaching the sentinel.
+  -- 15 V has to clear the largest legitimate reading without reaching the sentinel. Measured
+  -- on the instrument, a range carries 20 % of headroom -- on the 1 V range a reading is real
+  -- up to 1.2 V and the sentinel at or past it -- so the ceiling anywhere is the 10 V range at
+  -- 12 V. Both 11 V and a full-headroom 12 V have to read as voltages.
   b.readings[7] = 11.0
   local inrange = fftsa.cap_overrange(b)
+  b.readings[7] = 12.0
+  local headroom = fftsa.cap_overrange(b)
   -- The threshold itself, both ends, so it is a tested value and not an incidental one. The
   -- comparison is exclusive: 15.0 exactly is still a reading, 15.5 is not.
   b.readings[7] = 15.0
@@ -2420,12 +2425,13 @@ check('a capture past the range is detected from the buffer statistics', (functi
   buffer.delete(b)
   return clean == false and hi == true and lo == true
          and inrange == false and empty == false and fftsa.cap_overrange(nil) == false
+         and headroom == false
          and at_hi == false and over_hi == true
          and at_lo == false and over_lo == true,
-         string.format('clean=%s +sentinel=%s -sentinel=%s 11V=%s empty=%s; '
+         string.format('clean=%s +sentinel=%s -sentinel=%s 11V=%s 12V=%s empty=%s; '
                        .. '+15.0=%s +15.5=%s -15.0=%s -15.5=%s',
                        tostring(clean), tostring(hi), tostring(lo),
-                       tostring(inrange), tostring(empty), tostring(at_hi),
+                       tostring(inrange), tostring(headroom), tostring(empty), tostring(at_hi),
                        tostring(over_hi), tostring(at_lo), tostring(over_lo))
 end)())
 -- The claim is that detection is free. It is only free because it asks the firmware for
