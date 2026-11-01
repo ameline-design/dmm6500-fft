@@ -324,13 +324,14 @@ if(DSP_DST_NATIVE)
   # absolute data references, and without the table every float constant, the error
   # string table and dsp_wincos read from the link-time address instead of the load
   # address. Do not strip, and do not drop this flag.
+  # Plain ld.lld flags: the toolchain file links with ld.lld directly, not through the
+  # clang driver, so there is no -Wl, wrapping here and no -nostdlib to ask for.
   target_link_options(dsp_native_elf PRIVATE
       -T ${CMAKE_CURRENT_SOURCE_DIR}/dsp_native.ld
-      -nostdlib
       -e dsp_native_run
       --no-dynamic-linker
-      -Wl,--unresolved-symbols=report-all
-      -Wl,--emit-relocs)
+      --unresolved-symbols=report-all
+      --emit-relocs)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_custom_command(
@@ -342,4 +343,16 @@ if(DSP_DST_NATIVE)
       DEPENDS dsp_native_elf ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
       COMMENT "Emitting dsp_native.bin and its relocation table")
   add_custom_target(dsp_native_bin ALL DEPENDS dsp_native.bin dsp_native_reloc.lua)
+
+  # The relocation applier against the linker as an independent oracle: link the same
+  # objects at the load address and require the applier's output to be byte-identical.
+  # This is not redundant with the Lua unit checks -- those compared the applier against
+  # hand-computed expectations that shared its own wrong idea of where an ADDR16 field
+  # sits, so they passed while the emitted table was off by two bytes on every one of 427
+  # entries. The oracle caught it on the first run.
+  add_test(NAME reloc_vs_linker
+           COMMAND ${Python3_EXECUTABLE}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_reloc.py
+                   --build ${CMAKE_CURRENT_BINARY_DIR}
+                   --objdir ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/dsp_native_elf.dir)
 endif()

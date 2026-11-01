@@ -153,6 +153,10 @@ enum {
      layer that owns the attributes -- the TSP surface in `docs/NATIVE-DSP-PROPOSAL.md`,
      whose `spectrum` refuses with it. Defined here so both sides name one code. */
     DSP_EDIRTY       = -10,
+    /** No segment can hold one of the arrays. Only ::dsp_plan_init_segs returns it: the
+     arrays are each laid out whole, so the largest of them -- the window, @c n entries --
+     has to fit a single segment. See ::dsp_plan_segs for the resulting bound on @c n. */
+    DSP_ESEG         = -11,
 };
 
 /**
@@ -570,6 +574,61 @@ size_t dsp_plan_bytes(int n, int decim, int method);
  */
 int dsp_plan_init(dsp_plan *p, void *arena, size_t bytes, int n, int kind, double beta, int decim,
                   int method);
+
+/**
+ * @brief Segments of @p seg_bytes the plan needs, when no one block is big enough.
+ *
+ * For a caller whose memory comes in fixed-size pieces that are not adjacent. On the
+ * DMM6500 a reading buffer's chunk payloads are 32,768 bytes each and are placed
+ * independently by the allocator, so a multi-chunk arena is not one region; see
+ * `notes/firmware/fwmem-BUFFER.md`.
+ *
+ * The layout walk then places each array wholly inside one segment, skipping to the next
+ * when the remainder of the current one is too small. Every array stays flat and
+ * contiguous, so nothing in the transform changes -- only where the arrays sit. The cost
+ * is the skipped tail of each segment, which ::dsp_plan_segs accounts for.
+ *
+ * Because an array is never split, **the largest one has to fit a single segment**. That
+ * is the window at `n * sizeof(dsp_real)`, so `n <= seg_bytes / sizeof(dsp_real)`: with
+ * 32,768-byte segments, 4096 in a double build and 8192 in a single one. A larger @p n
+ * is ::DSP_ESEG from ::dsp_plan_init_segs and 0 here.
+ *
+ * @param n         Sample count; a power of two in `4..DSP_N_MAX`.
+ * @param decim     Decimation the FIR output scratch must hold; 1 for none.
+ * @param method    One of the `DSP_FFT_*` values.
+ * @param seg_bytes Size of one segment; a multiple of ::DSP_ALIGN.
+ * @return Segments required, or 0 for a configuration that would be refused.
+ */
+int dsp_plan_segs(int n, int decim, int method, size_t seg_bytes);
+
+/**
+ * @brief ::dsp_plan_init over segments that are not adjacent.
+ *
+ * Identical to ::dsp_plan_init in what it builds and what the plan then does; the only
+ * difference is where the arrays live. See ::dsp_plan_segs for the layout rule and the
+ * bound it puts on @p n.
+ *
+ * @param[out] p         Plan to fill. Zeroed before anything else is checked, as in
+ *                       ::dsp_plan_init.
+ * @param[in]  segs      @p nsegs segment base addresses, each aligned to ::DSP_ALIGN and
+ *                       each holding @p seg_bytes. Retained by @p p for its lifetime.
+ * @param      nsegs     Segments available; at least ::dsp_plan_segs.
+ * @param      seg_bytes Size of one segment; a multiple of ::DSP_ALIGN.
+ * @param      n         Sample count.
+ * @param      kind      One of the `DSP_WINDOW_*` values.
+ * @param      beta      Kaiser only; ignored otherwise.
+ * @param      decim     Decimation to size the FIR output scratch for; 1 for none.
+ * @param      method    Decomposition to build for.
+ * @return ::DSP_OK, ::DSP_EARG, ::DSP_EPOW2, ::DSP_ENOMEM, ::DSP_EALIGN, ::DSP_EBETA or
+ *         ::DSP_ESEG. ::DSP_ENOMEM means @p nsegs is short of ::dsp_plan_segs; ::DSP_ESEG
+ *         means no segment could hold one array whatever @p nsegs is.
+ * @pre Every entry of @p segs is non-NULL, aligned, holds @p seg_bytes, and is reached
+ *      through no other live pointer; the plan writes all of them.
+ * @note The segments need not be in address order, and need not be adjacent. Overlapping
+ *       segments are not detected and would corrupt the plan.
+ */
+int dsp_plan_init_segs(dsp_plan *p, void *const *segs, int nsegs, size_t seg_bytes, int n, int kind,
+                       double beta, int decim, int method);
 
 /**
  * @brief Install the filter taps, or clear the filter.

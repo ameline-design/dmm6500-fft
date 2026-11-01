@@ -464,9 +464,35 @@ typedef struct {
         re, im, wkr, wki, blkr, blki, pwr, h, fir_out, total;
 } dsp_layout;
 
-static size_t dsp_bump(size_t *at, const size_t bytes) {
-    const size_t off = *at;
-    *at = off + ((bytes + (DSP_ALIGN - 1U)) & ~(size_t)(DSP_ALIGN - 1U));
+/* The walk's state. `seg` is 0 for one contiguous arena, which is what dsp_plan_bytes and
+ * dsp_plan_init ask for and the only behaviour this had before segments existed.
+ *
+ * With a non-zero `seg` the offsets returned are into a virtual space laid out as
+ * consecutive segments, so `off / seg` selects the segment and `off % seg` is the position
+ * inside it. That keeps every array flat and contiguous -- the transform is unchanged --
+ * and confines the whole question to this walk. */
+typedef struct {
+    size_t at;
+    size_t seg;
+    int    fail; /* an array larger than one segment; no placement exists */
+} dsp_walk;
+
+static size_t dsp_bump(dsp_walk *wk, const size_t bytes) {
+    const size_t need = (bytes + (DSP_ALIGN - 1U)) & ~(size_t)(DSP_ALIGN - 1U);
+    size_t off = wk->at;
+    if (wk->seg != 0U && need != 0U) {
+        size_t within;
+        /* Arrays are never split, so one has to fit a segment whole. The caller turns this
+         * into DSP_ESEG rather than laying out something that straddles. */
+        if (need > wk->seg) {
+            wk->fail = 1;
+            return 0;
+        }
+        within = off % wk->seg;
+        if (within + need > wk->seg)
+            off += wk->seg - within; /* skip the tail; start of the next segment */
+    }
+    wk->at = off + need;
     return off;
 }
 
@@ -546,8 +572,10 @@ static int dsp_method_built(const dsp_plan *p) {
  * lists -- so sizing for the union carries whichever the plan will not run: at n = 16,384 in
  * single that is the 32,768-byte swap list, 8 % of the arena.
  * An offset of 0 means the array was not allocated and the plan's pointer stays NULL. */
-static int dsp_layout_of(int n, const int decim, const int method, dsp_layout *lay) {
-    size_t at = 0, r = sizeof(dsp_real);
+static int dsp_layout_of(int n, const int decim, const int method, const size_t seg_bytes,
+                         dsp_layout *lay) {
+    dsp_walk wk;
+    size_t r = sizeof(dsp_real);
     int m, ntw, m1, m2, meth;
     if (decim < 1 || decim > DSP_DECIM_MAX)
         return DSP_EARG;
@@ -555,73 +583,114 @@ static int dsp_layout_of(int n, const int decim, const int method, dsp_layout *l
         return DSP_EARG;
     if (!dsp_is_pow2(n))
         return DSP_EPOW2;
+    /* A segment smaller than the alignment, or not a multiple of it, would put arrays off a
+     * DSP_ALIGN boundary however well aligned the segment bases are. */
+    if (seg_bytes != 0U && (seg_bytes < DSP_ALIGN || (seg_bytes & (DSP_ALIGN - 1U)) != 0U))
+        return DSP_EARG;
+    wk.at = 0;
+    wk.seg = seg_bytes;
+    wk.fail = 0;
     m = dsp_half(n);
     ntw = (m >= 4) ? m - 2 : 1; /* stages len=4..m contribute len/2 each: m-2 in total */
     dsp_fs_factors(m, &m1, &m2);
     meth = dsp_method_of(m, m2, method);
-    lay->w     = dsp_bump(&at, (size_t)n * r);
+    lay->w     = dsp_bump(&wk, (size_t)n * r);
     /* Radix-2's own swap list, needed when it is the decomposition or when the four-step has
      * substituted it. */
     if (meth == DSP_FFT_RADIX2) {
-        lay->swp_a = dsp_bump(&at, (size_t)dsp_half(m) * sizeof(int));
-        lay->swp_b = dsp_bump(&at, (size_t)dsp_half(m) * sizeof(int));
+        lay->swp_a = dsp_bump(&wk, (size_t)dsp_half(m) * sizeof(int));
+        lay->swp_b = dsp_bump(&wk, (size_t)dsp_half(m) * sizeof(int));
     } else {
         lay->swp_a = 0;
         lay->swp_b = 0;
     }
     /* The four-step bit-reverses its two factors instead, which is m1/2 + m2/2 against m/2. */
     if (meth == DSP_FFT_FOURSTEP) {
-        lay->sw1_a = dsp_bump(&at, (size_t)(dsp_half(m1) + 1) * sizeof(int));
-        lay->sw1_b = dsp_bump(&at, (size_t)(dsp_half(m1) + 1) * sizeof(int));
-        lay->sw2_a = dsp_bump(&at, (size_t)(dsp_half(m2) + 1) * sizeof(int));
-        lay->sw2_b = dsp_bump(&at, (size_t)(dsp_half(m2) + 1) * sizeof(int));
+        lay->sw1_a = dsp_bump(&wk, (size_t)(dsp_half(m1) + 1) * sizeof(int));
+        lay->sw1_b = dsp_bump(&wk, (size_t)(dsp_half(m1) + 1) * sizeof(int));
+        lay->sw2_a = dsp_bump(&wk, (size_t)(dsp_half(m2) + 1) * sizeof(int));
+        lay->sw2_b = dsp_bump(&wk, (size_t)(dsp_half(m2) + 1) * sizeof(int));
     } else {
         lay->sw1_a = 0;
         lay->sw1_b = 0;
         lay->sw2_a = 0;
         lay->sw2_b = 0;
     }
-    lay->twr   = dsp_bump(&at, (size_t)ntw * r);
-    lay->twi   = dsp_bump(&at, (size_t)ntw * r);
-    lay->utr   = dsp_bump(&at, (size_t)m * r);
-    lay->uti   = dsp_bump(&at, (size_t)m * r);
-    lay->re    = dsp_bump(&at, (size_t)m * r);
-    lay->im    = dsp_bump(&at, (size_t)m * r);
+    lay->twr   = dsp_bump(&wk, (size_t)ntw * r);
+    lay->twi   = dsp_bump(&wk, (size_t)ntw * r);
+    lay->utr   = dsp_bump(&wk, (size_t)m * r);
+    lay->uti   = dsp_bump(&wk, (size_t)m * r);
+    lay->re    = dsp_bump(&wk, (size_t)m * r);
+    lay->im    = dsp_bump(&wk, (size_t)m * r);
     /* The four-step's intermediate matrix and its gather block. Radix-2 is in place and
      * wants neither. */
     if (meth == DSP_FFT_FOURSTEP) {
-        lay->wkr  = dsp_bump(&at, (size_t)m * r);
-        lay->wki  = dsp_bump(&at, (size_t)m * r);
-        lay->blkr = dsp_bump(&at, (size_t)(DSP_FS_BLOCK * m1) * r);
-        lay->blki = dsp_bump(&at, (size_t)(DSP_FS_BLOCK * m1) * r);
+        lay->wkr  = dsp_bump(&wk, (size_t)m * r);
+        lay->wki  = dsp_bump(&wk, (size_t)m * r);
+        lay->blkr = dsp_bump(&wk, (size_t)(DSP_FS_BLOCK * m1) * r);
+        lay->blki = dsp_bump(&wk, (size_t)(DSP_FS_BLOCK * m1) * r);
     } else {
         lay->wkr  = 0;
         lay->wki  = 0;
         lay->blkr = 0;
         lay->blki = 0;
     }
-    lay->pwr   = dsp_bump(&at, (size_t)m * r);
-    lay->h     = dsp_bump(&at, (size_t)DSP_FIR_MAXTAPS * r);
+    lay->pwr   = dsp_bump(&wk, (size_t)m * r);
+    lay->h     = dsp_bump(&wk, (size_t)DSP_FIR_MAXTAPS * r);
     /* Only when something will decimate. The read budget stops allowing even decim 2 from
      * n = 3906 up -- (DSP_FIR_MAXM - maxtaps)/(n-1) falls below 2 there -- so this is
      * nothing at every count the application offers above 2048. */
-    lay->fir_out = (decim > 1) ? dsp_bump(&at, (size_t)n * sizeof(double)) : 0;
-    lay->total = at;
+    lay->fir_out = (decim > 1) ? dsp_bump(&wk, (size_t)n * sizeof(double)) : 0;
+    /* Checked once at the end rather than at every bump: the walk records the failure and
+     * keeps going, so there is one place that turns it into a status. */
+    if (wk.fail)
+        return DSP_ESEG;
+    lay->total = wk.at;
     return DSP_OK;
 }
 
 size_t dsp_plan_bytes(const int n, const int decim, const int method) {
     dsp_layout lay;
-    if (dsp_layout_of(n, decim, method, &lay) != DSP_OK)
+    if (dsp_layout_of(n, decim, method, 0U, &lay) != DSP_OK)
         return 0;
     return lay.total;
 }
 
-int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int kind, const double beta, const int decim,
-                  const int method) {
+int dsp_plan_segs(const int n, const int decim, const int method, const size_t seg_bytes) {
     dsp_layout lay;
-    unsigned char *a = (unsigned char *)arena;
-    int m, rc, i, idx, len, half, kdc, meth;
+    size_t segs;
+    if (seg_bytes == 0U)
+        return 0;
+    if (dsp_layout_of(n, decim, method, seg_bytes, &lay) != DSP_OK)
+        return 0;
+    /* lay.total is the end of the last array in the virtual space, and no array straddles a
+     * boundary, so the ceiling divide is the count. */
+    segs = (lay.total + seg_bytes - 1U) / seg_bytes;
+    if (segs > (size_t)DSP_N_MAX)
+        return 0;
+    return (int)segs;
+}
+
+/* Where an offset lands. With seg == 0 the virtual space is the one arena and this is the
+ * addition it always was; otherwise the offset splits into a segment index and a position
+ * inside it. Every array is whole, so one pointer per array is all the transform ever needs
+ * and no inner loop learns about segments. */
+static void *dsp_seg_at(void *const *segs, const size_t seg_bytes, const size_t off) {
+    if (seg_bytes == 0U)
+        return (void *)((unsigned char *)segs[0] + off);
+    return (void *)((unsigned char *)segs[off / seg_bytes] + (off % seg_bytes));
+}
+
+/* The shared body of dsp_plan_init and dsp_plan_init_segs.
+ *
+ * seg_bytes == 0 is the flat case: segs holds one base and flat_bytes is its size, which is
+ * what gets compared against the layout. Otherwise nsegs segments of seg_bytes each are
+ * available and the count is what gets compared. */
+static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const size_t seg_bytes,
+                          const size_t flat_bytes, int n, const int kind, const double beta,
+                          const int decim, const int method) {
+    dsp_layout lay;
+    int m, rc, i, idx, len, half, kdc, meth, si;
     double wsum, di;
 
     if (p == NULL)
@@ -631,24 +700,39 @@ int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int
      * the return code from running a frame on the pointers of a plan it has already released:
      * p->n == 0 fails dsp_spectrum_run's guard and p->m == 0 fails dsp_rfft's. */
     memset(p, 0, sizeof(*p));
-    if (arena == NULL)
+    if (segs == NULL || nsegs < 1)
         return DSP_EARG;
+    for (si = 0; si < nsegs; si++) {
+        if (segs[si] == NULL)
+            return DSP_EARG;
+    }
 #if DSP_CHECK_OVERLAP
     /* The plan against its own arena. Both extents are arguments, so this is checkable, and
      * the failure it prevents is the worst in the library: the carve-up below writes table
      * pointers into p while the tables themselves are built in the arena, so a plan sitting
      * inside its arena has its own pointers overwritten by window samples and every later
-     * call reads whatever that left. */
-    if (dsp_overlaps(p, sizeof(*p), arena, bytes))
-        return DSP_EARG;
+     * call reads whatever that left. Every segment is checked, not just the first. */
+    for (si = 0; si < nsegs; si++) {
+        if (dsp_overlaps(p, sizeof(*p), segs[si], (seg_bytes == 0U) ? flat_bytes : seg_bytes))
+            return DSP_EARG;
+    }
 #endif
-    rc = dsp_layout_of(n, decim, method, &lay);
+    rc = dsp_layout_of(n, decim, method, seg_bytes, &lay);
     if (rc != DSP_OK)
         return rc;
-    if (bytes < lay.total)
-        return DSP_ENOMEM;
-    if (((uintptr_t)a & (uintptr_t)(DSP_ALIGN - 1)) != 0)
-        return DSP_EALIGN;
+    if (seg_bytes == 0U) {
+        if (flat_bytes < lay.total)
+            return DSP_ENOMEM;
+    } else {
+        if ((size_t)nsegs * seg_bytes < lay.total)
+            return DSP_ENOMEM;
+    }
+    /* Every base, for the same reason the flat case checks its one: the offsets are aligned
+     * within a segment, so a misaligned base misaligns every array in it. */
+    for (si = 0; si < nsegs; si++) {
+        if (((uintptr_t)segs[si] & (uintptr_t)(DSP_ALIGN - 1)) != 0)
+            return DSP_EALIGN;
+    }
 
     m = dsp_half(n);
     dsp_fs_factors(m, &p->m1, &p->m2);
@@ -662,32 +746,32 @@ int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int
     p->beta   = beta;
     p->decim  = decim;
     p->method = meth;
-    p->w     = (dsp_real *)(void *)(a + lay.w);
-    p->twr   = (dsp_real *)(void *)(a + lay.twr);
-    p->twi   = (dsp_real *)(void *)(a + lay.twi);
-    p->utr   = (dsp_real *)(void *)(a + lay.utr);
-    p->uti   = (dsp_real *)(void *)(a + lay.uti);
-    p->re    = (dsp_real *)(void *)(a + lay.re);
-    p->im    = (dsp_real *)(void *)(a + lay.im);
-    p->pwr   = (dsp_real *)(void *)(a + lay.pwr);
-    p->h     = (dsp_real *)(void *)(a + lay.h);
+    p->w     = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.w);
+    p->twr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.twr);
+    p->twi   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.twi);
+    p->utr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.utr);
+    p->uti   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.uti);
+    p->re    = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.re);
+    p->im    = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.im);
+    p->pwr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.pwr);
+    p->h     = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.h);
     /* The rest only exist for the decomposition that reads them, by the same conditions the
      * layout used. A pointer left NULL is an array this plan did not pay for. */
     if (meth == DSP_FFT_RADIX2) {
-        p->swp_a = (int *)(void *)(a + lay.swp_a);
-        p->swp_b = (int *)(void *)(a + lay.swp_b);
+        p->swp_a = (int *)dsp_seg_at(segs, seg_bytes, lay.swp_a);
+        p->swp_b = (int *)dsp_seg_at(segs, seg_bytes, lay.swp_b);
     }
     if (meth == DSP_FFT_FOURSTEP) {
-        p->sw1_a = (int *)(void *)(a + lay.sw1_a);
-        p->sw1_b = (int *)(void *)(a + lay.sw1_b);
-        p->sw2_a = (int *)(void *)(a + lay.sw2_a);
-        p->sw2_b = (int *)(void *)(a + lay.sw2_b);
-        p->wkr   = (dsp_real *)(void *)(a + lay.wkr);
-        p->wki   = (dsp_real *)(void *)(a + lay.wki);
-        p->blkr  = (dsp_real *)(void *)(a + lay.blkr);
-        p->blki  = (dsp_real *)(void *)(a + lay.blki);
+        p->sw1_a = (int *)dsp_seg_at(segs, seg_bytes, lay.sw1_a);
+        p->sw1_b = (int *)dsp_seg_at(segs, seg_bytes, lay.sw1_b);
+        p->sw2_a = (int *)dsp_seg_at(segs, seg_bytes, lay.sw2_a);
+        p->sw2_b = (int *)dsp_seg_at(segs, seg_bytes, lay.sw2_b);
+        p->wkr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.wkr);
+        p->wki   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.wki);
+        p->blkr  = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.blkr);
+        p->blki  = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.blki);
     }
-    p->fir_out = (decim > 1) ? (double *)(void *)(a + lay.fir_out) : NULL;
+    p->fir_out = (decim > 1) ? (double *)dsp_seg_at(segs, seg_bytes, lay.fir_out) : NULL;
 
     rc = dsp_window(p->w, n, kind, beta);
     if (rc != DSP_OK) {
@@ -761,6 +845,26 @@ int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int
         }
     }
     return DSP_OK;
+}
+
+int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int kind, const double beta,
+                  const int decim, const int method) {
+    /* An lvalue so the one-segment case can share dsp_plan_build's interface. A NULL arena
+     * still reaches the segs[0] == NULL test and comes back DSP_EARG. */
+    void *one = arena;
+    return dsp_plan_build(p, &one, 1, 0U, bytes, n, kind, beta, decim, method);
+}
+
+int dsp_plan_init_segs(dsp_plan *p, void *const *segs, const int nsegs, const size_t seg_bytes, int n,
+                       const int kind, const double beta, const int decim, const int method) {
+    /* Zero would mean the flat case, where nsegs and seg_bytes say nothing about how much
+     * memory there is. Callers with one contiguous block want dsp_plan_init. */
+    if (seg_bytes == 0U) {
+        if (p != NULL)
+            memset(p, 0, sizeof(*p));
+        return DSP_EARG;
+    }
+    return dsp_plan_build(p, segs, nsegs, seg_bytes, 0U, n, kind, beta, decim, method);
 }
 
 int dsp_plan_set_fir(dsp_plan *p, const dsp_real *h, const int ntaps) {
@@ -1370,6 +1474,8 @@ const char *dsp_strerror(const int code) {
         return "arena misaligned";
     case DSP_EZONE:
         return "band spans a Nyquist zone";
+    case DSP_ESEG:
+        return "array larger than one segment";
     case DSP_EDIRTY:
         return "settings moved, commit again";
     default:

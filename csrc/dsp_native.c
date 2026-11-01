@@ -101,8 +101,13 @@ typedef struct {
     uint32_t rd_hi;
     uint32_t out_lo;       /* graph buffer chunk storage                            */
     uint32_t out_hi;
-    uint32_t arena_lo;     /* plan arena; every plan pointer must lie inside        */
-    uint32_t arena_hi;
+
+    /* The plan arena, as chunk payloads. Chunk payloads are placed independently by the
+     * allocator, so a multi-chunk arena is not one region and dsp_plan_init_segs is what
+     * lays the arrays out across them. One chunk is just nsegs == 1. */
+    uint32_t seg_bytes;    /* payload size of one chunk, a multiple of DSP_ALIGN     */
+    uint32_t nsegs;        /* chunks given to the arena                             */
+    uint32_t segs_addr;    /* nsegs big-endian words: the payload addresses         */
 
     uint32_t plan_addr;    /* dsp_plan, initialised by dsp_plan_init at startup      */
     uint32_t src_flat;     /* scratch for the de-strided capture, cap_n doubles      */
@@ -140,9 +145,37 @@ typedef struct {
 #define DSPN_MODE_INIT   1U
 #define DSPN_MODE_RUN    2U
 #define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; touches no memory */
+#define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes; touches no memory */
+
+/* Chunks the arena may span. At the largest n a single chunk can hold an array for, the
+ * layout needs six, so this is generous; it bounds a stack array in dsp_native_run. */
+#define DSPN_MAX_SEGS    32U
+
+/* Sizes the Lua side has to agree with, exported so they come from the compiler that
+ * built this image rather than from a host build.  The target is 32-bit big-endian
+ * PowerPC: a pointer is 4 bytes, so sizeof(dsp_plan) is 1024 here against 1120 on a
+ * 64-bit host, and a figure copied from a host build is wrong by 96 bytes.
+ *
+ * emit_reloc.py reads these out of the linked image and writes them into the generated
+ * Lua, so native_link.tsp carries no struct size of its own.
+ *
+ *   [0] sizeof(dsp_plan)
+ *   [1] sizeof(dsp_native_params)
+ *   [2] sizeof(dsp_real)
+ *   [3] DSP_ALIGN
+ *
+ * Initialised, not tentative: without the initialiser this is a common definition that
+ * lands in .bss as zeros and reports nothing.
+ */
+const uint32_t dsp_native_sizes[4] = {
+    (uint32_t)sizeof(dsp_plan),
+    (uint32_t)sizeof(dsp_native_params),
+    (uint32_t)sizeof(dsp_real),
+    (uint32_t)DSP_ALIGN
+};
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  31
+#define DSP_NATIVE_PARAM_WORDS  32
 
 /* Column descriptor field offsets, from fwmem-BUFFER.md.  The write cursor and two of
  * the copies of n.  The remaining fields the descriptor carries -- the second iterator,
@@ -250,13 +283,14 @@ static uint32_t rb_addr(uint32_t ch1, uint32_t ch2, uint32_t perchunk, uint32_t 
 }
 
 /* -------------------------------------------------------------------------
- * Confine every pointer the plan carries to the declared arena.
+ * Confine every pointer the plan carries to the chunks the arena was built from.
  *
- * dsp.c writes through these, so the arena bound is what keeps its stores inside memory
- * we own.  NULL is permitted: the arena holds only what its own decomposition reads, so
- * the arrays belonging to the other method are NULL by design.
+ * dsp.c writes through these, so this bound is what keeps its stores inside memory we
+ * own.  NULL is permitted: the arena holds only what its own decomposition reads, so the
+ * arrays belonging to the other method are NULL by design.
  * -------------------------------------------------------------------------*/
-static int plan_ptrs_ok(const dsp_native_params *p, const dsp_plan *pl)
+static int plan_ptrs_ok(const dsp_plan *pl, const uint32_t *segs, int nsegs,
+                        uint32_t seg_bytes)
 {
     const void *const ptrs[20] = {
         pl->w,    pl->swp_a, pl->swp_b, pl->sw1_a, pl->sw1_b,
@@ -264,11 +298,18 @@ static int plan_ptrs_ok(const dsp_native_params *p, const dsp_plan *pl)
         pl->uti,  pl->re,    pl->im,    pl->wkr,   pl->wki,
         pl->blkr, pl->blki,  pl->pwr,   pl->h,     pl->fir_out
     };
-    int i;
+    int i, s;
     for (i = 0; i < 20; i++) {
         uint32_t a = (uint32_t)(uintptr_t)ptrs[i];
+        int inside = 0;
         if (a == 0U) { continue; }
-        if (!range_ok(a, 1U, p->arena_lo, p->arena_hi)) { return 0; }
+        /* Inside one of the segments. With a segmented arena there is no single range to
+         * test against, and an array that straddled two would pass a span test while
+         * sitting partly in the gap between them. */
+        for (s = 0; s < nsegs; s++) {
+            if (range_ok(a, 1U, segs[s], segs[s] + seg_bytes)) { inside = 1; break; }
+        }
+        if (!inside) { return 0; }
     }
     /* A yield callback would be a call through a params-derived pointer; refuse it. */
     if (pl->yield != NULL) { return 0; }
@@ -291,8 +332,10 @@ int dsp_native_run(void *L)
     dsp_plan *plan_w;
     double *src;
     uint32_t paddr;
+    uint32_t segs[DSPN_MAX_SEGS];
+    uint32_t seg_bytes = 0U;
     int parse_err = 0;
-    int n, m, nbins, k;
+    int n, m, nbins, k, nsegs = 0;
 
     const char *arg1 = lts(L, 1);
     if (arg1 == NULL) { return 0; }
@@ -324,13 +367,35 @@ int dsp_native_run(void *L)
      * before they are trusted to validate anything else. */
     if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < HEAP_LO || p->wr_hi  > HEAP_HI ||
         p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI ||
-        p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END ||
-        p->arena_lo >= p->arena_hi) {
+        p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END) {
         push(L, (double)DSPN_EBOUNDS); return 1;
     }
-    /* The arena is written through, so it must be a sub-range of the writable window. */
-    if (!wr_ok(p, p->arena_lo, p->arena_hi - p->arena_lo)) {
+
+    /* The arena's chunks.  Copied into a local array rather than used in place: the
+     * params field is a uint32 vector, and reading it as void*[] would rely on a pointer
+     * being exactly four bytes.  That is true on this target and is still the wrong thing
+     * to depend on silently. */
+    if (p->nsegs == 0U || p->nsegs > DSPN_MAX_SEGS ||
+        p->seg_bytes == 0U || (p->seg_bytes & (DSP_ALIGN - 1U)) != 0U) {
         push(L, (double)DSPN_EBOUNDS); return 1;
+    }
+    if (!range_ok(p->segs_addr, p->nsegs * 4U, HEAP_LO, HEAP_HI)) {
+        push(L, (double)DSPN_EBOUNDS); return 1;
+    }
+    nsegs = (int)p->nsegs;
+    seg_bytes = p->seg_bytes;
+    {
+        const uint32_t *vec = (const uint32_t *)(uintptr_t)p->segs_addr;
+        int s;
+        for (s = 0; s < nsegs; s++) {
+            segs[s] = vec[s];
+            /* Written through by dsp.c, so the full writable test, plus the alignment
+             * every array inside it inherits. */
+            if (!wr_ok(p, segs[s], seg_bytes) ||
+                (segs[s] & (DSP_ALIGN - 1U)) != 0U) {
+                push(L, (double)DSPN_EBOUNDS); return 1;
+            }
+        }
     }
 
     /* Math addresses, before anything calls through them. */
@@ -351,9 +416,14 @@ int dsp_native_run(void *L)
     if (!wr_ok(p, p->plan_addr, (uint32_t)sizeof(dsp_plan))) {
         push(L, (double)DSPN_EPLAN); return 1;
     }
-    if (p->plan_addr < p->arena_hi &&
-        (p->plan_addr + (uint32_t)sizeof(dsp_plan)) > p->arena_lo) {
-        push(L, (double)DSPN_EPLAN); return 1;
+    {
+        int s;
+        for (s = 0; s < nsegs; s++) {
+            if (p->plan_addr < segs[s] + seg_bytes &&
+                (p->plan_addr + (uint32_t)sizeof(dsp_plan)) > segs[s]) {
+                push(L, (double)DSPN_EPLAN); return 1;
+            }
+        }
     }
     plan   = (const dsp_plan *)(uintptr_t)p->plan_addr;
     plan_w = (dsp_plan *)(uintptr_t)p->plan_addr;
@@ -363,15 +433,24 @@ int dsp_native_run(void *L)
     /* Build the plan and stop.  dsp_plan_init zeroes the plan before any refusal, so a
      * non-zero return leaves p->n == 0 and the run path below refuses on geometry. */
     if (p->mode == DSPN_MODE_INIT) {
-        int rc = dsp_plan_init(plan_w,
-                               (void *)(uintptr_t)p->arena_lo,
-                               (size_t)(p->arena_hi - p->arena_lo),
-                               n,
-                               (int)p->init_kind,
-                               (double)p->init_beta_milli / 1000.0,
-                               (int)p->init_decim,
-                               (int)p->init_method);
+        /* void* rather than uint32: dsp_plan_init_segs takes pointers, and building the
+         * array here keeps the type pun out of it. */
+        void *segv[DSPN_MAX_SEGS];
+        int rc, s;
+        for (s = 0; s < nsegs; s++) { segv[s] = (void *)(uintptr_t)segs[s]; }
+        rc = dsp_plan_init_segs(plan_w, segv, nsegs, (size_t)seg_bytes,
+                                n,
+                                (int)p->init_kind,
+                                (double)p->init_beta_milli / 1000.0,
+                                (int)p->init_decim,
+                                (int)p->init_method);
         push(L, (double)rc);
+        return 1;
+    }
+
+    if (p->mode == DSPN_MODE_SEGS) {
+        push(L, (double)dsp_plan_segs(n, (int)p->init_decim, (int)p->init_method,
+                                      (size_t)seg_bytes));
         return 1;
     }
 
@@ -383,15 +462,23 @@ int dsp_native_run(void *L)
         push(L, (double)DSPN_EGEOM); return 1;
     }
 
-    if (!plan_ptrs_ok(p, plan)) { push(L, (double)DSPN_EARENA); return 1; }
+    if (!plan_ptrs_ok(plan, segs, nsegs, seg_bytes)) {
+        push(L, (double)DSPN_EARENA); return 1;
+    }
 
     /* Scratch for the de-strided capture: n doubles, contiguous, and it must not
      * overlap the arena -- dsp.c's overlap checks assume src is separate. */
     if (!wr_ok(p, p->src_flat, (uint32_t)n * 8U)) {
         push(L, (double)DSPN_ESCRATCH); return 1;
     }
-    if (p->src_flat < p->arena_hi && (p->src_flat + (uint32_t)n * 8U) > p->arena_lo) {
-        push(L, (double)DSPN_ESCRATCH); return 1;
+    {
+        int s;
+        for (s = 0; s < nsegs; s++) {
+            if (p->src_flat < segs[s] + seg_bytes &&
+                (p->src_flat + (uint32_t)n * 8U) > segs[s]) {
+                push(L, (double)DSPN_ESCRATCH); return 1;
+            }
+        }
     }
 
     /* Capture storage: read only, and only within what Lua declared. */

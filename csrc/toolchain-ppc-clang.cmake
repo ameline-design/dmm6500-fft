@@ -58,6 +58,14 @@ find_program(LLVM_LD ld.lld
           /usr/local/opt/lld/bin
     REQUIRED)
 set(CMAKE_LINKER "${LLVM_LD}")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "${CMAKE_EXE_LINKER_FLAGS_INIT} -fuse-ld=${LLVM_LD}")
+
+# Link with ld.lld directly rather than through the clang driver. Driving the link through
+# clang on this host makes it inject the Darwin link line -- -dynamic, -arch,
+# -platform_version, -syslibroot, -lto_library -- which ld.lld rejects one flag at a time.
+# A bare-metal image has no driver work to do anyway: no crt files, no default libraries,
+# no dynamic loader. Linker flags in target_link_options are therefore plain ld.lld flags
+# and must not be wrapped in -Wl,.
+set(CMAKE_C_LINK_EXECUTABLE
+    "<CMAKE_LINKER> <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 
 set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)

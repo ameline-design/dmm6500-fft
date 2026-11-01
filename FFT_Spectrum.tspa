@@ -2634,12 +2634,20 @@ fftsa.nl.RC = {
 fftsa.nl.MODE_INIT  = 1
 fftsa.nl.MODE_RUN   = 2
 fftsa.nl.MODE_BYTES = 3
+fftsa.nl.MODE_SEGS  = 4
 
 fftsa.nl.MAGIC = 1146310705   -- 0x44535031, 'DSP1'
 
 -- Chunk payload is a fixed 32,768 bytes; 1024 elements follows from 32768/32.
 fftsa.nl.CHUNK_BYTES = 32768
-fftsa.nl.PARAM_WORDS = 31
+fftsa.nl.PARAM_WORDS = 32
+
+-- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
+-- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
+-- pointers, so sizeof(dsp_plan) is 1024 there against 1120 on a 64-bit host.
+fftsa.nl.SIZEOF_PLAN   = 0
+fftsa.nl.SIZEOF_PARAMS = 0
+fftsa.nl.SIZEOF_REAL   = 0
 
 -- The 164-byte cache-flush trampoline for 1.7.17a. Reads two hex strings from the Lua
 -- stack (address, count) and calls dcbst_icbi_isync_range. Position-independent: it has
@@ -2895,7 +2903,7 @@ function fftsa.nl.write_params(t)
     t.wr_lo or 0, t.wr_hi or 0,
     t.rd_lo or 0, t.rd_hi or 0,
     t.out_lo or 0, t.out_hi or 0,
-    t.arena_lo or 0, t.arena_hi or 0,
+    t.seg_bytes or 0, t.nsegs or 0, t.segs_addr or 0,
     t.plan_addr or 0,
     t.src_flat or 0,
     t.cap_chunk1 or 0, t.cap_chunk2 or 0, t.cap_n or 0, t.cap_perchunk or 0,
@@ -3024,54 +3032,86 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   flush(code_base, string.len(img))
   nl.entry = code_base
 
-  -- 7. Arena size for the requested n, asked of the binary rather than guessed.
-  nl.write_params({ mode = nl.MODE_BYTES, cap_n = want_n,
+  -- 7. How many chunks the arena needs, asked of the binary rather than guessed.
+  --    The arrays are laid out one per chunk by dsp_plan_init_segs, so the arena does
+  --    not need contiguous memory -- which it could not have, since chunk payloads are
+  --    placed independently by the allocator.
+  nl.write_params({ mode = nl.MODE_SEGS, cap_n = want_n,
+                    seg_bytes = nl.CHUNK_BYTES,
                     init_decim = decim or 1, init_method = method or 0 })
-  local need = via_peek8(code_base, hx(nl.params))
-  if type(need) ~= 'number' or need <= 0 then buffer.delete(cb) return false end
-
-  -- Plan struct, arena and the de-strided scratch all have to be contiguous, and a
-  -- chunk payload is the largest contiguous block available: chunk payloads are
-  -- separated by a 16-byte header, so two chunks are not one region.
-  local plan_sz  = 1120                      -- sizeof(dsp_plan)
-  local scratch  = want_n * 8
-  local total    = align8(plan_sz) + align8(need) + scratch
-  if total > nl.CHUNK_BYTES then
-    -- Not a failure of the mechanism: the arena for this n does not fit one chunk.
+  local nseg = via_peek8(code_base, hx(nl.params))
+  if type(nseg) ~= 'number' or nseg <= 0 then
+    -- Zero means no chunk can hold one of the arrays: the window is n * 8 bytes, so
+    -- this is the bound on n rather than a failure of the mechanism.
     nl.nmax = 0
     buffer.delete(cb)
     return false
   end
 
-  -- 8. Plan buffer, found the same way.
-  local pb = buffer.make(1024, buffer.STYLE_WRITABLE_FULL)
+  -- 8. Plan buffer: one chunk per segment, plus one for the plan struct and the
+  --    de-strided scratch, which must not sit inside the arena.
+  local chunks_wanted = nseg + 1
+  local pb = buffer.make(chunks_wanted * 1024, buffer.STYLE_WRITABLE_FULL)
   buffer.write.format(pb, buffer.UNIT_VOLT, buffer.DIGITS_6_5,
                       buffer.UNIT_VOLT, buffer.DIGITS_6_5)
   for k = 1, 3 do
     buffer.write.reading(pb, 1000000 + k, 3000000 + k, k, 0)
   end
   buffer.getstats(barrier_buf)
-  local plan_base = nl._find_storage(pb)
-  if not plan_base then
+
+  local pdesc = nl.describe(pb)
+  if pdesc == nil or pdesc.vec == nil then
     buffer.delete(pb) buffer.delete(cb) return false
   end
   nl.plan_buf = pb
 
-  local plan_addr = plan_base
-  local arena_lo  = plan_base + align8(plan_sz)
-  local arena_hi  = arena_lo + align8(need)
-  local src_flat  = arena_hi
+  -- Chunk payload addresses from the vector. They are not in address order and not
+  -- adjacent; dsp_plan_init_segs does not care, and nothing here may assume otherwise.
+  local payload = {}
+  local i
+  for i = 1, chunks_wanted do
+    local a = W(pdesc.vec + (i - 1) * 4)
+    if a == nil or a == 0 then
+      buffer.delete(pb) buffer.delete(cb) return false
+    end
+    payload[i] = a
+  end
 
-  -- 9. Build the plan.
-  nl.wr_lo = plan_base
-  nl.wr_hi = plan_base + nl.CHUNK_BYTES
+  -- The last chunk holds the plan struct and the scratch; the first nseg are the arena.
+  local host      = payload[chunks_wanted]
+  local plan_addr = host
+  local src_flat  = host + align8(nl.SIZEOF_PLAN)
+  if (src_flat - host) + want_n * 8 > nl.CHUNK_BYTES then
+    buffer.delete(pb) buffer.delete(cb) return false
+  end
+
+  -- The segment vector itself, in the code buffer above the params struct.
+  local segs_addr = nl.params + align8(nl.PARAM_WORDS * 4)
+  if (segs_addr - code_base) + nseg * 4 > nl.CHUNK_BYTES then
+    buffer.delete(pb) buffer.delete(cb) return false
+  end
+  local sv = {}
+  for i = 1, nseg do sv[i] = u32_pack(payload[i]) end
+  ki.memwrite(hx(segs_addr), table.concat(sv))
+
+  -- The writable window has to cover every chunk of this buffer, and the chunks are
+  -- scattered, so it spans from the lowest to the highest.
+  local lo, hi = payload[1], payload[1]
+  for i = 2, chunks_wanted do
+    if payload[i] < lo then lo = payload[i] end
+    if payload[i] > hi then hi = payload[i] end
+  end
+  nl.wr_lo = lo
+  nl.wr_hi = hi + nl.CHUNK_BYTES
+
+  -- 9. Build the plan across the chunks.
   nl.write_params({
     mode = nl.MODE_INIT,
     wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
     rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
     out_lo = nl.wr_lo, out_hi = nl.wr_hi,
-    arena_lo = arena_lo, arena_hi = arena_hi,
-    plan_addr = plan_addr, cap_n = want_n,
+    seg_bytes = nl.CHUNK_BYTES, nsegs = nseg, segs_addr = segs_addr,
+    plan_addr = plan_addr, src_flat = src_flat, cap_n = want_n,
     init_kind = kind or 1,
     init_beta_milli = math.floor((beta or 0) * 1000),
     init_decim = decim or 1, init_method = method or 0,
@@ -3083,8 +3123,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   end
 
   nl.plan_addr = plan_addr
-  nl.arena_lo  = arena_lo
-  nl.arena_hi  = arena_hi
+  nl.seg_bytes = nl.CHUNK_BYTES
+  nl.nsegs     = nseg
+  nl.segs_addr = segs_addr
   nl.src_flat  = src_flat
   nl.n         = want_n
   nl.nmax      = want_n
@@ -3113,7 +3154,7 @@ function fftsa.nl.call_dsp(cap, out)
     wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
     rd_lo = cap.lo, rd_hi = cap.hi,
     out_lo = out.lo, out_hi = out.hi,
-    arena_lo = nl.arena_lo, arena_hi = nl.arena_hi,
+    seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
     plan_addr = nl.plan_addr, src_flat = nl.src_flat,
     cap_chunk1 = cap.chunk1, cap_chunk2 = cap.chunk2,
     cap_n = nl.n, cap_perchunk = cap.perchunk,

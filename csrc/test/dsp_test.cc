@@ -4678,4 +4678,275 @@ TEST(PeakInterp, OneObjectForBothOutputsIsRefusedAndTwoNullsAreNot) {
     EXPECT_NE(-99.0, only);
 }
 
+// ---------------------------------------------------------------------------
+// segmented arenas
+//
+// For memory that arrives in fixed-size pieces that are not adjacent. On the DMM6500 a
+// reading buffer's chunk payloads are 32,768 bytes each and the allocator places them
+// independently, so a multi-chunk arena is not one region; measured in
+// notes/firmware/fwmem-BUFFER.md. Each array is laid out whole inside one segment, so the
+// transform is unchanged and only the placement differs -- which is what the equivalence
+// test below is for.
+// ---------------------------------------------------------------------------
+
+// A plan over segments that are deliberately separate allocations, handed over in an order
+// that is not address order, so nothing can quietly depend on adjacency or sortedness.
+class SegPlan {
+  public:
+    SegPlan(int n, int kind, size_t seg_bytes, int nsegs, double beta = 12.0, int decim = 1,
+            int method = DSP_FFT_DEFAULT) {
+        for (int i = 0; i < nsegs; i++) {
+            blocks_.push_back(std::vector<unsigned char>(seg_bytes + DSP_ALIGN, 0));
+        }
+        // Reverse order: the library must not assume the bases ascend.
+        for (int i = nsegs - 1; i >= 0; i--) {
+            bases_.push_back(AlignUp(blocks_[static_cast<size_t>(i)].data()));
+        }
+        rc_ = dsp_plan_init_segs(&p_, reinterpret_cast<void *const *>(bases_.data()), nsegs,
+                                 seg_bytes, n, kind, beta, decim, method);
+        seg_bytes_ = seg_bytes;
+    }
+    int rc() const { return rc_; }
+    dsp_plan *operator->() { return &p_; }
+    dsp_plan &get() { return p_; }
+    // Is [p, p+bytes) wholly inside one of the segments?
+    bool InOneSegment(const void *q, size_t bytes) const {
+        const unsigned char *lo = static_cast<const unsigned char *>(q);
+        for (size_t i = 0; i < bases_.size(); i++) {
+            if (lo >= bases_[i] && lo + bytes <= bases_[i] + seg_bytes_)
+                return true;
+        }
+        return false;
+    }
+
+  private:
+    std::vector<std::vector<unsigned char>> blocks_;
+    std::vector<unsigned char *> bases_;
+    size_t seg_bytes_ = 0;
+    dsp_plan p_{};
+    int rc_ = DSP_EARG;
+};
+
+// 32,768 bytes is the instrument's chunk payload, which is the case this exists for.
+constexpr size_t kSeg = 32768;
+
+// The smallest n whose layout needs at least `want` segments, or 0 if none does within the
+// bound that no array may exceed a segment. Measured rather than written down: at kSeg the
+// double build crosses into two segments at n = 1024 and the single build only at n = 2048,
+// so a hardcoded n silently tests one segment in one of the two variants.
+int NForSegs(int want, int method = DSP_FFT_DEFAULT) {
+    const int nmax = static_cast<int>(kSeg / sizeof(dsp_real));
+    for (int n = 64; n <= nmax; n *= 2) {
+        const int segs = dsp_plan_segs(n, 1, method, kSeg);
+        if (segs >= want)
+            return n;
+    }
+    return 0;
+}
+
+TEST(Segments, CountIsPositiveAndSufficient) {
+    for (int n : {64, 256, 512, 1024}) {
+        int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+        ASSERT_GT(segs, 0) << "n=" << n;
+        // It must be enough: asking for exactly that many succeeds.
+        SegPlan p(n, DSP_WINDOW_HANN, kSeg, segs);
+        EXPECT_EQ(DSP_OK, p.rc()) << "n=" << n << " segs=" << segs;
+        // And it must not be wasteful past the padding: flat bytes cannot need more.
+        size_t flat = dsp_plan_bytes(n, 1, DSP_FFT_DEFAULT);
+        EXPECT_GE(static_cast<size_t>(segs) * kSeg, flat) << "n=" << n;
+    }
+}
+
+TEST(Segments, OneShortIsEnomem) {
+    const int n = NForSegs(2);
+    ASSERT_GT(n, 0) << "no n needs two segments at this precision; the bound is too tight";
+    int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 1);
+    SegPlan p(n, DSP_WINDOW_HANN, kSeg, segs - 1);
+    EXPECT_EQ(DSP_ENOMEM, p.rc());
+    EXPECT_EQ(0, p->n) << "a refused plan must be left zeroed";
+}
+
+TEST(Segments, ArrayLargerThanASegmentIsRefused) {
+    // No array is ever split, so the window -- n entries, the largest -- has to fit one
+    // segment. That is the bound on n, and it is the whole cost of the approach.
+    const size_t nmax = kSeg / sizeof(dsp_real);
+    const int at_limit = static_cast<int>(nmax);
+    const int over = at_limit * 2;
+
+    EXPECT_GT(dsp_plan_segs(at_limit, 1, DSP_FFT_DEFAULT, kSeg), 0)
+        << "n = seg_bytes/sizeof(dsp_real) must still lay out";
+    EXPECT_EQ(0, dsp_plan_segs(over, 1, DSP_FFT_DEFAULT, kSeg));
+
+    SegPlan p(over, DSP_WINDOW_HANN, kSeg, 64);
+    EXPECT_EQ(DSP_ESEG, p.rc()) << "and plenty of segments does not help";
+    EXPECT_STREQ("array larger than one segment", dsp_strerror(DSP_ESEG));
+}
+
+TEST(Segments, EveryArrayLiesWhollyInOneSegment) {
+    const int n = 512;
+    int segs = dsp_plan_segs(n, 1, DSP_FFT_RADIX2, kSeg);
+    ASSERT_GT(segs, 0);
+    SegPlan p(n, DSP_WINDOW_HANN, kSeg, segs, 12.0, 1, DSP_FFT_RADIX2);
+    ASSERT_EQ(DSP_OK, p.rc());
+    const int m = p->m;
+    // The arrays the radix-2 plan owns, with the extent each is read to.
+    EXPECT_TRUE(p.InOneSegment(p->w, static_cast<size_t>(n) * sizeof(dsp_real))) << "w";
+    EXPECT_TRUE(p.InOneSegment(p->twr, static_cast<size_t>(m - 2) * sizeof(dsp_real))) << "twr";
+    EXPECT_TRUE(p.InOneSegment(p->twi, static_cast<size_t>(m - 2) * sizeof(dsp_real))) << "twi";
+    EXPECT_TRUE(p.InOneSegment(p->utr, static_cast<size_t>(m) * sizeof(dsp_real))) << "utr";
+    EXPECT_TRUE(p.InOneSegment(p->uti, static_cast<size_t>(m) * sizeof(dsp_real))) << "uti";
+    EXPECT_TRUE(p.InOneSegment(p->re, static_cast<size_t>(m) * sizeof(dsp_real))) << "re";
+    EXPECT_TRUE(p.InOneSegment(p->im, static_cast<size_t>(m) * sizeof(dsp_real))) << "im";
+    EXPECT_TRUE(p.InOneSegment(p->pwr, static_cast<size_t>(m) * sizeof(dsp_real))) << "pwr";
+    EXPECT_TRUE(p.InOneSegment(p->h, DSP_FIR_MAXTAPS * sizeof(dsp_real))) << "h";
+    EXPECT_TRUE(p.InOneSegment(p->swp_a, static_cast<size_t>(m / 2) * sizeof(int))) << "swp_a";
+    EXPECT_TRUE(p.InOneSegment(p->swp_b, static_cast<size_t>(m / 2) * sizeof(int))) << "swp_b";
+}
+
+TEST(Segments, EveryArrayIsAligned) {
+    const int n = 512;
+    int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0);
+    SegPlan p(n, DSP_WINDOW_HANN, kSeg, segs);
+    ASSERT_EQ(DSP_OK, p.rc());
+    const void *arrays[] = {p->w, p->twr, p->twi, p->utr, p->uti, p->re, p->im, p->pwr, p->h};
+    for (const void *q : arrays) {
+        EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(q) & (DSP_ALIGN - 1));
+    }
+}
+
+// The test that matters: placement must not change a single bit of the result.
+TEST(Segments, SpectrumIsBitIdenticalToAFlatArena) {
+    for (int method : {DSP_FFT_RADIX2, DSP_FFT_FOURSTEP}) {
+        for (int n : {64, 256, 512}) {
+            const int segs = dsp_plan_segs(n, 1, method, kSeg);
+            ASSERT_GT(segs, 0) << "n=" << n;
+
+            Plan flat(n, DSP_WINDOW_BLACKMAN_HARRIS, 12.0, 1, method);
+            ASSERT_EQ(DSP_OK, flat.rc());
+            SegPlan seg(n, DSP_WINDOW_BLACKMAN_HARRIS, kSeg, segs, 12.0, 1, method);
+            ASSERT_EQ(DSP_OK, seg.rc());
+            ASSERT_EQ(flat->method, seg->method) << "both must resolve the same decomposition";
+
+            // Two tones and a DC offset, so the window, the twiddles, the untangle and the
+            // mean removal all contribute.
+            std::vector<double> x(static_cast<size_t>(n));
+            for (int i = 0; i < n; i++) {
+                const double t = static_cast<double>(i);
+                x[static_cast<size_t>(i)] = 0.75 + std::sin(2.0 * M_PI * 5.25 * t / n) +
+                                            0.3 * std::sin(2.0 * M_PI * 19.0 * t / n + 0.4);
+            }
+
+            double mean_flat = 0.0, mean_seg = 0.0;
+            ASSERT_EQ(flat->m, dsp_spectrum_run(&flat.get(), x.data(), n, &mean_flat));
+            ASSERT_EQ(seg->m, dsp_spectrum_run(&seg.get(), x.data(), n, &mean_seg));
+
+            EXPECT_EQ(mean_flat, mean_seg) << "n=" << n << " method=" << method;
+            for (int k = 0; k < flat->m; k++) {
+                ASSERT_EQ(flat->pwr[k], seg->pwr[k])
+                    << "bin " << k << " differs, n=" << n << " method=" << method;
+            }
+            // The window and the twiddles are built by the same code over the same offsets,
+            // so they have to agree exactly too.
+            for (int i = 0; i < n; i++) {
+                ASSERT_EQ(flat->w[i], seg->w[i]) << "window " << i << " differs, n=" << n;
+            }
+        }
+    }
+}
+
+TEST(Segments, RefusesTheArgumentsItShould) {
+    const int n = 256;
+    const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0);
+    std::vector<unsigned char> block(kSeg + DSP_ALIGN, 0);
+    unsigned char *base = AlignUp(block.data());
+    void *one[2] = {base, base};
+    dsp_plan p{};
+
+    // seg_bytes of zero is the flat case, which has its own entry point.
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(&p, one, 1, 0u, n, DSP_WINDOW_HANN, 12.0, 1,
+                                           DSP_FFT_DEFAULT));
+    EXPECT_EQ(0, p.n) << "and the plan is still zeroed on that path";
+    // Not a multiple of DSP_ALIGN: the offsets are aligned within a segment, so this would
+    // misalign every array in it however well aligned the base is.
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(&p, one, 1, kSeg + 1, n, DSP_WINDOW_HANN, 12.0, 1,
+                                           DSP_FFT_DEFAULT));
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(&p, one, 1, DSP_ALIGN / 2, n, DSP_WINDOW_HANN, 12.0,
+                                           1, DSP_FFT_DEFAULT));
+    // No segments, a null table, and a null entry inside an otherwise good table.
+    EXPECT_EQ(DSP_EARG,
+              dsp_plan_init_segs(&p, one, 0, kSeg, n, DSP_WINDOW_HANN, 12.0, 1, DSP_FFT_DEFAULT));
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(&p, nullptr, 1, kSeg, n, DSP_WINDOW_HANN, 12.0, 1,
+                                           DSP_FFT_DEFAULT));
+    void *with_null[2] = {base, nullptr};
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(&p, with_null, 2, kSeg, n, DSP_WINDOW_HANN, 12.0, 1,
+                                           DSP_FFT_DEFAULT));
+    // A null plan is refused without being written through.
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(nullptr, one, 1, kSeg, n, DSP_WINDOW_HANN, 12.0, 1,
+                                           DSP_FFT_DEFAULT));
+    // And dsp_plan_segs reports nothing for a seg_bytes it would refuse.
+    EXPECT_EQ(0, dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, 0u));
+    EXPECT_EQ(0, dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg + 1));
+    EXPECT_EQ(0, dsp_plan_segs(n + 1, 1, DSP_FFT_DEFAULT, kSeg)) << "n not a power of two";
+}
+
+TEST(Segments, MisalignedSegmentIsEalign) {
+    const int n = 256;
+    const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0);
+    // Enough room for every segment plus the deliberate one-byte skew.
+    std::vector<unsigned char> block(kSeg * static_cast<size_t>(segs) + 2 * DSP_ALIGN, 0);
+    unsigned char *base = AlignUp(block.data());
+    std::vector<void *> bases;
+    for (int i = 0; i < segs; i++)
+        bases.push_back(base + static_cast<size_t>(i) * kSeg);
+    dsp_plan p{};
+    ASSERT_EQ(DSP_OK, dsp_plan_init_segs(&p, bases.data(), segs, kSeg, n, DSP_WINDOW_HANN, 12.0,
+                                         1, DSP_FFT_DEFAULT));
+    // Skew the last one. It is checked even though the first is fine.
+    bases[static_cast<size_t>(segs - 1)] =
+        static_cast<unsigned char *>(bases[static_cast<size_t>(segs - 1)]) + 1;
+    EXPECT_EQ(DSP_EALIGN, dsp_plan_init_segs(&p, bases.data(), segs, kSeg, n, DSP_WINDOW_HANN,
+                                             12.0, 1, DSP_FFT_DEFAULT));
+}
+
+#if DSP_CHECK_OVERLAP
+TEST(Segments, PlanInsideAnySegmentIsRefused) {
+    const int n = NForSegs(2);
+    ASSERT_GT(n, 0) << "no n needs two segments at this precision";
+    const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 1);
+    std::vector<std::vector<unsigned char>> blocks;
+    for (int i = 0; i < segs; i++)
+        blocks.push_back(std::vector<unsigned char>(kSeg + DSP_ALIGN, 0));
+    std::vector<void *> bases;
+    for (int i = 0; i < segs; i++)
+        bases.push_back(AlignUp(blocks[static_cast<size_t>(i)].data()));
+
+    // A plan living inside the LAST segment, not the first: checking only segs[0] would
+    // miss it, and the carve-up would then overwrite the plan's own pointers.
+    void *last = bases[static_cast<size_t>(segs - 1)];
+    dsp_plan *inside = static_cast<dsp_plan *>(last);
+    EXPECT_EQ(DSP_EARG, dsp_plan_init_segs(inside, bases.data(), segs, kSeg, n, DSP_WINDOW_HANN,
+                                           12.0, 1, DSP_FFT_DEFAULT));
+}
+#endif
+
+TEST(Segments, PaddingIsTheOnlyCost) {
+    // The segmented layout can only be bigger than the flat one, and only by the tails it
+    // skips -- at most one array's worth per segment boundary. A regression that made it
+    // wildly bigger would show up here rather than as a mysterious ENOMEM.
+    for (int n : {64, 256, 512, 1024}) {
+        const size_t flat = dsp_plan_bytes(n, 1, DSP_FFT_DEFAULT);
+        const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+        ASSERT_GT(segs, 0) << "n=" << n;
+        const size_t given = static_cast<size_t>(segs) * kSeg;
+        ASSERT_GE(given, flat) << "n=" << n;
+        // One wholly wasted segment would be a layout bug, not padding.
+        EXPECT_LT(given - flat, kSeg + flat) << "n=" << n << ": padding is out of proportion";
+    }
+}
+
 } // namespace

@@ -97,6 +97,33 @@ class Elf32BE:
                 return s
         return None
 
+    def symbol_named(self, name):
+        """The address of a global symbol, or None. Needs .strtab for the symbol table."""
+        symtab = None
+        for s in self.sections:
+            if s["type"] == SHT_SYMTAB:
+                symtab = s
+                break
+        if symtab is None:
+            return None
+        strtab = self.sections[symtab["link"]]
+        names = self.blob[strtab["offset"]:strtab["offset"] + strtab["size"]]
+        for sym in self.symbols(symtab):
+            end = names.find(b"\0", sym["name_off"])
+            if names[sym["name_off"]:end].decode("ascii", "replace") == name:
+                return sym["value"]
+        return None
+
+    def read_at(self, addr, nbytes):
+        """Bytes at a virtual address, from whichever allocated section holds it."""
+        for s in self.sections:
+            if not (s["flags"] & 0x2) or s["type"] == 8 or s["size"] == 0:
+                continue
+            if s["addr"] <= addr and addr + nbytes <= s["addr"] + s["size"]:
+                off = s["offset"] + (addr - s["addr"])
+                return self.blob[off:off + nbytes]
+        return None
+
     def symbols(self, symtab):
         """Symbol values for a SHT_SYMTAB section, indexed as the relocations index them."""
         out = []
@@ -119,6 +146,57 @@ class Elf32BE:
                 yield (s["name"], r_offset, r_info & 0xFF, r_info >> 8, r_addend)
 
 
+def relocation_entries(elf):
+    """(kind, field offset, target) for every relocation that needs patching.
+
+    Shared with tools/check_reloc.py, which validates the result against the linker: two
+    copies of this walk is how the field offset came to be wrong in both at once.
+
+    r_offset points **at the 16-bit field**, not at the start of the instruction, for the
+    ADDR16 family. For the `lis r3,0` at 0x104 whose immediate lives at 0x106, ld.lld
+    emits r_offset = 0x106. Adding 2 to reach the immediate lands on the next
+    instruction's opcode instead, which is what the first version of this did.
+    """
+    symtab = None
+    for s in elf.sections:
+        if s["type"] == SHT_SYMTAB:
+            symtab = s
+            break
+    if symtab is None:
+        raise ValueError("no symbol table: link with --emit-relocs and do not strip")
+    syms = elf.symbols(symtab)
+
+    entries = []
+    skipped = 0
+    for sec_name, r_offset, r_type, r_sym, r_addend in elf.relocations():
+        if r_type in PC_RELATIVE:
+            skipped += 1
+            continue
+        kind = PATCHABLE.get(r_type)
+        if kind is None:
+            raise ValueError(
+                "relocation type %d in %s at 0x%X is not handled; a missed relocation "
+                "reads the wrong address silently, so this is fatal"
+                % (r_type, sec_name, r_offset))
+        if r_sym >= len(syms):
+            raise ValueError("relocation in %s references symbol %d, past the symbol table"
+                             % (sec_name, r_sym))
+        target = (syms[r_sym]["value"] + r_addend) & 0xFFFFFFFF
+        entries.append((kind, r_offset, target))
+
+    entries.sort(key=lambda e: e[1])
+    return entries, skipped
+
+
+def pack_table(entries):
+    """The on-wire table: 9 bytes per entry, big-endian."""
+    table = bytearray()
+    for kind, field, target in entries:
+        table.append(kind)
+        table.extend(struct.pack(">II", field, target))
+    return bytes(table)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,36 +216,10 @@ def main():
         sys.exit(".text must be linked at address 0; check dsp_native.ld "
                  "(got 0x%08X)" % text["addr"])
 
-    symtab = None
-    for s in elf.sections:
-        if s["type"] == SHT_SYMTAB:
-            symtab = s
-            break
-    if symtab is None:
-        sys.exit("no symbol table: link with --emit-relocs and do not strip")
-    syms = elf.symbols(symtab)
-
-    entries = []
-    skipped = 0
-    for sec_name, r_offset, r_type, r_sym, r_addend in elf.relocations():
-        if r_type in PC_RELATIVE:
-            skipped += 1
-            continue
-        kind = PATCHABLE.get(r_type)
-        if kind is None:
-            sys.exit("relocation type %d in %s at 0x%X is not handled; a missed "
-                     "relocation reads the wrong address silently, so this is fatal"
-                     % (r_type, sec_name, r_offset))
-        if r_sym >= len(syms):
-            sys.exit("relocation in %s references symbol %d, past the symbol table"
-                     % (sec_name, r_sym))
-        target = (syms[r_sym]["value"] + r_addend) & 0xFFFFFFFF
-        # The field offset for a halfword relocation is the low half of the
-        # instruction, two bytes into it.
-        field = r_offset if kind == KIND_WORD32 else r_offset + 2
-        entries.append((kind, field, target))
-
-    entries.sort(key=lambda e: e[1])
+    try:
+        entries, skipped = relocation_entries(elf)
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     # The flat image: every allocated section with contents, in address order. .bss has
     # no contents and is zeroed by the loader, so it is not in the image.
@@ -194,10 +246,7 @@ def main():
         if field + (4 if kind == KIND_WORD32 else 2) > len(image):
             sys.exit("relocation field at 0x%X is past the end of the image" % field)
 
-    table = bytearray()
-    for kind, field, target in entries:
-        table.append(kind)
-        table.extend(struct.pack(">II", field, target))
+    table = pack_table(entries)
 
     bin_path = args.stem + ".bin"
     lua_path = args.stem + "_reloc.lua"
@@ -207,12 +256,31 @@ def main():
     def lua_literal(data):
         return "'" + "".join("\\%03d" % b for b in data) + "'"
 
+    # Struct sizes read out of the image the target compiler produced. A 32-bit
+    # big-endian PowerPC has 4-byte pointers, so sizeof(dsp_plan) is not what a 64-bit
+    # host reports and the Lua side must not carry its own copy of the figure.
+    sizes_addr = elf.symbol_named("dsp_native_sizes")
+    if sizes_addr is None:
+        sys.exit("dsp_native_sizes not found: the Lua side needs the target's struct sizes")
+    raw = elf.read_at(sizes_addr, 16)
+    if raw is None or len(raw) != 16:
+        sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
+    plan_sz, params_sz, real_sz, align = struct.unpack(">IIII", raw)
+    if plan_sz == 0 or params_sz == 0 or real_sz == 0 or align == 0:
+        sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
+                 "rather than an initialised one in .rodata")
+
     with open(lua_path, "w") as fh:
         fh.write("-- Generated by csrc/tools/emit_reloc.py; do not edit.\n")
         fh.write("-- %d relocations over a %d-byte image.\n" % (len(entries), len(image)))
         fh.write("%s = %s\n" % (args.var, lua_literal(table)))
         fh.write("%s_BSS_LO = %d\n" % (args.var, bss_lo))
         fh.write("%s_BSS_HI = %d\n" % (args.var, bss_hi))
+        fh.write("-- struct sizes from the target compiler, not from a host build\n")
+        fh.write("fftsa.nl.SIZEOF_PLAN = %d\n" % plan_sz)
+        fh.write("fftsa.nl.SIZEOF_PARAMS = %d\n" % params_sz)
+        fh.write("fftsa.nl.SIZEOF_REAL = %d\n" % real_sz)
+        fh.write("fftsa.nl.DSP_ALIGN = %d\n" % align)
 
     print("image      %s  %d bytes" % (bin_path, len(image)))
     print("relocs     %s  %d entries, %d bytes"
@@ -220,6 +288,8 @@ def main():
     print("pc-relative skipped: %d (correct at any load address)" % skipped)
     print("bss        0x%08X..0x%08X (%d bytes, zeroed by the loader)"
           % (bss_lo, bss_hi, bss_hi - bss_lo))
+    print("target     sizeof(dsp_plan)=%d  sizeof(params)=%d  sizeof(dsp_real)=%d  align=%d"
+          % (plan_sz, params_sz, real_sz, align))
     kinds = {}
     for kind, _, _ in entries:
         kinds[kind] = kinds.get(kind, 0) + 1
