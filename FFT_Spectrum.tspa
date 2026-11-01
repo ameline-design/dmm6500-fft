@@ -2839,11 +2839,14 @@ function fftsa.nl._find_storage(buf)
     for k = 1, table.getn(hits) do
       local h = hits[k]
       -- Confirm stride 32 against readings 2 and 3 before trusting the hit.
+      -- The expected words come from tonumber rather than decimal literals: these were
+      -- mistyped once as 0x412F8484, which made this function silently never match.
       local v2  = W(h + 32)
       local v2l = W(h + 36)
       local v3  = W(h + 64)
-      if v2 == 1093633156 and v2l == 0 and v3 == 1093633158 then
-        return h       -- 0x412E8484, 0x412E8486
+      if v2 == tonumber('412E8484', 16) and v2l == 0 and
+         v3 == tonumber('412E8486', 16) then
+        return h
       end
     end
   end
