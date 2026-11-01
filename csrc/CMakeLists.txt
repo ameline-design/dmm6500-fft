@@ -271,7 +271,7 @@ endforeach()
 #         -DDSP_DST_NATIVE=ON
 #   cmake --build build-ppc --target dsp_native_bin
 #
-# The output is build-ppc/dsp_native.bin (flat binary, entry at offset 4).
+# The output is build-ppc/dsp_native.bin (flat binary, entry at offset 0).
 # ---------------------------------------------------------------------------
 option(DSP_DST_NATIVE "Build dsp_native.c for the DMM6500 instrument" OFF)
 if(DSP_DST_NATIVE)
@@ -281,17 +281,27 @@ if(DSP_DST_NATIVE)
   target_include_directories(dsp_native_elf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(dsp_native_elf PUBLIC
       DSP_DOUBLE
-      DSP_CHECK_OVERLAP=0)
+      DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
+      )
   target_compile_options(dsp_native_elf PRIVATE
       -Os -fno-common -Wno-int-to-pointer-cast
+      -ffunction-sections  # lets the linker script place dsp_native_run first
       -Wall -Wextra -Wconversion -Wdouble-promotion
       -ffp-contract=off
       -fno-builtin)
-  # Link with the linker script that positions .native_header at offset 0.
+  # Final link: -r retains relocations and cannot produce a working flat binary.
+  # Use a final link with -nostdlib and --unresolved-symbols=report-all so any
+  # unresolved external (e.g. libm functions in dsp.c) is a build error, not
+  # a silent wrong-address branch.
   target_link_options(dsp_native_elf PRIVATE
       -T ${CMAKE_CURRENT_SOURCE_DIR}/dsp_native.ld
-      -nostdlib -r)
-  target_link_libraries(dsp_native_elf PRIVATE m)
+      -nostdlib
+      -e dsp_native_run
+      --no-dynamic-linker
+      -Wl,--unresolved-symbols=report-all)
+  # No -lm: dsp.c's math calls (floor, ceil, sqrt, sin, cos, log10) must be
+  # satisfied by implementations in dsp_native.c itself, not from the host.
+  # See csrc/README.md for the function-pointer-table approach.
 
   add_custom_command(
       OUTPUT dsp_native.bin

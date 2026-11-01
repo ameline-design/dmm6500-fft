@@ -174,10 +174,12 @@ function fftsa.nl._ensure_finds()
   if type(FINDS) == 'function' then return true end
   -- one statement under the 1024-byte limit; no Python % so %08X is Lua
   local r = nil
+  -- Uses ki.memread directly, not KG.read: KG is only available on the instrument
+  -- during a probe session, not inside a packaged .tspa application.
   r = (loadstring or load)(
     "do function FINDS(lo,hi,pat) local a=lo local out={} local pl=string.len(pat) "
     .. "while a<hi do local n=32768 if a+n>hi then n=hi-a end "
-    .. "local s=KG.read(a,n) "
+    .. "local s=ki.memread(string.format('%X',a),string.format('%X',n)) "
     .. "if s~=nil then local i=1 "
     .. "while true do local j=string.find(s,pat,i,true) if j==nil then break end "
     .. "table.insert(out,a+j-1) i=j+1 end end "

@@ -441,7 +441,12 @@ function fftsa.frame_body()
     -- addresses discovered at startup.  The params struct already contains the
     -- addresses written by nl.init(); this call updates per-frame fields.
     nseg = fftsa.nl.call_dsp()
-    if nseg == nil then nseg = -1 end
+    if nseg == nil then
+      -- demote to the Keithley path for the rest of the session rather than
+      -- erroring on every frame
+      fftsa.nl.ready = false
+      nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+    end
     -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
     if nseg > 0 then
       display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
