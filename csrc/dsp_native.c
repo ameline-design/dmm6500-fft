@@ -64,17 +64,31 @@
 #include "dsp.h"
 
 /* -------------------------------------------------------------------------
- * Firmware function addresses (1.7.17a).
+ * Library function strategy
+ * -------------------------
+ * Two classes of external function:
  *
- * These are in the firmware's .text which is always at fixed addresses.
- * They are position-independent: correct at any load address for our binary.
- * For other firmware versions, update these and rebuild.
+ * 1. Firmware math functions (sin, cos, tan, asin, acos, atan, atan2, sqrt,
+ *    exp, log, log10, floor, ceil): resolved at app startup via FNF scanning
+ *    the Lua math wrappers.  Any firmware that runs Lua's math.* exposes them
+ *    at discoverable, firmware-version-independent addresses.  Their addresses
+ *    arrive in the params struct.
+ *
+ * 2. memcpy, memset, fabs: not exposed through Lua wrappers, so no reliable
+ *    runtime discovery path exists.  Implemented directly below instead.
+ *    These trivial implementations are fast enough for DSP init and setup;
+ *    the hot loops in dsp.c use only math operations and array accesses.
+ *
+ * lua_tostring and hexparse are firmware addresses hardcoded below; they are
+ * needed to parse the params address off the Lua stack, before the params
+ * struct (which would carry discovered addresses) can be read.  For new
+ * firmware builds, update them here and rebuild.
  * -------------------------------------------------------------------------*/
 
-/* lua_tostring(lua_State *L, int n) -> const char *  */
+/* lua_tostring(lua_State *L, int n) -> const char *  1.7.17a */
 #define LUA_TOSTRING_ADDR  0x0021E868u
 
-/* hexparse(const char *str, int *err) -> uint32_t    */
+/* hexparse(const char *str, int *err) -> uint32_t    1.7.17a */
 #define HEXPARSE_ADDR      0x004BFE9Cu
 
 typedef const char *(*lua_tostring_fn)(void *, int);
@@ -82,10 +96,45 @@ typedef uint32_t    (*hexparse_fn)(const char *, int *);
 typedef void        (*lua_pushnumber_fn)(void *, double);
 
 /* -------------------------------------------------------------------------
- * Params struct.
+ * Self-contained implementations of the C runtime functions dsp.c needs
+ * that are not discoverable through Lua wrappers.
  * -------------------------------------------------------------------------*/
+
+void *memcpy(void *dst, const void *src, size_t n)
+{
+    unsigned char       *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    while (n--) { *d++ = *s++; }
+    return dst;
+}
+
+void *memset(void *s, int c, size_t n)
+{
+    unsigned char *p = (unsigned char *)s;
+    while (n--) { *p++ = (unsigned char)c; }
+    return s;
+}
+
+double fabs(double x) { return x < 0.0 ? -x : x; }
+
+/* Params struct with math function addresses written by FNF at startup.    */
 typedef struct {
-    uint32_t lua_pushnumber_addr;
+    uint32_t lua_pushnumber_addr;   /* 0x0021EF24 on 1.7.17a                */
+    /* math functions resolved by FNF(math.*) -- firmware .text addresses   */
+    uint32_t sin_addr;
+    uint32_t cos_addr;
+    uint32_t tan_addr;
+    uint32_t asin_addr;
+    uint32_t acos_addr;
+    uint32_t atan_addr;
+    uint32_t atan2_addr;
+    uint32_t sqrt_addr;
+    uint32_t exp_addr;
+    uint32_t log_addr;
+    uint32_t log10_addr;
+    uint32_t floor_addr;
+    uint32_t ceil_addr;
+    /* per-frame data                                                        */
     uint32_t cap_chunk1;
     uint32_t cap_chunk2;
     uint32_t cap_n;
@@ -96,6 +145,8 @@ typedef struct {
     uint32_t out_desc_n_1;
     uint32_t plan_addr;
 } dsp_native_params;
+
+/* (old params struct removed; see the full definition above) */
 
 /* -------------------------------------------------------------------------
  * Reading buffer element access: 32-byte stride, reading double at offset 0.

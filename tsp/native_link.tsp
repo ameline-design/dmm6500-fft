@@ -110,15 +110,31 @@ local function u32_pack(v)
   return string.char(b1, b2, b3, b4)
 end
 
--- Build the dsp_native_params struct (40 bytes) and write it to fftsa.nl.params.
--- Called before each frame to update the chunk addresses.
--- field offsets match dsp_native.c dsp_native_params.
+-- Build and write the dsp_native_params struct.
+-- Field order matches dsp_native.c dsp_native_params exactly.
+-- Math function addresses are resolved by FNF at startup; memcpy/memset/fabs
+-- are implemented directly in dsp_native.c and need no address here.
 function fftsa.nl.write_params(cap_ch1, cap_ch2, cap_n,
                                 out_ch1, out_ch2,
                                 out_cursor, out_n0, out_n1,
                                 plan_addr)
   local fn = fftsa.nl.fn
   local s = u32_pack(fn.lua_pushnumber or 0)
+           -- math functions (firmware .text, resolved at startup by FNF)
+           .. u32_pack(fn.sin   or 0)
+           .. u32_pack(fn.cos   or 0)
+           .. u32_pack(fn.tan   or 0)
+           .. u32_pack(fn.asin  or 0)
+           .. u32_pack(fn.acos  or 0)
+           .. u32_pack(fn.atan  or 0)
+           .. u32_pack(fn.atan2 or 0)
+           .. u32_pack(fn.sqrt  or 0)
+           .. u32_pack(fn.exp   or 0)
+           .. u32_pack(fn.log   or 0)
+           .. u32_pack(fn.log10 or 0)
+           .. u32_pack(fn.floor or 0)
+           .. u32_pack(fn.ceil  or 0)
+           -- per-frame data
            .. u32_pack(cap_ch1 or 0)
            .. u32_pack(cap_ch2 or 0)
            .. u32_pack(cap_n or 0)
