@@ -39,7 +39,7 @@ OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
 # dsp_lua.tsp has to come before it or the call reaches a nil and the whole archive dies at
 # load with -286.
 MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
-           'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp', 'tsp/spectrum_app.tsp']
+           'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp', 'tsp/native_link.tsp', 'tsp/spectrum_app.tsp']
 
 # Panel icons: assets/<name>.png, embedded as their own loadimage block. The names are
 # NOT listed here -- script_images() reads them out of the modules' `fftsa.img_* = "name"`

@@ -1,0 +1,33 @@
+# Static analysis gate for dsp.c. The checks that find defects are on; the two families that
+# would ask for the interface to be reshaped are off, each with its reason.
+Checks: >
+  clang-analyzer-*,
+  cert-*,
+  bugprone-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-isolate-declaration,
+  -readability-braces-around-statements,
+  -readability-avoid-nested-conditional-operator,
+  -readability-math-missing-parentheses
+WarningsAsErrors: '*'
+HeaderFilterRegex: 'dsp\.h'
+FormatStyle: none
+#
+# bugprone-easily-swappable-parameters: flags 16 adjacent same-type parameters, which are the
+#   bin windows (k0, k1, kdc, want) and the dB limits (dbmin, dbmax, vfloor). Satisfying it
+#   means wrapping each group in a struct, which changes the registration shape every TSP
+#   entry point has to use and buys nothing a compiler can check. The documented argument
+#   order is the mitigation.
+# readability-identifier-length: re, im, twr, uti, m1, m2 are the names the algebra uses and
+#   the header derives; longer ones would make the butterfly unreadable.
+# readability-magic-numbers: the window coefficients and the 2.56 margin are constants with
+#   derivations in the header, not magic.
+# readability-math-missing-parentheses: would parenthesise the multiply-add expressions the
+#   FPU mapping depends on being written as written.

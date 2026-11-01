@@ -13,11 +13,18 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- Capability gate. The whole of the change when native dsp.* ships: the
--- firmware's own primitives are used when they are there, and the Lua
--- implementation is installed when they are not.
+-- Capability gate.  Three tiers, from fastest to slowest:
+--   1. native-dsp branch: our own compiled PPC DSP (no flicker, no Keithley clear).
+--      nl.ready is set by nl.init() called from fftsa.start(); it stays false until
+--      tsp/native_link.tsp has installed its binary.
+--   2. Keithley's native dsp.* module (fast, but clears sg_buf before each fill).
+--   3. Lua fallback installed by fftsa.dsp_install() (dsp_lua.tsp).
 fftsa.dsp_native = (dsp ~= nil and dsp.version ~= nil and dsp.version >= 1)
 if not fftsa.dsp_native then fftsa.dsp_install() end
+
+-- nl.ready is set by fftsa.nl.init() inside fftsa.start().  It is false here at
+-- load time so the frame body starts on the existing path without waiting.
+-- native_link.tsp is concatenated before this file in the package order.
 
 -- Here and not in fft_core.tsp because tools/package_tspa.py concatenates the modules into
 -- one loadscript chunk in a fixed order and there is no runtime module loading on this
@@ -424,15 +431,28 @@ function fftsa.frame_body()
   fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
   local npk = fftsa.dsp_live()
   fftsa.dsp_window()
-  -- FILTER, WINDOW, TRANSFORM, POWER, REDUCE, PEAKS, and the trace written and counted. The
-  -- primitive clears the destination itself: a clear-then-refill from out here opens a
-  -- window in which the graph paints a half-filled trace.
-  --
-  -- marks = nil deliberately. One point a peak on a STYLE_LINE trace draws a polyline
-  -- joining the peaks across the plot, and drawstyle is per graph, so the spectrum's own 255
-  -- points would get markers too. fftsa.sg_update_markers draws needles instead -- three
-  -- points a peak, a pixel either side -- from the same resolved table.
-  local nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+  -- Native path: the compiled DSP function writes the spectrum into sg_buf's chunk
+  -- storage in-place and rewinds the descriptor's cursor, so no buffer.clear()
+  -- happens and the graph does not flash blank between frames.
+  -- Falls back to dsp.spectrum when nl.ready is false (binary not installed yet).
+  local nseg
+  if fftsa.nl ~= nil and fftsa.nl.ready then
+    -- TODO: populate nl.write_params from the capture and output buffer descriptor
+    -- addresses discovered at startup.  The params struct already contains the
+    -- addresses written by nl.init(); this call updates per-frame fields.
+    nseg = fftsa.nl.call_dsp()
+    if nseg == nil then nseg = -1 end
+    -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
+    if nseg > 0 then
+      display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
+    end
+    -- binhz does not come from the native function yet; carry the last dsp.fft value.
+    -- TODO: return binhz from the params struct after the call.
+  else
+    -- Existing path: dsp.spectrum clears sg_buf internally before filling it.
+    -- marks = nil deliberately (see comment below).
+    nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+  end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
   -- ZERO SEGMENTS IS A SHORT RECORD, not a failure: nothing was written, the previous
   -- spectrum is still on screen, and a trigger timeout is the ordinary cause. Counted by the
@@ -441,10 +461,12 @@ function fftsa.frame_body()
     fftsa.shortreads = dsp.shortreads
     return
   end
-  -- MEASURED PER FRAME now, off the capture's own timestamps, where it used to be committed
-  -- once an Apply and refined once more. At the 0.01 % timebase wander that is a dither far
-  -- inside sg_pk_ftol, so the peak block does not redraw on it.
-  fftsa.binhz = dsp.fft.binwidth
+  -- binhz: from the native params after the call, or from dsp.fft.binwidth on the
+  -- existing path.  The native path sets this via TODO above once the params layout
+  -- is extended.
+  if not (fftsa.nl ~= nil and fftsa.nl.ready) then
+    fftsa.binhz = dsp.fft.binwidth
+  end
   -- Segments the widget was actually handed, from the primitive's own count rather than
   -- inferred from the buffer: clamped or overrun, the buffer's n ends at capacity either
   -- way, so only a counter can tell the two apart.
@@ -1677,14 +1699,18 @@ function fftsa.start()
   -- so one backstop per entry point stays until those paths are proved non-raising.
   local ok, err = pcall(function()
     fftsa.apply()
-    -- With the computed period, not the 0.05 s floor: apply() re-arms on a size change
-    -- but cannot do it here, because the timer is created after the first apply() runs.
-    -- Left at the floor, the default size kept whatever idle the quantisation happened
-    -- to leave -- which is the whole fault this period exists to remove.
     fftsa.period = fftsa.frame_period(fftsa.n)
     fftsa.arm(fftsa.period)
   end)
   if not ok then return fftsa.start_failed(tostring(err)) end
+
+  -- Attempt to initialise the native DSP path.  fftsa.cap is a live reading buffer
+  -- after apply(), so it serves as the IPC barrier buffer.
+  -- nl.ready stays false if the binary has not been loaded; the frame body falls back
+  -- to dsp.spectrum.
+  if fftsa.cap ~= nil and fftsa.nl ~= nil then
+    fftsa.nl.init(fftsa.cap)
+  end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
     display.settext(fftsa.sg_xunit, "WARNING: End App will not clean up")

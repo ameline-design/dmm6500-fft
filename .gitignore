@@ -43,7 +43,7 @@ out/
 __pycache__/
 *.pyc
 
-# DSP proposal work -- kept locally, deliberately not tracked
-csrc/
+# On main: csrc/ stays local (proposal stage).
+# On native-dsp: csrc/ is tracked -- the C code ships on the branch.
 docs/NATIVE-DSP-*
 tools/make_pdf.py
