@@ -33,7 +33,7 @@
  *
  * Params struct  (matches tsp/native_link.tsp nl.pack_params)
  * -----------------------------------------------------------
- *   +0   uint32  lua_pushnumber_addr  -- lua_pushnumber(L, v) on 1.7.17a: 0x0021EF40
+ *   +0   uint32  lua_pushnumber_addr  -- lua_pushnumber(L, f1) on 1.7.17a: 0x0021EF24
  *   +4   uint32  cap_chunk1           -- capture chunk 1 payload address
  *   +8   uint32  cap_chunk2           -- chunk 2, or 0
  *   +12  uint32  cap_n                -- N, power of two

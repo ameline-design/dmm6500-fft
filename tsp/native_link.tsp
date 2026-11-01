@@ -78,7 +78,7 @@ function fftsa.nl.resolve_math()
   -- lua_pushnumber is resolved from a function that wraps it; pick math.sqrt's wrapper
   -- and scan for the call with the opposite direction (wrapper calls pushnumber after
   -- the computation).  For now, use the known 1.7.17a address as the fallback.
-  fn.lua_pushnumber = 567232  -- 0x0021EF40 on 1.7.17a; FNF-based resolution TODO
+  fn.lua_pushnumber = 2223908  -- 0x0021EF24 on 1.7.17a (confirmed by disassembly)
   return found
 end
 
