@@ -96,12 +96,64 @@ typedef uint32_t    (*hexparse_fn)(const char *, int *);
 typedef void        (*lua_pushnumber_fn)(void *, double);
 
 /* -------------------------------------------------------------------------
+ * Address safety helpers
+ *
+ * The BAT windows decoded from the firmware's boot code (fwmem-PEEK.md)
+ * are hardware constants: the boot loader programs them once and they never
+ * change.  The heap range is firmware-build-specific but conservatively
+ * approximated; anything that is not heap is refused.
+ *
+ * Readable: DRAM (0x00000000-0x0FFFFFFF).  Not flash, not MMIO.
+ * Writable: heap only (~0x01000000-0x0E000000).  This excludes .text,
+ *   .rodata, .data, .bss, stacks, MMIO, and flash by a single range test.
+ *
+ * On a bounds failure memcpy/memset return without doing anything.  The
+ * caller has a bug and doing nothing is safer than touching a hardware
+ * register or corrupting a firmware section.
+ * -------------------------------------------------------------------------*/
+
+/* Invariant BAT-defined boundaries. */
+#define DRAM_END     0x10000000U  /* 256 MB DRAM window ends here              */
+#define MMIO_START   0x80000000U  /* first MMIO window (conservative lower)    */
+#define FLASH_START  0xFE000000U  /* 32 MB flash window                        */
+
+/* Conservative heap range: true heap is 0x01036000-0x0D836000 on 1.7.17a.
+ * This lower bound is above .bss (ends 0x00FE5548) and .text (ends ~0x00527xxx).
+ * The upper bound is below the stacks (0x0D836000+).                          */
+#define HEAP_LO  0x01000000U
+#define HEAP_HI  0x0E000000U
+
+static int addr_readable(const void *p, size_t n)
+{
+    uintptr_t a = (uintptr_t)p;
+    uintptr_t e = a + n;
+    if (n == 0)          { return 1; }
+    if (e < a)           { return 0; }   /* overflow                            */
+    if (a >= MMIO_START) { return 0; }   /* MMIO, flash, or unmapped            */
+    if (e > DRAM_END)    { return 0; }   /* straddles the DRAM ceiling          */
+    return 1;
+}
+
+static int addr_writable(const void *p, size_t n)
+{
+    uintptr_t a = (uintptr_t)p;
+    uintptr_t e = a + n;
+    if (n == 0)        { return 1; }
+    if (e < a)         { return 0; }   /* overflow                              */
+    if (a < HEAP_LO)   { return 0; }   /* .text, .rodata, .data, .bss, vectors  */
+    if (e > HEAP_HI)   { return 0; }   /* stacks, MMIO, flash                   */
+    return 1;
+}
+
+/* -------------------------------------------------------------------------
  * Self-contained implementations of the C runtime functions dsp.c needs
- * that are not discoverable through Lua wrappers.
+ * that are not discoverable through Lua wrappers.  Both check their address
+ * arguments before touching any memory.
  * -------------------------------------------------------------------------*/
 
 void *memcpy(void *dst, const void *src, size_t n)
 {
+    if (!addr_writable(dst, n) || !addr_readable(src, n)) { return dst; }
     unsigned char       *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
     while (n--) { *d++ = *s++; }
@@ -110,6 +162,7 @@ void *memcpy(void *dst, const void *src, size_t n)
 
 void *memset(void *s, int c, size_t n)
 {
+    if (!addr_writable(s, n)) { return s; }
     unsigned char *p = (unsigned char *)s;
     while (n--) { *p++ = (unsigned char)c; }
     return s;
