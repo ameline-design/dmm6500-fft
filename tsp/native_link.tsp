@@ -253,41 +253,38 @@ function fftsa.nl.init(barrier_buf)
   nl.params = code_base + 512
 
   -- 7. Install the DSP function bytes if provided.
+  --    The binary is purely .text: dsp_native_run is at offset 0 (CODE_BASE).
+  --    The params address is passed as arg 1 via the Lua stack, not via a global.
   if nl._DSP_CODE ~= nil and string.len(nl._DSP_CODE) > 0 then
     local dsp_code = nl._DSP_CODE
-    -- Write the binary (starts with the 4-byte params-address slot, then the code).
     ki.memwrite(string.format('%X', code_base), dsp_code)
     buffer.getstats(barrier_buf)
-    -- Flush via the trampoline.
+    -- Flush the DSP binary via the trampoline.
     local orig_h2 = ki.peek32(string.format('%X', cls+12))
     ki.poke32(string.format('%X', cls+12), string.format('%08X', tramp_addr))
     ki.peek8(string.format('%X', code_base),
              string.format('%X', string.len(dsp_code)))
     ki.poke32(string.format('%X', cls+12), orig_h2)
 
-    -- The params_addr slot is the first 4 bytes of the binary.
-    -- Write the params address there via ki.poke32.
-    ki.poke32(string.format('%X', code_base),
-              string.format('%08X', nl.params))
-
-    nl.dsp_entry = code_base + 4   -- entry point at binary offset 4
+    nl.dsp_entry = code_base   -- entry at binary offset 0
     nl.ready     = true
   end
 
   return nl.ready
 end
 
--- Redirect ki.peek8 to the native DSP function, call it, and restore.
--- The params struct must already be written via nl.write_params.
--- Returns nil until the binary is installed and nl.ready is true.
+-- Redirect ki.peek8 to the native DSP function, call it with the params address,
+-- and restore.  Returns the bin count (an integer), or nil on failure.
 function fftsa.nl.call_dsp()
   local nl = fftsa.nl
   if not nl.ready then return nil end
-  local cls_hex = string.format('%X', nl.peek8_cls + 12)
-  local orig_hex = string.format('%08X', nl.peek8_f)
+  local cls_hex    = string.format('%X', nl.peek8_cls + 12)
+  local orig_hex   = string.format('%08X', nl.peek8_f)
+  local params_hex = string.format('%X', nl.params)
   ki.poke32(cls_hex, string.format('%08X', nl.dsp_entry))
-  -- No stack arguments: the function reads nl.params via the global slot.
-  local result = ki.peek8('00')
+  -- Arg 1 on the Lua stack: the params struct address as a hex string.
+  -- dsp_native_run parses it with lua_tostring + hexparse (firmware addresses).
+  local result = ki.peek8(params_hex)
   ki.poke32(cls_hex, orig_hex)
   return result
 end

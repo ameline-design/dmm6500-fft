@@ -1,31 +1,25 @@
 /*
  * dsp_native.ld -- linker script for the DMM6500 native DSP binary.
  *
- * Places .native_header (dsp_native_params_addr) at the start, followed by
- * .text, .rodata and .data.  The result is a flat binary with:
+ * The binary is purely .text + .rodata; there are no globals so there is no
+ * .data section.  dsp_native_run is at offset 0, which is CODE_BASE at runtime.
  *
- *   [0x00]  dsp_native_params_addr  (4 bytes, initialised to 0)
- *   [0x04]  dsp_native_run entry point
- *   [...]   rest of .text from dsp.c, then .rodata, then .data
- *
- * The Lua startup code:
- *   1. ki.poke32(CODE_BASE + 0, params_addr)   -- write params address
- *   2. redirect ki.peek8 closure to CODE_BASE + 4  -- entry point
+ * The Lua startup redirects ki.peek8 to CODE_BASE and calls
+ *   ki.peek8(params_addr_hex)
+ * where params_addr_hex is the address of the dsp_native_params struct.
  *
  * Usage:
- *   powerpc-eabi-ld -T csrc/dsp_native.ld -r dsp_native.o dsp.o \
- *       -o dsp_native_linked.o
- *   powerpc-eabi-objcopy -O binary dsp_native_linked.o dsp_native.bin
+ *   cmake -B build-ppc -DCMAKE_TOOLCHAIN_FILE=csrc/toolchain-ppc-clang.cmake \
+ *         -DDSP_DST_NATIVE=ON
+ *   cmake --build build-ppc --target dsp_native_bin
+ *   # output: build-ppc/dsp_native.bin
  *
- * Use `powerpc-eabi-nm dsp_native_linked.o` to confirm:
- *   - dsp_native_params_addr at relative offset 0x0000
- *   - dsp_native_run at relative offset 0x0004
+ * Verify entry offset (should be 0x0000):
+ *   llvm-nm build-ppc/dsp_native_elf | grep dsp_native_run
  */
 SECTIONS {
     . = 0;
-    .native_header : { *(.native_header) }
-    .text          : { *(.text .text.*) }
-    .rodata        : { *(.rodata .rodata.*) }
-    .data          : { *(.data .data.*) }
-    /DISCARD/      : { *(.comment) *(.note*) *(.eh_frame*) *(.ARM.extab*) *(.ARM.exidx*) }
+    .text   : { *(.text.dsp_native_run) *(.text .text.*) }
+    .rodata : { *(.rodata .rodata.*) }
+    /DISCARD/ : { *(.data*) *(.bss*) *(.comment) *(.note*) *(.eh_frame*) }
 }

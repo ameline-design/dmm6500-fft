@@ -1,68 +1,88 @@
 /*
  * dsp_native.c  --  lua_CFunction glue between native_link and dsp.c.
  *
- * Compiled for PowerPC e300 and loaded into the instrument's heap via the trampoline
- * mechanism in tsp/native_link.tsp.  The entry point dsp_native_run replaces one frame
- * of dsp.spectrum (Keithley's service call) without the internal buffer.clear() that
- * causes flicker.
+ * Compiled for PowerPC e300c4 (big-endian) and loaded into the instrument's heap via
+ * the trampoline mechanism in tsp/native_link.tsp.
  *
- * Binary layout
- * -------------
- * The flat binary produced by objcopy begins with a 4-byte slot for the params address,
- * followed immediately by dsp_native_run at offset 4.  The Lua startup code writes the
- * params address to (CODE_BASE + 0) via ki.poke32, then redirects ki.peek8 to
- * (CODE_BASE + 4).
+ * Position independence
+ * --------------------
+ * The binary is loaded at a heap address chosen at startup (CODE_BASE).  Traditional
+ * -fPIC uses a GOT with relocation entries that a dynamic linker must apply; there is
+ * no dynamic linker here, so -fPIC cannot be used.
  *
- * The binary is linked with a linker script that places .native_header before .text.
+ * Instead the binary is made position-independent by construction:
+ *   - Internal calls use `bl offset` (PC-relative) and work wherever the binary lands.
+ *   - Calls to firmware functions use absolute addresses in the firmware's own .text,
+ *     which is always at the same addresses regardless of where our binary is.
+ *   - No global variables -- there is nothing in .data or .bss, so no absolute
+ *     references to our own binary.
  *
- *   [0x00]  dsp_native_params_addr  (uint32_t, zero until Lua writes it)
- *   [0x04]  dsp_native_run entry point
- *   [...]   rest of .text and .rodata from dsp.c
+ * The params address is passed as arg 1 on the Lua stack (a hex string), and parsed
+ * using lua_tostring + hexparse at their known 1.7.17a addresses.  These are firmware
+ * addresses, not binary-relative, so they remain correct at any load address.
+ *
+ * Binary layout (from dsp_native.ld)
+ * ------------------------------------
+ * No header slot is needed since we no longer use a global.  The flat binary is purely
+ * .text followed by .rodata; dsp_native_run is at offset 0.
+ *
+ *   [0x00]  dsp_native_run entry point
+ *   [...]   rest of .text from dsp.c, then .rodata
+ *
+ * The Lua side redirects ki.peek8 directly to CODE_BASE.
  *
  * Params struct  (matches tsp/native_link.tsp nl.pack_params)
  * -----------------------------------------------------------
- *   +0   uint32  lua_pushnumber_addr  -- lua_pushnumber(L, v); 1.7.17a: 0x0021EF40
+ *   +0   uint32  lua_pushnumber_addr  -- lua_pushnumber(L, v) on 1.7.17a: 0x0021EF40
  *   +4   uint32  cap_chunk1           -- capture chunk 1 payload address
  *   +8   uint32  cap_chunk2           -- chunk 2, or 0
  *   +12  uint32  cap_n                -- N, power of two
  *   +16  uint32  out_chunk1           -- graph buffer chunk 1 payload address
  *   +20  uint32  out_chunk2           -- chunk 2, or 0
- *   +24  uint32  out_desc_cursor      -- column descriptor +0x4C address (write cursor)
+ *   +24  uint32  out_desc_cursor      -- column descriptor +0x4C (write cursor)
  *   +28  uint32  out_desc_n_0         -- column descriptor +0x50 (n, first copy)
  *   +32  uint32  out_desc_n_1         -- column descriptor +0x60 (n, second copy)
- *   +36  uint32  plan_addr            -- dsp_plan in heap, init'd at startup
+ *   +36  uint32  plan_addr            -- dsp_plan in heap, initialised at startup
  *
- * Calling convention for dsp_native_run
- * ---------------------------------------
- * Standard PPC EABI / Lua CFunction: r3 = lua_State *L on entry; return count in r3.
- * The function pushes one number (bin count) and returns 1.
- * lua_pushnumber is called via an indirect call through the resolved address in params.
+ * Firmware addresses (1.7.17a -- rebuild dsp_native.bin for other firmware)
+ * ---------------------------------------------------------------------------
+ * LUA_TOSTRING  0x0021E868   lua_tostring(L, n) -> const char* in r3
+ * HEXPARSE      0x004BFE9C   hexparse(str, &err) -> uint32 in r3
+ * LUA_PUSHNUMBER resolved from params->lua_pushnumber_addr (written by FNF at startup)
  *
- * Build
- * -----
- *   powerpc-eabi-gcc -mcpu=e300c2 -mhard-float -Os -fno-common -fPIE \
- *       -DSP_DOUBLE -DDSP_CHECK_OVERLAP=0 -I csrc \
- *       -c csrc/dsp_native.c csrc/dsp.c
- *   powerpc-eabi-ld -T csrc/dsp_native.ld -r dsp_native.o dsp.o \
- *       -o dsp_native_linked.o
- *   powerpc-eabi-objcopy -O binary dsp_native_linked.o dsp_native.bin
+ * Build (requires clang with PPC backend + ld.lld)
+ * ------------------------------------------------
+ *   cmake -B build-ppc -DCMAKE_TOOLCHAIN_FILE=csrc/toolchain-ppc-clang.cmake \
+ *         -DDSP_DST_NATIVE=ON
+ *   cmake --build build-ppc --target dsp_native_bin
  *
- *   # Find the offset of dsp_native_params_addr in the flat binary:
- *   powerpc-eabi-nm dsp_native_linked.o | grep dsp_native_params_addr
- *   # Subtract the link address to get the file offset; that is CODE_BASE + offset.
+ * Then set fftsa.nl._DSP_CODE in native_link.tsp to the contents of
+ * build-ppc/dsp_native.bin.
  */
 
 #include <stdint.h>
 #include "dsp.h"
 
 /* -------------------------------------------------------------------------
- * Type used for Lua function pointers.  The only signature needed here is
- * lua_pushnumber, which takes (lua_State*, double) and returns void.
+ * Firmware function addresses (1.7.17a).
+ *
+ * These are in the firmware's .text which is always at fixed addresses.
+ * They are position-independent: correct at any load address for our binary.
+ * For other firmware versions, update these and rebuild.
  * -------------------------------------------------------------------------*/
-typedef void (*lua_pushnumber_fn)(void *L, double v);
+
+/* lua_tostring(lua_State *L, int n) -> const char *  */
+#define LUA_TOSTRING_ADDR  0x0021E868u
+
+/* hexparse(const char *str, int *err) -> uint32_t    */
+#define HEXPARSE_ADDR      0x004BFE9Cu
+
+typedef const char *(*lua_tostring_fn)(void *, int);
+typedef uint32_t    (*hexparse_fn)(const char *, int *);
+typedef void        (*lua_pushnumber_fn)(void *, double);
 
 /* -------------------------------------------------------------------------
- * Params struct (layout matches tsp/native_link.tsp nl.pack_params).
+ * Params struct.
  * -------------------------------------------------------------------------*/
 typedef struct {
     uint32_t lua_pushnumber_addr;
@@ -78,21 +98,7 @@ typedef struct {
 } dsp_native_params;
 
 /* -------------------------------------------------------------------------
- * The 4-byte params-address slot placed before dsp_native_run by the linker
- * script.  Initialised to zero; the Lua side writes the actual params address
- * via ki.poke32(CODE_BASE, params_addr_hex) before the first call.
- * -------------------------------------------------------------------------*/
-/* Placed at offset 0 in the flat binary by the ELF linker script dsp_native.ld.
- * The section attribute is silenced on non-ELF hosts; the host build is only used
- * to check that the source compiles, not to run it.                                 */
-#ifdef __ELF__
-uint32_t dsp_native_params_addr __attribute__((section(".native_header"))) = 0;
-#else
-uint32_t dsp_native_params_addr = 0;
-#endif
-
-/* -------------------------------------------------------------------------
- * Reading buffer element access: elements are 32 bytes, reading double at +0.
+ * Reading buffer element access: 32-byte stride, reading double at offset 0.
  * A chunk holds 1024 elements (32 768-byte payload).
  * -------------------------------------------------------------------------*/
 static inline double rb_read(uint32_t ch1, uint32_t ch2, int k)
@@ -104,7 +110,7 @@ static inline double rb_read(uint32_t ch1, uint32_t ch2, int k)
         base = (const double *)(uintptr_t)ch2;
         k   -= 1024;
     }
-    return base[(size_t)k * 4u];          /* stride 4 doubles = 32 bytes */
+    return base[(size_t)k * 4U];   /* stride 4 doubles = 32 bytes */
 }
 
 static inline void rb_write(uint32_t ch1, uint32_t ch2, int k, double v)
@@ -116,38 +122,45 @@ static inline void rb_write(uint32_t ch1, uint32_t ch2, int k, double v)
         base = (double *)(uintptr_t)ch2;
         k   -= 1024;
     }
-    base[(size_t)k * 4u] = v;
+    base[(size_t)k * 4U] = v;
 }
 
 /* -------------------------------------------------------------------------
  * Entry point.
+ *
+ * Arg 1 on the Lua stack: params_addr (hex string).
+ * Pushes one number (bin count) and returns 1.
  * -------------------------------------------------------------------------*/
 int dsp_native_run(void *L)
 {
-    uint32_t paddr = dsp_native_params_addr;
-    if (paddr == 0u) { return 0; }
+    /* Parse the params address from arg 1 on the Lua stack.
+     * lua_tostring and hexparse are called via function pointers built from
+     * their known firmware addresses.  No globals in our binary.             */
+    lua_tostring_fn  lts  = (lua_tostring_fn)(uintptr_t)LUA_TOSTRING_ADDR;
+    hexparse_fn      hp   = (hexparse_fn)(uintptr_t)HEXPARSE_ADDR;
+
+    const char *arg1 = lts(L, 1);
+    if (arg1 == NULL) { return 0; }
+    int parse_err = 0;
+    uint32_t paddr = hp(arg1, &parse_err);
+    if (parse_err) { return 0; }
 
     const dsp_native_params *p = (const dsp_native_params *)(uintptr_t)paddr;
     dsp_plan *plan = (dsp_plan *)(uintptr_t)p->plan_addr;
     if (plan == NULL || plan->n == 0) { return 0; }
 
     int n = (int)p->cap_n;
-    int m = plan->m;                 /* N/2 bins */
+    int m = plan->m;
     if (n != plan->n) { return 0; }
 
-    /* ------------------------------------------------------------------
-     * Build a flat double array from the strided capture chunk storage.
-     * The plan's fir_out pointer is reused as scratch when decim == 1
-     * (in which case dsp_plan_init leaves it NULL and we must not use it).
-     * We place the scratch right after the plan struct, 32-byte aligned.
-     * The plan and its scratch live in the same arena block; the Lua
-     * startup must size it to include n doubles of extra space.
-     * ------------------------------------------------------------------ */
+    /* Place the flat source array immediately after the plan, 32-byte aligned.
+     * The Lua startup must size the plan arena to include n doubles of scratch.  */
     uintptr_t plan_end = (uintptr_t)plan + sizeof(dsp_plan);
     plan_end = (plan_end + (uintptr_t)(DSP_ALIGN - 1))
                & ~(uintptr_t)(DSP_ALIGN - 1);
     double *src_flat = (double *)plan_end;
 
+    /* Extract readings from strided chunk storage into the flat array.           */
     {
         int k;
         for (k = 0; k < n; k++) {
@@ -158,10 +171,7 @@ int dsp_native_run(void *L)
     int nbins = dsp_spectrum_run(plan, src_flat, n, NULL);
     if (nbins <= 0) { return 0; }
 
-    /* ------------------------------------------------------------------
-     * Write the power spectrum (plan->pwr) to the graph buffer's chunk
-     * storage, reading the double directly since DSP_DOUBLE is defined.
-     * ------------------------------------------------------------------ */
+    /* Write power spectrum to graph buffer chunk storage.                        */
     {
         int k;
         for (k = 0; k < m; k++) {
@@ -169,38 +179,28 @@ int dsp_native_run(void *L)
         }
     }
 
-    /* ------------------------------------------------------------------
-     * Cursor-rewind: put the column descriptor's write cursor and n back
-     * to the start so the graph widget sees a buffer that was "just filled"
-     * from element 0, without a buffer.clear().  The descriptor fields are
-     * the two iterator copies (+0x4C and +0x5C per fwmem-BUFFER.md).
-     * We update only the first n copy here; the Lua notify (scaletrace or
-     * drawstyle) triggers the widget re-read.
-     * ------------------------------------------------------------------ */
-    if (p->out_desc_cursor != 0u) {
-        /* Cursor points to the slot AFTER the last write.  m writes from
-         * chunk1 land the cursor at chunk1 + m*32 bytes when m <= 1024,
-         * or into chunk2 otherwise.                                        */
+    /* Cursor-rewind: advance the write cursor to slot m so the firmware knows
+     * m elements have been written, without issuing a buffer.clear().
+     * Two n-copies are updated; fwmem-BUFFER.md confirms these are the fields
+     * the graph widget tests.                                                    */
+    if (p->out_desc_cursor != 0U) {
         uint32_t new_cur;
         if (m <= 1024) {
-            new_cur = p->out_chunk1 + (uint32_t)m * 32u;
+            new_cur = p->out_chunk1 + (uint32_t)m * 32U;
         } else {
-            new_cur = p->out_chunk2 + (uint32_t)(m - 1024) * 32u;
+            new_cur = p->out_chunk2 + (uint32_t)(m - 1024) * 32U;
         }
         *(volatile uint32_t *)(uintptr_t)p->out_desc_cursor = new_cur;
     }
-    if (p->out_desc_n_0 != 0u) {
+    if (p->out_desc_n_0 != 0U) {
         *(volatile uint32_t *)(uintptr_t)p->out_desc_n_0 = (uint32_t)m;
     }
-    if (p->out_desc_n_1 != 0u) {
+    if (p->out_desc_n_1 != 0U) {
         *(volatile uint32_t *)(uintptr_t)p->out_desc_n_1 = (uint32_t)m;
     }
 
-    /* ------------------------------------------------------------------
-     * Push the bin count onto the Lua stack and return 1.
-     * lua_pushnumber address comes from params; on 1.7.17a it is 0x0021EF40.
-     * ------------------------------------------------------------------ */
-    if (p->lua_pushnumber_addr != 0u) {
+    /* Push the bin count and return 1 value.                                     */
+    if (p->lua_pushnumber_addr != 0U) {
         lua_pushnumber_fn push =
             (lua_pushnumber_fn)(uintptr_t)p->lua_pushnumber_addr;
         push(L, (double)nbins);
