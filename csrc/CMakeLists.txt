@@ -259,6 +259,28 @@ foreach(variant IN ITEMS single double)
   target_compile_options(dsp_bench_${variant} PRIVATE ${DSP_C_FLAGS} ${DSP_FP_FLAGS})
 endforeach()
 
+# The address bounds the native entry point guards every write with. A host test,
+# deliberately: the instrument cannot be asked whether a write to a device register is
+# refused without performing it when the answer is no. Built for the host even when the
+# PPC target is not configured, because this is the gate that runs before instrument time.
+add_executable(dsp_native_bounds_test test/dsp_native_bounds_test.cc)
+target_include_directories(dsp_native_bounds_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(dsp_native_bounds_test PRIVATE GTest::gtest_main)
+target_compile_options(dsp_native_bounds_test PRIVATE ${DSP_CXX_FLAGS})
+add_test(NAME dsp_native_bounds COMMAND dsp_native_bounds_test)
+
+# The relocation applier runs on the instrument under Lua 5.0.2, where a wrong patch is a
+# silently wrong address rather than a failure. Its checks run against hand-computed
+# answers, including the ADDR16_HA carry boundary. Not gated on the PPC target: it tests
+# Lua, and it is a gate that should run on every build.
+find_program(LUA502 lua HINTS $ENV{HOME}/tmp/lua502/lua-5.0.2/bin NO_DEFAULT_PATH)
+if(LUA502)
+  add_test(NAME relocate_applier
+           COMMAND ${LUA502} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_relocate.lua)
+else()
+  message(STATUS "Lua 5.0.2 not found; the relocate_applier gate will not run")
+endif()
+
 # ---------------------------------------------------------------------------
 # PPC cross-compilation target for the DMM6500 instrument.
 #
@@ -278,7 +300,12 @@ if(DSP_DST_NATIVE)
   add_executable(dsp_native_elf
       dsp_native.c
       dsp.c)
-  target_include_directories(dsp_native_elf PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+  # freestanding/ first: the bare powerpc-unknown-elf triple ships no C library headers,
+  # so <math.h> and <string.h> come from there. They declare only what dsp.c calls, and
+  # dsp_native.c defines every one of them.
+  target_include_directories(dsp_native_elf PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}/freestanding
+      ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_definitions(dsp_native_elf PUBLIC
       DSP_DOUBLE
       DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
@@ -289,24 +316,30 @@ if(DSP_DST_NATIVE)
       -Wall -Wextra -Wconversion -Wdouble-promotion
       -ffp-contract=off
       -fno-builtin)
-  # Final link: -r retains relocations and cannot produce a working flat binary.
-  # Use a final link with -nostdlib and --unresolved-symbols=report-all so any
-  # unresolved external (e.g. libm functions in dsp.c) is a build error, not
-  # a silent wrong-address branch.
+  # --unresolved-symbols=report-all so a libm call dsp.c makes that dsp_native.c does not
+  # define is a build error rather than a branch to address zero.
+  #
+  # --emit-relocs keeps the .rela sections in the linked image. They are what
+  # emit_reloc.py turns into the table the Lua loader applies: the image carries 355
+  # absolute data references, and without the table every float constant, the error
+  # string table and dsp_wincos read from the link-time address instead of the load
+  # address. Do not strip, and do not drop this flag.
   target_link_options(dsp_native_elf PRIVATE
       -T ${CMAKE_CURRENT_SOURCE_DIR}/dsp_native.ld
       -nostdlib
       -e dsp_native_run
       --no-dynamic-linker
-      -Wl,--unresolved-symbols=report-all)
-  # No -lm: dsp.c's math calls (floor, ceil, sqrt, sin, cos, log10) must be
-  # satisfied by implementations in dsp_native.c itself, not from the host.
-  # See csrc/README.md for the function-pointer-table approach.
+      -Wl,--unresolved-symbols=report-all
+      -Wl,--emit-relocs)
 
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_custom_command(
-      OUTPUT dsp_native.bin
-      COMMAND ${CMAKE_OBJCOPY} -O binary dsp_native_elf dsp_native.bin
-      DEPENDS dsp_native_elf
-      COMMENT "Producing flat binary dsp_native.bin")
-  add_custom_target(dsp_native_bin ALL DEPENDS dsp_native.bin)
+      OUTPUT dsp_native.bin dsp_native_reloc.lua
+      COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
+              $<TARGET_FILE:dsp_native_elf>
+              --stem ${CMAKE_CURRENT_BINARY_DIR}/dsp_native
+      DEPENDS dsp_native_elf ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
+      COMMENT "Emitting dsp_native.bin and its relocation table")
+  add_custom_target(dsp_native_bin ALL DEPENDS dsp_native.bin dsp_native_reloc.lua)
 endif()

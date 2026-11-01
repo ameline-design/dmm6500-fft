@@ -33,22 +33,26 @@ set(CMAKE_C_COMPILER   "${LLVM_CLANG}")
 set(CMAKE_CXX_COMPILER "${LLVM_CLANG}++")
 set(CMAKE_ASM_COMPILER "${LLVM_CLANG}")
 
+# No -mabi=: clang rejects it for this triple ("unsupported option '-mabi='") and does not
+# need it. powerpc-unknown-elf already selects the 32-bit System V EABI, which is the
+# convention the firmware's own code uses.
 set(CLANG_TARGET "powerpc-unknown-elf")
 set(COMMON_FLAGS
     "--target=${CLANG_TARGET} -mcpu=603e -mhard-float -mbig-endian \
-     -mabi=sysv -ffreestanding -fno-PIC")
+     -ffreestanding -fno-PIC")
 
 set(CMAKE_C_FLAGS_INIT   "${COMMON_FLAGS}")
 set(CMAKE_CXX_FLAGS_INIT "${COMMON_FLAGS}")
 set(CMAKE_ASM_FLAGS_INIT "${COMMON_FLAGS}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "")
 
-# llvm-objcopy and ld.lld from the same brew prefix.
 find_program(LLVM_OBJCOPY llvm-objcopy
     HINTS /opt/homebrew/opt/llvm/bin /usr/local/opt/llvm/bin
     REQUIRED)
 set(CMAKE_OBJCOPY "${LLVM_OBJCOPY}")
 
+# ld.lld ships in the `lld` formula, not in `llvm`: a brew llvm install alone leaves it
+# missing and the configure step then fails here. Install it with `brew install lld`.
 find_program(LLVM_LD ld.lld
     HINTS /opt/homebrew/opt/lld/bin /opt/homebrew/opt/llvm/bin
           /usr/local/opt/lld/bin

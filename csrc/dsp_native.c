@@ -2,88 +2,56 @@
  * dsp_native.c  --  lua_CFunction glue between native_link and dsp.c.
  *
  * Compiled for PowerPC e300c4 (big-endian) and loaded into the instrument's heap via
- * the trampoline mechanism in tsp/native_link.tsp.
+ * the mechanism in tsp/native_link.tsp.
  *
- * Position independence
- * --------------------
- * The binary is loaded at a heap address chosen at startup (CODE_BASE).  Traditional
- * -fPIC uses a GOT with relocation entries that a dynamic linker must apply; there is
- * no dynamic linker here, so -fPIC cannot be used.
+ * Load address and relocation
+ * ---------------------------
+ * The binary lands at a heap address chosen at startup, so it has to tolerate being
+ * somewhere other than where it was linked.  Function calls are PC-relative and need
+ * nothing, but on PPC32 a data reference is `lis rX,hi` + `lfd fY,lo(rX)` -- an absolute
+ * address fixed at link time.  dsp.c alone emits 355 of those, for its float constants,
+ * its string table and its window coefficient table.
  *
- * Instead the binary is made position-independent by construction:
- *   - Internal calls use `bl offset` (PC-relative) and work wherever the binary lands.
- *   - Calls to firmware functions use absolute addresses in the firmware's own .text,
- *     which is always at the same addresses regardless of where our binary is.
- *   - No global variables -- there is nothing in .data or .bss, so no absolute
- *     references to our own binary.
+ * They are fixed up at install time: the build emits a relocation table beside the
+ * binary, and nl.relocate() patches each immediate for the real load address before the
+ * first call.  See csrc/tools/emit_reloc.py and fftsa.nl.relocate.
  *
- * The params address is passed as arg 1 on the Lua stack (a hex string), and parsed
- * using lua_tostring + hexparse at their known 1.7.17a addresses.  These are firmware
- * addresses, not binary-relative, so they remain correct at any load address.
+ * Because relocation runs, this file may use globals -- their absolute references are
+ * patched like any other.  The math function pointers below are globals for that reason;
+ * threading them through every dsp.c call site would be the alternative.
  *
- * Binary layout (from dsp_native.ld)
- * ------------------------------------
- * No header slot is needed since we no longer use a global.  The flat binary is purely
- * .text followed by .rodata; dsp_native_run is at offset 0.
+ * Memory safety
+ * -------------
+ * Every address this code writes through arrives from Lua in the params struct, so
+ * every one is validated before use, at entry, against two independent bounds:
  *
- *   [0x00]  dsp_native_run entry point
- *   [...]   rest of .text from dsp.c, then .rodata
+ *   1. The region Lua declares it owns (params->wr_lo .. wr_hi), which is the chunk
+ *      storage of buffers the app allocated.
+ *   2. A compiled-in backstop of the documented heap extent, so a params struct that
+ *      is garbage cannot widen the window.
  *
- * The Lua side redirects ki.peek8 directly to CODE_BASE.
+ * A write that fails either test aborts the call with a negative status.  Nothing is
+ * written before every pointer has passed, so a refusal leaves memory untouched.
  *
- * Params struct  (matches tsp/native_link.tsp nl.pack_params)
+ * Params struct  (matches tsp/native_link.tsp nl.write_params)
  * -----------------------------------------------------------
- *   +0   uint32  lua_pushnumber_addr  -- lua_pushnumber(L, f1) on 1.7.17a: 0x0021EF24
- *   +4   uint32  cap_chunk1           -- capture chunk 1 payload address
- *   +8   uint32  cap_chunk2           -- chunk 2, or 0
- *   +12  uint32  cap_n                -- N, power of two
- *   +16  uint32  out_chunk1           -- graph buffer chunk 1 payload address
- *   +20  uint32  out_chunk2           -- chunk 2, or 0
- *   +24  uint32  out_desc_cursor      -- column descriptor +0x4C (write cursor)
- *   +28  uint32  out_desc_n_0         -- column descriptor +0x50 (n, first copy)
- *   +32  uint32  out_desc_n_1         -- column descriptor +0x60 (n, second copy)
- *   +36  uint32  plan_addr            -- dsp_plan in heap, initialised at startup
+ * Field order here and in write_params must agree exactly; see DSP_NATIVE_PARAM_WORDS.
  *
- * Firmware addresses (1.7.17a -- rebuild dsp_native.bin for other firmware)
- * ---------------------------------------------------------------------------
+ * Firmware addresses (1.7.17a -- update for other builds)
+ * ------------------------------------------------------
  * LUA_TOSTRING  0x0021E868   lua_tostring(L, n) -> const char* in r3
  * HEXPARSE      0x004BFE9C   hexparse(str, &err) -> uint32 in r3
- * LUA_PUSHNUMBER resolved from params->lua_pushnumber_addr (written by FNF at startup)
+ * lua_pushnumber arrives in the params struct; FNF resolves it at startup.
  *
- * Build (requires clang with PPC backend + ld.lld)
- * ------------------------------------------------
+ * Build
+ * -----
  *   cmake -B build-ppc -DCMAKE_TOOLCHAIN_FILE=csrc/toolchain-ppc-clang.cmake \
  *         -DDSP_DST_NATIVE=ON
  *   cmake --build build-ppc --target dsp_native_bin
- *
- * Then set fftsa.nl._DSP_CODE in native_link.tsp to the contents of
- * build-ppc/dsp_native.bin.
  */
 
 #include <stdint.h>
 #include "dsp.h"
-
-/* -------------------------------------------------------------------------
- * Library function strategy
- * -------------------------
- * Two classes of external function:
- *
- * 1. Firmware math functions (sin, cos, tan, asin, acos, atan, atan2, sqrt,
- *    exp, log, log10, floor, ceil): resolved at app startup via FNF scanning
- *    the Lua math wrappers.  Any firmware that runs Lua's math.* exposes them
- *    at discoverable, firmware-version-independent addresses.  Their addresses
- *    arrive in the params struct.
- *
- * 2. memcpy, memset, fabs: not exposed through Lua wrappers, so no reliable
- *    runtime discovery path exists.  Implemented directly below instead.
- *    These trivial implementations are fast enough for DSP init and setup;
- *    the hot loops in dsp.c use only math operations and array accesses.
- *
- * lua_tostring and hexparse are firmware addresses hardcoded below; they are
- * needed to parse the params address off the Lua stack, before the params
- * struct (which would carry discovered addresses) can be read.  For new
- * firmware builds, update them here and rebuild.
- * -------------------------------------------------------------------------*/
 
 /* lua_tostring(lua_State *L, int n) -> const char *  1.7.17a */
 #define LUA_TOSTRING_ADDR  0x0021E868u
@@ -94,222 +62,387 @@
 typedef const char *(*lua_tostring_fn)(void *, int);
 typedef uint32_t    (*hexparse_fn)(const char *, int *);
 typedef void        (*lua_pushnumber_fn)(void *, double);
+typedef double      (*math1_fn)(double);
+
+/* The address bounds and the predicates built on them.  In a header of their own so the
+ * host suite tests the code that ships rather than a copy of it; see
+ * test/dsp_native_bounds_test.cc, which covers every forbidden region by name. */
+#include "dsp_native_bounds.h"
+
+#define HEAP_LO   DSPN_HEAP_LO
+#define HEAP_HI   DSPN_HEAP_HI
+#define DRAM_END  DSPN_DRAM_END
+
+/* Status pushed back to Lua.  Non-negative is a bin count; negative is a refusal. */
+#define DSPN_OK            0
+#define DSPN_EMAGIC      (-1)
+#define DSPN_EBOUNDS     (-2)
+#define DSPN_EPLAN       (-3)
+#define DSPN_EGEOM       (-4)
+#define DSPN_ECAPTURE    (-5)
+#define DSPN_EOUTPUT     (-6)
+#define DSPN_EDESC       (-7)
+#define DSPN_EARENA      (-8)
+#define DSPN_ESCRATCH    (-9)
+#define DSPN_ERUN       (-10)
+#define DSPN_EMATH      (-11)
+
+#define DSP_NATIVE_MAGIC  0x44535031U   /* 'DSP1' */
+
+typedef struct {
+    uint32_t magic;        /* DSP_NATIVE_MAGIC, or the struct was never written     */
+    uint32_t mode;         /* DSPN_MODE_INIT or DSPN_MODE_RUN                       */
+
+    /* The plan, the capture and the graph buffer are three separate allocations, so
+     * each gets its own window rather than one span loose enough to cover all three. */
+    uint32_t wr_lo;        /* plan struct, arena and scratch                        */
+    uint32_t wr_hi;        /* one past the end                                      */
+    uint32_t rd_lo;        /* capture chunk storage, read only                      */
+    uint32_t rd_hi;
+    uint32_t out_lo;       /* graph buffer chunk storage                            */
+    uint32_t out_hi;
+    uint32_t arena_lo;     /* plan arena; every plan pointer must lie inside        */
+    uint32_t arena_hi;
+
+    uint32_t plan_addr;    /* dsp_plan, initialised by dsp_plan_init at startup      */
+    uint32_t src_flat;     /* scratch for the de-strided capture, cap_n doubles      */
+
+    uint32_t cap_chunk1;   /* capture chunk payloads, stride 32, reading at +0       */
+    uint32_t cap_chunk2;   /* 0 when the capture fits one chunk                     */
+    uint32_t cap_n;        /* samples, a power of two                               */
+    uint32_t cap_perchunk; /* elements per chunk, from the descriptor               */
+
+    uint32_t out_chunk1;   /* graph buffer chunk payloads                           */
+    uint32_t out_chunk2;
+    uint32_t out_perchunk;
+    uint32_t out_desc;     /* column descriptor base; the fields written are at the  */
+                           /* offsets below, so one address is validated not three   */
+
+    uint32_t lua_pushnumber_addr;
+
+    /* Firmware math addresses resolved by FNF; copied into the globals below.      */
+    uint32_t sin_addr;
+    uint32_t cos_addr;
+    uint32_t sqrt_addr;
+    uint32_t log10_addr;
+    uint32_t floor_addr;
+    uint32_t ceil_addr;
+
+    /* DSPN_MODE_INIT only.  beta arrives scaled by 1000 because the struct is packed
+     * from Lua as big-endian words and Lua 5.0.2 has no way to lay out an IEEE754
+     * double; milli-resolution is far finer than the window needs. */
+    uint32_t init_kind;
+    uint32_t init_beta_milli;
+    uint32_t init_decim;
+    uint32_t init_method;
+} dsp_native_params;
+
+#define DSPN_MODE_INIT   1U
+#define DSPN_MODE_RUN    2U
+#define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; touches no memory */
+
+/* Words in the struct; write_params must pack exactly this many. */
+#define DSP_NATIVE_PARAM_WORDS  31
+
+/* Column descriptor field offsets, from fwmem-BUFFER.md.  The write cursor and two of
+ * the copies of n.  The remaining fields the descriptor carries -- the second iterator,
+ * the lagging pointer and index, and four further copies of n -- are not written yet;
+ * experiment E7 measures whether the graph needs them before the notify holds. */
+#define DESC_CURSOR  0x4CU
+#define DESC_N_0     0x50U
+#define DESC_N_1     0x60U
+#define DESC_SPAN    0x64U   /* past the last field written */
 
 /* -------------------------------------------------------------------------
- * Address safety helpers
- *
- * The BAT windows decoded from the firmware's boot code (fwmem-PEEK.md)
- * are hardware constants: the boot loader programs them once and they never
- * change.  The heap range is firmware-build-specific but conservatively
- * approximated; anything that is not heap is refused.
- *
- * Readable: DRAM (0x00000000-0x0FFFFFFF).  Not flash, not MMIO.
- * Writable: heap only (~0x01000000-0x0E000000).  This excludes .text,
- *   .rodata, .data, .bss, stacks, MMIO, and flash by a single range test.
- *
- * On a bounds failure memcpy/memset return without doing anything.  The
- * caller has a bug and doing nothing is safer than touching a hardware
- * register or corrupting a firmware section.
+ * Bounds helpers.  Each takes a byte range and answers whether it is permitted.
+ * A zero-length range is permitted anywhere: it touches nothing.
  * -------------------------------------------------------------------------*/
 
-/* Invariant BAT-defined boundaries. */
-#define DRAM_END     0x10000000U  /* 256 MB DRAM window ends here              */
-#define MMIO_START   0x80000000U  /* first MMIO window (conservative lower)    */
-#define FLASH_START  0xFE000000U  /* 32 MB flash window                        */
+#define range_ok(a, n, lo, hi)  dspn_range_ok((a), (n), (lo), (hi))
+#define text_ok(a)              dspn_text_ok(a)
 
-/* Conservative heap range: true heap is 0x01036000-0x0D836000 on 1.7.17a.
- * This lower bound is above .bss (ends 0x00FE5548) and .text (ends ~0x00527xxx).
- * The upper bound is below the stacks (0x0D836000+).                          */
-#define HEAP_LO  0x01000000U
-#define HEAP_HI  0x0E000000U
-
-static int addr_readable(const void *p, size_t n)
+/* Writable: inside the plan window Lua declared, and inside the documented heap. */
+static int wr_ok(const dsp_native_params *p, uint32_t a, uint32_t n)
 {
-    uintptr_t a = (uintptr_t)p;
-    uintptr_t e = a + n;
-    if (n == 0)          { return 1; }
-    if (e < a)           { return 0; }   /* overflow                            */
-    if (a >= MMIO_START) { return 0; }   /* MMIO, flash, or unmapped            */
-    if (e > DRAM_END)    { return 0; }   /* straddles the DRAM ceiling          */
-    return 1;
+    return dspn_write_ok(a, n, p->wr_lo, p->wr_hi);
 }
 
-static int addr_writable(const void *p, size_t n)
+/* Strided element ranges: k elements of `stride` bytes from base.  The capture is read
+ * and the output is written, so the two sides go through different gates. */
+static int stride_ok_out(const dsp_native_params *p, uint32_t base,
+                         uint32_t k, uint32_t stride)
 {
-    uintptr_t a = (uintptr_t)p;
-    uintptr_t e = a + n;
-    if (n == 0)        { return 1; }
-    if (e < a)         { return 0; }   /* overflow                              */
-    if (a < HEAP_LO)   { return 0; }   /* .text, .rodata, .data, .bss, vectors  */
-    if (e > HEAP_HI)   { return 0; }   /* stacks, MMIO, flash                   */
-    return 1;
+    return dspn_stride_ok(base, k, stride, p->out_lo, p->out_hi, 1);
+}
+
+static int stride_ok_rd(const dsp_native_params *p, uint32_t base,
+                        uint32_t k, uint32_t stride)
+{
+    return dspn_stride_ok(base, k, stride, p->rd_lo, p->rd_hi, 0);
 }
 
 /* -------------------------------------------------------------------------
- * Self-contained implementations of the C runtime functions dsp.c needs
- * that are not discoverable through Lua wrappers.  Both check their address
- * arguments before touching any memory.
+ * Math functions dsp.c calls.  The firmware's GHS library provides them at
+ * addresses FNF resolves at startup; these globals are filled from the params
+ * struct on entry and are valid because relocation has patched the references
+ * to them.  All take and return a double in f1.
  * -------------------------------------------------------------------------*/
+static math1_fn g_sin;
+static math1_fn g_cos;
+static math1_fn g_sqrt;
+static math1_fn g_log10;
+static math1_fn g_floor;
+static math1_fn g_ceil;
 
-void *memcpy(void *dst, const void *src, size_t n)
-{
-    if (!addr_writable(dst, n) || !addr_readable(src, n)) { return dst; }
-    unsigned char       *d = (unsigned char *)dst;
-    const unsigned char *s = (const unsigned char *)src;
-    while (n--) { *d++ = *s++; }
-    return dst;
-}
+double sin(double x)   { return g_sin(x);   }
+double cos(double x)   { return g_cos(x);   }
+double sqrt(double x)  { return g_sqrt(x);  }
+double log10(double x) { return g_log10(x); }
+double floor(double x) { return g_floor(x); }
+double ceil(double x)  { return g_ceil(x);  }
 
+/* fabs is a sign-bit clear, cheaper inline than a call through the table. */
+double fabs(double x) { return x < 0.0 ? -x : x; }
+
+/*
+ * memset is the only C runtime function dsp.c calls, at seven sites, all of the form
+ * memset(p, 0, sizeof(*p)) on a struct.  Three of those zero a caller-supplied out
+ * struct, which dsp.c's callers put on the stack, and dsp.c documents that zeroing as a
+ * contract: a caller that reads the struct after an error sees zeros rather than the
+ * previous frame's figures.
+ *
+ * So this is deliberately unguarded.  A bounds test here would refuse the stack writes
+ * and break that contract silently -- the struct would be left uninitialised with the
+ * return code unchanged, which the caller cannot detect.  Confinement belongs at the
+ * entry point, where the untrusted addresses actually arrive, and that is where
+ * dsp_native_run does it.
+ */
 void *memset(void *s, int c, size_t n)
 {
-    if (!addr_writable(s, n)) { return s; }
     unsigned char *p = (unsigned char *)s;
     while (n--) { *p++ = (unsigned char)c; }
     return s;
 }
 
-double fabs(double x) { return x < 0.0 ? -x : x; }
-
-/* Params struct with math function addresses written by FNF at startup.    */
-typedef struct {
-    uint32_t lua_pushnumber_addr;   /* 0x0021EF24 on 1.7.17a                */
-    /* math functions resolved by FNF(math.*) -- firmware .text addresses   */
-    uint32_t sin_addr;
-    uint32_t cos_addr;
-    uint32_t tan_addr;
-    uint32_t asin_addr;
-    uint32_t acos_addr;
-    uint32_t atan_addr;
-    uint32_t atan2_addr;
-    uint32_t sqrt_addr;
-    uint32_t exp_addr;
-    uint32_t log_addr;
-    uint32_t log10_addr;
-    uint32_t floor_addr;
-    uint32_t ceil_addr;
-    /* per-frame data                                                        */
-    uint32_t cap_chunk1;
-    uint32_t cap_chunk2;
-    uint32_t cap_n;
-    uint32_t out_chunk1;
-    uint32_t out_chunk2;
-    uint32_t out_desc_cursor;
-    uint32_t out_desc_n_0;
-    uint32_t out_desc_n_1;
-    uint32_t plan_addr;
-} dsp_native_params;
-
-/* (old params struct removed; see the full definition above) */
-
 /* -------------------------------------------------------------------------
- * Reading buffer element access: 32-byte stride, reading double at offset 0.
- * A chunk holds 1024 elements (32 768-byte payload).
+ * Reading buffer element access: elements of `stride` bytes, reading double at +0.
  * -------------------------------------------------------------------------*/
-static inline double rb_read(uint32_t ch1, uint32_t ch2, int k)
+static double rb_read(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k)
 {
-    const double *base;
-    if (k < 1024) {
-        base = (const double *)(uintptr_t)ch1;
-    } else {
-        base = (const double *)(uintptr_t)ch2;
-        k   -= 1024;
-    }
-    return base[(size_t)k * 4U];   /* stride 4 doubles = 32 bytes */
+    uint32_t idx = (uint32_t)k;
+    uint32_t base = (idx < perchunk) ? ch1 : ch2;
+    uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
+    return *(const double *)(uintptr_t)(base + off * 32U);
 }
 
-static inline void rb_write(uint32_t ch1, uint32_t ch2, int k, double v)
+static void rb_write(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k, double v)
 {
-    double *base;
-    if (k < 1024) {
-        base = (double *)(uintptr_t)ch1;
-    } else {
-        base = (double *)(uintptr_t)ch2;
-        k   -= 1024;
+    uint32_t idx = (uint32_t)k;
+    uint32_t base = (idx < perchunk) ? ch1 : ch2;
+    uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
+    *(double *)(uintptr_t)(base + off * 32U) = v;
+}
+
+/* Address of element k, for the cursor rewind. */
+static uint32_t rb_addr(uint32_t ch1, uint32_t ch2, uint32_t perchunk, uint32_t k)
+{
+    return (k < perchunk) ? (ch1 + k * 32U) : (ch2 + (k - perchunk) * 32U);
+}
+
+/* -------------------------------------------------------------------------
+ * Confine every pointer the plan carries to the declared arena.
+ *
+ * dsp.c writes through these, so the arena bound is what keeps its stores inside memory
+ * we own.  NULL is permitted: the arena holds only what its own decomposition reads, so
+ * the arrays belonging to the other method are NULL by design.
+ * -------------------------------------------------------------------------*/
+static int plan_ptrs_ok(const dsp_native_params *p, const dsp_plan *pl)
+{
+    const void *const ptrs[20] = {
+        pl->w,    pl->swp_a, pl->swp_b, pl->sw1_a, pl->sw1_b,
+        pl->sw2_a, pl->sw2_b, pl->twr,  pl->twi,   pl->utr,
+        pl->uti,  pl->re,    pl->im,    pl->wkr,   pl->wki,
+        pl->blkr, pl->blki,  pl->pwr,   pl->h,     pl->fir_out
+    };
+    int i;
+    for (i = 0; i < 20; i++) {
+        uint32_t a = (uint32_t)(uintptr_t)ptrs[i];
+        if (a == 0U) { continue; }
+        if (!range_ok(a, 1U, p->arena_lo, p->arena_hi)) { return 0; }
     }
-    base[(size_t)k * 4U] = v;
+    /* A yield callback would be a call through a params-derived pointer; refuse it. */
+    if (pl->yield != NULL) { return 0; }
+    return 1;
 }
 
 /* -------------------------------------------------------------------------
  * Entry point.
  *
- * Arg 1 on the Lua stack: params_addr (hex string).
- * Pushes one number (bin count) and returns 1.
+ * Arg 1 on the Lua stack: the params struct address, as a hex string.
+ * Pushes one number: the bin count, or a negative DSPN_* status.
  * -------------------------------------------------------------------------*/
 int dsp_native_run(void *L)
 {
-    /* Parse the params address from arg 1 on the Lua stack.
-     * lua_tostring and hexparse are called via function pointers built from
-     * their known firmware addresses.  No globals in our binary.             */
-    lua_tostring_fn  lts  = (lua_tostring_fn)(uintptr_t)LUA_TOSTRING_ADDR;
-    hexparse_fn      hp   = (hexparse_fn)(uintptr_t)HEXPARSE_ADDR;
+    lua_tostring_fn lts = (lua_tostring_fn)(uintptr_t)LUA_TOSTRING_ADDR;
+    hexparse_fn     hp  = (hexparse_fn)(uintptr_t)HEXPARSE_ADDR;
+    lua_pushnumber_fn push;
+    const dsp_native_params *p;
+    const dsp_plan *plan;
+    dsp_plan *plan_w;
+    double *src;
+    uint32_t paddr;
+    int parse_err = 0;
+    int n, m, nbins, k;
 
     const char *arg1 = lts(L, 1);
     if (arg1 == NULL) { return 0; }
-    int parse_err = 0;
-    uint32_t paddr = hp(arg1, &parse_err);
+    paddr = hp(arg1, &parse_err);
     if (parse_err) { return 0; }
 
-    const dsp_native_params *p = (const dsp_native_params *)(uintptr_t)paddr;
-    dsp_plan *plan = (dsp_plan *)(uintptr_t)p->plan_addr;
-    if (plan == NULL || plan->n == 0) { return 0; }
-
-    int n = (int)p->cap_n;
-    int m = plan->m;
-    if (n != plan->n) { return 0; }
-
-    /* Place the flat source array immediately after the plan, 32-byte aligned.
-     * The Lua startup must size the plan arena to include n doubles of scratch.  */
-    uintptr_t plan_end = (uintptr_t)plan + sizeof(dsp_plan);
-    plan_end = (plan_end + (uintptr_t)(DSP_ALIGN - 1))
-               & ~(uintptr_t)(DSP_ALIGN - 1);
-    double *src_flat = (double *)plan_end;
-
-    /* Extract readings from strided chunk storage into the flat array.           */
-    {
-        int k;
-        for (k = 0; k < n; k++) {
-            src_flat[k] = rb_read(p->cap_chunk1, p->cap_chunk2, k);
-        }
+    /* The params struct itself must be in the heap before it is dereferenced. */
+    if (!range_ok(paddr, (uint32_t)sizeof(dsp_native_params), HEAP_LO, HEAP_HI)) {
+        return 0;
     }
+    p = (const dsp_native_params *)(uintptr_t)paddr;
 
-    int nbins = dsp_spectrum_run(plan, src_flat, n, NULL);
-    if (nbins <= 0) { return 0; }
+    /* Nothing can be reported without a way to push, so this is checked first and a
+     * failure is a silent return rather than a status. */
+    if (!text_ok(p->lua_pushnumber_addr)) { return 0; }
+    push = (lua_pushnumber_fn)(uintptr_t)p->lua_pushnumber_addr;
 
-    /* Write power spectrum to graph buffer chunk storage.                        */
-    {
-        int k;
-        for (k = 0; k < m; k++) {
-            rb_write(p->out_chunk1, p->out_chunk2, k, (double)plan->pwr[k]);
-        }
-    }
+    if (p->magic != DSP_NATIVE_MAGIC) { push(L, (double)DSPN_EMAGIC); return 1; }
 
-    /* Cursor-rewind: advance the write cursor to slot m so the firmware knows
-     * m elements have been written, without issuing a buffer.clear().
-     * Two n-copies are updated; fwmem-BUFFER.md confirms these are the fields
-     * the graph widget tests.                                                    */
-    if (p->out_desc_cursor != 0U) {
-        uint32_t new_cur;
-        if (m <= 1024) {
-            new_cur = p->out_chunk1 + (uint32_t)m * 32U;
-        } else {
-            new_cur = p->out_chunk2 + (uint32_t)(m - 1024) * 32U;
-        }
-        *(volatile uint32_t *)(uintptr_t)p->out_desc_cursor = new_cur;
-    }
-    if (p->out_desc_n_0 != 0U) {
-        *(volatile uint32_t *)(uintptr_t)p->out_desc_n_0 = (uint32_t)m;
-    }
-    if (p->out_desc_n_1 != 0U) {
-        *(volatile uint32_t *)(uintptr_t)p->out_desc_n_1 = (uint32_t)m;
-    }
-
-    /* Push the bin count and return 1 value.                                     */
-    if (p->lua_pushnumber_addr != 0U) {
-        lua_pushnumber_fn push =
-            (lua_pushnumber_fn)(uintptr_t)p->lua_pushnumber_addr;
-        push(L, (double)nbins);
+    /* Arena sizing, answered before any bound is examined because it dereferences
+     * nothing: it is how Lua learns how much storage to find in the first place. */
+    if (p->mode == DSPN_MODE_BYTES) {
+        push(L, (double)dsp_plan_bytes((int)p->cap_n, (int)p->init_decim,
+                                       (int)p->init_method));
         return 1;
     }
 
-    return 0;
+    /* The declared windows have to be sane in themselves, and inside the backstop,
+     * before they are trusted to validate anything else. */
+    if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < HEAP_LO || p->wr_hi  > HEAP_HI ||
+        p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI ||
+        p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END ||
+        p->arena_lo >= p->arena_hi) {
+        push(L, (double)DSPN_EBOUNDS); return 1;
+    }
+    /* The arena is written through, so it must be a sub-range of the writable window. */
+    if (!wr_ok(p, p->arena_lo, p->arena_hi - p->arena_lo)) {
+        push(L, (double)DSPN_EBOUNDS); return 1;
+    }
+
+    /* Math addresses, before anything calls through them. */
+    if (!text_ok(p->sin_addr)  || !text_ok(p->cos_addr)   || !text_ok(p->sqrt_addr) ||
+        !text_ok(p->log10_addr)|| !text_ok(p->floor_addr) || !text_ok(p->ceil_addr)) {
+        push(L, (double)DSPN_EMATH); return 1;
+    }
+    g_sin   = (math1_fn)(uintptr_t)p->sin_addr;
+    g_cos   = (math1_fn)(uintptr_t)p->cos_addr;
+    g_sqrt  = (math1_fn)(uintptr_t)p->sqrt_addr;
+    g_log10 = (math1_fn)(uintptr_t)p->log10_addr;
+    g_floor = (math1_fn)(uintptr_t)p->floor_addr;
+    g_ceil  = (math1_fn)(uintptr_t)p->ceil_addr;
+
+    /* The plan struct is written by dsp_plan_init, so it needs the writable test.  It
+     * must not sit inside the arena: dsp_plan_init carves the arena from its base and
+     * would overwrite a plan placed there. */
+    if (!wr_ok(p, p->plan_addr, (uint32_t)sizeof(dsp_plan))) {
+        push(L, (double)DSPN_EPLAN); return 1;
+    }
+    if (p->plan_addr < p->arena_hi &&
+        (p->plan_addr + (uint32_t)sizeof(dsp_plan)) > p->arena_lo) {
+        push(L, (double)DSPN_EPLAN); return 1;
+    }
+    plan   = (const dsp_plan *)(uintptr_t)p->plan_addr;
+    plan_w = (dsp_plan *)(uintptr_t)p->plan_addr;
+
+    n = (int)p->cap_n;
+
+    /* Build the plan and stop.  dsp_plan_init zeroes the plan before any refusal, so a
+     * non-zero return leaves p->n == 0 and the run path below refuses on geometry. */
+    if (p->mode == DSPN_MODE_INIT) {
+        int rc = dsp_plan_init(plan_w,
+                               (void *)(uintptr_t)p->arena_lo,
+                               (size_t)(p->arena_hi - p->arena_lo),
+                               n,
+                               (int)p->init_kind,
+                               (double)p->init_beta_milli / 1000.0,
+                               (int)p->init_decim,
+                               (int)p->init_method);
+        push(L, (double)rc);
+        return 1;
+    }
+
+    if (p->mode != DSPN_MODE_RUN) { push(L, (double)DSPN_EBOUNDS); return 1; }
+
+    m = plan->m;
+    if (plan->n == 0 || plan->n != n || m <= 0 || p->cap_perchunk == 0U ||
+        p->out_perchunk == 0U) {
+        push(L, (double)DSPN_EGEOM); return 1;
+    }
+
+    if (!plan_ptrs_ok(p, plan)) { push(L, (double)DSPN_EARENA); return 1; }
+
+    /* Scratch for the de-strided capture: n doubles, contiguous, and it must not
+     * overlap the arena -- dsp.c's overlap checks assume src is separate. */
+    if (!wr_ok(p, p->src_flat, (uint32_t)n * 8U)) {
+        push(L, (double)DSPN_ESCRATCH); return 1;
+    }
+    if (p->src_flat < p->arena_hi && (p->src_flat + (uint32_t)n * 8U) > p->arena_lo) {
+        push(L, (double)DSPN_ESCRATCH); return 1;
+    }
+
+    /* Capture storage: read only, and only within what Lua declared. */
+    {
+        uint32_t in_first  = (uint32_t)n < p->cap_perchunk ? (uint32_t)n : p->cap_perchunk;
+        uint32_t in_second = (uint32_t)n - in_first;
+        if (!stride_ok_rd(p, p->cap_chunk1, in_first, 32U) ||
+            !stride_ok_rd(p, p->cap_chunk2, in_second, 32U)) {
+            push(L, (double)DSPN_ECAPTURE); return 1;
+        }
+    }
+
+    /* Output storage: written, so the output window and the heap backstop. */
+    {
+        uint32_t o_first  = (uint32_t)m < p->out_perchunk ? (uint32_t)m : p->out_perchunk;
+        uint32_t o_second = (uint32_t)m - o_first;
+        if (!stride_ok_out(p, p->out_chunk1, o_first, 32U) ||
+            !stride_ok_out(p, p->out_chunk2, o_second, 32U)) {
+            push(L, (double)DSPN_EOUTPUT); return 1;
+        }
+    }
+
+    /* The descriptor is a separate allocation from the chunk storage, so it is checked
+     * against the heap backstop rather than the bulk window, and only its base is
+     * trusted: the field offsets are compiled in. */
+    if (!range_ok(p->out_desc, DESC_SPAN, HEAP_LO, HEAP_HI)) {
+        push(L, (double)DSPN_EDESC); return 1;
+    }
+
+    /* Every address has passed.  From here on memory is touched. */
+    src = (double *)(uintptr_t)p->src_flat;
+    for (k = 0; k < n; k++) {
+        src[k] = rb_read(p->cap_chunk1, p->cap_chunk2, p->cap_perchunk, k);
+    }
+
+    nbins = dsp_spectrum_run(plan_w, src, n, NULL);
+    if (nbins <= 0) { push(L, (double)DSPN_ERUN); return 1; }
+
+    for (k = 0; k < m; k++) {
+        rb_write(p->out_chunk1, p->out_chunk2, p->out_perchunk, k,
+                 (double)plan->pwr[k]);
+    }
+
+    /* Cursor rewind: tell the firmware m elements are present without a buffer.clear().
+     * The cursor points at the slot after the last written element, which is why it is
+     * computed from m rather than m-1. */
+    *(volatile uint32_t *)(uintptr_t)(p->out_desc + DESC_CURSOR) =
+        rb_addr(p->out_chunk1, p->out_chunk2, p->out_perchunk, (uint32_t)m);
+    *(volatile uint32_t *)(uintptr_t)(p->out_desc + DESC_N_0) = (uint32_t)m;
+    *(volatile uint32_t *)(uintptr_t)(p->out_desc + DESC_N_1) = (uint32_t)m;
+
+    push(L, (double)nbins);
+    return 1;
 }
