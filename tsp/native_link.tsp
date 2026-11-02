@@ -291,9 +291,15 @@ function fftsa.nl._find_desc(elem0)
       if s1 == base and s2 == base then
         local elemsize = W(base + 8)
         local perchunk = W(base + 12)
-        if elemsize ~= nil and perchunk ~= nil and
+        local nchunks  = W(base + 16)   -- 0x10, chunk count
+        if elemsize ~= nil and perchunk ~= nil and nchunks ~= nil and
+           nchunks > 0 and nchunks < 4096 and
            elemsize * perchunk == fftsa.nl.CHUNK_BYTES then
-          return base, elemsize, perchunk, W(base + 68)   -- 0x44, chunk vector
+          -- 0x44 is the chunk vector. The count comes back with it because a caller
+          -- indexing the vector has no other way to know where it ends: reading one
+          -- entry too far returns whatever follows it in the heap, and an address that
+          -- happens to land in the heap would pass the backstop and be written to.
+          return base, elemsize, perchunk, W(base + 68), nchunks
         end
       end
     end
@@ -376,11 +382,42 @@ function fftsa.nl.restore_peek8()
   return true
 end
 
+-- Every failure exit from nl.init comes through here. Deleting the buffers is not enough:
+-- nl.entry, nl.tramp and nl.params point into chunk storage that the delete frees, so a
+-- later via_peek8 through a stale nl.entry would branch into whatever the allocator hands
+-- out next. call_dsp is gated on nl.ready and that stays false, but a dangling function
+-- pointer sitting in a module table is a trap, not a guard. peek8_cls and peek8_f are kept
+-- deliberately: restore_peek8 needs them, and they are firmware addresses, not heap.
+function fftsa.nl._abort(cb, pb)
+  local nl = fftsa.nl
+  if pb ~= nil then pcall(function() buffer.delete(pb) end) end
+  if cb ~= nil then pcall(function() buffer.delete(cb) end) end
+  nl.ready     = false
+  nl.entry     = nil
+  nl.tramp     = nil
+  nl.params    = nil
+  nl.code_buf  = nil
+  nl.code_base = nil
+  nl.plan_buf  = nil
+  nl.plan_addr = nil
+  nl.segs_addr = nil
+  nl.src_flat  = nil
+  return false
+end
+
 -- ---------------------------------------------------------------------------
--- Init. Called once at startup, before any frame.
--- barrier_buf: any live buffer; buffer.getstats on it is the IPC barrier that drains
--- the store buffer to DRAM. Writing code without it leaves the I-cache filling from
--- stale DRAM, which is a bluescreen rather than a wrong answer.
+-- Init. Called once per boot, at startup, before any frame. Once per boot and not merely
+-- once per app start: the IPC barrier drains the store buffer to DRAM but does not
+-- invalidate the I-cache, and the trampoline cannot flush a replacement for itself, so a
+-- second install at a fresh address wedges the interpreter. Reinstalling needs a power
+-- cycle until the invalidate can be bootstrapped out of firmware .text.
+--
+-- barrier_buf is accepted and validated but not used as the barrier. init fills its own
+-- code buffer with three readings and uses that, because buffer.getstats is the barrier
+-- only when it makes the service-task call and on an empty buffer it need not -- and the
+-- caller's buffer is empty more often than not.
+--
+-- Returns true with nl.ready set, or false with every heap-derived field nil'd.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local nl = fftsa.nl
@@ -421,10 +458,23 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   for k = 1, 3 do
     buffer.write.reading(cb, 1000000 + k, 3000000 + k, k, 0)
   end
-  buffer.getstats(barrier_buf)
+
+  -- THE BARRIER USES cb, THE BUFFER THIS FUNCTION JUST FILLED, NOT THE CALLER'S.
+  -- buffer.getstats is the barrier only when it actually makes the service-task call,
+  -- and on an empty buffer it need not. Passing defbuffer1, empty after a power cycle,
+  -- bluescreened the instrument once: the trampoline had not reached DRAM, the I-cache
+  -- filled from stale heap and the CPU executed a deleted buffer's readings. The caller
+  -- cannot be trusted to hand over a live buffer -- fftsa.start() passes fftsa.cap,
+  -- which is empty until the first capture completes -- so init no longer depends on it.
+  -- barrier_buf is still accepted, and validated rather than used, so a caller that
+  -- passes something unusable is told rather than crashed.
+  if barrier_buf ~= nil and barrier_buf.n == nil then return fftsa.nl._abort(cb) end
+  local bar = cb
+  if bar.n == nil or bar.n < 1 then return fftsa.nl._abort(cb) end
+  buffer.getstats(bar)
 
   local code_base = nl._find_storage(cb)
-  if not code_base then buffer.delete(cb) return false end
+  if not code_base then return fftsa.nl._abort(cb) end
   nl.code_buf  = cb
   nl.code_base = code_base
 
@@ -437,22 +487,22 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local tramp_at   = code_base + img_span
   local params_at  = tramp_at + align8(string.len(nl._TRAMP))
   local span       = (params_at - code_base) + nl.PARAM_WORDS * 4
-  if span > nl.CHUNK_BYTES then buffer.delete(cb) return false end
+  if span > nl.CHUNK_BYTES then return fftsa.nl._abort(cb) end
   nl.params = params_at
 
   -- 5. Trampoline first, so later writes can be flushed properly. Its own first
   --    execution rides on the IPC barrier alone.
   ki.memwrite(hx(tramp_at), nl._TRAMP)
-  buffer.getstats(barrier_buf)
+  buffer.getstats(bar)
   nl.tramp = tramp_at
   via_peek8(tramp_at, hx(tramp_at), hx(string.len(nl._TRAMP)))
 
   -- 6. The image, patched for this load address.
   local img, err = nl.relocate(nl._DSP_CODE, nl._DSP_RELOC, code_base,
                                nl._DSP_RELOC_BSS_HI)
-  if img == nil then buffer.delete(cb) return false end
+  if img == nil then return fftsa.nl._abort(cb) end
   ki.memwrite(hx(code_base), img)
-  buffer.getstats(barrier_buf)
+  buffer.getstats(bar)
   flush(code_base, string.len(img))
   nl.entry = code_base
 
@@ -468,8 +518,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     -- Zero means no chunk can hold one of the arrays: the window is n * 8 bytes, so
     -- this is the bound on n rather than a failure of the mechanism.
     nl.nmax = 0
-    buffer.delete(cb)
-    return false
+    return fftsa.nl._abort(cb)
   end
 
   -- 8. Plan buffer: one chunk per segment, plus one for the plan struct and the
@@ -481,22 +530,36 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   for k = 1, 3 do
     buffer.write.reading(pb, 1000000 + k, 3000000 + k, k, 0)
   end
-  buffer.getstats(barrier_buf)
+  buffer.getstats(bar)
 
   local pdesc = nl.describe(pb)
-  if pdesc == nil or pdesc.vec == nil then
-    buffer.delete(pb) buffer.delete(cb) return false
+  if pdesc == nil or pdesc.vec == nil then return fftsa.nl._abort(cb, pb) end
+
+  -- The vector has to actually hold the entries about to be read out of it. The chunk
+  -- count is the descriptor's own field at +0x10, so this is the allocator's answer and
+  -- not an inference from the capacity asked for. Without it, one entry past the end
+  -- returns whatever follows the vector in the heap, and a value that happened to look
+  -- like a heap address would pass the native backstop and be written through -- into
+  -- somebody else's allocation.
+  if pdesc.nchunks == nil or pdesc.nchunks < chunks_wanted then
+    return fftsa.nl._abort(cb, pb)
   end
   nl.plan_buf = pb
 
   -- Chunk payload addresses from the vector. They are not in address order and not
   -- adjacent; dsp_plan_init_segs does not care, and nothing here may assume otherwise.
+  -- Each is checked against the heap here as well as by the native entry point, so a
+  -- bad vector is a refusal from Lua rather than a status code from a call that has
+  -- already been handed the address.
   local payload = {}
   local i
   for i = 1, chunks_wanted do
     local a = W(pdesc.vec + (i - 1) * 4)
     if a == nil or a == 0 then
-      buffer.delete(pb) buffer.delete(cb) return false
+      return fftsa.nl._abort(cb, pb)
+    end
+    if a < nl.HEAP_LO or a + nl.CHUNK_BYTES > nl.HEAP_HI then
+      return fftsa.nl._abort(cb, pb)
     end
     payload[i] = a
   end
@@ -506,13 +569,13 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local plan_addr = host
   local src_flat  = host + align8(nl.SIZEOF_PLAN)
   if (src_flat - host) + want_n * 8 > nl.CHUNK_BYTES then
-    buffer.delete(pb) buffer.delete(cb) return false
+    return fftsa.nl._abort(cb, pb)
   end
 
   -- The segment vector itself, in the code buffer above the params struct.
   local segs_addr = nl.params + align8(nl.PARAM_WORDS * 4)
   if (segs_addr - code_base) + nseg * 4 > nl.CHUNK_BYTES then
-    buffer.delete(pb) buffer.delete(cb) return false
+    return fftsa.nl._abort(cb, pb)
   end
   local sv = {}
   for i = 1, nseg do sv[i] = u32_pack(payload[i]) end
@@ -543,7 +606,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local rc = via_peek8(code_base, hx(nl.params))
   nl.last_rc = rc
   if rc ~= 0 then
-    buffer.delete(pb) buffer.delete(cb) return false
+    return fftsa.nl._abort(cb, pb)
   end
 
   nl.plan_addr = plan_addr
@@ -601,7 +664,7 @@ end
 function fftsa.nl.describe(buf)
   local elem0 = fftsa.nl._find_storage(buf)
   if not elem0 then return nil end
-  local desc, elemsize, perchunk, vec = fftsa.nl._find_desc(elem0)
+  local desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
   if not desc then return nil end
   -- The window must cover both payloads, and they are scattered: the second is often
   -- BELOW the first, measured at 0x360D600 and 0x36055F0. Taking hi from the second
@@ -620,6 +683,6 @@ function fftsa.nl.describe(buf)
     end
   end
   return { chunk1 = elem0, chunk2 = ch2, perchunk = perchunk,
-           elemsize = elemsize, desc = desc, vec = vec,
+           elemsize = elemsize, desc = desc, vec = vec, nchunks = nchunks,
            lo = lo, hi = hi }
 end

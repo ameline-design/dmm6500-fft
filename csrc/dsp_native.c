@@ -163,15 +163,24 @@ typedef struct {
  *   [1] sizeof(dsp_native_params)
  *   [2] sizeof(dsp_real)
  *   [3] DSP_ALIGN
+ *   [4] DSPN_HEAP_LO
+ *   [5] DSPN_HEAP_HI
+ *
+ * The heap bounds are here so the Lua side can sanity-check an address before passing it
+ * in, without a second copy of the numbers to drift: a Lua literal and this header would
+ * diverge silently the first time a firmware build moved the heap, and both sides would
+ * still look self-consistent.
  *
  * Initialised, not tentative: without the initialiser this is a common definition that
  * lands in .bss as zeros and reports nothing.
  */
-const uint32_t dsp_native_sizes[4] = {
+const uint32_t dsp_native_sizes[6] = {
     (uint32_t)sizeof(dsp_plan),
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
-    (uint32_t)DSP_ALIGN
+    (uint32_t)DSP_ALIGN,
+    (uint32_t)DSPN_HEAP_LO,
+    (uint32_t)DSPN_HEAP_HI
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
