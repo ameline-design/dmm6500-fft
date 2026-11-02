@@ -352,7 +352,18 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME reduce_selftest
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_reduce.py --self-test)
+    # The cache-flush routine is the one firmware address the native path cannot be handed
+    # and cannot do without, so it is found by what it does -- dcbst over the range, icbi
+    # over the same range, isync before returning. Pinning it to one build makes a firmware
+    # upgrade a branch into whatever occupies that address now, which bluescreens.
+    add_test(NAME find_flush
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_findflush.py)
+    add_test(NAME find_flush_selftest
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_findflush.py --self-test)
     set_tests_properties(f64_pack b64_blob b64_blob_selftest reduce reduce_selftest
+                         find_flush find_flush_selftest
                          PROPERTIES ENVIRONMENT "LUA502=${LUA502}")
   endif()
 endif()

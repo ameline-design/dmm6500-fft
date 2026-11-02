@@ -2490,6 +2490,110 @@ function fftsa.nl.fw_probe(words)
 end
 
 -- ---------------------------------------------------------------------------
+-- Finding the cache-flush routine by what it does.
+--
+-- A range flush has to push the data range out of the D-cache with dcbst, invalidate the
+-- same range in the I-cache with icbi, and isync before returning so the next fetch sees
+-- the new bytes. Nothing else in an interpreter's text does all three, which makes the
+-- combination an identity rather than a guess -- and one that survives a firmware build
+-- moving the routine, because it describes the instructions and not the address.
+--
+-- isync is a fixed word, so string.find sweeps for it at C speed and only the few words
+-- around each hit are read one at a time. Both other opcodes carry register fields, so they
+-- are matched on the primary opcode and the extended opcode with the registers masked out.
+--
+-- Lua 5.0.2 has no bitwise operators and the instrument's bit library is not present on a
+-- host, so the masks are arithmetic: a divide for the primary opcode and math.mod for the
+-- low eleven bits.
+-- ---------------------------------------------------------------------------
+fftsa.nl.OP_ISYNC  = 1275068716   -- 0x4C00012C, fixed
+fftsa.nl.OP_BLR    = 1317011488   -- 0x4E800020, fixed
+fftsa.nl.OP_NOP    = 1610612736   -- 0x60000000, ori r0,r0,0
+fftsa.nl.XO_ICBI   = 1964         -- 0x7AC, extended opcode 982 shifted
+fftsa.nl.XO_DCBST  = 108          -- 0x6C,  extended opcode 54 shifted
+fftsa.nl.ISYNC_STR = '\076\000\001\044'
+
+-- Primary opcode 31 with the given extended opcode, registers and Rc ignored.
+local function is_x31(w, xo)
+  if w == nil then return false end
+  if math.floor(w / 67108864) ~= 31 then return false end
+  return math.mod(w, 2048) == xo
+end
+fftsa.nl._is_x31 = is_x31
+
+-- The entry of the routine an isync at `at` belongs to, or nil if it is not a range flush.
+--
+-- Walks back word by word: an icbi and a dcbst have to appear before the previous function
+-- ends, and the entry is the first word after that function's blr with any padding skipped.
+-- A window rather than the whole text because a flush loop is a few dozen instructions, and
+-- stopping at the blr is what keeps the search inside one function.
+function fftsa.nl._flush_entry(at, win)
+  local nl = fftsa.nl
+  local icbi, dcbst, back = false, false, nil
+  local i
+  for i = 1, win do
+    local a = at - i * 4
+    local w = W(a)
+    if w == nil then return nil end
+    if w == nl.OP_BLR then back = a; break end
+    if is_x31(w, nl.XO_ICBI) then icbi = true end
+    if is_x31(w, nl.XO_DCBST) then dcbst = true end
+  end
+  if not (icbi and dcbst) then return nil end
+  -- No blr inside the window means the function is longer than the window or the text
+  -- before it is not a function that returns; either way the entry is not established.
+  if back == nil then return nil end
+  local a = back + 4
+  for i = 1, 8 do
+    local w = W(a)
+    if w == nil then return nil end
+    if w ~= nl.OP_NOP then break end
+    a = a + 4
+  end
+  if a > at then return nil end
+  return a
+end
+
+-- Sweep a text range for the flush routine. Returns the address and how many candidates
+-- were seen; two different candidates is an answer this refuses, because picking one would
+-- be a branch into the wrong function and that is a bluescreen rather than a refusal.
+function fftsa.nl.find_flush(lo, hi, chunk, win)
+  local nl = fftsa.nl
+  lo = lo or nl.TEXT_LO
+  hi = hi or nl.TEXT_HI
+  chunk = chunk or 32768
+  win = win or 96
+  local found, seen, base = nil, 0, lo
+  while base < hi do
+    local n = chunk
+    if base + n > hi then n = hi - base end
+    local s = ki.memread(hx(base), hx(n))
+    if s == nil then return nil, seen end
+    local len = string.len(s)
+    if len < 4 then return nil, seen end
+    local p = 1
+    while true do
+      local i = string.find(s, nl.ISYNC_STR, p, true)
+      if i == nil then break end
+      -- 4-aligned only, which every instruction is. The chunk base and length are
+      -- multiples of four, so no instruction straddles a chunk and the sweep needs no
+      -- overlap; an unaligned hit is data that happens to read as isync.
+      if math.mod(i - 1, 4) == 0 then
+        local e = nl._flush_entry(base + i - 1, win)
+        if e ~= nil then
+          seen = seen + 1
+          if found == nil then found = e
+          elseif found ~= e then return nil, seen end
+        end
+      end
+      p = i + 1
+    end
+    base = base + n
+  end
+  return found, seen
+end
+
+-- ---------------------------------------------------------------------------
 -- Relocation.
 --
 -- On PPC32 every data reference is `lis rX,hi` plus a `lo(rX)` access, an absolute
