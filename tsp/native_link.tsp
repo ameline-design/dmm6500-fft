@@ -45,6 +45,23 @@ fftsa.nl.FFT_FOURSTEP = 1
 
 -- Chunk payload is a fixed 32,768 bytes; 1024 elements follows from 32768/32.
 fftsa.nl.CHUNK_BYTES = 32768
+
+-- THE ALLOCATOR ONLY GUARANTEES 16-BYTE ALIGNMENT, AND DSP_ALIGN IS 32. Measured payload
+-- addresses alternate: 0x360D600 and 0x3613180 are 32-aligned, 0x36055F0, 0x360B170 and
+-- 0x3603C90 are 16-aligned. dsp_native_run refuses a misaligned segment with DSPN_EBOUNDS,
+-- so an arena built straight from the chunk vector works or fails depending on which
+-- payload the allocator happened to put first -- it passed three times and then failed,
+-- which is a coin flip rather than a regression.
+--
+-- So every segment base is rounded up to 32 and the usable size drops by one alignment
+-- unit. SEG_BYTES stays a multiple of DSP_ALIGN, and rounding up adds at most 31, so
+-- align32(payload) + SEG_BYTES never leaves the payload. The same value has to go to
+-- MODE_SEGS as to MODE_INIT, or the chunk count is computed for a size the arena does not
+-- have.
+fftsa.nl.SEG_BYTES = 32768 - 32
+
+local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
+fftsa.nl._align32 = align32
 fftsa.nl.PARAM_WORDS = 32
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
@@ -653,8 +670,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   --    The arrays are laid out one per chunk by dsp_plan_init_segs, so the arena does
   --    not need contiguous memory -- which it could not have, since chunk payloads are
   --    placed independently by the allocator.
+  -- SEG_BYTES, the same value MODE_INIT gets. Asking with CHUNK_BYTES would compute a
+  -- chunk count for an arena 32 bytes per segment larger than the one actually built.
   nl.write_params({ mode = nl.MODE_SEGS, cap_n = want_n,
-                    seg_bytes = nl.CHUNK_BYTES,
+                    seg_bytes = nl.SEG_BYTES,
                     init_decim = decim or 1, init_method = method or 0 })
   trace('call.segs', hx(code_base), hx(nl.params))
   local nseg = via_peek8(code_base, hx(nl.params))
@@ -711,11 +730,23 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     payload[i] = a
   end
 
+  -- Segment bases rounded up to DSP_ALIGN. The allocator only guarantees 16 and dsp.c
+  -- needs 32, so a raw payload is refused with DSPN_EBOUNDS half the time depending on
+  -- which one the allocator put first. The raw payloads still define the window below --
+  -- the rounding loses addressable bytes at the front of a segment, not permission.
+  local segbase = {}
+  for i = 1, nseg do
+    segbase[i] = align32(payload[i])
+    if (segbase[i] - payload[i]) + nl.SEG_BYTES > nl.CHUNK_BYTES then
+      return fftsa.nl._abort(cb, pb)
+    end
+  end
+
   -- The last chunk holds the plan struct and the scratch; the first nseg are the arena.
-  local host      = payload[chunks_wanted]
+  local host      = align32(payload[chunks_wanted])
   local plan_addr = host
   local src_flat  = host + align8(nl.SIZEOF_PLAN)
-  if (src_flat - host) + want_n * 8 > nl.CHUNK_BYTES then
+  if (src_flat - payload[chunks_wanted]) + want_n * 8 > nl.CHUNK_BYTES then
     return fftsa.nl._abort(cb, pb)
   end
 
@@ -725,7 +756,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     return fftsa.nl._abort(cb, pb)
   end
   local sv = {}
-  for i = 1, nseg do sv[i] = u32_pack(payload[i]) end
+  for i = 1, nseg do sv[i] = u32_pack(segbase[i]) end
   trace('segs.write', hx(segs_addr), nseg)
   ki.memwrite(hx(segs_addr), table.concat(sv))
 
@@ -745,7 +776,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
     rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
     out_lo = nl.wr_lo, out_hi = nl.wr_hi,
-    seg_bytes = nl.CHUNK_BYTES, nsegs = nseg, segs_addr = segs_addr,
+    seg_bytes = nl.SEG_BYTES, nsegs = nseg, segs_addr = segs_addr,
     plan_addr = plan_addr, src_flat = src_flat, cap_n = want_n,
     init_kind = kind or 1,
     init_beta_milli = math.floor((beta or 0) * 1000),
@@ -760,7 +791,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   end
 
   nl.plan_addr = plan_addr
-  nl.seg_bytes = nl.CHUNK_BYTES
+  nl.seg_bytes = nl.SEG_BYTES
   nl.nsegs     = nseg
   nl.segs_addr = segs_addr
   nl.src_flat  = src_flat
