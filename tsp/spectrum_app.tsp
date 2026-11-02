@@ -620,7 +620,6 @@ function fftsa.apply()
   -- work somewhere it is not.
   fftsa.ph_peak = {}
   fftsa.work_plain, fftsa.work_tick = nil, nil
-  fftsa.period_modelled = true
   -- Dropped rather than carried across: the rate the previous sample count ran at is wrong
   -- for this one, and the line is written twice from here, so a stale figure would be on
   -- the glass before the first new frame.
@@ -628,6 +627,12 @@ function fftsa.apply()
   if fftsa.timer ~= nil and fftsa.armed_n ~= fftsa.n then
     fftsa.period = fftsa.frame_period(fftsa.n)
     fftsa.arm(fftsa.period)
+    -- Set with the modelled arm and not beside it. An Apply that leaves the count alone --
+    -- an adopted gesture, a span or window change -- keeps a period measured from real
+    -- frames, and flagging that modelled would have the next frame re-arm from one frame:
+    -- a timer deleted and recreated, and the measurement thrown away, which is the whole
+    -- thing the guard on this branch exists to prevent.
+    fftsa.period_modelled = true
   end
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   -- The native plan follows the same three attributes dsp.commit() rebuilds from. The code
@@ -850,7 +855,14 @@ function fftsa.frame_body()
   -- Display work the primitive does not do: outside any write window, then the paint.
   -- Whether the one-a-second block ran is recorded, because the timer period follows the
   -- PEAK frame over a window and that block is in one frame of every window.
-  fftsa.ph_tick = fftsa.sg_slow_tick()
+  -- The SECOND answer, which is whether the one-a-second block ran. The first is whether
+  -- any of sg_slow_tick ran, and its 0.15 s gesture clock sets that on every frame at any
+  -- count whose period is longer than 150 ms -- every count from 4096 up. Keyed on the
+  -- first, no frame from 4096 up was ever recorded as plain, plain_peak stayed nil for the
+  -- life of the setting, and the period rule fell back to the worst frame of all at exactly
+  -- the counts pacing from the plain frame was aimed at.
+  local sg_ran, sg_heavy = fftsa.sg_slow_tick()
+  fftsa.ph_tick = sg_heavy
   local t_e = os.clock()
   delay(fftsa.sg_yield)
   local t_f = os.clock()

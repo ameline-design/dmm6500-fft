@@ -4858,6 +4858,13 @@ check('every frame length keeps the idle floor, and the long ones do not overpay
       (function()
   local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}
   local slack = 0.0025
+  -- The floor itself, or this case compares the rule against whatever the rule used: at
+  -- tick_idle = 0 every period trivially keeps a floor of nothing. The boundary case above
+  -- pins the value; this pins that there is one.
+  if not (fftsa.tick_idle >= 0.012) then
+    return false, 'tick_idle is ' .. tostring(fftsa.tick_idle)
+            .. ', at or under the 12 ms measured as too little to dispatch a press'
+  end
   local i
   for i = 1, 10 do
     local b = busy[i]
@@ -4875,6 +4882,52 @@ check('every frame length keeps the idle floor, and the long ones do not overpay
     end
   end
   return true
+end)())
+
+-- Which frames count as carrying the display block, because the period is paced from the
+-- worst frame that does NOT. sg_slow_tick answers two questions and the gesture clock in it
+-- fires every 0.15 s, so keying on "did anything run" marks every frame at any count whose
+-- period exceeds 150 ms -- every count from 4096 up -- as a block frame. plain_peak then
+-- stays nil for the life of the setting and the period silently reverts to the worst frame
+-- of all, at exactly the counts pacing from the plain frame was aimed at.
+check('only the one-a-second block marks a frame as carrying it', (function()
+  -- The gesture clock due, the one-a-second block not.
+  fftsa.sg_scale_last, fftsa.sg_tick_last = nil, os.clock()
+  local ran, heavy = fftsa.sg_slow_tick()
+  local gesture = (ran == true and not heavy)
+  -- Both due.
+  fftsa.sg_scale_last, fftsa.sg_tick_last = nil, nil
+  local ran2, heavy2 = fftsa.sg_slow_tick()
+  local both = (ran2 == true and heavy2 == true)
+  -- And the frame records the second answer, not the first.
+  fftsa.sg_scale_last, fftsa.sg_tick_last = nil, os.clock()
+  fftsa.ph_tick = true
+  fftsa.frame_body()
+  local framed = (fftsa.ph_tick == false or fftsa.ph_tick == nil)
+  return gesture and both and framed,
+         string.format('gesture ran=%s heavy=%s / both ran=%s heavy=%s / frame ph_tick=%s',
+                       tostring(ran), tostring(heavy), tostring(ran2), tostring(heavy2),
+                       tostring(fftsa.ph_tick))
+end)())
+
+-- An Apply that leaves the sample count alone keeps a period measured from real frames, so
+-- it must not be flagged modelled: the flag makes the next frame re-arm from a single frame,
+-- which deletes and recreates the timer and throws the measurement away. Reachable from an
+-- adopted gesture, a span change or a window change -- every Apply that is not a count press.
+check('an Apply that does not change the count keeps its measured period', (function()
+  display.setvalue(fftsa.opt_n, 1)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  display.setvalue(fftsa.opt_n, 2)
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local on_change = fftsa.period_modelled
+  fftsa.period_modelled = false
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local on_same = fftsa.period_modelled
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  return on_change == true and on_same == false,
+         string.format('count changed=%s, count unchanged=%s',
+                       tostring(on_change), tostring(on_same))
 end)())
 
 -- The period is re-armed from frames that actually ran, not from frame_estimate(). The

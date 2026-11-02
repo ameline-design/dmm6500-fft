@@ -754,7 +754,37 @@ end
 -- Steps 3 to 5 of the recipe in fwmem-BUFFER.md: find the storage address as a word,
 -- the descriptor starts 0x48 below it, then confirm with the two self-pointers and the
 -- chunk geometry. Returns descriptor base, elemsize, perchunk, chunk vector.
+-- The descriptor fields, from a base this function did not have to search for. Split out so
+-- the words can be re-read without the sweep below: they are five peek32, and re-reading
+-- them is how a caller picks up a chunk vector that has lengthened. The validation is the
+-- same, so a base that no longer describes this buffer is refused here and the caller
+-- sweeps again.
+function fftsa.nl._read_desc(base, elem0)
+  if base == nil then return nil end
+  if W(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
+  if W(base + 84) ~= base or W(base + 100) ~= base then return nil end
+  local elemsize = W(base + 8)
+  local perchunk = W(base + 12)
+  local nchunks  = W(base + 16)
+  if elemsize == nil or perchunk == nil or nchunks == nil then return nil end
+  if nchunks < 1 or nchunks >= 4096 or elemsize < 8 or perchunk < 1 then return nil end
+  if elemsize * perchunk > fftsa.nl.CHUNK_BYTES then return nil end
+  if elemsize * (perchunk + 1) <= fftsa.nl.CHUNK_BYTES then return nil end
+  return base, elemsize, perchunk, W(base + 68), nchunks
+end
+
 function fftsa.nl._find_desc(elem0)
+  -- The cached base first, re-validated rather than trusted. This is the expensive half of
+  -- describe(): the sweep below walks 33 MB as 32 kB reads on its first window and 133 MB on
+  -- its second, which the tree measures at about a minute. Keyed on the storage address, so
+  -- a buffer whose storage moved misses, and _read_desc refuses a base that no longer points
+  -- back at elem0 even if the key matched.
+  local nl = fftsa.nl
+  if nl._desc_of == elem0 then
+    local b, es, pc, v, nc = nl._read_desc(nl._desc_at, elem0)
+    if b ~= nil then return b, es, pc, v, nc end
+    nl._desc_of, nl._desc_at = nil, nil
+  end
   local needle = u32_pack(elem0)
   local windows = {
     { 50331648, 83886080 },
@@ -787,6 +817,7 @@ function fftsa.nl._find_desc(elem0)
           -- indexing the vector has no other way to know where it ends: reading one
           -- entry too far returns whatever follows it in the heap, and an address that
           -- happens to land in the heap would pass the backstop and be written to.
+          nl._desc_of, nl._desc_at = elem0, base
           return base, elemsize, perchunk, W(base + 68), nchunks
         end
       end

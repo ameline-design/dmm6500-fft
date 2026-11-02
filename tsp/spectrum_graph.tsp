@@ -976,6 +976,7 @@ function fftsa.help_stay() return fftsa.help_check(nil) end
 function fftsa.sg_slow_tick()
   local now = os.clock()
   local did = false
+  local heavy = false
   if fftsa.sg_scale_last == nil
      or (now - fftsa.sg_scale_last) >= fftsa.sg_scale_period then
     fftsa.sg_scale_last = now
@@ -1007,8 +1008,17 @@ function fftsa.sg_slow_tick()
     -- That is why it is on this clock and not the frame's.
     fftsa.sg_show_thd()
     did = true
+    heavy = true
   end
-  return did
+  -- Two answers, because the callers want different questions. did says any of this ran, and
+  -- the gesture clock above sets it every 0.15 s. heavy says the one-a-second block ran,
+  -- which is the one that carries the noise pass and the icon re-assert.
+  --
+  -- The period rule needs heavy. Keyed on did, every frame at a count whose period is longer
+  -- than 0.15 s reads as a block frame -- which is every count from 4096 up -- so the worst
+  -- plain frame is never recorded, and pacing from it silently reverts to pacing from the
+  -- worst frame of all, exactly at the counts it was aimed at.
+  return did, heavy
 end
 
 -- The recovery path after a failed frame, and the same binding as the build.
