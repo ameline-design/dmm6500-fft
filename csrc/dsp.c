@@ -564,6 +564,29 @@ static int dsp_log2_of(const int v) {
     return s;
 }
 
+/* Element i of a strided record. One block is the array case and takes a branch rather than
+ * a divide, which is what every caller holding a plain array gets. */
+static double dsp_src_at(const dsp_src *s, const int i) {
+    const unsigned char *q;
+    if (s->nblock == 1)
+        q = s->blk[0] + (size_t)i * (size_t)s->stride;
+    else
+        q = s->blk[i / s->per] + (size_t)(i % s->per) * (size_t)s->stride;
+    return *(const double *)(const void *)q;
+}
+
+/* A contiguous array as a one-block record. */
+static void dsp_src_flat(dsp_src *s, const double *x, const int len) {
+    int b;
+    for (b = 0; b < DSP_MAX_SRC_BLOCKS; b++)
+        s->blk[b] = NULL;
+    s->blk[0]  = (const unsigned char *)(const void *)x;
+    s->nblock  = (x != NULL) ? 1 : 0;
+    s->per     = (len > 0) ? len : 1;
+    s->stride  = (int)sizeof(double);
+    s->len     = len;
+}
+
 /* A contiguous array as a one-slice vector, so that the functions taking a plain pointer and
  * the ones taking a plan share a body. per is rounded up past len, which is what makes the
  * shift zero and the mask the identity for every index the caller can pass. */
@@ -1120,11 +1143,17 @@ static void dsp_do_yield(const dsp_plan *p) {
  * through DSP_AT, because any of the three may have been split: at n = 16,384 the window is
  * four segments by itself. Two integer operations and a table load a sample, which is tens
  * of microseconds against a frame, and the alternative is two copies of this arithmetic. */
-static int dsp_load_vec(const double *DSP_RESTRICT x, const int n, const dsp_vec *w,
+static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
                         const double wsum, dsp_vec *re, dsp_vec *im, double *mean_out) {
     double s0 = 0.0, s1 = 0.0, mean;
     int i, k, m;
     if (x == NULL || w == NULL || re == NULL || im == NULL)
+        return DSP_EARG;
+    if (x->nblock < 1 || x->nblock > DSP_MAX_SRC_BLOCKS || x->per < 1 || x->len < n)
+        return DSP_EARG;
+    /* A double load off a 4-aligned element traps on this core, and the record's elements
+     * are only as aligned as the stride makes them. */
+    if ((x->stride & 7) != 0)
         return DSP_EARG;
     if (w->nslice < 1 || re->nslice < 1 || im->nslice < 1)
         return DSP_EARG;
@@ -1140,29 +1169,37 @@ static int dsp_load_vec(const double *DSP_RESTRICT x, const int n, const dsp_vec
      * window they are built from. The packing loop reads x[i] and w[i] while writing re[k]
      * and im[k] with k behind i, so an overlap reads samples it has already replaced. */
     {
-        const size_t zx = (size_t)n * sizeof(*x);
-        if (dsp_vec_hits_vec(re, im) || dsp_vec_hits(re, x, zx) || dsp_vec_hits_vec(re, w)
-            || dsp_vec_hits(im, x, zx) || dsp_vec_hits_vec(im, w)
+        int b;
+        if (dsp_vec_hits_vec(re, im) || dsp_vec_hits_vec(re, w) || dsp_vec_hits_vec(im, w)
             || dsp_vec_hits(re, mean_out, sizeof(*mean_out))
             || dsp_vec_hits(im, mean_out, sizeof(*mean_out))
-            || dsp_vec_hits(w, mean_out, sizeof(*mean_out))
-            || dsp_overlaps(mean_out, sizeof(*mean_out), x, zx))
+            || dsp_vec_hits(w, mean_out, sizeof(*mean_out)))
             return DSP_EARG;
+        /* The record block by block, at the extent the stride gives it. */
+        for (b = 0; b < x->nblock; b++) {
+            const int rest = x->len - b * x->per;
+            const int take = (rest < x->per) ? rest : x->per;
+            const size_t zb = (take > 0) ? (size_t)take * (size_t)x->stride : 0U;
+            if (dsp_vec_hits(re, x->blk[b], zb) || dsp_vec_hits(im, x->blk[b], zb)
+                || dsp_vec_hits(w, x->blk[b], zb)
+                || dsp_overlaps(mean_out, sizeof(*mean_out), x->blk[b], zb))
+                return DSP_EARG;
+        }
     }
 #endif
     /* Two chains, split over the even and odd samples, which is also the pairing the packing
      * loop below wants, so the record is walked the same way twice. */
     for (i = 0; i < n; i += 2) {
-        s0 = s0 + x[i] * (double)DSP_AT(w, i);
-        s1 = s1 + x[i + 1] * (double)DSP_AT(w, i + 1);
+        s0 = s0 + dsp_src_at(x, i) * (double)DSP_AT(w, i);
+        s1 = s1 + dsp_src_at(x, i + 1) * (double)DSP_AT(w, i + 1);
     }
     mean = (s0 + s1) / wsum;
     /* The subtraction happens in double and rounds once into the complex array: in the
      * single build that is what keeps the pedestal residue at the rounding of the products
      * rather than at the rounding of a difference of two large numbers. */
     for (k = 0, i = 0; k < m; k++, i += 2) {
-        DSP_AT(re, k) = (dsp_real)((x[i] - mean) * (double)DSP_AT(w, i));
-        DSP_AT(im, k) = (dsp_real)((x[i + 1] - mean) * (double)DSP_AT(w, i + 1));
+        DSP_AT(re, k) = (dsp_real)((dsp_src_at(x, i) - mean) * (double)DSP_AT(w, i));
+        DSP_AT(im, k) = (dsp_real)((dsp_src_at(x, i + 1) - mean) * (double)DSP_AT(w, i + 1));
     }
     if (mean_out != NULL)
         *mean_out = mean;
@@ -1173,14 +1210,16 @@ int dsp_load(const double *DSP_RESTRICT x, const int n, const dsp_real *DSP_REST
              const double wsum, dsp_real *DSP_RESTRICT re, dsp_real *DSP_RESTRICT im,
              double *mean_out) {
     dsp_vec wv, rv, iv;
-    if (w == NULL || re == NULL || im == NULL)
+    dsp_src xs;
+    if (x == NULL || w == NULL || re == NULL || im == NULL)
         return DSP_EARG;
     if (!dsp_is_pow2(n))
         return DSP_EPOW2;
     dsp_vec_flat_ro(&wv, w, n);
     dsp_vec_flat(&rv, re, dsp_half(n));
     dsp_vec_flat(&iv, im, dsp_half(n));
-    return dsp_load_vec(x, n, &wv, wsum, &rv, &iv, mean_out);
+    dsp_src_flat(&xs, x, n);
+    return dsp_load_vec(&xs, n, &wv, wsum, &rv, &iv, mean_out);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2177,10 +2216,10 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
 /* one frame                                                                 */
 /* ------------------------------------------------------------------------- */
 
-int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc, double *mean_out) {
-    const double *load_from;
+int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double *mean_out) {
+    dsp_src from;
     int need, rc;
-    if (p == NULL || src == NULL)
+    if (p == NULL || src == NULL || src->nblock < 1)
         return DSP_EARG;
     if (p->n < 4)
         return DSP_EARG;
@@ -2202,19 +2241,23 @@ int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc
         return DSP_ESHORT;
 
     if (p->decim > 1) {
-        /* `need`, not nsrc: a longer capture produces outputs nothing reads, and fir_out holds
-         * exactly p->n of them. */
-        const int ny = dsp_fir_run(src, need, p->h, p->ntaps, p->decim, p->fir_out);
+        /* The filter reads the record as an array, so a decimating plan takes a contiguous
+         * one. Nothing reaches this with a strided source: the read budget stops allowing
+         * even decim 2 from n = 3906 up, which is below every count a split arena serves. */
+        const int ny = (src->nblock == 1 && src->stride == (int)sizeof(double))
+                           ? dsp_fir_run((const double *)(const void *)src->blk[0], need, p->h,
+                                         p->ntaps, p->decim, p->fir_out)
+                           : DSP_EUNSUPPORTED;
         if (ny < p->n)
             return (ny < 0) ? ny : DSP_ESHORT;
-        load_from = p->fir_out;
+        dsp_src_flat(&from, p->fir_out, p->n);
         /* The filter is the longest single stretch in a decimating frame: 384 taps over
          * 16,384 outputs is 6.3 M multiply-accumulates. */
         dsp_do_yield(p);
     } else {
-        load_from = src;
+        from = *src;
     }
-    rc = dsp_load_vec(load_from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
+    rc = dsp_load_vec(&from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
     if (rc != DSP_OK)
         return rc;
     dsp_do_yield(p);
@@ -2222,6 +2265,15 @@ int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc
     dsp_do_yield(p);
     dsp_power_vec(&p->re_v, &p->im_v, p->m, &p->utr_v, &p->uti_v, &p->pwr_v, p->ksq);
     return p->m;
+}
+
+int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc,
+                     double *mean_out) {
+    dsp_src s;
+    if (src == NULL)
+        return DSP_EARG;
+    dsp_src_flat(&s, src, (nsrc > 0) ? nsrc : 0);
+    return dsp_spectrum_run_src(p, &s, nsrc, mean_out);
 }
 
 /* ------------------------------------------------------------------------- */

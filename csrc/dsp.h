@@ -130,6 +130,35 @@ typedef struct {
     int       len;     /**< Elements in the whole array. */
 } dsp_vec;
 
+/**
+ * @brief Blocks a strided source record may be spread over.
+ *
+ * Thirty-two covers `n = 16,384` from a reading buffer of 24-byte elements, which holds 1365
+ * to a 32,768-byte chunk and so needs thirteen.
+ */
+#define DSP_MAX_SRC_BLOCKS 32
+
+/**
+ * @brief A record of doubles the caller holds as strided elements in equal-sized blocks.
+ *
+ * The instrument's capture is a reading buffer: fixed-size elements with the reading at
+ * offset zero, packed into chunks of a fixed payload, so a record longer than one chunk is
+ * this rather than an array. Reading it in place is what removes the de-strided copy -- @c n
+ * doubles, 131 kB at 16,384 samples and longer than any segment -- from the frame entirely.
+ *
+ * @c nblock 1 with @c stride `sizeof(double)` is a plain array, which is what the entry
+ * points taking one build. @c stride must be a multiple of 8: the elements are then as
+ * aligned as the block base and a `double` load is safe, which a 4-aligned stride would not
+ * make it.
+ */
+typedef struct {
+    const unsigned char *blk[DSP_MAX_SRC_BLOCKS];
+    int nblock;
+    int per;    /**< Elements in each block; only the last may hold fewer. */
+    int stride; /**< Bytes between elements, a multiple of 8. */
+    int len;    /**< Elements in the record. */
+} dsp_src;
+
 /** @brief Element @p i of @p v. @p v is a `dsp_vec *`. */
 #define DSP_AT(v, i)  ((v)->tab[(i) >> (v)->sh][(i) & (v)->mask])
 
@@ -1115,6 +1144,15 @@ double dsp_binwidth(double fs, int n, int decim);
  *       ::dsp_binwidth still reports the decimated width, so it is refused.
  */
 int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, int nsrc, double *mean_out);
+
+/**
+ * @brief ::dsp_spectrum_run over a record the caller holds as strided blocks.
+ *
+ * The form the instrument uses: the capture is read in place out of the reading buffer's
+ * chunks, so no de-strided copy exists. ::dsp_spectrum_run is this over a one-block record.
+ * A decimating plan still needs a contiguous one, the filter reading it as an array.
+ */
+int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, int nsrc, double *mean_out);
 
 /* ------------------------------------------------------------------------- */
 

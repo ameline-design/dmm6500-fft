@@ -4779,6 +4779,70 @@ size_t SliceBytes(const dsp_vec &v, int s) {
     return take > 0 ? static_cast<size_t>(take) * sizeof(dsp_real) : 0u;
 }
 
+TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
+    // The instrument's capture: 24-byte elements with the reading at offset zero, packed into
+    // chunks. per is deliberately ODD, so an even/odd sample pair straddles a block boundary
+    // and the packing loop has to address the two halves independently.
+    const int n = 1024;
+    const int stride = 24;
+    const int per = 65;
+    const int nblk = (n + per - 1) / per;
+    ASSERT_LE(nblk, DSP_MAX_SRC_BLOCKS);
+
+    std::vector<double> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+        const double t = static_cast<double>(i);
+        x[static_cast<size_t>(i)] = 0.8 * std::sin(2.0 * M_PI * 53.0 * t / n) +
+                                   0.03 * std::sin(2.0 * M_PI * 211.0 * t / n) - 0.02;
+    }
+    // Each block its own allocation, so they are genuinely not contiguous.
+    std::vector<std::vector<unsigned char>> blocks;
+    for (int b = 0; b < nblk; b++) {
+        blocks.push_back(std::vector<unsigned char>(static_cast<size_t>(per) *
+                                                    static_cast<size_t>(stride), 0));
+    }
+    dsp_src src{};
+    for (int b = 0; b < nblk; b++)
+        src.blk[b] = blocks[static_cast<size_t>(b)].data();
+    src.nblock = nblk;
+    src.per = per;
+    src.stride = stride;
+    src.len = n;
+    for (int i = 0; i < n; i++) {
+        unsigned char *q = blocks[static_cast<size_t>(i / per)].data() +
+                           static_cast<size_t>(i % per) * static_cast<size_t>(stride);
+        std::memcpy(q, &x[static_cast<size_t>(i)], sizeof(double));
+    }
+
+    Plan flat(n, DSP_WINDOW_HANN);
+    ASSERT_EQ(DSP_OK, flat.rc());
+    Plan strided(n, DSP_WINDOW_HANN);
+    ASSERT_EQ(DSP_OK, strided.rc());
+    double mean_a = 0.0, mean_b = 0.0;
+    ASSERT_GT(dsp_spectrum_run(&flat.get(), x.data(), n, &mean_a), 0);
+    ASSERT_GT(dsp_spectrum_run_src(&strided.get(), &src, n, &mean_b), 0);
+    EXPECT_EQ(mean_a, mean_b);
+    for (int k = 0; k < flat->m; k++)
+        ASSERT_EQ(flat->pwr[k], strided->pwr[k]) << "bin " << k;
+}
+
+TEST(Source, AStrideThatWouldMisalignADoubleIsRefused) {
+    // A double load off a 4-aligned element traps on the target, so the stride has to be a
+    // multiple of eight whatever the block bases are.
+    const int n = 64;
+    std::vector<unsigned char> raw(static_cast<size_t>(n) * 12u, 0);
+    dsp_src src{};
+    src.blk[0] = raw.data();
+    src.nblock = 1;
+    src.per = n;
+    src.stride = 12;
+    src.len = n;
+    Plan p(n, DSP_WINDOW_HANN);
+    ASSERT_EQ(DSP_OK, p.rc());
+    double mean = 0.0;
+    EXPECT_EQ(DSP_EARG, dsp_spectrum_run_src(&p.get(), &src, n, &mean));
+}
+
 TEST(Segments, AnArrayLongerThanASegmentIsSplitRatherThanRefused) {
     // The window is n entries and the longest array, so it is the first to cross a segment.
     // Splitting it is what puts n = 8192 and n = 16,384 on this path at all: at 32,736 bytes
