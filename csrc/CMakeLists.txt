@@ -342,8 +342,18 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME b64_blob_selftest
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_b64.py --self-test)
-    set_tests_properties(f64_pack b64_blob b64_blob_selftest PROPERTIES
-                         ENVIRONMENT "LUA502=${LUA502}")
+    # Every point on the spectrum crosses to the graph through nl.reduce: the compiled path
+    # fills two arrays in the arena and the frame writes them with buffer.write.reading.
+    # A value decoded wrong there is a plausible wrong trace, and a nil reaching that call
+    # is a posted event per point.
+    add_test(NAME reduce
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_reduce.py)
+    add_test(NAME reduce_selftest
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_reduce.py --self-test)
+    set_tests_properties(f64_pack b64_blob b64_blob_selftest reduce reduce_selftest
+                         PROPERTIES ENVIRONMENT "LUA502=${LUA502}")
   endif()
 endif()
 
