@@ -1502,7 +1502,8 @@ end
 -- A value that does not decode to a finite number fails the whole call rather than leaving
 -- a hole, because a nil reaching buffer.write.reading is a posted event per point.
 --
--- The tables are allocated once and refilled, since this runs in a frame.
+-- The tables are allocated once and refilled, since this runs in a frame. The decibels are
+-- refilled every call and the frequencies only when the plan behind them moves.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.reduce(nseg)
   local nl = fftsa.nl
@@ -1514,17 +1515,48 @@ function fftsa.nl.reduce(nseg)
   local nbytes = nseg * 8
   local sd = ki.memread(hx(nl.red_db), hx(nbytes))
   if sd == nil or string.len(sd) ~= nbytes then return nil end
-  local sf = ki.memread(hx(nl.red_hz), hx(nbytes))
-  if sf == nil or string.len(sf) ~= nbytes then return nil end
   if nl._red == nil then nl._red = { db = {}, hz = {} } end
   local r = nl._red
   local db, hz = r.db, r.hz
-  local i, p = nil, 1
+  local i, p
+  -- The frequencies are an affine series the plan fixes: the primitive forms every one as
+  -- f0 + c * fstep from two numbers it derives before the segment loop, so no sample can
+  -- change one. They are decoded once a plan rather than once a frame, which is half the
+  -- values this call used to carry.
+  --
+  -- The two elements read here are those same two numbers -- element 1 is f0 and element 2
+  -- is f0 + fstep -- so an equal pair, at an equal count and an equal address, is the same
+  -- series to the last bit. Asking the array rather than recomputing the series from the
+  -- span keeps one owner of the arithmetic: a cache that agreed with a formula here and not
+  -- with the primitive would plot the right trace against the wrong axis.
+  local probe = 16
+  if nseg < 2 then probe = 8 end
+  local sp = ki.memread(hx(nl.red_hz), hx(probe))
+  if sp == nil or string.len(sp) ~= probe then return nil end
+  local h1 = f64_unpack(sp, 1)
+  local h2 = nil
+  if nseg >= 2 then h2 = f64_unpack(sp, 9) end
+  if h1 == nil or (nseg >= 2 and h2 == nil) then return nil end
+  if r.hz_nseg ~= nseg or r.hz_at ~= nl.red_hz or r.hz_1 ~= h1 or r.hz_2 ~= h2 then
+    -- Cleared before the read, so a short read or an undecodable value cannot leave the
+    -- key describing a table that was only half refilled.
+    r.hz_nseg, r.hz_at, r.hz_1, r.hz_2 = nil, nil, nil, nil
+    local sf = ki.memread(hx(nl.red_hz), hx(nbytes))
+    if sf == nil or string.len(sf) ~= nbytes then return nil end
+    p = 1
+    for i = 1, nseg do
+      local f = f64_unpack(sf, p)
+      if f == nil then return nil end
+      hz[i] = f
+      p = p + 8
+    end
+    r.hz_nseg, r.hz_at, r.hz_1, r.hz_2 = nseg, nl.red_hz, h1, h2
+  end
+  p = 1
   for i = 1, nseg do
     local v = f64_unpack(sd, p)
-    local f = f64_unpack(sf, p)
-    if v == nil or f == nil then return nil end
-    db[i], hz[i] = v, f
+    if v == nil then return nil end
+    db[i] = v
     p = p + 8
   end
   r.nseg = nseg
@@ -1534,7 +1566,24 @@ end
 -- Describe a buffer's storage for call_dsp, from the content scan and descriptor walk.
 -- Returns nil if either step fails, so a caller cannot build a half-filled table.
 function fftsa.nl.describe(buf, has_extras)
-  local elem0, stride = fftsa.nl._find_storage(buf, has_extras)
+  -- The two halves cost orders of magnitude apart, so they are cached apart. Finding
+  -- storage sweeps the heap window, and its answer is a property of the allocation, which
+  -- only a replacement can move -- so it is kept against the buffer it was measured on.
+  -- The descriptor walk below is a handful of peek32 and runs on every call, because the
+  -- chunk vector lengthens as a longer record is captured into the same allocation, and a
+  -- chunk left outside lo..hi is a refusal from the entry point on every frame.
+  local nl = fftsa.nl
+  local elem0, stride
+  if nl._stor_of == buf and nl._stor_x == has_extras and nl._stor_elem0 ~= nil then
+    elem0, stride = nl._stor_elem0, nl._stor_stride
+  else
+    nl._stor_of, nl._stor_x, nl._stor_elem0, nl._stor_stride = nil, nil, nil, nil
+    elem0, stride = nl._find_storage(buf, has_extras)
+    if elem0 then
+      nl._stor_of, nl._stor_x = buf, has_extras
+      nl._stor_elem0, nl._stor_stride = elem0, stride
+    end
+  end
   if not elem0 then return nil end
   local desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
   if not desc then return nil end

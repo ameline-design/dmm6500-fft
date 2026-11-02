@@ -363,12 +363,13 @@ end
 -- count press cost one call instead of an install.
 fftsa.nl_nmax = 16384
 
--- The count the acquisition buffer's capacity is floored at, which is deliberately not
--- nl_nmax. Finding a buffer's storage is a content scan of seconds and it runs whenever the
--- object identity changes, so the buffer is grown and never shrunk and the floor keeps the
--- small counts sharing one allocation. Flooring at nl_nmax would hold 65,536 readings --
--- 1.5 MB -- from the first Apply at every count, for a record of 512.
-fftsa.cap_floor_n = 2048
+-- The count the acquisition buffer's capacity is floored at. At nl_nmax one allocation
+-- serves every count, so the buffer's object identity never changes and the content scan
+-- that finds its storage -- a sweep of the whole heap window, seconds of ki.memread -- runs
+-- once per boot rather than once per step up to a longer record. The price is 65,536
+-- readings held for the life of the app, 1.6 MB of a 200 MB window, and it buys an Apply
+-- that sweeps nothing at any count.
+fftsa.cap_floor_n = fftsa.nl_nmax
 
 -- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
 --
@@ -413,9 +414,11 @@ function fftsa.mains_native(v)
   return fftsa.nl.MAINS_BOTH
 end
 
--- Chunk storage for the capture. A content scan takes seconds, so this must never run in a
--- frame; it runs at Apply, and only for a buffer whose object identity has changed, which is
--- the one thing that can move the storage.
+-- Chunk storage for the capture. This runs at Apply and never in a frame. describe() is
+-- called every time, because the chunk vector lengthens as a longer record lands in the
+-- same allocation and a chunk outside the window is refused on every frame; the heap sweep
+-- inside it is cached against the buffer, so calling it again costs a few peek32 and only a
+-- replaced buffer pays for storage to be found afresh.
 --
 -- The trace buffer is not scanned for at all. Its points reach the graph through
 -- buffer.write.reading -- the display task draws from its own copy of a bound buffer and
@@ -433,12 +436,10 @@ function fftsa.nl_bind()
     fftsa.nl_cap = nil
     return false
   end
-  if fftsa.nl_cap == nil or fftsa.nl_cap_of ~= fftsa.cap then
-    fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
-    local c = nl.describe(fftsa.cap, false)
-    if c == nil then return false end
-    fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
-  end
+  fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
+  local c = nl.describe(fftsa.cap, false)
+  if c == nil then return false end
+  fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
   return true
 end
 
@@ -532,10 +533,10 @@ function fftsa.apply()
   -- srclength read back rather than assumed to be fftsa.n: it is the primitive that decides
   -- how long a record it consumes, and under-acquiring would short-read every frame.
   dmm.digitize.count      = need
-  -- Capacity, never the record length, and grown but never shrunk: nl_bind's content scan
-  -- for this buffer's storage takes seconds and runs whenever its object identity changes,
-  -- so replacing it per sample count puts that scan on every size change. Going up to a
-  -- larger count pays one scan; coming back down pays none.
+  -- Capacity, never the record length, and floored at the longest record the app offers, so
+  -- the same allocation serves every count and the buffer is made once per boot. Replacing
+  -- it is what moves its storage, and finding storage again is a heap sweep of seconds; the
+  -- grow-and-never-shrink rule below is kept for a floor that is ever lowered.
   local want = need
   if want < fftsa.cap_floor_n then want = fftsa.cap_floor_n end
   want = want * 4
@@ -560,8 +561,9 @@ function fftsa.apply()
   -- derived from. arm() deletes the timer and creates a replacement, so re-arming restarts
   -- the period and churns the object pool: an adopted gesture, which cannot change the
   -- count, would pay a frame of latency for an identical timer and throw away the period
-  -- frame() had measured. From the model, which frame() replaces after eight real frames.
+  -- frame() had measured. From the model, which frame() replaces on the first real frame.
   fftsa.work_peak, fftsa.work_seen = nil, 0
+  fftsa.period_modelled = true
   -- Dropped rather than carried across: the rate the previous sample count ran at is wrong
   -- for this one, and the line is written twice from here, so a stale figure would be on
   -- the glass before the first new frame.
@@ -883,6 +885,9 @@ fftsa.ph_tick  = false      -- the one-a-second display block ran in the last fr
 -- period is set by the spectrum or by the display.
 fftsa.work_plain = nil
 fftsa.work_tick  = nil
+-- The period in force came from frame_estimate and no frame has been timed against it yet,
+-- so the first one that is may replace it outright.
+fftsa.period_modelled = false
 
 function fftsa.frame()
   if fftsa.halted then return end
@@ -930,12 +935,22 @@ function fftsa.frame()
       fftsa.work_plain = fftsa.frame_work
     end
     fftsa.work_seen = (fftsa.work_seen or 0) + 1
-    if fftsa.work_seen >= 8 and fftsa.timer ~= nil then
+    -- One frame replaces a modelled period, eight replace a measured one. The model is
+    -- frame_estimate, which is the interpreted primitive's cost for the count: the compiled
+    -- path runs a fraction of it, so at the large counts the modelled period is several
+    -- times the real frame and a window of eight would hold the app there for most of a
+    -- minute. Nothing is lost by replacing it early, because the peak still governs from
+    -- the next window on and a period set by a plain frame is raised again by the next
+    -- frame that carries the display block.
+    local win = 8
+    if fftsa.period_modelled then win = 1 end
+    if fftsa.work_seen >= win and fftsa.timer ~= nil then
       local want = fftsa.tick_period(fftsa.work_peak)
       if want ~= fftsa.period then
         fftsa.period = want
         fftsa.arm(want)
       end
+      fftsa.period_modelled = false
       -- Decay the peak so a size change downwards is noticed: it is re-earned over the
       -- next window rather than remembered for the life of the app.
       fftsa.work_peak = fftsa.frame_work

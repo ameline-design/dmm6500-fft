@@ -49,12 +49,17 @@ HZ = [0.0, 1953.125, 61.03515625, 1000000.0 / 512.0, 49800.0, 1.0 / 3.0, 1e-9,
 
 PRELUDE = """fftsa = { nl = {} }
 local MEM = {}
+-- Bytes asked for, counted so a case can assert what a call leaves unread. The frequencies
+-- are decoded once a plan, and a cache that silently stopped working would return the right
+-- trace while costing what it was built to save -- invisible to a value comparison.
+RBYTES = 0
 -- Serves any address inside a region, so a read that runs off the end comes back short
 -- rather than nil -- which is what the length check exists for. An address in no region
 -- reads nothing, as ki.memread does outside mapped memory.
 ki = { memread = function(addr, len)
   local a, n = tonumber(addr, 16), tonumber(len, 16)
   if a == nil or n == nil then return nil end
+  RBYTES = RBYTES + n
   local base, s = nil, nil
   local b, v
   for b, v in pairs(MEM) do
@@ -140,6 +145,65 @@ return nil
 """ % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
        DB_ADDR, HZ_ADDR, NSEG_MAX, n, DB[0], HZ[1])))
 
+    # The frequencies are an affine series the plan fixes, so they are decoded once a plan and
+    # reused. Two properties matter. The steady state must not re-read the array -- that is
+    # the whole point, and nothing about the returned values would show its loss. And a plan
+    # whose series differs must be noticed, or the trace plots against the wrong axis. The
+    # detector reads elements 1 and 2, which are f0 and f0 + fstep, so it is exercised on each
+    # of them on its own: a key that watched only one would pass a test that moved both.
+    # One element moved per variant, so each case can only be caught by the half of the key
+    # that watches that element. Moving both would let either half pass the pair.
+    hz_f0 = [HZ[0] + 1.0] + HZ[1:]
+    hz_fstep = [HZ[0], HZ[1] + 7.0] + HZ[2:]
+
+    cases.append(('the frequencies are decoded once a plan, not once a call', """
+setmem(%d, '%s'); setmem(%d, '%s')
+local nl = fftsa.nl
+nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+if nl.reduce(%d) == nil then return 'first call returned nil' end
+RBYTES = 0
+local r = nl.reduce(%d)
+if r == nil then return 'second call returned nil' end
+-- The decibels in full, plus a two-element probe of the frequencies. Re-reading the whole
+-- frequency array would add as much again.
+local want = %d * 8 + 16
+if RBYTES ~= want then
+  return string.format('%%d bytes on the second call, wanted %%d', RBYTES, want)
+end
+local want_hz = {%s}
+local i
+for i = 1, %d do
+  if r.hz[i] ~= want_hz[i] then
+    return string.format('hz[%%d] %%.17g wanted %%.17g', i, r.hz[i], want_hz[i])
+  end
+end
+return nil
+""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
+       DB_ADDR, HZ_ADDR, NSEG_MAX, n, n, n,
+       ','.join('%.17g' % v for v in HZ), n)))
+
+    for label, vals in (('f0', hz_f0), ('fstep', hz_fstep)):
+        cases.append(('a plan with a new %s refills the frequencies' % label, """
+setmem(%d, '%s'); setmem(%d, '%s')
+local nl = fftsa.nl
+nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+if nl.reduce(%d) == nil then return 'the first plan returned nil' end
+setmem(%d, '%s')
+local r = nl.reduce(%d)
+if r == nil then return 'the second plan returned nil' end
+local want_hz = {%s}
+local i
+for i = 1, %d do
+  if r.hz[i] ~= want_hz[i] then
+    return string.format('hz[%%d] %%.17g wanted %%.17g', i, r.hz[i], want_hz[i])
+  end
+end
+return nil
+""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
+       DB_ADDR, HZ_ADDR, NSEG_MAX, n,
+       HZ_ADDR, esc(image(vals)), n,
+       ','.join('%.17g' % v for v in vals), n)))
+
     # Fails closed, one case per refusal. Each must be nil, not a table with a hole and not
     # an error: the caller falls back to the interpreted primitive on nil.
     refusals = [
@@ -211,14 +275,20 @@ def run(module):
 
 
 # Each mutation has to break at least one case above. A gate whose cases all pass against a
-# wrong module is the failure mode worth testing for, and these are the three faults the
-# function could plausibly acquire: the wrong stride through the image, a short read taken
-# as a whole one, and the finite check dropped.
+# wrong module is the failure mode worth testing for. The first four are faults the decode
+# could acquire -- a wrong stride through either image, a short read taken as a whole one,
+# the finite check dropped. The last three are the cache: one per input of its key, so a key
+# that watched the count and the address but not the series would be caught, plus a cache
+# that stops hitting, which costs what it was built to save and shows in nothing it returns.
 MUTATIONS = [
-    ('the value stride', 'p = p + 8', 'p = p + 4'),
+    ('the decibel stride', 'db[i] = v\n    p = p + 8', 'db[i] = v\n    p = p + 4'),
+    ('the frequency stride', 'hz[i] = f\n      p = p + 8', 'hz[i] = f\n      p = p + 4'),
     ('a short read accepted', 'string.len(sd) ~= nbytes', 'string.len(sd) < 0'),
-    ('the finite check dropped', 'if v == nil or f == nil then return nil end',
+    ('the finite check dropped', 'if v == nil then return nil end',
      'if v ~= nil and v == nil then return nil end'),
+    ('the cache ignores f0', ' or r.hz_1 ~= h1', ''),
+    ('the cache ignores fstep', ' or r.hz_2 ~= h2', ''),
+    ('the cache never hits', 'if r.hz_nseg ~= nseg or', 'if true or'),
 ]
 
 

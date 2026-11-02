@@ -4446,10 +4446,13 @@ check('all size transitions keep the original trace bound and plot without leaks
   local adds0, removes0 = OBJ[graph0].adds, OBJ[graph0].removes
   local transitions = {1, 2, 1, 3, 1, 4, 1, 5, 1, 6, 1, 6, 5, 4, 3, 2, 1}
   -- The acquisition buffer's capacity is four times the record, floored at four times
-  -- fftsa.cap_floor_n and never shrunk, so the small counts share one allocation and the
-  -- content scan that finding its storage needs runs once. Tracked rather than restated per
-  -- size, because the figure at any point depends on the largest count visited so far.
+  -- fftsa.cap_floor_n and never shrunk. With the floor at the longest record the app offers
+  -- that is one capacity for every count, so the buffer is allocated once and its identity
+  -- never changes -- which is the point, because a replacement is what moves its storage and
+  -- finding storage again is a heap sweep of seconds. Tracked rather than restated per size,
+  -- so the arithmetic still holds if the floor is ever lowered.
   local capmax = 0
+  local cap0 = fftsa.cap
   for _, i in ipairs(transitions) do
     local oldcap = fftsa.cap
     local n = fftsa.sample_counts[i]
@@ -4483,6 +4486,13 @@ check('all size transitions keep the original trace bound and plot without leaks
     if oldcap ~= fftsa.cap and oldcap.alive then
       display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
       return false, 'old buffer still alive at N=' .. n
+    end
+    -- The capacity serves every count, so no size change may replace the buffer. Asserted on
+    -- identity and not on .cap alone: a replacement with the same capacity reads identical
+    -- there and still costs the sweep.
+    if fftsa.cap ~= cap0 then
+      display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
+      return false, 'acquisition buffer was replaced at N=' .. n
     end
     fftsa.frame()
     local kmin, kmax = fftsa.sg_window_bins(n / 2, fftsa.binhz)
