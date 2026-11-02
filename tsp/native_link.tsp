@@ -1319,6 +1319,48 @@ function fftsa.nl.results()
   return r
 end
 
+-- ---------------------------------------------------------------------------
+-- The reduced trace the last run produced: one decibel value per segment and the frequency
+-- of each, in two tables for the caller to write with buffer.write.reading.
+--
+-- That write is the only route onto a graph. The native side can put the same numbers into
+-- the bound buffer's chunk storage and rewind its descriptor -- the buffer then reads back
+-- correct from Lua and buf.n says the right count -- and the graph stays blank, because the
+-- display task works from its own copy of a bound buffer and buffer.write.reading is what
+-- feeds it. No notify call reaches a write it never saw.
+--
+-- A value that does not decode to a finite number fails the whole call rather than leaving
+-- a hole, because a nil reaching buffer.write.reading is a posted event per point.
+--
+-- The tables are allocated once and refilled, since this runs in a frame.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.reduce(nseg)
+  local nl = fftsa.nl
+  if nl.red_db == nil or nl.red_hz == nil then return nil end
+  if nseg == nil or nl.nseg_max == nil or nseg < 1 or nseg > nl.nseg_max then return nil end
+  -- f64_unpack reads eight bytes; a single-precision image moves SIZEOF_REAL and its words
+  -- decoded as a double would be silent nonsense.
+  if nl.SIZEOF_REAL ~= 8 then return nil end
+  local nbytes = nseg * 8
+  local sd = ki.memread(hx(nl.red_db), hx(nbytes))
+  if sd == nil or string.len(sd) ~= nbytes then return nil end
+  local sf = ki.memread(hx(nl.red_hz), hx(nbytes))
+  if sf == nil or string.len(sf) ~= nbytes then return nil end
+  if nl._red == nil then nl._red = { db = {}, hz = {} } end
+  local r = nl._red
+  local db, hz = r.db, r.hz
+  local i, p = nil, 1
+  for i = 1, nseg do
+    local v = f64_unpack(sd, p)
+    local f = f64_unpack(sf, p)
+    if v == nil or f == nil then return nil end
+    db[i], hz[i] = v, f
+    p = p + 8
+  end
+  r.nseg = nseg
+  return r
+end
+
 -- Describe a buffer's storage for call_dsp, from the content scan and descriptor walk.
 -- Returns nil if either step fails, so a caller cannot build a half-filled table.
 function fftsa.nl.describe(buf, has_extras)

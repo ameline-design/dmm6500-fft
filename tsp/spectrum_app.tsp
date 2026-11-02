@@ -176,7 +176,7 @@ end
 -- previous launch's objects. fftsa.start()'s opening fftsa.stop() reclaims them.
 if fftsa.handles_inited == nil then
   fftsa.cap      = nil      -- acquisition buffer
-  fftsa.cap_n    = nil      -- the fftsa.n it was sized for
+  fftsa.cap_cap  = nil      -- readings it was made for
   fftsa.optbtn   = nil      -- Options (cog) button on the spectrum screen
   fftsa.optimg   = nil      -- cog image drawn over it
   fftsa.lockbtn  = nil      -- Lock button beside it
@@ -530,13 +530,20 @@ function fftsa.apply()
   -- srclength read back rather than assumed to be fftsa.n: it is the primitive that decides
   -- how long a record it consumes, and under-acquiring would short-read every frame.
   dmm.digitize.count      = need
-  if fftsa.cap ~= nil and fftsa.cap_n ~= need then
+  -- Capacity, never the record length, and grown but never shrunk: nl_bind's content scan
+  -- for this buffer's storage takes seconds and runs whenever its object identity changes,
+  -- so replacing it per sample count puts that scan on every size change. The floor is the
+  -- native ceiling, so every count the compiled path can serve shares one allocation.
+  local want = need
+  if want < fftsa.nl_nmax then want = fftsa.nl_nmax end
+  want = want * 4
+  if fftsa.cap ~= nil and (fftsa.cap_cap == nil or fftsa.cap_cap < want) then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
   end
   if fftsa.cap == nil then
-    fftsa.cap   = buffer.make(need * 4, buffer.STYLE_STANDARD)
-    fftsa.cap_n = need
+    fftsa.cap     = buffer.make(want, buffer.STYLE_STANDARD)
+    fftsa.cap_cap = want
   end
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
@@ -581,8 +588,9 @@ function fftsa.nl_replan()
   if nl == nil or type(nl.reinit) ~= 'function' then return false end
   if nl.entry == nil or nl.entry == 0 then return false end
   if nl.nmax == nil or fftsa.n > nl.nmax then
+    -- The descriptors stay: they are keyed on buffer identity, and dropping them here means
+    -- a second content scan on the way back down to a count the arena can serve.
     nl.ready = false
-    fftsa.nl_cap, fftsa.nl_out = nil, nil
     return false
   end
   local ok = nl.reinit(fftsa.n, nl.win_to_native(fftsa.win_i),
@@ -713,31 +721,30 @@ function fftsa.frame_body()
       fftsa.nl_lasterr = tostring(fftsa.nl.last_rc)
       nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
     else
-      fftsa.binhz = binhz
-      fftsa.nl_frame = true
-      fftsa.nl_res = fftsa.nl.results()
-      -- NO NOTIFY CALL, and display.graph.scaletrace in particular. It was here on the
-      -- claim that it "makes the widget re-read sg_buf without a clear", and that claim was
-      -- never tested. MEASURED: it UNPINS BOTH AXES. The first native frame on the glass
-      -- came back with the x axis auto-scaled to +000.0..+560.0 Hz -- the range of the
-      -- extra values sg_mkbuf seeded, not the 195 Hz..49.8 kHz the trace holds -- the
-      -- decibel labels gone from the y axis, and so no trace visible at all, because the
-      -- points were off the right-hand edge. The peak table and the THD line, which do not
-      -- go through the widget, were correct throughout.
+      -- The trace reaches the graph through buffer.write.reading, from the values the same
+      -- call reduced. The display task works from its own copy of a bound buffer and that
+      -- write is what feeds it, so the native side's own write into the buffer's chunk
+      -- storage draws nothing and no notify call rescues it; nl.reduce says more.
       --
-      -- NO NOTIFY CALL HERE, because none of them works and two of them cost real time.
-      -- Measured, three runs, same conditions and the same five-frame method:
-      --
-      --   scaletrace per frame   126.6 ms, axes UNPINNED, no trace
-      --   drawstyle per frame     46.6 ms, axes correct, no trace
-      --   nothing                 21.4 ms, axes correct, no trace
-      --
-      -- In all three the buffer itself was right: 255 points at the right frequencies,
-      -- readable from Lua, with the descriptor rewound so buf.n says 255. The widget does
-      -- not re-read it. spectrum_graph.tsp:69 says why and said so before any of this --
-      -- the clear is the only notify compatible with FILL_ONCE, and the whole point of
-      -- this path is not to clear. So the remaining lever is the buffer's fill mode, not a
-      -- call from here, and that belongs in sg_mkbuf where the mode is set.
+      -- Cleared and refilled, which is what dsp.spectrum does internally on the other
+      -- path, so the window holding a partial trace is the loop below and no longer.
+      local rd = fftsa.nl.reduce(nseg)
+      if rd == nil then
+        fftsa.nl.ready = false
+        fftsa.nl_lasterr = 'reduce'
+        nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+      else
+        fftsa.binhz = binhz
+        fftsa.nl_frame = true
+        fftsa.nl_res = fftsa.nl.results()
+        local wr = buffer.write.reading
+        local tb, db, hz = fftsa.sg_buf, rd.db, rd.hz
+        local i
+        tb.clear()
+        for i = 1, nseg do
+          wr(tb, db[i], hz[i], i, 0)
+        end
+      end
     end
   else
     -- Existing path: dsp.spectrum clears sg_buf internally before filling it.
@@ -2081,7 +2088,7 @@ function fftsa.stop()
   end
   if fftsa.cap ~= nil then
     fftsa.del_buf(fftsa.cap)
-    fftsa.cap = nil
+    fftsa.cap, fftsa.cap_cap = nil, nil
   end
   -- The pending re-plan goes with the app. Two stops under one frame reach the teardown
   -- from the second call, which clears stop_pending -- and fftsa.frame() then finds the flag

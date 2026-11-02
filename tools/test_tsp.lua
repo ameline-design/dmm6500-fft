@@ -4354,16 +4354,25 @@ check('all size transitions keep the original trace bound and plot without leaks
   local graphbuf0 = fftsa.sg_buf
   local adds0, removes0 = OBJ[graph0].adds, OBJ[graph0].removes
   local transitions = {1, 2, 1, 3, 1, 4, 1, 5, 1, 6, 1, 6, 5, 4, 3, 2, 1}
+  -- The acquisition buffer's capacity is four times the record, floored at four times the
+  -- native ceiling and never shrunk, so a count the compiled path can serve always finds
+  -- the buffer it already scanned. Tracked rather than restated per size, because the exact
+  -- figure at any point depends on the largest count visited so far.
+  local capmax = 0
   for _, i in ipairs(transitions) do
     local oldcap = fftsa.cap
     local n = fftsa.sample_counts[i]
+    local wantcap = n * 4
+    if wantcap < fftsa.nl_nmax * 4 then wantcap = fftsa.nl_nmax * 4 end
+    if wantcap < capmax then wantcap = capmax end
+    capmax = wantcap
     display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])
     if not fftsa.options_apply() then
       display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
       return false, fftsa.lasterr
     end
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
-       or dmm.digitize.count ~= n or fftsa.cap.cap ~= n * 4
+       or dmm.digitize.count ~= n or fftsa.cap.cap ~= wantcap
        or fftsa.sg_buf.capacity ~= fftsa.sg_maxpts
        or OBJ[graph0].buffer ~= graphbuf0
        or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
@@ -4415,6 +4424,10 @@ check('unchanged sample counts reuse acquisition and graph buffers', (function()
 end)())
 check('a buffer allocation failure halts frames and allows recovery', (function()
   display.setvalue(fftsa.opt_n, 2)
+  -- The recorded capacity is what decides whether the acquisition buffer is replaced, and
+  -- a count below the one already allocated for replaces nothing. Zeroed so that apply()
+  -- reaches buffer.make, which is where the failure is injected.
+  fftsa.cap_cap = 0
   local real = buffer.make
   buffer.make = function() error('resize-boom', 0) end
   local ok = fftsa.options_apply()
@@ -4448,7 +4461,9 @@ check('sample changes never allocate or replace a graph buffer', (function()
   local recovered = fftsa.options_apply()
   fftsa.frame()
   local shown = OBJ[fftsa.sg_graph].buffer
-  return ok and allocations == 1 and recovered and not fftsa.halted and fftsa.errrun == 0
+  -- Nothing at all is allocated: a count within the native ceiling fits the acquisition
+  -- buffer already there, and the graph buffer is the one the hook above refuses outright.
+  return ok and allocations == 0 and recovered and not fftsa.halted and fftsa.errrun == 0
          and livebufs() == buffers0 and fftsa.sg_buf == trace and shown == trace,
          string.format('allocs=%d same=%s bound=%s bufs %d/%d',
                        allocations, tostring(fftsa.sg_buf == trace),
