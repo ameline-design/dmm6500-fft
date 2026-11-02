@@ -45,10 +45,12 @@ figure is why the Options button was unreachable at the larger counts: `delay()`
 paint, but dispatching a touch needs the Lua interpreter, and during a frame the interpreter is busy,
 so the only time a press can be handled is the gap between a frame ending and the next tick.
 
-The app now arms the timer deliberately, at the smallest tick count leaving about a fifth of the
-period idle, from the peak work over eight real frames (`fftsa.tick_period`). The quantisation is
-unchanged -- it is the firmware's -- but which tick a size lands on is now a decision with a reason
-rather than a remainder.
+The app now arms the timer deliberately, at the smallest tick count that leaves `fftsa.tick_idle`
+free -- 20 ms, an amount rather than a proportion, because dispatching a press costs about the same
+whatever the frame cost. The work it sizes against is the worst frame of the window that did **not**
+carry the once-a-second display block; that frame is left to overrun and drop a tick rather than
+every period being padded for it. The quantisation is unchanged -- it is the firmware's -- but which
+tick a size lands on is now a decision with a reason rather than a remainder.
 
 ### Measured, N=512, 256 bins, graph 784x272, timer frozen, frames back to back
 
@@ -155,6 +157,46 @@ Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, a 12.5 kHz 1.000 V
 parked, so the period each size settles on has been re-armed from real frames before it is read.
 Taken 2026-10-25, event log clean throughout. `tools/../../fftmeas/docmeas5.py` is the run.
 
+**Superseded on the rate and period columns by the figures below.** The table that follows was
+taken before the work of 2026-11-02, which removed about 44 ms a frame of HELP-key polling, put the
+compiled path into single precision, and replaced the occupancy rule. Its frame breakdowns and its
+point about the worst frame still hold; its rates are between two and eight times low.
+
+### Rates after 2026-11-02
+
+Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, 255 trace points, nothing attached to
+the control socket. Read off the front panel, which is how they have to be taken: an attached probe
+inflates measured frame work enough to buy a whole tick, so a socket reading at 2048 came back 5.0
+where the glass showed 6.7.
+
+| N | period | displayed | true rate | note |
+|---|---|---|---|---|
+| 512 | 0.10 s | 10 fps | 10 | |
+| 2048 | 0.10 s | 9.5 fps | 10 | the estimator reads low, see below |
+| 4096 | 0.20 s | 5.0 fps | 5.0 | |
+| 8192 | 0.25 s | 4.0 fps | 4.0 | |
+| 16384 | 0.25 s | 3.8 fps | 4.0 | |
+
+1024 was not measured; it shares 2048's period.
+
+**The displayed figure runs about 5 % low**, and it is the estimator rather than the app: the window
+closes on the first frame past one second, so ten frames spanning 1.05 s report as 9.5. `fftsa.fps`
+is completed frames over the wall clock, not `1 / period`.
+
+Phase breakdown from `fftsa.phases()`, milliseconds, last frame, with `fftsa.ph_peak` cleared first
+so no figure belongs to another count:
+
+| N | acq | spec | mark | tick | yld | show | frame |
+|---|---|---|---|---|---|---|---|
+| 2048 | 21.6 | 34.3 | 0.1 | 0.0 | 10.1 | 0.1 | 66 |
+| 16384 | 169.3 | 47.6 | 0.1 | 0.0 | 10.1 | 0.1 | 227 |
+
+`spec` carries the transform, the arena read-back and the 255 `buffer.write.reading` calls. `show`
+was 46.1 ms at 16384 until the HELP poll moved off the per-frame path; it is now the settings line
+alone. At 16384 the frame is 227 ms against the 230 ms five ticks allows, so the next tick needs
+50 ms removed from a frame whose largest term is an acquisition that cannot be shortened at a given
+rate and record length.
+
 | N | Apply | frame | worst frame | period | displayed | occupancy | bin width | record |
 |---|---|---|---|---|---|---|---|---|
 | 512 | 0.106 s | 0.079 s | 0.081 s | 0.10 s | **10.0 fps** | 81 % | 195.31 Hz | 5.1 ms |
@@ -171,16 +213,18 @@ turns over. Every other count holds within 2 % of its mean. The occupancy column
 so 4096's 88 % is that outlier arriving after the period had been armed from a lower peak.
 
 **The displayed rate is now a figure the app chooses, not one the quantisation leaves.** The period
-is re-armed from the peak work over eight real frames, through `fftsa.tick_period()`, which asks for
-the work to be about 80 % of the period and rounds up to the firmware's 0.05 s tick. So `period` is
-what the operator sees and `worst frame` is what it was sized to cover -- the mean is only there to
-show the spread is small, under 2 % at every count.
+is re-armed through `fftsa.tick_period()`, which adds `fftsa.tick_idle` to the measured work and
+rounds up to the firmware's 0.05 s tick, less 2.5 ms of slack so a frame a hair over a boundary does
+not buy a whole tick. It re-arms on the first frame after an Apply -- the modelled period it replaces
+comes from the interpreted primitive's cost and is several times the compiled path's -- and every
+eighth frame after that. So `period` is what the operator sees and `worst frame` is what it was
+sized to cover; the mean is only there to show the spread is small, under 2 % at every count.
 
 4096 and 8192 are **slower than an earlier revision of this table** recorded -- 1.67 fps against 2.0,
 0.91 against 1.1 -- and that is the rule working rather than a regression. Those figures came from a
 period left at the 0.05 s floor with ticks dropped, which gave the interpreter 2 % idle at 4096 and
-made the Options button unreachable there. A fifth of each frame is now idle by construction, and the
-button answers at 16384.
+made the Options button unreachable there. Every period now leaves at least 20 ms free by
+construction, against the 12 ms measured as too little, and the button answers at 16384.
 
 Two sources of error this table had before, both now gone: the frame times were taken without the
 display task's paint and so ran a tick or two optimistic, and the trace point count grew with N

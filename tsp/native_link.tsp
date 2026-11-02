@@ -1286,7 +1286,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
 
   -- dsp_reduce writes nseg entries into each of db and hz, and the trace count is a
   -- front-panel choice, so the room is reserved for the largest the app can ask for
-  -- rather than for the one in force. Both are dsp_real, which is double in this build;
+  -- rather than for the one in force. Both are dsp_real, four bytes in the shipped image;
   -- SIZEOF_REAL comes out of the image so a single-precision build moves it.
   local red_host = align32(payload[nseg + 2])
   local red_db   = red_host
@@ -1630,9 +1630,12 @@ function fftsa.nl.describe(buf, has_extras)
   -- The two halves cost orders of magnitude apart, so they are cached apart. Finding
   -- storage sweeps the heap window, and its answer is a property of the allocation, which
   -- only a replacement can move -- so it is kept against the buffer it was measured on.
-  -- The descriptor walk below is a handful of peek32 and runs on every call, because the
-  -- chunk vector lengthens as a longer record is captured into the same allocation, and a
-  -- chunk left outside lo..hi is a refusal from the entry point on every frame.
+  -- Both halves sweep the heap, and both are cached, against different keys. Finding
+  -- storage is keyed on the buffer, since only a replacement moves it. Finding the
+  -- descriptor is keyed on the storage address, inside _find_desc, and its five words are
+  -- re-read every call -- which is what makes calling describe() again cheap, and is how a
+  -- chunk vector that lengthened is picked up. A chunk left outside lo..hi would be a
+  -- refusal from the entry point on every frame.
   local nl = fftsa.nl
   local elem0, stride
   if nl._stor_of == buf and nl._stor_x == has_extras and nl._stor_elem0 ~= nil then

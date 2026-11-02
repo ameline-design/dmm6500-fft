@@ -461,9 +461,11 @@ end
 
 -- Chunk storage for the capture. This runs at Apply and never in a frame. describe() is
 -- called every time, because the chunk vector lengthens as a longer record lands in the
--- same allocation and a chunk outside the window is refused on every frame; the heap sweep
--- inside it is cached against the buffer, so calling it again costs a few peek32 and only a
--- replaced buffer pays for storage to be found afresh.
+-- same allocation and a chunk outside the window is refused on every frame. It is cheap to
+-- call again: describe() sweeps the heap twice, once for the storage and once for the
+-- descriptor, and caches both -- the first against the buffer, the second against the
+-- storage address -- so a repeat call re-reads the descriptor's words and nothing else.
+-- Only a replaced buffer pays either sweep, and the capture buffer is never replaced.
 --
 -- The trace buffer is not scanned for at all. Its points reach the graph through
 -- buffer.write.reading -- the display task draws from its own copy of a bound buffer and
@@ -658,8 +660,9 @@ function fftsa.nl_replan()
   if nl == nil or type(nl.reinit) ~= 'function' then return false end
   if nl.entry == nil or nl.entry == 0 then return false end
   if nl.nmax == nil or fftsa.n > nl.nmax then
-    -- The descriptors stay: they are keyed on buffer identity, and dropping them here means
-    -- a second content scan on the way back down to a count the arena can serve.
+    -- The descriptors stay. Dropping them here would throw away both of describe()'s
+    -- cached sweeps on the way back down to a count the arena can serve, and each is a walk
+    -- of the heap window.
     nl.ready = false
     return false
   end
@@ -878,7 +881,7 @@ function fftsa.frame_body()
   -- never reading a half-painted screen. There is no event to hang it on; every delivery
   -- path the firmware offers refuses the key.
   --
-  -- ONCE A SECOND, not once a frame, and the cost is not the checksum itself. The firmware
+  -- Once a second, not once a frame, and the cost is not the checksum itself. The firmware
   -- answers that in 0.33 ms. It is the wait: getchecksum returns glass-derived data, so it
   -- blocks until the display task answers, and at this point in the frame that task owes the
   -- 255 reading messages the trace fill just batched and the repaint they cause. Measured on
@@ -2119,9 +2122,10 @@ end
 -- that left 12 ms of 500 at 4096 samples, where Options was unreachable.
 --
 -- An amount, not a fraction, because that is the shape of the thing being reserved for:
--- dispatching a press costs about the same however long the frame was. A fifth of the frame
--- held back 85 ms at 16,384 samples, nearly two ticks of rate spent on idle nothing needs,
--- while a 40 ms frame got 10 ms -- below the figure measured as too little.
+-- dispatching a press costs about the same however long the frame was, so a reserve in
+-- proportion to frame work over-provisions the long counts and under-provisions the short
+-- ones. It is also the display task's budget, with fftsa.sg_yield -- that task runs only
+-- while Lua is blocked.
 --
 -- 20 ms rather than more because of where the tick boundaries fall: the floor only costs
 -- rate when it pushes busy over a multiple of 50 ms, and at 25 or 30 it does that to the

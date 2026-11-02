@@ -413,7 +413,7 @@ if(DSP_DST_NATIVE)
       DSP_NO_SINGLE_MATH
       DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
       )
-  # -ffp-contract=fast HERE and nowhere else. The reason the host variants hold it off is to
+  # -ffp-contract=fast here and nowhere else. The reason the host variants hold it off is to
   # keep the single-against-double comparison honest -- an FMA makes the single build more
   # accurate than a plain compiler would and hides what that comparison exists to measure.
   # The target image is not in that comparison, and the e300c4 has a fused multiply-add that

@@ -145,11 +145,13 @@ def main():
         print('unresponsive after cleanup'); return 2
 
     # ---- the one build ----
-    # 900 s, not 300: start() installs the native image, and that costs FOUR content scans
-    # over the heap -- two inside nl.init to find the code and plan buffers, two more in
-    # nl_bind for the capture and trace buffers. Each is about a minute. A timeout shorter
-    # than the work does not just lose the answer: the late reply arrives while the next
-    # query is waiting and every read after it is one behind.
+    # 900 s, not 300: start() installs the native image, and that costs content scans over
+    # the heap -- two inside nl.init to find the code and plan buffers, and two more in
+    # nl_bind for the capture buffer, which needs its storage found and then its descriptor.
+    # The trace buffer is not scanned at all; its points reach the graph through
+    # buffer.write.reading. Each scan is about a minute. A timeout shorter than the work does
+    # not just lose the answer: the late reply arrives while the next query is waiting and
+    # every read after it is one behind.
     print('start     :', d.q('fftsa.start()', timeout=900))
     print('  log     :', log(d))
     d.exec('eventlog.clear()')

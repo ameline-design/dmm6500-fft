@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 6.6
+-- $Version: 6.7
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -1548,7 +1548,7 @@ end
 
 -- Move the floor to what the range wants, answering whether it moved. One assignment is the
 -- whole move: every reader takes fftsa.sg_dbmin live -- the trace fill, the peak column, the
--- marker needles, the restore's span and dsp.out.dbfloor through dsp_live(). The answer is
+-- marker needles, the restore's span and dsp.out.dbfloor through dsp_live_push(). The answer is
 -- what apply() pins the axis on, an axis write costing 60 ms and a full repaint, so an
 -- unchanged limit is never written.
 function fftsa.sg_dbmin_set(range)
@@ -1797,7 +1797,7 @@ fftsa.help_x2,  fftsa.help_y2 = 108, 66
 fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
 fftsa.help_shown = 0            -- times the key has been answered
 fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
--- OFF, by the operator's decision, because the key is not worth what it costs the frame
+-- Off, by the operator's decision, because the key is not worth what it costs the frame
 -- rate. The poll waits on the display task -- see help_period below -- and measured 44 ms of
 -- a 274 ms frame at 16,384 samples. What it buys back is that pressing HELP now leaves the
 -- firmware's own dialog on the glass until EXIT is pressed, instead of the app noticing and
@@ -1934,9 +1934,16 @@ function fftsa.sg_bind_min()
 end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint it; too
--- short and the firmware posts 1706. Small because the timer period already leaves a fifth
--- of every frame idle with Lua blocked, so this only insures against a frame whose work
--- fills its whole period.
+-- short and the firmware posts 1706. The display task runs only while Lua is blocked, so
+-- this and the timer's idle are the whole of its budget: fftsa.tick_idle reserves 20 ms of
+-- every period whatever the frame cost, which at 16,384 samples is about a tenth of what a
+-- fifth of the frame used to leave.
+--
+-- Measured at 2048 samples, this is neutral from 5 to 20 ms -- 9.53, 9.51 and 9.52 frames a
+-- second -- and costs a whole tick at 30. At 5 ms the frame grew by about 50 ms at 16,384,
+-- because the task does not finish inside the shorter slice and the remainder contends with
+-- the next frame's work, which is ten times what the yield saved. So 10 ms is not a figure
+-- to shave: the saving is nothing and the loss is a torn trace and event 1706.
 fftsa.sg_yield = 0.010
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
@@ -3400,7 +3407,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
 
   -- dsp_reduce writes nseg entries into each of db and hz, and the trace count is a
   -- front-panel choice, so the room is reserved for the largest the app can ask for
-  -- rather than for the one in force. Both are dsp_real, which is double in this build;
+  -- rather than for the one in force. Both are dsp_real, four bytes in the shipped image;
   -- SIZEOF_REAL comes out of the image so a single-precision build moves it.
   local red_host = align32(payload[nseg + 2])
   local red_db   = red_host
@@ -3744,9 +3751,12 @@ function fftsa.nl.describe(buf, has_extras)
   -- The two halves cost orders of magnitude apart, so they are cached apart. Finding
   -- storage sweeps the heap window, and its answer is a property of the allocation, which
   -- only a replacement can move -- so it is kept against the buffer it was measured on.
-  -- The descriptor walk below is a handful of peek32 and runs on every call, because the
-  -- chunk vector lengthens as a longer record is captured into the same allocation, and a
-  -- chunk left outside lo..hi is a refusal from the entry point on every frame.
+  -- Both halves sweep the heap, and both are cached, against different keys. Finding
+  -- storage is keyed on the buffer, since only a replacement moves it. Finding the
+  -- descriptor is keyed on the storage address, inside _find_desc, and its five words are
+  -- re-read every call -- which is what makes calling describe() again cheap, and is how a
+  -- chunk vector that lengthened is picked up. A chunk left outside lo..hi would be a
+  -- refusal from the entry point on every frame.
   local nl = fftsa.nl
   local elem0, stride
   if nl._stor_of == buf and nl._stor_x == has_extras and nl._stor_elem0 ~= nil then
@@ -4840,9 +4850,11 @@ end
 
 -- Chunk storage for the capture. This runs at Apply and never in a frame. describe() is
 -- called every time, because the chunk vector lengthens as a longer record lands in the
--- same allocation and a chunk outside the window is refused on every frame; the heap sweep
--- inside it is cached against the buffer, so calling it again costs a few peek32 and only a
--- replaced buffer pays for storage to be found afresh.
+-- same allocation and a chunk outside the window is refused on every frame. It is cheap to
+-- call again: describe() sweeps the heap twice, once for the storage and once for the
+-- descriptor, and caches both -- the first against the buffer, the second against the
+-- storage address -- so a repeat call re-reads the descriptor's words and nothing else.
+-- Only a replaced buffer pays either sweep, and the capture buffer is never replaced.
 --
 -- The trace buffer is not scanned for at all. Its points reach the graph through
 -- buffer.write.reading -- the display task draws from its own copy of a bound buffer and
@@ -5037,8 +5049,9 @@ function fftsa.nl_replan()
   if nl == nil or type(nl.reinit) ~= 'function' then return false end
   if nl.entry == nil or nl.entry == 0 then return false end
   if nl.nmax == nil or fftsa.n > nl.nmax then
-    -- The descriptors stay: they are keyed on buffer identity, and dropping them here means
-    -- a second content scan on the way back down to a count the arena can serve.
+    -- The descriptors stay. Dropping them here would throw away both of describe()'s
+    -- cached sweeps on the way back down to a count the arena can serve, and each is a walk
+    -- of the heap window.
     nl.ready = false
     return false
   end
@@ -5257,7 +5270,7 @@ function fftsa.frame_body()
   -- never reading a half-painted screen. There is no event to hang it on; every delivery
   -- path the firmware offers refuses the key.
   --
-  -- ONCE A SECOND, not once a frame, and the cost is not the checksum itself. The firmware
+  -- Once a second, not once a frame, and the cost is not the checksum itself. The firmware
   -- answers that in 0.33 ms. It is the wait: getchecksum returns glass-derived data, so it
   -- blocks until the display task answers, and at this point in the frame that task owes the
   -- 255 reading messages the trace fill just batched and the repaint they cause. Measured on
@@ -6498,9 +6511,10 @@ end
 -- that left 12 ms of 500 at 4096 samples, where Options was unreachable.
 --
 -- An amount, not a fraction, because that is the shape of the thing being reserved for:
--- dispatching a press costs about the same however long the frame was. A fifth of the frame
--- held back 85 ms at 16,384 samples, nearly two ticks of rate spent on idle nothing needs,
--- while a 40 ms frame got 10 ms -- below the figure measured as too little.
+-- dispatching a press costs about the same however long the frame was, so a reserve in
+-- proportion to frame work over-provisions the long counts and under-provisions the short
+-- ones. It is also the display task's budget, with fftsa.sg_yield -- that task runs only
+-- while Lua is blocked.
 --
 -- 20 ms rather than more because of where the tick boundaries fall: the floor only costs
 -- rate when it pushes busy over a multiple of 50 ms, and at 25 or 30 it does that to the

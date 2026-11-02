@@ -10,7 +10,7 @@ screen and buffer the app made.
 
 ![The spectrum screen: a 12.5 kHz 4.0020 V tone reading 12.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -95 dB. Between the graph and the peak table a line reads THD 0.01%, S/N 78.4 dB and a noise floor of -89.7 dBV. A padlock button, closed, and a cog button sit to the right of the peak table](manual-spectrum.png)
 
-+20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. By default, 512
++20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. By default, 2048
 samples a frame, 256 bins, 10 frames a second. Options offers larger records for finer bin spacing,
 at a slower update rate.
 
@@ -232,7 +232,7 @@ works either way.
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
-| FFT Samples | 512 (default), 1024, 2048, 4096, 8192 or 16384. More samples give finer bins but take more time and memory. |
+| FFT Samples | 512, 1024, 2048 (default), 4096, 8192 or 16384. More samples give finer bins. Below 4096 they cost no frame rate: 512, 1024 and 2048 all run at the same 10 frames a second, because what sets the rate there does not depend on the count. |
 
 Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
 open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
@@ -433,7 +433,7 @@ Three consequences, and the first is the point of it:
 - **The noise floor reads as a band, not a line**, because the minimum is drawn as well as the
   maximum. Maximum alone would lift the apparent floor by about 6 dB at 64 bins a column, since the
   largest of 64 noise samples sits well above their average.
-- **Below 256 points nothing is reduced.** The default 512 samples puts about 255 bins in a 10 Hz to
+- **Below 256 points nothing is reduced.** 512 samples puts about 255 bins in a 10 Hz to
   50 kHz span, so the default trace is every bin, exactly as it has always been.
 
 | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
@@ -518,7 +518,7 @@ to DC, which is the one thing Kaiser β=4 is better at than β=18.
 
 What you get either side of it, measured over a 1.000 V tone swept in 0.01-bin steps at four phases:
 
-The two boundaries below are **in bins**, and the Hz are the default 512 samples at 100 kS/s. At
+The two boundaries below are **in bins**, and the Hz are 512 samples at 100 kS/s. At
 16384 samples the same 0.3 bins is 1.8 Hz rather than 58.6.
 
 | tone sits | the table |
@@ -537,21 +537,27 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 ## Limits
 
 - **Bin width is the sample rate divided by the selected sample count**, and the sample rate is
-  100 kS/s for any span up to 50 kHz. At the default 512 samples bins are 195.3 Hz; at 16384 they are
+  100 kS/s for any span up to 50 kHz. At 512 samples bins are 195.3 Hz; at the default 2048 they are
+  48.8 Hz; at 16384 they are
   6.10 Hz. **Zooming in alone does not make them finer**; increase FFT Samples instead.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. At 512 samples:
   200 kS/s to 100 kHz (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz).
   Divide all three by 32 at 16384 samples. 500 kHz is the highest tone the instrument can show.
-- **10 frames a second at 512 samples, and far slower above it.** The firmware's shortest timer
-  period is 0.05 s and a tick arriving mid-frame is dropped, so the rate can only be `1 / (0.05 * k)`
-  -- a ladder of 20, 10, 6.67, 5 fps and on down. The app times its own frames and picks the smallest
-  period that leaves about a fifth of it idle, so the rate below is what it settles on rather than
-  wherever the rounding fell:
+- **10 frames a second up to 2048 samples, and 4 at 16384.** The firmware's shortest timer period is
+  0.05 s and a tick arriving mid-frame is dropped, so the rate can only be `1 / (0.05 * k)` -- a
+  ladder of 20, 10, 6.67, 5 fps and on down. The app times its own frames and picks the smallest
+  period that still leaves 20 ms free, so the rate below is what it settles on rather than wherever
+  the rounding fell:
 
   | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
   |---|---|---|---|---|---|---|
-  | frame | 0.079 s | 0.122 s | 0.212 s | 0.460 s | 0.860 s | 1.686 s |
-  | displayed | 10 fps | 5 fps | 3.33 fps | 1.67 fps | 0.91 fps | **0.47 fps** |
+  | period | 0.10 s | 0.10 s | 0.10 s | 0.20 s | 0.25 s | 0.25 s |
+  | displayed | 10 fps | 10 fps | 10 fps | 5 fps | 4 fps | **4 fps** |
+
+  The three smallest counts share a rate because below 4096 the frame is dominated by work that does
+  not depend on the sample count, which is why 2048 is the default: it is four times the frequency
+  resolution of 512 for nothing. The figure on the settings line reads about 5 % low, because its
+  window closes on the first frame past one second.
 
   That reserved idle is what keeps the **padlock** and **cog** answering: `delay()` lets the display task
   paint, but dispatching a press needs the Lua interpreter, and during a frame the interpreter is
@@ -578,5 +584,6 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 | Peaks update but the trace is missing | A frame failed inside the refill, leaving the trace unbound. Fixed in this build; on an older one, change the span or the sample count to force a rebind. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
+| A help dialog sits over the app after pressing HELP | Expected. Press EXIT to dismiss it. The firmware offers the app no way to receive that key, so the only way to notice the dialog is to poll the glass for it, and that poll waits on the display task: it cost 44 ms of every frame, a sixth of the rate at 16384 samples. It ships off. `fftsa.help_enabled = true` turns the recogniser back on, where it runs once a second rather than once a frame. |
 | Peak width changes as you tune | Expected. See above. |
 | A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |

@@ -648,7 +648,7 @@ end
 
 -- Move the floor to what the range wants, answering whether it moved. One assignment is the
 -- whole move: every reader takes fftsa.sg_dbmin live -- the trace fill, the peak column, the
--- marker needles, the restore's span and dsp.out.dbfloor through dsp_live(). The answer is
+-- marker needles, the restore's span and dsp.out.dbfloor through dsp_live_push(). The answer is
 -- what apply() pins the axis on, an axis write costing 60 ms and a full repaint, so an
 -- unchanged limit is never written.
 function fftsa.sg_dbmin_set(range)
@@ -897,7 +897,7 @@ fftsa.help_x2,  fftsa.help_y2 = 108, 66
 fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
 fftsa.help_shown = 0            -- times the key has been answered
 fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
--- OFF, by the operator's decision, because the key is not worth what it costs the frame
+-- Off, by the operator's decision, because the key is not worth what it costs the frame
 -- rate. The poll waits on the display task -- see help_period below -- and measured 44 ms of
 -- a 274 ms frame at 16,384 samples. What it buys back is that pressing HELP now leaves the
 -- firmware's own dialog on the glass until EXIT is pressed, instead of the app noticing and
@@ -1034,9 +1034,16 @@ function fftsa.sg_bind_min()
 end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint it; too
--- short and the firmware posts 1706. Small because the timer period already leaves a fifth
--- of every frame idle with Lua blocked, so this only insures against a frame whose work
--- fills its whole period.
+-- short and the firmware posts 1706. The display task runs only while Lua is blocked, so
+-- this and the timer's idle are the whole of its budget: fftsa.tick_idle reserves 20 ms of
+-- every period whatever the frame cost, which at 16,384 samples is about a tenth of what a
+-- fifth of the frame used to leave.
+--
+-- Measured at 2048 samples, this is neutral from 5 to 20 ms -- 9.53, 9.51 and 9.52 frames a
+-- second -- and costs a whole tick at 30. At 5 ms the frame grew by about 50 ms at 16,384,
+-- because the task does not finish inside the shorter slice and the remainder contends with
+-- the next frame's work, which is ten times what the yield saved. So 10 ms is not a figure
+-- to shave: the saving is nothing and the loss is a torn trace and event 1706.
 fftsa.sg_yield = 0.010
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
