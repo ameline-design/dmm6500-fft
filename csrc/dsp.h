@@ -96,6 +96,52 @@ extern const int dsp_real_size;
 #define DSP_ALIGN 32
 
 /**
+ * @brief Slices one array may be cut into when no segment will hold it whole.
+ *
+ * Thirty-two is what `n = 16,384` needs in double precision against the instrument's
+ * 32,736-byte segment: the window is `n` entries and the slice holds 512, so it is exactly
+ * at this bound and `n = 32,768` is refused with ::DSP_ESEG rather than silently truncated.
+ */
+#define DSP_MAX_SLICES 32
+
+/**
+ * @brief An array the arena may have had to split across segments.
+ *
+ * A contiguous array is one slice, and ::DSP_AT is then `tab[0][i]` -- the indexing it
+ * always was, which is why the contiguous suite covers this type. An array longer than a
+ * segment is cut into slices of @c per elements, each whole inside one segment, so an index
+ * splits with a shift and a mask rather than a divide.
+ *
+ * @c per is a power of two and a multiple of every row length the transform addresses.
+ * `m1`, `m2` and ::DSP_FS_BLOCK are all powers of two, so @c per being at least the largest
+ * of them is enough, and that is what lets the kernels go on taking a row base pointer and
+ * a contiguous run: no inner loop learns about slices.
+ *
+ * @c per is a capacity, not a length. An array whose length is not a power of two -- the
+ * twiddle tables at `m-2` -- rounds @c per up, so the unused tail of the last slice is
+ * never addressed.
+ */
+typedef struct {
+    dsp_real *tab[DSP_MAX_SLICES];
+    int       nslice;  /**< Slices in use; 1 when the array is contiguous. */
+    int       sh;      /**< log2 of @c per. */
+    int       mask;    /**< @c per less one. */
+    int       per;     /**< Elements a slice holds. */
+    int       len;     /**< Elements in the whole array. */
+} dsp_vec;
+
+/** @brief Element @p i of @p v. @p v is a `dsp_vec *`. */
+#define DSP_AT(v, i)  ((v)->tab[(i) >> (v)->sh][(i) & (v)->mask])
+
+/**
+ * @brief Address of element @p i, for a run that stays inside one slice.
+ *
+ * Valid for @c per elements less the offset within the slice. Every caller here passes a
+ * row base whose length divides @c per.
+ */
+#define DSP_ROW(v, i) (&DSP_AT(v, i))
+
+/**
  * @brief Analysis windows.
  *
  * ::DSP_WINDOW_RECT is here because the proposal's enum lists it; the shipped Lua refuses
@@ -522,6 +568,21 @@ typedef struct {
     double    *fir_out; /**< @c n decimated samples; NULL when @c decim is 1. */
     int        m1;      /**< Four-step factors, `m1 * m2 == m`, `m1 <= m2`. */
     int        m2;
+    /* The arrays above that a segment may be too small to hold whole, as the slice tables
+     * the kernels address them through. The raw pointer beside each one is the whole array
+     * only while its @c nslice is 1; past that it is the first slice and nothing else, and
+     * ::dsp_plan_segs is what decides which. The small arrays -- the swap lists, the gather
+     * block, the FIR taps -- are never split and have no table here. */
+    dsp_vec    w_v;
+    dsp_vec    twr_v;
+    dsp_vec    twi_v;
+    dsp_vec    utr_v;
+    dsp_vec    uti_v;
+    dsp_vec    re_v;
+    dsp_vec    im_v;
+    dsp_vec    wkr_v;
+    dsp_vec    wki_v;
+    dsp_vec    pwr_v;
     dsp_interp ip;
     int        kdc;     /**< Bins above DC the mean removal makes unreportable. */
     int        mono;    /**< Copy of `ip.mono`: the window has an invertible offset table. */

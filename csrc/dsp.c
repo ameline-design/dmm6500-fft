@@ -459,9 +459,16 @@ int dsp_peak_interp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, cons
 /* arena layout                                                              */
 /* ------------------------------------------------------------------------- */
 
+/* Where one array's slices landed in the virtual space. nslice 0 is an array this method
+ * does not allocate, which is what an offset of 0 means for the scalars beside it. */
 typedef struct {
-    size_t w, swp_a, swp_b, sw1_a, sw1_b, sw2_a, sw2_b, twr, twi, utr, uti,
-        re, im, wkr, wki, blkr, blki, pwr, h, fir_out, total;
+    size_t off[DSP_MAX_SLICES];
+    int    nslice, per, sh, len;
+} dsp_vlay;
+
+typedef struct {
+    size_t swp_a, swp_b, sw1_a, sw1_b, sw2_a, sw2_b, blkr, blki, h, fir_out, total;
+    dsp_vlay w, twr, twi, utr, uti, re, im, wkr, wki, pwr;
 } dsp_layout;
 
 /* The walk's state. `seg` is 0 for one contiguous arena, which is what dsp_plan_bytes and
@@ -494,6 +501,74 @@ static size_t dsp_bump(dsp_walk *wk, const size_t bytes) {
     }
     wk->at = off + need;
     return off;
+}
+
+static int dsp_log2_of(const int v) {
+    int s = 0;
+    while ((1 << s) < v)
+        s++;
+    return s;
+}
+
+/* Elements one slice of a split array holds.
+ *
+ * A power of two, so an index splits with a shift and a mask, and a multiple of the longest
+ * row the transform addresses -- rowmin, which is a power of two itself, so being at least
+ * as large is enough. An array that fits a segment whole is one slice and this is its length
+ * rounded up to a power of two, which leaves the placement and dsp_plan_bytes exactly as
+ * they are without segments.
+ *
+ * A quarter of the segment for a split array rather than the largest that fits: the arena is
+ * a bump space, so a slice too large to follow the last one wastes the rest of its segment,
+ * and halving twice takes that waste from a half to an eighth. Returns 0 when no slice can
+ * be both at least rowmin and small enough to fit, which the walk turns into DSP_ESEG. */
+static int dsp_slice_of(const size_t len, const size_t r, const size_t seg_bytes,
+                        const int rowmin) {
+    int per = 1, cap = 1, want = 1;
+    if (len == 0U)
+        return 1;
+    if (seg_bytes == 0U || len * r <= seg_bytes) {
+        while ((size_t)per < len)
+            per <<= 1;
+        return per;
+    }
+    while ((size_t)(cap * 2) * r <= seg_bytes)
+        cap <<= 1;
+    while ((size_t)(want * 2) * r * 4U <= seg_bytes)
+        want <<= 1;
+    per = (want > rowmin) ? want : rowmin;
+    if ((size_t)per * r > seg_bytes || per > cap)
+        return 0;
+    return per;
+}
+
+/* One array, as the slices it needs. The last slice takes only the remainder, so a
+ * one-slice array bumps exactly the bytes it did before and no existing layout moves. */
+static void dsp_bump_vec(dsp_walk *wk, dsp_vlay *v, const size_t len, const size_t r,
+                         const int per) {
+    size_t left = len;
+    int s;
+    v->len = (int)len;
+    v->per = (per > 0) ? per : 1;
+    v->sh = dsp_log2_of(v->per);
+    v->nslice = 0;
+    if (len == 0U)
+        return;
+    if (per <= 0) {
+        wk->fail = 1;
+        return;
+    }
+    v->nslice = (int)((len + (size_t)per - 1U) / (size_t)per);
+    if (v->nslice > DSP_MAX_SLICES) {
+        wk->fail = 1;
+        v->nslice = 0;
+        return;
+    }
+    for (s = 0; s < v->nslice; s++) {
+        const size_t take = (left < (size_t)per) ? left : (size_t)per;
+        v->off[s] = dsp_bump(wk, take * r);
+        left -= take;
+    }
 }
 
 /* Both bounds matter. Without the upper one the layout walk wrapped a 32-bit size_t and
@@ -576,7 +651,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
                          dsp_layout *lay) {
     dsp_walk wk;
     size_t r = sizeof(dsp_real);
-    int m, ntw, m1, m2, meth;
+    int m, ntw, m1, m2, meth, rowmin, per_m, per_n, per_tw;
     if (decim < 1 || decim > DSP_DECIM_MAX)
         return DSP_EARG;
     if (method < 0 || method >= DSP_FFT_COUNT)
@@ -594,7 +669,17 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     ntw = (m >= 4) ? m - 2 : 1; /* stages len=4..m contribute len/2 each: m-2 in total */
     dsp_fs_factors(m, &m1, &m2);
     meth = dsp_method_of(m, m2, method);
-    lay->w     = dsp_bump(&wk, (size_t)n * r);
+    /* The longest contiguous run any kernel asks for: the four-step addresses rows of m2 in
+     * the intermediate matrix and rows of m1 in the transposed output, and gathers
+     * DSP_FS_BLOCK at a time. A slice at least that long and a power of two holds every one
+     * of them whole, so no run crosses a slice and the kernels keep taking a row pointer. */
+    rowmin = (m1 > m2) ? m1 : m2;
+    if (rowmin < DSP_FS_BLOCK)
+        rowmin = DSP_FS_BLOCK;
+    per_m  = dsp_slice_of((size_t)m, r, seg_bytes, rowmin);
+    per_n  = dsp_slice_of((size_t)n, r, seg_bytes, rowmin);
+    per_tw = dsp_slice_of((size_t)ntw, r, seg_bytes, rowmin);
+    dsp_bump_vec(&wk, &lay->w, (size_t)n, r, per_n);
     /* Radix-2's own swap list, needed when it is the decomposition or when the four-step has
      * substituted it. */
     if (meth == DSP_FFT_RADIX2) {
@@ -616,26 +701,26 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
         lay->sw2_a = 0;
         lay->sw2_b = 0;
     }
-    lay->twr   = dsp_bump(&wk, (size_t)ntw * r);
-    lay->twi   = dsp_bump(&wk, (size_t)ntw * r);
-    lay->utr   = dsp_bump(&wk, (size_t)m * r);
-    lay->uti   = dsp_bump(&wk, (size_t)m * r);
-    lay->re    = dsp_bump(&wk, (size_t)m * r);
-    lay->im    = dsp_bump(&wk, (size_t)m * r);
+    dsp_bump_vec(&wk, &lay->twr, (size_t)ntw, r, per_tw);
+    dsp_bump_vec(&wk, &lay->twi, (size_t)ntw, r, per_tw);
+    dsp_bump_vec(&wk, &lay->utr, (size_t)m, r, per_m);
+    dsp_bump_vec(&wk, &lay->uti, (size_t)m, r, per_m);
+    dsp_bump_vec(&wk, &lay->re, (size_t)m, r, per_m);
+    dsp_bump_vec(&wk, &lay->im, (size_t)m, r, per_m);
     /* The four-step's intermediate matrix and its gather block. Radix-2 is in place and
      * wants neither. */
     if (meth == DSP_FFT_FOURSTEP) {
-        lay->wkr  = dsp_bump(&wk, (size_t)m * r);
-        lay->wki  = dsp_bump(&wk, (size_t)m * r);
+        dsp_bump_vec(&wk, &lay->wkr, (size_t)m, r, per_m);
+        dsp_bump_vec(&wk, &lay->wki, (size_t)m, r, per_m);
         lay->blkr = dsp_bump(&wk, (size_t)(DSP_FS_BLOCK * m1) * r);
         lay->blki = dsp_bump(&wk, (size_t)(DSP_FS_BLOCK * m1) * r);
     } else {
-        lay->wkr  = 0;
-        lay->wki  = 0;
+        dsp_bump_vec(&wk, &lay->wkr, 0U, r, 1);
+        dsp_bump_vec(&wk, &lay->wki, 0U, r, 1);
         lay->blkr = 0;
         lay->blki = 0;
     }
-    lay->pwr   = dsp_bump(&wk, (size_t)m * r);
+    dsp_bump_vec(&wk, &lay->pwr, (size_t)m, r, per_m);
     lay->h     = dsp_bump(&wk, (size_t)DSP_FIR_MAXTAPS * r);
     /* Only when something will decimate. The read budget stops allowing even decim 2 from
      * n = 3906 up -- (DSP_FIR_MAXM - maxtaps)/(n-1) falls below 2 there -- so this is
@@ -644,6 +729,15 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     /* Checked once at the end rather than at every bump: the walk records the failure and
      * keeps going, so there is one place that turns it into a status. */
     if (wk.fail)
+        return DSP_ESEG;
+    /* Radix-2 indexes re, im and the twiddle table across the whole transform, so a split
+     * one has runs that cross a slice and there is no row for the kernel to take. It is the
+     * decomposition only below DSP_FS_MIN, where nothing is long enough to split, so this
+     * refuses a combination that does not arise rather than one that matters. The window and
+     * the power and untangle tables are read in order by both methods and may still split. */
+    if (meth != DSP_FFT_FOURSTEP &&
+        (lay->re.nslice > 1 || lay->im.nslice > 1 ||
+         lay->twr.nslice > 1 || lay->twi.nslice > 1))
         return DSP_ESEG;
     lay->total = wk.at;
     return DSP_OK;
@@ -679,6 +773,23 @@ static void *dsp_seg_at(void *const *segs, const size_t seg_bytes, const size_t 
     if (seg_bytes == 0U)
         return (void *)((unsigned char *)segs[0] + off);
     return (void *)((unsigned char *)segs[off / seg_bytes] + (off % seg_bytes));
+}
+
+/* One array's slice offsets as the addresses the kernels index through. An array this
+ * method does not allocate leaves every slice NULL, which is the pointer beside it being
+ * NULL as it always was. */
+static void dsp_bind_vec(dsp_vec *v, const dsp_vlay *lay, void *const *segs,
+                         const size_t seg_bytes) {
+    int s;
+    v->nslice = lay->nslice;
+    v->per    = lay->per;
+    v->sh     = lay->sh;
+    v->mask   = lay->per - 1;
+    v->len    = lay->len;
+    for (s = 0; s < DSP_MAX_SLICES; s++)
+        v->tab[s] = NULL;
+    for (s = 0; s < lay->nslice; s++)
+        v->tab[s] = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay->off[s]);
 }
 
 /* The shared body of dsp_plan_init and dsp_plan_init_segs.
@@ -746,14 +857,25 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     p->beta   = beta;
     p->decim  = decim;
     p->method = meth;
-    p->w     = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.w);
-    p->twr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.twr);
-    p->twi   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.twi);
-    p->utr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.utr);
-    p->uti   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.uti);
-    p->re    = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.re);
-    p->im    = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.im);
-    p->pwr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.pwr);
+    dsp_bind_vec(&p->w_v, &lay.w, segs, seg_bytes);
+    dsp_bind_vec(&p->twr_v, &lay.twr, segs, seg_bytes);
+    dsp_bind_vec(&p->twi_v, &lay.twi, segs, seg_bytes);
+    dsp_bind_vec(&p->utr_v, &lay.utr, segs, seg_bytes);
+    dsp_bind_vec(&p->uti_v, &lay.uti, segs, seg_bytes);
+    dsp_bind_vec(&p->re_v, &lay.re, segs, seg_bytes);
+    dsp_bind_vec(&p->im_v, &lay.im, segs, seg_bytes);
+    dsp_bind_vec(&p->pwr_v, &lay.pwr, segs, seg_bytes);
+    /* The first slice, which is the whole array while nslice is 1. Kept because every
+     * contiguous caller and the whole test suite index these, and because dsp_method_built
+     * reads them to identify the decomposition the arena was built for. */
+    p->w     = p->w_v.tab[0];
+    p->twr   = p->twr_v.tab[0];
+    p->twi   = p->twi_v.tab[0];
+    p->utr   = p->utr_v.tab[0];
+    p->uti   = p->uti_v.tab[0];
+    p->re    = p->re_v.tab[0];
+    p->im    = p->im_v.tab[0];
+    p->pwr   = p->pwr_v.tab[0];
     p->h     = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.h);
     /* The rest only exist for the decomposition that reads them, by the same conditions the
      * layout used. A pointer left NULL is an array this plan did not pay for. */
@@ -766,8 +888,10 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         p->sw1_b = (int *)dsp_seg_at(segs, seg_bytes, lay.sw1_b);
         p->sw2_a = (int *)dsp_seg_at(segs, seg_bytes, lay.sw2_a);
         p->sw2_b = (int *)dsp_seg_at(segs, seg_bytes, lay.sw2_b);
-        p->wkr   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.wkr);
-        p->wki   = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.wki);
+        dsp_bind_vec(&p->wkr_v, &lay.wkr, segs, seg_bytes);
+        dsp_bind_vec(&p->wki_v, &lay.wki, segs, seg_bytes);
+        p->wkr   = p->wkr_v.tab[0];
+        p->wki   = p->wki_v.tab[0];
         p->blkr  = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.blkr);
         p->blki  = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.blki);
     }
