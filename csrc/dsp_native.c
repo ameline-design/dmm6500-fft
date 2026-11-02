@@ -356,10 +356,16 @@ int dsp_native_run(void *L)
     if (p->magic != DSP_NATIVE_MAGIC) { push(L, (double)DSPN_EMAGIC); return 1; }
 
     /* Arena sizing, answered before any bound is examined because it dereferences
-     * nothing: it is how Lua learns how much storage to find in the first place. */
+     * nothing: it is how Lua learns how much storage to find in the first place, so
+     * requiring a valid arena to ask would be circular. Both are pure arithmetic. */
     if (p->mode == DSPN_MODE_BYTES) {
         push(L, (double)dsp_plan_bytes((int)p->cap_n, (int)p->init_decim,
                                        (int)p->init_method));
+        return 1;
+    }
+    if (p->mode == DSPN_MODE_SEGS) {
+        push(L, (double)dsp_plan_segs((int)p->cap_n, (int)p->init_decim,
+                                      (int)p->init_method, (size_t)p->seg_bytes));
         return 1;
     }
 
@@ -445,12 +451,6 @@ int dsp_native_run(void *L)
                                 (int)p->init_decim,
                                 (int)p->init_method);
         push(L, (double)rc);
-        return 1;
-    }
-
-    if (p->mode == DSPN_MODE_SEGS) {
-        push(L, (double)dsp_plan_segs(n, (int)p->init_decim, (int)p->init_method,
-                                      (size_t)seg_bytes));
         return 1;
     }
 
