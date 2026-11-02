@@ -560,6 +560,10 @@ function fftsa.apply()
   -- count, would pay a frame of latency for an identical timer and throw away the period
   -- frame() had measured. From the model, which frame() replaces after eight real frames.
   fftsa.work_peak, fftsa.work_seen = nil, 0
+  -- Dropped rather than carried across: the rate the previous sample count ran at is wrong
+  -- for this one, and the line is written twice from here, so a stale figure would be on
+  -- the glass before the first new frame.
+  fftsa.fps, fftsa.fps_n, fftsa.fps_t0 = nil, 0, nil
   if fftsa.timer ~= nil and fftsa.armed_n ~= fftsa.n then
     fftsa.period = fftsa.frame_period(fftsa.n)
     fftsa.arm(fftsa.period)
@@ -825,6 +829,13 @@ function fftsa.frame_estimate(n)
 end
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
+-- Frame rate, measured over a window of completed frames and shown on the settings line.
+fftsa.fps_window = 1.0      -- seconds a measurement spans
+fftsa.fps        = nil      -- frames a second, nil until the first window closes
+fftsa.fps_n      = 0        -- frames counted in the window
+fftsa.fps_t0     = nil      -- when the window opened
+fftsa.fps_show   = false    -- a fresh figure is waiting for the line
+
 function fftsa.frame()
   if fftsa.halted then return end
   if fftsa.busy then
@@ -838,6 +849,19 @@ function fftsa.frame()
   local entry = os.clock()
   local ok, err = pcall(fftsa.frame_body)
   fftsa.frame_work = os.clock() - entry
+  -- Completed frames against the wall clock, which is the rate on the glass. Neither of the
+  -- other two figures is that: frame_work is one frame's work with no idle in it, and the
+  -- timer period rounds up to a 50 ms tick, so a 60 ms frame and a 99 ms frame both display
+  -- at 10 a second. Counted over a window and not per frame, because a rate from one
+  -- interval dithers by a tick.
+  fftsa.fps_n = (fftsa.fps_n or 0) + 1
+  if fftsa.fps_t0 == nil then fftsa.fps_t0 = entry end
+  local span = os.clock() - fftsa.fps_t0
+  if span >= fftsa.fps_window then
+    fftsa.fps = fftsa.fps_n / span
+    fftsa.fps_n, fftsa.fps_t0 = 0, os.clock()
+    fftsa.fps_show = true
+  end
   -- Re-arm from measured work: frame_estimate() is a model, and divided by the occupancy
   -- target an error of a few ms lands either side of a tick boundary, which is a 50 %
   -- swing in displayed rate.
@@ -883,6 +907,13 @@ function fftsa.frame()
     end
   else
     fftsa.errrun = 0
+  end
+  -- Once a second, when the window above closed, so the line carries the rate just measured.
+  -- Not written per frame: the line is otherwise off the frame path and a closure per second
+  -- is affordable where one per frame would not be. Never over a halt message.
+  if fftsa.fps_show and not fftsa.halted then
+    fftsa.fps_show = false
+    fftsa.sg_write_xunit()
   end
   -- An unlocked gesture's span is installed here, between frames: fftsa.apply() re-plans
   -- the digitizer and takes its own capture, so it cannot run inside a frame using the

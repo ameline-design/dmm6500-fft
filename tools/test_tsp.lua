@@ -2709,6 +2709,77 @@ check('the settings line names the terminal selection, last on the line', (funct
          and string.sub(unknown, -5) == 'TERM?',
          string.format('[%s] / [%s] / [%s]', front, rear, unknown)
 end)())
+-- The rate is measured over a window of completed frames, and a host frame is sub-millisecond,
+-- so the window has to be backdated to close at all. Without that every assertion below
+-- passes on an empty string.
+check('the frame rate reaches the line, and is absent before a window closes', (function()
+  fftsa.fps, fftsa.fps_n, fftsa.fps_t0, fftsa.fps_show = nil, 0, nil, false
+  local before = fftsa.sg_xunit_text()
+  fftsa.frame()
+  local still = fftsa.fps
+  fftsa.fps_t0 = os.clock() - 2.0 * fftsa.fps_window
+  fftsa.fps_n = 7
+  fftsa.frame()
+  local measured, shown = fftsa.fps, tostring(OBJ[fftsa.sg_xunit].text)
+  -- Eight frames over the backdated two-second window, so the figure is about 4 a second
+  -- and the field is on the line the frame rewrote.
+  local ok = still == nil and string.find(before, 'fps', 1, true) == nil
+             and measured ~= nil and measured > 3.0 and measured < 5.0
+             and string.find(shown, 'fps', 1, true) ~= nil
+             and not fftsa.fps_show and fftsa.fps_n == 0
+  return ok, string.format('still=%s measured=%s [%s]',
+                           tostring(still), tostring(measured), shown)
+end)())
+check('the rate carries one decimal under ten a second and none above', (function()
+  local was = fftsa.fps
+  fftsa.fps = 4.25
+  local slow = fftsa.sg_fps_text()
+  fftsa.fps = 18.6
+  local fast = fftsa.sg_fps_text()
+  fftsa.fps = 0
+  local zero = fftsa.sg_fps_text()
+  fftsa.fps = was
+  return slow == '  4.2 fps' and fast == '  19 fps' and zero == '',
+         string.format('[%s] [%s] [%s]', slow, fast, zero)
+end)())
+-- The terminal selection has to stay last, which is what the case above this group asserts;
+-- the rate sits in front of it rather than after it.
+check('the rate does not displace the terminal selection from the end', (function()
+  local was = fftsa.fps
+  fftsa.fps = 7.5
+  local t = fftsa.sg_xunit_text()
+  fftsa.fps = was
+  local term = fftsa.terminal_text()
+  return string.sub(t, -string.len(term)) == term
+         and string.find(t, 'fps', 1, true) ~= nil, t
+end)())
+check('an Apply drops the rate rather than carrying the previous count forward', (function()
+  fftsa.fps, fftsa.fps_n = 12.0, 5
+  local ok = fftsa.options_apply()
+  return ok and fftsa.fps == nil and fftsa.fps_n == 0
+         and string.find(tostring(OBJ[fftsa.sg_xunit].text), 'fps', 1, true) == nil,
+         string.format('fps=%s [%s]', tostring(fftsa.fps),
+                       tostring(OBJ[fftsa.sg_xunit].text))
+end)())
+-- A halt message owns the line until the app is restarted, and the rate tick must not paint
+-- over the one thing that says why the trace stopped.
+check('a halted app keeps its halt message on the line', (function()
+  local realbody = fftsa.frame_body
+  fftsa.frame_body = function() error('fps-halt-boom', 0) end
+  fftsa.errrun, fftsa.halted, fftsa.errmax = 0, false, 1
+  fftsa.frame()
+  local halted, msg = fftsa.halted, tostring(OBJ[fftsa.sg_xunit].text)
+  -- The rate tick is armed, and the next frame returns at the halt test before it.
+  fftsa.fps_t0, fftsa.fps_n, fftsa.fps_show = os.clock() - 2.0, 9, true
+  fftsa.frame()
+  local after = tostring(OBJ[fftsa.sg_xunit].text)
+  fftsa.frame_body = realbody
+  fftsa.halted, fftsa.errrun, fftsa.errmax = false, 0, 20
+  fftsa.fps, fftsa.fps_n, fftsa.fps_t0, fftsa.fps_show = nil, 0, nil, false
+  local recovered = fftsa.options_apply()
+  return halted and string.find(msg, 'fps-halt-boom', 1, true) ~= nil
+         and after == msg and recovered, string.format('[%s] -> [%s]', msg, after)
+end)())
 -- Written only when the answer changes: a text write every tick for the life of the app
 -- would be the lazy way to keep it true, and this tick is shared with the peak table.
 check('a terminal change reaches the line without an Apply, and only on a change',

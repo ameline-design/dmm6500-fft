@@ -225,7 +225,18 @@ function fftsa.sg_xunit_text()
   end
   -- Last on the line, and always present: the selection is only useful if its absence
   -- cannot be read as FRONT.
-  return t .. "   " .. fftsa.terminal_text()
+  return t .. fftsa.sg_fps_text() .. "   " .. fftsa.terminal_text()
+end
+
+-- The measured rate, or nothing until a window has closed. Absent rather than zero before
+-- the first one: 0.0 fps on a running analyser reads as a fault. Ahead of the terminal
+-- selection, which stays last on the line, and off the over-range line, which replaces the
+-- whole of this one and has no room.
+function fftsa.sg_fps_text()
+  local f = fftsa.fps
+  if f == nil or not (f > 0) then return "" end
+  if f < 10 then return string.format("  %.1f fps", f) end
+  return string.format("  %.0f fps", f)
 end
 
 -- The trace buffer: WRITABLE_FULL carries value, extra and timestamp per point, the value
