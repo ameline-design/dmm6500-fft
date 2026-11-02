@@ -122,6 +122,38 @@ static int dsp_overlaps(const void *a, const size_t na, const void *b, const siz
         return (pb - pa) < (uintptr_t)na;
     return (pa - pb) < (uintptr_t)nb;
 }
+
+/* Bytes slice s of v holds. The last one carries only the remainder, which is what the bump
+ * walk allocated for it. */
+static size_t dsp_slice_bytes(const dsp_vec *v, const int s) {
+    const int rest = v->len - s * v->per;
+    const int take = (rest < v->per) ? rest : v->per;
+    return (take > 0) ? (size_t)take * sizeof(dsp_real) : 0U;
+}
+
+/* A split array against a plain byte range: every slice, because they are scattered and an
+ * overlap with any one of them is the aliasing the caller is being refused for. */
+static int dsp_vec_hits(const dsp_vec *v, const void *q, const size_t qz) {
+    int s;
+    if (v == NULL || q == NULL || qz == 0U)
+        return 0;
+    for (s = 0; s < v->nslice; s++) {
+        if (dsp_overlaps(v->tab[s], dsp_slice_bytes(v, s), q, qz))
+            return 1;
+    }
+    return 0;
+}
+
+static int dsp_vec_hits_vec(const dsp_vec *a, const dsp_vec *b) {
+    int s;
+    if (a == NULL || b == NULL)
+        return 0;
+    for (s = 0; s < a->nslice; s++) {
+        if (dsp_vec_hits(b, a->tab[s], dsp_slice_bytes(a, s)))
+            return 1;
+    }
+    return 0;
+}
 #endif /* DSP_CHECK_OVERLAP */
 
 /* floor() and ceil() to int, with the range check inside instead of at each call site.
@@ -196,10 +228,12 @@ static double dsp_bessel_i0(const double x) {
     return s;
 }
 
-int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const double beta) {
+/* The body both forms share. w may be split, so every store goes through DSP_AT; the window
+ * is built once a plan and never in a frame, so the indexing costs nothing that matters. */
+static int dsp_window_vec(dsp_vec *w, const int n, const int kind, const double beta) {
     double di;
     int half, i;
-    if (w == NULL || n < 2)
+    if (w == NULL || w->nslice < 1 || n < 2)
         return DSP_EARG;
     if (kind < 0 || kind >= DSP_WINDOW_COUNT)
         return DSP_EARG;
@@ -228,8 +262,8 @@ int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const doub
             if (s < 0.0)
                 s = 0.0;
             v = dsp_bessel_i0(beta * DSP_SQRT(s)) * inv_i0b;
-            w[i] = (dsp_real)v;
-            w[n - 1 - i] = (dsp_real)v;
+            DSP_AT(w, i) = (dsp_real)v;
+            DSP_AT(w, n - 1 - i) = (dsp_real)v;
         }
     } else {
         const double *c = dsp_wincos[kind];
@@ -238,11 +272,19 @@ int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const doub
             const double t = step * di;
             double v = c[0] - c[1] * DSP_COS(t) + c[2] * DSP_COS(2.0 * t) -
                        c[3] * DSP_COS(3.0 * t);
-            w[i] = (dsp_real)v;
-            w[n - 1 - i] = (dsp_real)v;
+            DSP_AT(w, i) = (dsp_real)v;
+            DSP_AT(w, n - 1 - i) = (dsp_real)v;
         }
     }
     return DSP_OK;
+}
+
+int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const double beta) {
+    dsp_vec v;
+    if (w == NULL)
+        return DSP_EARG;
+    dsp_vec_flat(&v, w, n);
+    return dsp_window_vec(&v, n, kind, beta);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -253,7 +295,7 @@ int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const doub
  * sum is twice the half sum and only n/2 cosines are evaluated. */
 /* inv_wsum rather than wsum: this runs DSP_GN + DSP_KDCN + 1 times per plan against one
  * window sum, so the reciprocal is formed once by the caller. */
-static double dsp_gain_at(const dsp_real *w, const int n, const double x, const double inv_wsum) {
+static double dsp_gain_at(const dsp_vec *w, const int n, const double x, const double inv_wsum) {
     const double ctr = 0.5 * (double)(n - 1);
     const double a = 2.0 * M_PI * x / (double)n;
     double s = 0.0, d;
@@ -263,7 +305,7 @@ static double dsp_gain_at(const dsp_real *w, const int n, const double x, const 
      * bits against 53. This is the hottest conversion in a plan -- n/2 of them for each of
      * DSP_GN + DSP_KDCN + 1 calls, and on the target the conversion goes through memory. */
     for (i = 0, d = -ctr; i < half; i++, d += 1.0)
-        s += (double)w[i] * DSP_COS(a * d);
+        s += (double)DSP_AT(w, i) * DSP_COS(a * d);
     s = 2.0 * s * inv_wsum;
     return s < 0.0 ? -s : s;
 }
@@ -296,14 +338,14 @@ int dsp_window_lobe(const int kind, const double beta) {
     }
 }
 
-static int dsp_win_tables(const dsp_real *w, const int n, dsp_interp *ip, int *kdc_out) {
+static int dsp_win_tables(const dsp_vec *w, const int n, dsp_interp *ip, int *kdc_out) {
     double rt[DSP_DN + 1];
     double wsum = 0.0, inv_wsum;
     int one, nd, mono, j, jd, b, kdc;
     const int half = dsp_half(n);
 
     for (j = 0; j < half; j++)
-        wsum += (double)w[j];
+        wsum += (double)DSP_AT(w, j);
     wsum = 2.0 * wsum;
     if (!(wsum > 0.0))
         return DSP_EARG;
@@ -416,8 +458,8 @@ int dsp_win_offset(const dsp_interp *ip, double r, double *d_out) {
     return DSP_OK;
 }
 
-int dsp_peak_interp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, const int k, const int nbins,
-                    double *d_out, double *amp_out) {
+int dsp_peak_interp_vec(const dsp_interp *ip, const dsp_vec *pwr, const int k, const int nbins,
+                        double *d_out, double *amp_out) {
     double pc, pl, pr, cc, ll, rr, den, d, g;
     if (ip == NULL || pwr == NULL)
         return DSP_EARG;
@@ -434,9 +476,9 @@ int dsp_peak_interp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, cons
         return DSP_EDECLINE;
     if (k < 1 || k >= nbins - 1)
         return DSP_EDECLINE;
-    pc = (double)pwr[k];
-    pl = (double)pwr[k - 1];
-    pr = (double)pwr[k + 1];
+    pc = (double)DSP_AT(pwr, k);
+    pl = (double)DSP_AT(pwr, k - 1);
+    pr = (double)DSP_AT(pwr, k + 1);
     if (!(pc > 0.0) || !(pl >= 0.0) || !(pr >= 0.0))
         return DSP_EDECLINE;
     cc = DSP_SQRT(pc);
@@ -508,6 +550,34 @@ static int dsp_log2_of(const int v) {
     while ((1 << s) < v)
         s++;
     return s;
+}
+
+/* A contiguous array as a one-slice vector, so that the functions taking a plain pointer and
+ * the ones taking a plan share a body. per is rounded up past len, which is what makes the
+ * shift zero and the mask the identity for every index the caller can pass. */
+static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len);
+
+/* The read-only form. The table is non-const because the writing forms share the type, and
+ * a vector built here is only ever read; the union carries the value across without a cast
+ * that drops the qualifier. */
+static void dsp_vec_flat_ro(dsp_vec *v, const dsp_real *p, const int len) {
+    union { const dsp_real *c; dsp_real *m; } u;
+    u.c = p;
+    dsp_vec_flat(v, u.m, len);
+}
+
+static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len) {
+    int s, per = 1;
+    while (per < len)
+        per <<= 1;
+    for (s = 0; s < DSP_MAX_SLICES; s++)
+        v->tab[s] = NULL;
+    v->tab[0]  = p;
+    v->nslice  = (len > 0 && p != NULL) ? 1 : 0;
+    v->per     = per;
+    v->sh      = dsp_log2_of(per);
+    v->mask    = per - 1;
+    v->len     = len;
 }
 
 /* Elements one slice of a split array holds.
@@ -897,7 +967,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     }
     p->fir_out = (decim > 1) ? (double *)dsp_seg_at(segs, seg_bytes, lay.fir_out) : NULL;
 
-    rc = dsp_window(p->w, n, kind, beta);
+    rc = dsp_window_vec(&p->w_v, n, kind, beta);
     if (rc != DSP_OK) {
         memset(p, 0, sizeof(*p));
         return rc;
@@ -907,7 +977,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
      * reads every amplitude 0.2 % low at n = 512. */
     wsum = 0.0;
     for (i = 0; i < n; i++)
-        wsum += (double)p->w[i];
+        wsum += (double)DSP_AT(&p->w_v, i);
     if (!(wsum > 0.0)) {
         memset(p, 0, sizeof(*p));
         return DSP_EARG;
@@ -921,7 +991,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         p->ksq = iw * iw;
     }
 
-    rc = dsp_win_tables(p->w, n, &p->ip, &kdc);
+    rc = dsp_win_tables(&p->w_v, n, &p->ip, &kdc);
     if (rc != DSP_OK) {
         memset(p, 0, sizeof(*p));
         return rc;
@@ -954,8 +1024,8 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
          * reused by both calls instead of converting twice. */
         for (i = 0, di = 0.0; i < half; i++, di += 1.0) {
             const double t = ang * di;
-            p->twr[idx] = (dsp_real)DSP_COS(t);
-            p->twi[idx] = (dsp_real)DSP_SIN(t);
+            DSP_AT(&p->twr_v, idx) = (dsp_real)DSP_COS(t);
+            DSP_AT(&p->twi_v, idx) = (dsp_real)DSP_SIN(t);
             idx++;
         }
     }
@@ -964,8 +1034,8 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         const double ang = -2.0 * M_PI / (double)n;
         for (i = 0, di = 0.0; i < m; i++, di += 1.0) {
             const double t = ang * di;
-            p->utr[i] = (dsp_real)DSP_COS(t);
-            p->uti[i] = (dsp_real)DSP_SIN(t);
+            DSP_AT(&p->utr_v, i) = (dsp_real)DSP_COS(t);
+            DSP_AT(&p->uti_v, i) = (dsp_real)DSP_SIN(t);
         }
     }
     return DSP_OK;
@@ -1033,11 +1103,17 @@ static void dsp_do_yield(const dsp_plan *p) {
 /* load                                                                      */
 /* ------------------------------------------------------------------------- */
 
-int dsp_load(const double *DSP_RESTRICT x, const int n, const dsp_real *DSP_RESTRICT w, const double wsum,
-             dsp_real *DSP_RESTRICT re, dsp_real *DSP_RESTRICT im, double *mean_out) {
+/* The body both forms share. Every window read and every store into the packed record goes
+ * through DSP_AT, because any of the three may have been split: at n = 16,384 the window is
+ * four segments by itself. Two integer operations and a table load a sample, which is tens
+ * of microseconds against a frame, and the alternative is two copies of this arithmetic. */
+static int dsp_load_vec(const double *DSP_RESTRICT x, const int n, const dsp_vec *w,
+                        const double wsum, dsp_vec *re, dsp_vec *im, double *mean_out) {
     double s0 = 0.0, s1 = 0.0, mean;
     int i, k, m;
     if (x == NULL || w == NULL || re == NULL || im == NULL)
+        return DSP_EARG;
+    if (w->nslice < 1 || re->nslice < 1 || im->nslice < 1)
         return DSP_EARG;
     if (!dsp_is_pow2(n))
         return DSP_EPOW2;
@@ -1051,36 +1127,47 @@ int dsp_load(const double *DSP_RESTRICT x, const int n, const dsp_real *DSP_REST
      * window they are built from. The packing loop reads x[i] and w[i] while writing re[k]
      * and im[k] with k behind i, so an overlap reads samples it has already replaced. */
     {
-        const size_t zh = (size_t)m * sizeof(*re);
         const size_t zx = (size_t)n * sizeof(*x);
-        const size_t zw = (size_t)n * sizeof(*w);
-        if (dsp_overlaps(re, zh, im, zh) || dsp_overlaps(re, zh, x, zx)
-            || dsp_overlaps(re, zh, w, zw) || dsp_overlaps(im, zh, x, zx)
-            || dsp_overlaps(im, zh, w, zw)
-            || dsp_overlaps(mean_out, sizeof(*mean_out), x, zx)
-            || dsp_overlaps(mean_out, sizeof(*mean_out), w, zw)
-            || dsp_overlaps(mean_out, sizeof(*mean_out), re, zh)
-            || dsp_overlaps(mean_out, sizeof(*mean_out), im, zh))
+        if (dsp_vec_hits_vec(re, im) || dsp_vec_hits(re, x, zx) || dsp_vec_hits_vec(re, w)
+            || dsp_vec_hits(im, x, zx) || dsp_vec_hits_vec(im, w)
+            || dsp_vec_hits(re, mean_out, sizeof(*mean_out))
+            || dsp_vec_hits(im, mean_out, sizeof(*mean_out))
+            || dsp_vec_hits(w, mean_out, sizeof(*mean_out))
+            || dsp_overlaps(mean_out, sizeof(*mean_out), x, zx))
             return DSP_EARG;
     }
 #endif
     /* Two chains, split over the even and odd samples, which is also the pairing the packing
      * loop below wants, so the record is walked the same way twice. */
     for (i = 0; i < n; i += 2) {
-        s0 = s0 + x[i] * (double)w[i];
-        s1 = s1 + x[i + 1] * (double)w[i + 1];
+        s0 = s0 + x[i] * (double)DSP_AT(w, i);
+        s1 = s1 + x[i + 1] * (double)DSP_AT(w, i + 1);
     }
     mean = (s0 + s1) / wsum;
     /* The subtraction happens in double and rounds once into the complex array: in the
      * single build that is what keeps the pedestal residue at the rounding of the products
      * rather than at the rounding of a difference of two large numbers. */
     for (k = 0, i = 0; k < m; k++, i += 2) {
-        re[k] = (dsp_real)((x[i] - mean) * (double)w[i]);
-        im[k] = (dsp_real)((x[i + 1] - mean) * (double)w[i + 1]);
+        DSP_AT(re, k) = (dsp_real)((x[i] - mean) * (double)DSP_AT(w, i));
+        DSP_AT(im, k) = (dsp_real)((x[i + 1] - mean) * (double)DSP_AT(w, i + 1));
     }
     if (mean_out != NULL)
         *mean_out = mean;
     return DSP_OK;
+}
+
+int dsp_load(const double *DSP_RESTRICT x, const int n, const dsp_real *DSP_RESTRICT w,
+             const double wsum, dsp_real *DSP_RESTRICT re, dsp_real *DSP_RESTRICT im,
+             double *mean_out) {
+    dsp_vec wv, rv, iv;
+    if (w == NULL || re == NULL || im == NULL)
+        return DSP_EARG;
+    if (!dsp_is_pow2(n))
+        return DSP_EPOW2;
+    dsp_vec_flat_ro(&wv, w, n);
+    dsp_vec_flat(&rv, re, dsp_half(n));
+    dsp_vec_flat(&iv, im, dsp_half(n));
+    return dsp_load_vec(x, n, &wv, wsum, &rv, &iv, mean_out);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1210,13 +1297,23 @@ static void fft_block(dsp_real *DSP_RESTRICT sr, dsp_real *DSP_RESTRICT si, cons
 static void fft_fourstep(dsp_plan *p) {
     const int m1 = p->m1, m2 = p->m2;
     const int h = dsp_half(p->m);
-    dsp_real *DSP_RESTRICT re = p->re;
-    dsp_real *DSP_RESTRICT im = p->im;
-    dsp_real *DSP_RESTRICT wkr = p->wkr;
-    dsp_real *DSP_RESTRICT wki = p->wki;
+    /* The four matrices as their slice tables: each is m entries and a segment holds fewer
+     * than that from n = 8192 up. Every run below is a row -- m2 in the intermediate matrix,
+     * m1 in the transposed output, DSP_FS_BLOCK in the gather -- and the slice length is a
+     * multiple of all three, so each row lies in one slice and the kernels still take a
+     * plain pointer. */
+    dsp_vec *re = &p->re_v;
+    dsp_vec *im = &p->im_v;
+    dsp_vec *wkr = &p->wkr_v;
+    dsp_vec *wki = &p->wki_v;
     dsp_real *DSP_RESTRICT blkr = p->blkr;
     dsp_real *DSP_RESTRICT blki = p->blki;
+    /* The sub-transforms read the first L-2 entries for a transform of length L, and the
+     * slice is at least as long as the longer factor, so both tables are in their first
+     * slice throughout. The twiddle-and-scatter pass below indexes the whole table and goes
+     * through the slices. */
     const dsp_real *twr = p->twr, *twi = p->twi;
+    const dsp_vec *twr_v = &p->twr_v, *twi_v = &p->twi_v;
     int log2h = 0, twbase, jb, k1, k2, kb, t;
 
     for (t = h; t > 1; t = dsp_half(t))
@@ -1231,8 +1328,8 @@ static void fft_fourstep(dsp_plan *p) {
         int j1, c;
 
         for (j1 = 0; j1 < m1; j1++) {
-            const dsp_real *gr = re + (size_t)j1 * (size_t)m2 + (size_t)jb;
-            const dsp_real *gi = im + (size_t)j1 * (size_t)m2 + (size_t)jb;
+            const dsp_real *gr = DSP_ROW(re, j1 * m2 + jb);
+            const dsp_real *gi = DSP_ROW(im, j1 * m2 + jb);
             dsp_real *dr = blkr + (size_t)j1 * DSP_FS_BLOCK;
             dsp_real *di = blki + (size_t)j1 * DSP_FS_BLOCK;
             for (c = 0; c < DSP_FS_BLOCK; c++) {
@@ -1252,8 +1349,8 @@ static void fft_fourstep(dsp_plan *p) {
         for (k1 = 0; k1 < m1; k1++) {
             const dsp_real *ar = blkr + (size_t)k1 * DSP_FS_BLOCK;
             const dsp_real *ai = blki + (size_t)k1 * DSP_FS_BLOCK;
-            dsp_real *o_r = wkr + (size_t)k1 * (size_t)m2 + (size_t)jb;
-            dsp_real *o_i = wki + (size_t)k1 * (size_t)m2 + (size_t)jb;
+            dsp_real *o_r = DSP_ROW(wkr, k1 * m2 + jb);
+            dsp_real *o_i = DSP_ROW(wki, k1 * m2 + jb);
             int idx = jb * k1;
             for (c = 0; c < DSP_FS_BLOCK; c++) {
                 /* idx is a product of counts and never negative, so the masking and the
@@ -1263,8 +1360,8 @@ static void fft_fourstep(dsp_plan *p) {
                 const int      off = (int)(u & ((unsigned)h - 1U));
                 const int      neg = (int)(u >> (unsigned)log2h);
                 const dsp_real sgn = (dsp_real)(1 - 2 * neg);
-                const dsp_real cr = sgn * twr[twbase + off];
-                const dsp_real ci = sgn * twi[twbase + off];
+                const dsp_real cr = sgn * DSP_AT(twr_v, twbase + off);
+                const dsp_real ci = sgn * DSP_AT(twi_v, twbase + off);
                 const dsp_real xr = ar[c], xi = ai[c];
                 o_r[c] = xr * cr - xi * ci;
                 o_i[c] = xr * ci + xi * cr;
@@ -1277,7 +1374,7 @@ static void fft_fourstep(dsp_plan *p) {
      * without leaving the cache. The in-place kernel is reused rather than a one-lane version
      * of fft_block: a lane loop with a trip count of one is pure overhead. */
     for (k1 = 0; k1 < m1; k1++) {
-        fft_radix2(wkr + (size_t)k1 * (size_t)m2, wki + (size_t)k1 * (size_t)m2, m2, p->sw2_a,
+        fft_radix2(DSP_ROW(wkr, k1 * m2), DSP_ROW(wki, k1 * m2), m2, p->sw2_a,
                    p->sw2_b, p->nsw2, twr, twi);
         dsp_do_yield(p);
     }
@@ -1293,11 +1390,11 @@ static void fft_fourstep(dsp_plan *p) {
             if (jhi > m1)
                 jhi = m1;
             for (k2 = kb; k2 < khi; k2++) {
-                dsp_real *o_r = re + (size_t)k2 * (size_t)m1;
-                dsp_real *o_i = im + (size_t)k2 * (size_t)m1;
+                dsp_real *o_r = DSP_ROW(re, k2 * m1);
+                dsp_real *o_i = DSP_ROW(im, k2 * m1);
                 for (k1 = jbb; k1 < jhi; k1++) {
-                    o_r[k1] = wkr[(size_t)k1 * (size_t)m2 + (size_t)k2];
-                    o_i[k1] = wki[(size_t)k1 * (size_t)m2 + (size_t)k2];
+                    o_r[k1] = DSP_AT(wkr, k1 * m2 + k2);
+                    o_i[k1] = DSP_AT(wki, k1 * m2 + k2);
                 }
             }
         }
@@ -1324,43 +1421,56 @@ void dsp_rfft(dsp_plan *p) {
 /* power                                                                     */
 /* ------------------------------------------------------------------------- */
 
-void dsp_power(const dsp_real *DSP_RESTRICT re, const dsp_real *DSP_RESTRICT im, const int m,
-               const dsp_real *DSP_RESTRICT utr, const dsp_real *DSP_RESTRICT uti,
-               dsp_real *DSP_RESTRICT pwr, const double scale) {
+/* The body both forms share. The mirror pair is addressed by index rather than by a pair of
+ * walking pointers: a descending cursor cannot carry across a slice boundary, and j and
+ * m - j are the indices those pointers held. */
+static void dsp_power_vec(const dsp_vec *re, const dsp_vec *im, const int m,
+                          const dsp_vec *utr, const dsp_vec *uti, dsp_vec *pwr,
+                          const double scale) {
     int half = dsp_half(m), j;
     /* Bin 0: X = Re Z[0] + Im Z[0], real. */
     {
-        const double s = 2.0 * ((double)re[0] + (double)im[0]);
-        pwr[0] = (dsp_real)(s * s * scale);
+        const double s = 2.0 * ((double)DSP_AT(re, 0) + (double)DSP_AT(im, 0));
+        DSP_AT(pwr, 0) = (dsp_real)(s * s * scale);
     }
     /* Bin m/2: its own mirror with twiddle -i, X = Re Z - i Im Z. Skipped at m < 2, where
      * m/2 is bin 0 and writing it again would overwrite the only bin there is with the
      * wrong formula. No plan reaches that -- dsp_plan_init refuses n below 4 -- but this is
      * published, so it answers for one bin rather than answering wrongly. */
     if (half > 0) {
-        double a  = (double)re[half], b = (double)im[half];
-        pwr[half] = (dsp_real)(4.0 * (a * a + b * b) * scale);
+        double a  = (double)DSP_AT(re, half), b = (double)DSP_AT(im, half);
+        DSP_AT(pwr, half) = (dsp_real)(4.0 * (a * a + b * b) * scale);
     }
     /* The untangle runs in dsp_real so the multiply-adds are the native width; only the final
      * scale is double, which keeps 1/wsum^2 exact for one multiply a bin. Mirror pairs share
      * four loads, so the pass walks inwards from both ends. */
-    {
-        const dsp_real *ar = re + 1, *ai = im + 1;
-        const dsp_real *cr = re + m - 1, *ci = im + m - 1;
-        const dsp_real *wr = utr + 1, *wi = uti + 1;
-        dsp_real *lo = pwr + 1, *hi = pwr + m - 1;
-        for (j = 1; j < half; j++) {
-            dsp_real a  = *ar++, b = *ai++, c = *cr--, d = *ci--;
-            const dsp_real s1 = a + c, s2 = b + d, d1 = a - c, d2 = b - d;
-            const dsp_real u  = *wr++, v = *wi++;
-            const dsp_real t1 = u * s2 + v * d1;
-            const dsp_real t2 = v * s2 - u * d1;
-            const dsp_real xr = s1 + t1, xi = d2 + t2;
-            const dsp_real yr = s1 - t1, yi = t2 - d2;
-            *lo++ = (dsp_real)(((double)xr * (double)xr + (double)xi * (double)xi) * scale);
-            *hi-- = (dsp_real)(((double)yr * (double)yr + (double)yi * (double)yi) * scale);
-        }
+    for (j = 1; j < half; j++) {
+        const int jh = m - j;
+        const dsp_real a = DSP_AT(re, j), b = DSP_AT(im, j);
+        const dsp_real c = DSP_AT(re, jh), d = DSP_AT(im, jh);
+        const dsp_real s1 = a + c, s2 = b + d, d1 = a - c, d2 = b - d;
+        const dsp_real u  = DSP_AT(utr, j), v = DSP_AT(uti, j);
+        const dsp_real t1 = u * s2 + v * d1;
+        const dsp_real t2 = v * s2 - u * d1;
+        const dsp_real xr = s1 + t1, xi = d2 + t2;
+        const dsp_real yr = s1 - t1, yi = t2 - d2;
+        DSP_AT(pwr, j) =
+            (dsp_real)(((double)xr * (double)xr + (double)xi * (double)xi) * scale);
+        DSP_AT(pwr, jh) =
+            (dsp_real)(((double)yr * (double)yr + (double)yi * (double)yi) * scale);
     }
+}
+
+void dsp_power(const dsp_real *DSP_RESTRICT re, const dsp_real *DSP_RESTRICT im, const int m,
+               const dsp_real *DSP_RESTRICT utr, const dsp_real *DSP_RESTRICT uti,
+               dsp_real *DSP_RESTRICT pwr, const double scale) {
+    dsp_vec rv, iv, ur, ui, pv;
+    dsp_vec_flat_ro(&rv, re, m);
+    dsp_vec_flat_ro(&iv, im, m);
+    dsp_vec_flat_ro(&ur, utr, m);
+    dsp_vec_flat_ro(&ui, uti, m);
+    dsp_vec_flat(&pv, pwr, m);
+    dsp_power_vec(&rv, &iv, m, &ur, &ui, &pv, scale);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1798,9 +1908,9 @@ int dsp_fir_run(const double *DSP_RESTRICT x, const int nx, const dsp_real *DSP_
 /* reduction and peak search                                                 */
 /* ------------------------------------------------------------------------- */
 
-int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, int k1, const int nseg,
-               const dsp_bandmap *map, const double dbmin, const double dbmax, const double vfloor,
-               dsp_real *DSP_RESTRICT db, dsp_real *DSP_RESTRICT hz) {
+int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, const int nseg,
+                   const dsp_bandmap *map, const double dbmin, const double dbmax,
+                   const double vfloor, dsp_real *DSP_RESTRICT db, dsp_real *DSP_RESTRICT hz) {
     double vfl = vfloor * vfloor; /* squared: the bins are power */
     double fstep, f0, binhz, dc;
     int npts, c, qstep, rstep, q0, q1, r1;
@@ -1813,8 +1923,8 @@ int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, 
      * nseg long and written point by point, so sharing bytes with pwr would have a segment
      * reduce bins an earlier segment had already overwritten. */
     if (dsp_overlaps(db, (size_t)nseg * sizeof(*db), hz, (size_t)nseg * sizeof(*hz))
-        || dsp_overlaps(db, (size_t)nseg * sizeof(*db), pwr, (size_t)nbins * sizeof(*pwr))
-        || dsp_overlaps(hz, (size_t)nseg * sizeof(*hz), pwr, (size_t)nbins * sizeof(*pwr)))
+        || dsp_vec_hits(pwr, db, (size_t)nseg * sizeof(*db))
+        || dsp_vec_hits(pwr, hz, (size_t)nseg * sizeof(*hz)))
         return DSP_EARG;
 #endif
     /* k1 clamped rather than refused, which is what dsp_peaks does over the same array: a
@@ -1871,7 +1981,6 @@ int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, 
          * while the frequency still rises with c. */
         int oa = q0, ob = q1 - 1;
         int a, b;
-        const dsp_real *qp;
         dsp_real top;
         double d;
         int run;
@@ -1894,10 +2003,11 @@ int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, 
          * bins at 16,384 samples, hiding a tone 4 bins away. Power is never negative, so
          * -1 cannot win against a real bin, and an all-NaN segment keeps it and plots at
          * the floor. */
-        qp = pwr + a;
+        /* By index rather than a walking pointer: the segment this reduces may be split
+         * across slices, and a run that crosses one has no single pointer to advance. */
         top = (dsp_real)-1;
-        for (run = b - a + 1; run > 0; run--) {
-            const dsp_real v = *qp++;
+        for (run = a; run <= b; run++) {
+            const dsp_real v = DSP_AT(pwr, run);
             top = (v > top) ? v : top;
         }
         /* Anything at or below the floor plots at the floor, so the logarithm never sees zero.
@@ -1926,9 +2036,9 @@ int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, 
     return nseg;
 }
 
-int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1, int kdc, const int want,
-              const dsp_interp *ip, int *DSP_RESTRICT bin, dsp_real *DSP_RESTRICT frac,
-              dsp_real *DSP_RESTRICT amp) {
+int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, const int want,
+                  const dsp_interp *ip, int *DSP_RESTRICT bin, dsp_real *DSP_RESTRICT frac,
+                  dsp_real *DSP_RESTRICT amp) {
     int kfloor, k, s, found = 0;
     double bv[DSP_PEAKS_MAX];
     if (pwr == NULL || bin == NULL || want < 1)
@@ -1972,14 +2082,14 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
         k1 = nbins - 1;
 
     for (k = k0; k <= k1; k++) {
-        double v = (double)pwr[k];
+        double v = (double)DSP_AT(pwr, k);
         /* A missing neighbour is the end of the spectrum and counts as lower. Inside a zoom
          * window the neighbours are real bins even when off-screen, so the flank of an
          * out-of-window tone does not read as a peak. Branching comparisons on purpose: a NaN
          * fails both, which keeps a NaN bin and its neighbours out of the table, and a
          * floating select would have to reproduce that by hand. */
-        const double vl = (k > 0) ? (double)pwr[k - 1] : -1.0;
-        const double vr = (k + 1 < nbins) ? (double)pwr[k + 1] : -1.0;
+        const double vl = (k > 0) ? (double)DSP_AT(pwr, k - 1) : -1.0;
+        const double vr = (k + 1 < nbins) ? (double)DSP_AT(pwr, k + 1) : -1.0;
         if (!(v > vl) || !(v >= vr))
             continue;
         if (k == kfloor && ip != NULL) {
@@ -1988,7 +2098,7 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
              * saturates at -0.5 there, so a peak estimating a quarter bin or more below the lowest
              * reportable bin is refused. */
             double d = 0.0;
-            if (dsp_peak_interp(ip, pwr, k, nbins, &d, NULL) != DSP_OK)
+            if (dsp_peak_interp_vec(ip, pwr, k, nbins, &d, NULL) != DSP_OK)
                 d = 0.0;
             if ((double)k + d < (double)kfloor - 0.25)
                 continue;
@@ -2011,13 +2121,13 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
         found++;
         if (frac != NULL || amp != NULL) {
             double d = 0.0, v;
-            if (ip != NULL && dsp_peak_interp(ip, pwr, bin[s], nbins, &d, &v) == DSP_OK) {
+            if (ip != NULL && dsp_peak_interp_vec(ip, pwr, bin[s], nbins, &d, &v) == DSP_OK) {
                 if (frac != NULL)
                     frac[s] = (dsp_real)d;
                 if (amp != NULL)
                     amp[s] = (dsp_real)v;
             } else {
-                const double pk = (double)pwr[bin[s]];
+                const double pk = (double)DSP_AT(pwr, bin[s]);
                 if (frac != NULL)
                     frac[s] = (dsp_real)0;
                 if (amp != NULL)
@@ -2075,13 +2185,13 @@ int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc
     } else {
         load_from = src;
     }
-    rc = dsp_load(load_from, p->n, p->w, p->wsum, p->re, p->im, mean_out);
+    rc = dsp_load_vec(load_from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
     if (rc != DSP_OK)
         return rc;
     dsp_do_yield(p);
     dsp_rfft(p);
     dsp_do_yield(p);
-    dsp_power(p->re, p->im, p->m, p->utr, p->uti, p->pwr, p->ksq);
+    dsp_power_vec(&p->re_v, &p->im_v, p->m, &p->utr_v, &p->uti_v, &p->pwr_v, p->ksq);
     return p->m;
 }
 
@@ -2096,7 +2206,7 @@ static double dsp_line_amp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pw
         *d_out = 0.0;
     if (ip != NULL) {
         double d = 0.0, a = 0.0;
-        if (dsp_peak_interp(ip, pwr, k, nbins, &d, &a) == DSP_OK && a > 0.0) {
+        if (dsp_peak_interp_vec(ip, pwr, k, nbins, &d, &a) == DSP_OK && a > 0.0) {
             amp = a;
             if (d_out != NULL)
                 *d_out = d;
@@ -2120,7 +2230,7 @@ static void dsp_noise_pass(const dsp_real *DSP_RESTRICT pwr, const int k0, const
             e++;
         if (e < nline && k >= line[e] - skirt)
             continue;
-        v = (double)pwr[k];
+        v = (double)DSP_AT(pwr, k);
         /* Positive tests, so a NaN bin is skipped instead of poisoning the sum. */
         if (!(v >= 0.0) || !(v <= ceil_v))
             continue;
@@ -2163,9 +2273,9 @@ static int dsp_is_mains(const double fhz, const double p, const double binhz, co
     return 0;
 }
 
-int dsp_thd_noise(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1, int kdc,
-                  const double binhz, const int mains, const dsp_interp *ip,
-                  dsp_thdn *DSP_RESTRICT out) {
+int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc,
+                      const double binhz, const int mains, const dsp_interp *ip,
+                      dsp_thdn *DSP_RESTRICT out) {
     int line[DSP_THD_HMAX + 1];
     int nline, kfloor, k, h, kf = -1, cnt = 0, skirt, nh = 0, stride;
     double pf = 0.0, vf, d0 = 0.0, fb = 0.0, hsum = 0.0, sum = 0.0;
@@ -2215,12 +2325,12 @@ int dsp_thd_noise(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int
      * Comparisons written as positives, so a NaN bin can never win and neither can its
      * neighbours. A missing neighbour is the end of the spectrum and counts as lower. */
     for (k = k0; k <= k1; k++) {
-        const double v = (double)pwr[k];
+        const double v = (double)DSP_AT(pwr, k);
         double l, r;
         if (!(v > pf))
             continue;
-        l = (k > 0) ? (double)pwr[k - 1] : -1.0;
-        r = (k + 1 < nbins) ? (double)pwr[k + 1] : -1.0;
+        l = (k > 0) ? (double)DSP_AT(pwr, k - 1) : -1.0;
+        r = (k + 1 < nbins) ? (double)DSP_AT(pwr, k + 1) : -1.0;
         if (!(v > l) || !(v >= r))
             continue;
         if (dsp_is_mains((double)k * binhz, v, binhz, mains))
@@ -2259,7 +2369,7 @@ int dsp_thd_noise(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int
         if (a < k0)
             a = k0;
         for (k = a; k <= b; k++) {
-            double v = (double)pwr[k];
+            double v = (double)DSP_AT(pwr, k);
             if (v > bp) {
                 bp = v;
                 bk = k;

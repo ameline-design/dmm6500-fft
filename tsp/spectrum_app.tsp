@@ -666,11 +666,13 @@ function fftsa.frame_body()
      or fftsa.sg_pk_f == nil then
     return
   end
+  local t_a = os.clock()
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
   -- Asked of the capture before anything is computed from it, and free: the firmware keeps the
   -- buffer's min and max current as the readings land, so this is one call rather than a pass.
   fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
+  local t_b = os.clock()
   local npk = fftsa.dsp_live()
   fftsa.dsp_window()
   -- Native path: the compiled DSP writes the trace into sg_buf's chunk storage in place
@@ -773,6 +775,7 @@ function fftsa.frame_body()
   -- inferred from the buffer: clamped or overrun, the buffer's n ends at capacity either
   -- way, so only a counter can tell the two apart.
   fftsa.sg_nwrote = nseg
+  local t_c = os.clock()
   local pk_hz, pk_v = fftsa.dsp_peaks(npk)
   -- After the trace rather than before it: the peaks come out of the same call that writes
   -- the trace, so the markers cannot be filled first. What the ordering was for still holds
@@ -780,9 +783,14 @@ function fftsa.frame_body()
   -- in which one of them is incomplete is now the 18 marker points rather than 255 trace
   -- points.
   fftsa.sg_update_markers(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
+  local t_d = os.clock()
   -- Display work the primitive does not do: outside any write window, then the paint.
-  fftsa.sg_slow_tick()
+  -- Whether the one-a-second block ran is recorded, because the timer period follows the
+  -- PEAK frame over a window and that block is in one frame of every window.
+  fftsa.ph_tick = fftsa.sg_slow_tick()
+  local t_e = os.clock()
   delay(fftsa.sg_yield)
+  local t_f = os.clock()
   -- Dashes rather than the figures, which are all arithmetic about the sentinel: the peak
   -- frequencies in particular are arbitrary picks from a spectrum whose bins are equal.
   if fftsa.overrange then
@@ -795,6 +803,34 @@ function fftsa.frame_body()
   -- reading a half-painted screen. Once per update is the cadence -- there is no event to
   -- hang it on, every delivery path the firmware offers refuses the key.
   fftsa.help_main()
+  -- Phase costs, last frame and the worst seen. Seven clock reads, about 15 us, against a
+  -- frame of tens of milliseconds; fftsa.phases() formats them.
+  local ph, pk = fftsa.ph, fftsa.ph_peak
+  ph.acq  = t_b - t_a
+  ph.spec = t_c - t_b
+  ph.mark = t_d - t_c
+  ph.tick = t_e - t_d
+  ph.yld  = t_f - t_e
+  ph.show = os.clock() - t_f
+  local k, v
+  for k, v in pairs(ph) do
+    if pk[k] == nil or v > pk[k] then pk[k] = v end
+  end
+end
+
+-- The per-phase costs as one line, for a probe. Milliseconds, last frame then the worst.
+function fftsa.phases()
+  local ph, pk = fftsa.ph, fftsa.ph_peak
+  local names = {'acq', 'spec', 'mark', 'tick', 'yld', 'show'}
+  local out, i = '', nil
+  for i = 1, table.getn(names) do
+    local k = names[i]
+    out = out .. string.format('%s %.1f/%.1f  ', k, 1000 * (ph[k] or 0),
+                               1000 * (pk[k] or 0))
+  end
+  return string.format('%sframe %.1f  plain %.1f  tick %.1f', out,
+                       1000 * (fftsa.frame_work or 0),
+                       1000 * (fftsa.work_plain or 0), 1000 * (fftsa.work_tick or 0))
 end
 
 -- Reentrancy-guarded frame. The body runs under pcall so an error cannot leave
@@ -836,6 +872,16 @@ fftsa.fps_n      = 0        -- frames counted in the window
 fftsa.fps_t0     = nil      -- when the window opened
 fftsa.fps_show   = false    -- a fresh figure is waiting for the line
 
+-- Per-phase frame costs, last frame and the worst seen, written by frame_body.
+fftsa.ph       = {}
+fftsa.ph_peak  = {}
+fftsa.ph_tick  = false      -- the one-a-second display block ran in the last frame
+-- The worst frame of each kind. The timer period follows a peak over eight frames and one
+-- of those frames carries the one-a-second block, so a single number cannot say whether the
+-- period is set by the spectrum or by the display.
+fftsa.work_plain = nil
+fftsa.work_tick  = nil
+
 function fftsa.frame()
   if fftsa.halted then return end
   if fftsa.busy then
@@ -873,6 +919,13 @@ function fftsa.frame()
   if ok then
     if fftsa.work_peak == nil or fftsa.frame_work > fftsa.work_peak then
       fftsa.work_peak = fftsa.frame_work
+    end
+    if fftsa.ph_tick then
+      if fftsa.work_tick == nil or fftsa.frame_work > fftsa.work_tick then
+        fftsa.work_tick = fftsa.frame_work
+      end
+    elseif fftsa.work_plain == nil or fftsa.frame_work > fftsa.work_plain then
+      fftsa.work_plain = fftsa.frame_work
     end
     fftsa.work_seen = (fftsa.work_seen or 0) + 1
     if fftsa.work_seen >= 8 and fftsa.timer ~= nil then

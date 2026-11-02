@@ -2742,6 +2742,26 @@ check('the rate carries one decimal under ten a second and none above', (functio
   return slow == '  4.2 fps' and fast == '  19 fps' and zero == '',
          string.format('[%s] [%s] [%s]', slow, fast, zero)
 end)())
+-- The split exists because the timer period follows a peak over eight frames and one of
+-- those carries the one-a-second display block, so a single peak cannot say whether the
+-- period is set by the spectrum or by the display.
+check('a frame records its phases and which kind of frame it was', (function()
+  fftsa.ph, fftsa.ph_peak = {}, {}
+  fftsa.work_plain, fftsa.work_tick = nil, nil
+  -- Both of the slow tick's clocks are due, so this frame carries the block.
+  fftsa.sg_tick_last, fftsa.sg_scale_last = nil, nil
+  fftsa.frame()
+  local was_tick, peak_tick = fftsa.ph_tick, fftsa.work_tick
+  -- The tick just reset both clocks and a host frame is sub-millisecond, so this one does not.
+  fftsa.frame()
+  local was_plain, peak_plain = fftsa.ph_tick, fftsa.work_plain
+  local filled = fftsa.ph.acq ~= nil and fftsa.ph.spec ~= nil and fftsa.ph.mark ~= nil
+                 and fftsa.ph.tick ~= nil and fftsa.ph.yld ~= nil and fftsa.ph.show ~= nil
+  return was_tick and not was_plain and peak_tick ~= nil and peak_plain ~= nil and filled
+         and string.find(fftsa.phases(), 'plain', 1, true) ~= nil,
+         string.format('tick=%s plain=%s [%s]', tostring(was_tick), tostring(was_plain),
+                       fftsa.phases())
+end)())
 -- The terminal selection has to stay last, which is what the case above this group asserts;
 -- the rate sits in front of it rather than after it.
 check('the rate does not displace the terminal selection from the end', (function()
