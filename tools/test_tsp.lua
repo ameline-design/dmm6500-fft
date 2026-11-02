@@ -4681,24 +4681,57 @@ check('a zoom well above the first bin keeps its own low limit', (function()
   return kept, string.format('pinned %g..%g, wanted 8000..16000', lo, hi)
 end)())
 
--- The 0.05 s tick is a cliff: the occupancy divide turns an 80.4 ms frame into 100.5 ms,
--- and a tick either side of that is 0.10 s and 10 fps against 0.15 and 6.7. Pinned at the
+-- The 0.05 s tick is a cliff: the idle floor turns an 80.4 ms frame into 100.4 ms, and a
+-- tick either side of that is 0.10 s and 10 fps against 0.15 and 6.7. Pinned at the
 -- boundary in both directions so the rounding cannot drift unnoticed.
 check('tick_period rounds up to the 0.05 s tick, and the boundary is exact', (function()
   -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
   -- 0.1499999999999999944, so == fails on values that are the same tick count.
   --
   -- 80.1 ms is the measured worst frame at 512 samples and must still give two ticks --
-  -- that is the whole point of the slack. 82 ms is past it and must give three, which is
+  -- that is the whole point of the slack. 85 ms is past it and must give three, which is
   -- what stops the slack from quietly becoming a rule that always rounds down.
+  --
+  -- 40 ms gives two ticks, not one: one tick would leave it 10 ms of idle, under the 12 ms
+  -- measured as too little to dispatch a press. The fifth-of-the-frame rule gave one.
   return near(fftsa.tick_period(0.080), 0.10, 1e-9)
          and near(fftsa.tick_period(0.0801), 0.10, 1e-9)
          and near(fftsa.tick_period(0.085), 0.15, 1e-9)
-         and near(fftsa.tick_period(0.040), 0.05, 1e-9)
+         and near(fftsa.tick_period(0.040), 0.10, 1e-9)
+         and near(fftsa.tick_period(0.029), 0.05, 1e-9)
          and near(fftsa.tick_period(0), 0.05, 1e-9),
-         string.format('80 ms -> %.2f, 80.1 -> %.2f, 85 -> %.2f, 40 -> %.2f',
+         string.format('80 ms -> %.2f, 80.1 -> %.2f, 85 -> %.2f, 40 -> %.2f, 29 -> %.2f',
                        fftsa.tick_period(0.080), fftsa.tick_period(0.0801),
-                       fftsa.tick_period(0.085), fftsa.tick_period(0.040))
+                       fftsa.tick_period(0.085), fftsa.tick_period(0.040),
+                       fftsa.tick_period(0.029))
+end)())
+
+-- Why the rule is an amount and not a fraction. What the idle is for -- dispatching a press
+-- the frame would otherwise swallow -- costs about the same whatever the frame cost, so the
+-- period must leave at least fftsa.tick_idle free at every frame length, less the slack it
+-- is allowed to spend on rate. A fifth-of-the-frame rule held back 85 ms at the long counts
+-- and under a tenth of this floor at the short ones, which is the wrong way round.
+check('every frame length keeps the idle floor, and the long ones do not overpay',
+      (function()
+  local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}
+  local slack = 0.0025
+  local i
+  for i = 1, 10 do
+    local b = busy[i]
+    local p = fftsa.tick_period(b)
+    local idle = p - b
+    if idle < fftsa.tick_idle - slack - 1e-9 then
+      return false, string.format('busy %g: period %g leaves %g, under the %g floor',
+                                  b, p, idle, fftsa.tick_idle)
+    end
+    -- And never more than the floor plus a whole tick, or the rule has started reserving a
+    -- proportion again: the tick rounding is the only thing allowed to add to the floor.
+    if idle > fftsa.tick_idle + 0.05 + 1e-9 then
+      return false, string.format('busy %g: period %g leaves %g, over a tick of overpay',
+                                  b, p, idle)
+    end
+  end
+  return true
 end)())
 
 -- The period is re-armed from frames that actually ran, not from frame_estimate(). The

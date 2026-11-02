@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 5.8
+-- $Version: 5.9
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -4883,7 +4883,7 @@ function fftsa.apply()
   -- the period and churns the object pool: an adopted gesture, which cannot change the
   -- count, would pay a frame of latency for an identical timer and throw away the period
   -- frame() had measured. From the model, which frame() replaces on the first real frame.
-  fftsa.work_peak, fftsa.work_seen = nil, 0
+  fftsa.work_peak, fftsa.work_seen, fftsa.plain_peak = nil, 0, nil
   fftsa.period_modelled = true
   -- Dropped rather than carried across: the rate the previous sample count ran at is wrong
   -- for this one, and the line is written twice from here, so a stale figure would be on
@@ -5206,6 +5206,10 @@ fftsa.ph_tick  = false      -- the one-a-second display block ran in the last fr
 -- period is set by the spectrum or by the display.
 fftsa.work_plain = nil
 fftsa.work_tick  = nil
+-- The worst plain frame of the window in force, which is what the period follows. Separate
+-- from work_plain, which is the worst since the count was applied and never decays, so it
+-- would pin the period to a single slow frame for the life of the setting.
+fftsa.plain_peak = nil
 -- The period in force came from frame_estimate and no frame has been timed against it yet,
 -- so the first one that is may replace it outright.
 fftsa.period_modelled = false
@@ -5252,8 +5256,13 @@ function fftsa.frame()
       if fftsa.work_tick == nil or fftsa.frame_work > fftsa.work_tick then
         fftsa.work_tick = fftsa.frame_work
       end
-    elseif fftsa.work_plain == nil or fftsa.frame_work > fftsa.work_plain then
-      fftsa.work_plain = fftsa.frame_work
+    else
+      if fftsa.work_plain == nil or fftsa.frame_work > fftsa.work_plain then
+        fftsa.work_plain = fftsa.frame_work
+      end
+      if fftsa.plain_peak == nil or fftsa.frame_work > fftsa.plain_peak then
+        fftsa.plain_peak = fftsa.frame_work
+      end
     end
     fftsa.work_seen = (fftsa.work_seen or 0) + 1
     -- One frame replaces a modelled period, eight replace a measured one. The model is
@@ -5266,15 +5275,26 @@ function fftsa.frame()
     local win = 8
     if fftsa.period_modelled then win = 1 end
     if fftsa.work_seen >= win and fftsa.timer ~= nil then
-      local want = fftsa.tick_period(fftsa.work_peak)
+      -- Paced from the worst frame that did not carry the one-a-second display block, not
+      -- from the worst of the window. That block lands in one frame of every eight, so a
+      -- period covering it holds every other frame idle for the difference; letting it
+      -- overrun instead drops a tick once a second and buys that difference back on the
+      -- other seven. For any window longer than one frame the arithmetic favours the
+      -- overrun, and the tick frame is still bounded by busy_max.
+      --
+      -- work_peak remains the basis until a plain frame has been seen, which is the state
+      -- in the first window after a size change.
+      local want = fftsa.tick_period(fftsa.plain_peak or fftsa.work_peak)
       if want ~= fftsa.period then
         fftsa.period = want
         fftsa.arm(want)
       end
       fftsa.period_modelled = false
-      -- Decay the peak so a size change downwards is noticed: it is re-earned over the
+      -- Decay the peaks so a size change downwards is noticed: they are re-earned over the
       -- next window rather than remembered for the life of the app.
       fftsa.work_peak = fftsa.frame_work
+      fftsa.plain_peak = nil
+      if not fftsa.ph_tick then fftsa.plain_peak = fftsa.frame_work end
       fftsa.work_seen = 0
     end
   end
@@ -6326,7 +6346,7 @@ function fftsa.build()
   return fftsa.sg_scr
 end
 
--- Timer period leaving a frame of this length about a fifth idle, rounded up to the
+-- Timer period leaving a frame of this length fftsa.tick_idle of slack, rounded up to the
 -- firmware's 0.05 s tick floor (arm(0.045) is refused with event 1131). The one place the
 -- occupancy rule lives, so the modelled first arm and the measured re-arms agree.
 --
@@ -6334,12 +6354,23 @@ end
 -- needs the interpreter, and a tick landing during a frame is dropped. At the 0.05 s floor
 -- that left 12 ms of 500 at 4096 samples, where Options was unreachable.
 --
+-- An amount, not a fraction, because that is the shape of the thing being reserved for:
+-- dispatching a press costs about the same however long the frame was. A fifth of the frame
+-- held back 85 ms at 16,384 samples, nearly two ticks of rate spent on idle nothing needs,
+-- while a 40 ms frame got 10 ms -- below the figure measured as too little.
+--
+-- 20 ms rather than more because of where the tick boundaries fall: the floor only costs
+-- rate when it pushes busy over a multiple of 50 ms, and at 25 or 30 it does that to the
+-- 80 ms frame and to 2048 samples while buying nothing at the long counts that 20 does not
+-- already buy. It is 1.7 times the 12 ms that failed, not a wide margin, and it is a live
+-- knob: raise fftsa.tick_idle from the socket if a press gets swallowed, no reinstall.
+--
 -- The 2.5 ms of slack prefers rate over idle. A tick is 50 ms, so holding the target to
--- the last millisecond buys a fiftieth of a tick of idle and costs a whole tick of rate:
--- the worst frame at 512 is 80.1 ms, a tenth of a millisecond past two ticks.
+-- the last millisecond buys a fiftieth of a tick of idle and costs a whole tick of rate.
+fftsa.tick_idle = 0.020
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return 0.05 end
-  local ticks = math.ceil((busy / 0.8) / 0.05 - 0.05)
+  local ticks = math.ceil((busy + fftsa.tick_idle) / 0.05 - 0.05)
   if ticks < 1 then ticks = 1 end
   return ticks * 0.05
 end
