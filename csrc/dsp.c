@@ -2219,7 +2219,9 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
 int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double *mean_out) {
     /* A pointer and not a copy: dsp_src carries DSP_MAX_SRC_BLOCKS addresses, and assigning
      * one is a structure copy the compiler emits a memcpy for -- which the freestanding
-     * target does not link. */
+     * target does not link. The firmware has one, and calling it would make a fifth address
+     * that belongs to one build; fwmem-NATIVEC.md has what the other four cost. Not copying
+     * is cheaper than either. */
     const dsp_src *from = src;
     dsp_src filtered;
     int need, rc;
