@@ -583,18 +583,30 @@ serial-decode repo has the mechanism). One call does the whole stage:
 | `fft_run` | 14.4 ms | |
 | `fft_power` | 2.0 ms | |
 | `find_peaks` | 1.9 ms | |
-| the 255-point trace fill, inside `sg_update` | ~1.8 ms | |
+| the 255-point trace fill, inside `sg_update` | ~1.8 ms | ~1.8 ms, both paths |
 | distortion and noise | not measured; a second pass over the bins | |
 | **total** | **34.4 ms** | **3.1 ms** |
 
-The compiled figure includes work the interpreted column does not: `dsp_reduce` writes the trace
-straight into the graph buffer's chunk storage as `(dB, Hz)` pairs, and `dsp_thd_noise` runs as well,
-so the single call leaves the trace, the ranked peaks and the THD/SNR/noise figures all ready.
+The compiled figure includes work the interpreted column does not: `dsp_reduce` reduces the spectrum
+to `(dB, Hz)` pairs and `dsp_thd_noise` runs as well, so the single call leaves the trace values, the
+ranked peaks and the THD/SNR/noise figures all ready.
+
+**The 255-point fill stays in Lua.** The call can write those pairs into the graph buffer's own chunk
+storage and rewind the descriptor, and the buffer then reads back correct from Lua with `buf.n` at the
+right count -- and the graph draws nothing. The display task works from its own copy of a bound buffer
+and `buffer.write.reading` is what feeds it, so a write it never saw cannot be rescued by a notify
+call, which is why `scaletrace` and `drawstyle` both left the trace missing. The markers, written with
+that call in the same frame on the same graph, drew throughout. So `fftsa.nl.reduce` reads the two
+reduced arrays back -- one `ki.memread` each, 2,040 bytes at 255 points -- and the frame writes the
+points with the same five-argument call the interpreted path makes.
 
 **What that does and does not buy, arithmetically.** `digitize.read` is still 6.4 ms and the paint
 inside `sg_update` is still proportional to graph area, so the frame does not fall by 31 ms. Taking
-the 81.8 ms column and substituting: minus the four interpreted phases (32.6), minus the 255-point
-fill the reduction now does itself (~1.8), plus the one call (3.1), is **about 50 ms**.
+the 81.8 ms column and substituting: minus the four interpreted phases (32.6), plus the one call
+(3.1), plus the read-back, keeping the ~1.8 ms fill, is **about 52 ms** plus whatever the read-back
+costs. The read-back is 510 `f64_unpack` calls at 255 points and has not been measured; exporting the
+decibels as scaled 32-bit integers would make it one table lookup and three multiply-adds per point,
+and is the obvious thing to try if it turns out to matter.
 
 **Measured on the instrument, 2026-11-02: 21.4 ms a frame at N = 512**, five frames called
 synchronously with the timer parked. Not 50. The substitution above was too pessimistic
@@ -603,6 +615,9 @@ was calling `display.graph.scaletrace` once a frame as a graph notify, and **tha
 cost about 105 ms** -- the same frame measured 126.6 ms with it and 21.4 ms without. It also
 unpinned both axes, which is the defect that found it. See the E7 section of
 `EXPERIMENTS-native.md` in the serial-decode repo.
+
+That 21.4 ms is a frame that computed the spectrum and drew no trace, so it is a floor rather
+than the cost of a working frame: the read-back and the 255-point fill are both on top of it.
 
 So the quantisation argument below was about the wrong number, and is kept because the
 reasoning still holds for anything that does not clear a 100 ms obstacle out of the way.

@@ -243,13 +243,14 @@ def main():
         ' fftsa.flo, fftsa.fhi, fftsa.range, fftsa.fs, fftsa.binhz))', timeout=120)
     cap(d, '/tmp/app_zoom.png', live=True)
     print('  zoom 8-16k -> /tmp/app_zoom.png')
-    # Search the DISPLAYED window, exactly as fftsa.frame_body() does, so this
-    # reports the peak that is actually on screen and not an off-screen tone.
-    print('  zoom peak:', d.q('local nb=fftsa.n/2 '
-        'local k0,k1=fftsa.sg_window_bins(nb,fftsa.binhz) '
-        'local bi,bv=fftsa.find_peaks(nb,fftsa.sg_npeak,k0,k1) '
-        'print(string.format("%.3f kHz @ %.4f V  (bins %d..%d)", '
-        '(bi[1]-1)*fftsa.binhz/1000, bv[1], k0, k1))', timeout=90))
+    # The peak the app is showing, from the tables the peak block reads, so the figure is
+    # the one on the glass whichever path produced it. fftsa.find_peaks walks the
+    # interpreted power array, which the compiled path never fills.
+    print('  zoom peak:', d.q('local hz,v=fftsa.pk_hz,fftsa.pk_v '
+        'local k0,k1=fftsa.sg_window_bins(fftsa.n/2,fftsa.binhz) '
+        'print(string.format("%.3f kHz @ %.4f V  (bins %d..%d, %s)", '
+        '(hz[1] or 0)/1000, v[1] or 0, k0, k1, '
+        'fftsa.nl_frame and "compiled" or "interpreted"))', timeout=90))
 
     # ---- a sample count press, which is what nl.reinit exists for ----
     # The arena is sized once per boot for fftsa.nl_nmax; a count at or below it re-plans
