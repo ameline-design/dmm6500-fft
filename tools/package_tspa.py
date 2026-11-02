@@ -44,8 +44,13 @@ OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
 # native_code.tsp is optional: without it the app still packages and runs, with the
 # native path never becoming ready and the frame body falling back to dsp.spectrum. That
 # is deliberate, so a tree with no PPC toolchain still produces a working archive.
+# tsp/dsp_lua.tsp is NOT here on this branch. It installs a complete Lua implementation
+# of dsp.* as a fallback, and the DSP work is done in C here, so shipping a second
+# implementation in interpreted Lua only costs script size. The file is still in the tree
+# and still ships on main; the capability gate in spectrum_app.tsp tests
+# type(fftsa.dsp_install) rather than assuming it exists.
 MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
-           'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp', 'tsp/native_link.tsp',
+           'tsp/spectrum_graph.tsp', 'tsp/native_link.tsp',
            'tsp/native_code.tsp', 'tsp/spectrum_app.tsp']
 MODULES = [m for m in MODULES
            if m != 'tsp/native_code.tsp' or os.path.exists(os.path.join(ROOT, m))]

@@ -13,14 +13,28 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- Capability gate.  Three tiers, from fastest to slowest:
---   1. native-dsp branch: our own compiled PPC DSP (no flicker, no Keithley clear).
---      nl.ready is set by nl.init() called from fftsa.start(); it stays false until
---      tsp/native_link.tsp has installed its binary.
+-- Capability gate.  Two tiers on this branch, from fastest to slowest:
+--   1. our own compiled PPC DSP (no flicker, no Keithley clear). nl.ready is set by
+--      nl.init() from fftsa.start(); it stays false until the binary is installed.
 --   2. Keithley's native dsp.* module (fast, but clears sg_buf before each fill).
---   3. Lua fallback installed by fftsa.dsp_install() (dsp_lua.tsp).
+--
+-- The Lua fallback that was tier 3 is not in the archive on this branch: the DSP work is
+-- done in C, so shipping a second full implementation in interpreted Lua only costs
+-- script size. tsp/dsp_lua.tsp still exists and still builds on main, it is just not in
+-- tools/package_tspa.py's MODULES here.
+--
+-- So dsp_install may be nil, and the gate must not call it. An instrument without
+-- Keithley's dsp module gets a refusal it can act on rather than a -286 at load from
+-- calling a nil, which is what reaching for the absent fallback would produce.
 fftsa.dsp_native = (dsp ~= nil and dsp.version ~= nil and dsp.version >= 1)
-if not fftsa.dsp_native then fftsa.dsp_install() end
+if not fftsa.dsp_native then
+  if type(fftsa.dsp_install) == 'function' then
+    fftsa.dsp_install()
+    fftsa.dsp_native = (dsp ~= nil and dsp.version ~= nil and dsp.version >= 1)
+  else
+    fftsa.dsp_absent = true
+  end
+end
 
 -- nl.ready is set by fftsa.nl.init() inside fftsa.start().  It is false here at
 -- load time so the frame body starts on the existing path without waiting.

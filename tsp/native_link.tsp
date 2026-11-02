@@ -86,6 +86,15 @@ end
 
 local function hx(v) return string.format('%X', v) end
 
+-- Firmware .text, where a lua_CFunction pointer must land. Anything else written into a
+-- closure's f is a jump into data on the next call.
+fftsa.nl.TEXT_LO = 16384      -- 0x00004000
+fftsa.nl.TEXT_HI = 5402624    -- 0x00527000
+
+function fftsa.nl._text_ok(a)
+  return type(a) == 'number' and a >= fftsa.nl.TEXT_LO and a < fftsa.nl.TEXT_HI
+end
+
 local function align8(v) return v + math.mod(8 - math.mod(v, 8), 8) end
 
 -- Read a word from the instrument, or nil. Reads are DRAM-only by construction here:
@@ -331,6 +340,9 @@ end
 local function via_peek8(addr, a1, a2)
   local nl = fftsa.nl
   if nl.peek8_cls == 0 then return nil, 'no closure' end
+  -- Checked on the way in, not just at capture: the restore below is unconditional, so
+  -- if this is wrong the redirect must not happen at all.
+  if not nl._text_ok(nl.peek8_f) then return nil, 'restore value not in .text' end
   local slot = hx(nl.peek8_cls + 12)
   local orig = string.format('%08X', nl.peek8_f)
   ki.poke32(slot, string.format('%08X', addr))
@@ -353,11 +365,15 @@ local function flush(addr, len)
   return true
 end
 
+-- Put ki.peek8 back. Refuses rather than writing a value that is not a .text address:
+-- a restore that writes garbage is worse than no restore, because the closure still
+-- works until something calls it.
 function fftsa.nl.restore_peek8()
-  if fftsa.nl.peek8_cls ~= 0 then
-    ki.poke32(hx(fftsa.nl.peek8_cls + 12),
-              string.format('%08X', fftsa.nl.peek8_f))
-  end
+  local nl = fftsa.nl
+  if nl.peek8_cls == 0 then return false end
+  if not nl._text_ok(nl.peek8_f) then return false end
+  ki.poke32(hx(nl.peek8_cls + 12), string.format('%08X', nl.peek8_f))
+  return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -383,8 +399,16 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   if not e then return false end
   local cls = tonumber(string.sub(s, e + 1), 16)
   if not cls then return false end
+  -- This value is written back into a live lua_CFunction pointer by every redirect, so
+  -- it is the most dangerous number in the module and it is validated before it is kept.
+  -- A single transport read is not enough: a desynchronised socket once returned a heap
+  -- address here, the restore wrote it into the dispatch path, and the next call executed
+  -- a deleted buffer's stale readings -- bc at +0 fell through to an illegal 0x00000000
+  -- at +4, PC 0x03518424. Two agreeing reads, both inside firmware .text, or refuse.
   local orig_f = W(cls + 12)
-  if not orig_f then return false end
+  if orig_f == nil then return false end
+  if not fftsa.nl._text_ok(orig_f) then return false end
+  if W(cls + 12) ~= orig_f then return false end
   nl.peek8_cls = cls
   nl.peek8_f   = orig_f
 
