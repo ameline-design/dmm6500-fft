@@ -609,18 +609,27 @@ decibels as scaled 32-bit integers would make it one table lookup and three mult
 and is the obvious thing to try if it turns out to matter.
 
 **Measured on the instrument, 2026-11-02: 21.4 ms a frame at N = 512**, five frames called
-synchronously with the timer parked. Not 50. The substitution above was too pessimistic
-because it assumed the rest of the frame was irreducible, and one call in it was not: the app
-was calling `display.graph.scaletrace` once a frame as a graph notify, and **that call alone
-cost about 105 ms** -- the same frame measured 126.6 ms with it and 21.4 ms without. It also
-unpinned both axes, which is the defect that found it. See the E7 section of
-`EXPERIMENTS-native.md` in the serial-decode repo.
+synchronously with the timer parked. Not 50. The substitution above assumed the rest of the frame
+was irreducible and one call in it was not: `display.graph.scaletrace` as a per-frame graph notify
+costs **about 105 ms** -- the same frame measures 126.6 ms with it and 21.4 ms without -- and it
+unpins both axes, which is the defect that found it. `sg_bind()` calls it once at bind time and
+re-pins both axes immediately after, which is the only way it is safe to call. See the E7 section
+of `EXPERIMENTS-native.md` in the serial-decode repo.
 
 That 21.4 ms is a frame that computed the spectrum and drew no trace, so it is a floor rather
 than the cost of a working frame: the read-back and the 255-point fill are both on top of it.
 
-So the quantisation argument below was about the wrong number, and is kept because the
-reasoning still holds for anything that does not clear a 100 ms obstacle out of the way.
+**A full frame is not transform-bound.** At N = 2048 a frame measures 157.6 ms of which the
+compiled transform is about 15 ms, so whatever sets the rate is elsewhere. `fftsa.period` follows
+`tick_period(work_peak)`, a peak over eight frames, and one frame a second carries
+`fftsa.sg_slow_tick()` -- so a single worst-frame figure cannot say whether the period is set by
+the spectrum or by the one-a-second display block. The app records `fftsa.work_plain` and
+`fftsa.work_tick` separately for that, and `fftsa.phases()` prints six per-phase costs (`acq`,
+`spec`, `mark`, `tick`, `yld`, `show`), last frame and worst. Neither has been read off the
+instrument yet.
+
+The quantisation argument below is about a smaller number than 157.6 ms, and the reasoning holds
+for anything that does not have a 100 ms obstacle in front of it.
 
 **50 ms is the bucket boundary itself, and arithmetic about it is not a result.** `displayed = 1 / (0.05 *
 ceil(frame / 0.05))` admits 20 fps at or under 50 ms and 10 fps at anything above, so a frame
@@ -631,15 +640,32 @@ document concluded nothing smaller could reach, and whether it crosses it has to
 instrument -- completed frames against the wall clock, which is the measurement the "not yet
 verified on hardware" section above already asks for.
 
-### The ceiling is the chunk, not the arithmetic
+### The compiled path covers every count the app offers
 
-The native path tops out at **N = 2048**, and the reason is memory geometry rather than speed. A
-reading buffer's chunk payload is a fixed 32,768 bytes; the de-strided capture is `n` doubles and has
-to be contiguous inside one of them, and `dsp_plan_init_segs` separately puts the window -- also `n`
-entries -- in a chunk of its own. With `dsp_real` as `double` both bound `n` at 4,092, so the next
-power of two down is 2048. Above that the app runs the interpreted path, which is why it is still in
-the archive.
+Up to and including N = 16384, in a double build. Two pieces of memory geometry decide that, and
+neither is a bound on N any more.
 
-`dsp.c` builds in single precision as well, and the test suite passes in both. That would double the
-ceiling to 4096 and put the transform on the e300c4's single-precision multiply-add array, which
-issues and completes one per cycle. It is the obvious next measurement and has not been taken.
+An array too long for one segment is cut into **slices**: at most 32 per array, each a power of two
+long and at least as long as the longest run a kernel addresses, so every row of the four-step still
+lies inside one slice and the butterfly loops still take a plain row pointer. Radix-2 is refused a
+split arena, because its butterflies index across the whole transform -- which costs nothing, since
+radix-2 is only the decomposition below `DSP_FS_MIN`, where nothing is long enough to split.
+
+The capture is not copied at all. `dsp_src` describes it as strided elements in equal-sized blocks,
+which is what a reading buffer is, and `dsp_spectrum_run_src` reads it in place out of the chunks.
+The stride has to be a multiple of 8, because a double load off a 4-aligned address traps on this
+core.
+
+So the sample count is bounded by segments available. Measured at the instrument's 32,736-byte
+segment in a double build, against the 32 the entry point accepts:
+
+| N | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|
+| segments | 2 | 4 | 10 | 13 | 26 |
+
+`dsp.c` builds in single precision as well and the test suite passes in both, but it buys no reach
+here: the awkward size is the array that just misses a segment, and halving the element size moves
+it one count step. At N = 8192 in double and N = 16384 in single, the m-entry array is 32,768 bytes
+against a 32,736-byte segment -- short by 32 bytes either way. What single precision would buy is
+the e300c4's single-precision multiply-add array, which issues and completes one per cycle. That
+has not been measured.

@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 5.5
+-- $Version: 5.6
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -2090,9 +2090,12 @@ end
 -- Called once at startup; sets fftsa.nl.ready when the native path is available.
 -- Falls back silently on any failure: the app then uses dsp.spectrum as before.
 --
--- Version-specific pieces: the trampoline bytes, which encode a call to
--- dcbst_icbi_isync_range at 0x004A9840 (1.7.17a), and the two firmware addresses
--- compiled into dsp_native.c. Everything else is resolved at runtime.
+-- Four addresses belong to one firmware build and none of them is discovered at runtime.
+-- Three are encoded in the trampoline bytes: dcbst_icbi_isync_range at 0x004A9840, and the
+-- two Lua helpers at 0x0021E868 and 0x004BFE9C that it reads its hex-string arguments
+-- through. The fourth is lua_pushnumber at 0x0021EF24, which the image calls to return its
+-- status. nl.FW names the build they were measured on and nothing installs on another one.
+-- Everything else -- the closure, the six libm entries -- is resolved at runtime.
 --
 -- Lua 5.0.2: no '#', no hex literals, no multi-return string.byte, math.mod not fmod.
 
@@ -2197,6 +2200,18 @@ function fftsa.nl.win_to_native(wi)
   if k == nil then k = fftsa.nl.WIN[1] end
   return k
 end
+
+-- The build these addresses were measured on, against localnode.version.
+--
+-- A build not listed here gets no native path. The four addresses would be wrong, and
+-- calling a wrong one is a bluescreen rather than a refusal -- which ki.reboot cannot
+-- recover. The interpreted path is slower and correct, so that is what an unrecognised
+-- build runs. The value is lua_pushnumber; the other three live in the trampoline bytes,
+-- which is why a new build needs both this entry and a trampoline rebuilt for it.
+fftsa.nl.FW = { ['1.7.17a'] = 2223908 }   -- lua_pushnumber at 0x0021EF24
+
+-- What localnode.version answered, listed or not, so a refusal can say which build it was.
+fftsa.nl.fw_seen = nil
 
 -- The 164-byte cache-flush trampoline for 1.7.17a. Reads two hex strings from the Lua
 -- stack (address, count) and calls dcbst_icbi_isync_range. Position-independent: it has
@@ -2426,6 +2441,19 @@ end
 -- Resolve the six functions dsp.c calls. Returns the count found.
 function fftsa.nl.resolve_math()
   local fn = fftsa.nl.fn
+  -- The build first. The trampoline's three addresses and lua_pushnumber below belong to
+  -- it and to no other, and there is nothing here that would notice them having moved: a
+  -- wrong flush routine is a call into whatever occupies that address now. Answering zero
+  -- leaves nl.init short of its six and the native path unbuilt.
+  local v = nil
+  if localnode ~= nil then v = localnode.version end
+  fftsa.nl.fw_seen = tostring(v)
+  local pn = nil
+  if v ~= nil then pn = fftsa.nl.FW[tostring(v)] end
+  if pn == nil then
+    trace('fw.unknown', fftsa.nl.fw_seen)
+    return 0
+  end
   local names = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
   local found = 0
   local k
@@ -2435,9 +2463,30 @@ function fftsa.nl.resolve_math()
     if fn[nm] then found = found + 1 end
   end
   -- lua_pushnumber is not behind a math wrapper, so it is the one address FNF cannot
-  -- reach. Confirmed by disassembly: li r0,3; stfd f1,8(r11).
-  fn.lua_pushnumber = 2223908   -- 0x0021EF24 on 1.7.17a
+  -- reach. Identified by disassembly: li r0,3; stfd f1,8(r11).
+  fn.lua_pushnumber = pn
   return found
+end
+
+-- The instruction words at the four build-specific addresses, as hex, for a probe to
+-- report. A fingerprint read back here is what would let a later release verify an address
+-- still holds the routine it was measured at instead of trusting a version string.
+function fftsa.nl.fw_probe(words)
+  -- 0x0021E868 and 0x0021EF24 are the two Lua entries, 0x004A9840 the flush routine and
+  -- 0x004BFE9C the second helper. Lua 5.0.2 has no hex literals.
+  local at = { 2222184, 2223908, 4888640, 4980380 }
+  local n = words or 4
+  local out, i, j = '', nil, nil
+  for i = 1, table.getn(at) do
+    out = out .. string.format('%X:', at[i])
+    for j = 0, n - 1 do
+      local w = W(at[i] + j * 4)
+      if w == nil then out = out .. '????????'
+      else out = out .. string.format('%08X', w) end
+    end
+    out = out .. ' '
+  end
+  return fftsa.nl.fw_seen .. ' ' .. out
 end
 
 -- ---------------------------------------------------------------------------

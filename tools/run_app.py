@@ -169,6 +169,11 @@ def main():
     # which is the point of the fallback and also the thing that would make every
     # measurement below describe the wrong implementation.
     print('\n=== native path ===')
+    # The build, and the words at the four addresses that belong to it. Nothing verifies
+    # those addresses before use, so a refusal here names the build it refused.
+    print('  firmware :', d.q(
+        'if fftsa.nl == nil then print("no nl table") else '
+        'print(fftsa.nl.fw_probe(2)) end', timeout=60))
     print('  state    :', d.q(
         'local nl = fftsa.nl '
         'if nl == nil then print("no nl table") else '
