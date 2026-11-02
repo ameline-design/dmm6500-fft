@@ -897,6 +897,12 @@ fftsa.help_x2,  fftsa.help_y2 = 108, 66
 fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
 fftsa.help_shown = 0            -- times the key has been answered
 fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
+-- How often the frame polls for the dialog. Not once a frame: getchecksum waits on the
+-- display task, which at that point owes the trace fill's batched messages, and the wait
+-- measured 46.1 ms of a 274.3 ms frame at 16,384 samples against 0.1 ms with the call gone.
+-- The gate itself is at the call site in frame_body, which is where the position matters.
+fftsa.help_period = 1.0
+fftsa.help_last   = nil
 
 function fftsa.help_is_dialog(c)
   if c == nil then return false end

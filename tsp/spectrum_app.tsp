@@ -852,11 +852,25 @@ function fftsa.frame_body()
   else
     fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
   end
-  -- The HELP key, at the END of the graph update: the glass is complete, so the firmware's
-  -- dialog is either over a finished frame or not there at all, and the check is never
-  -- reading a half-painted screen. Once per update is the cadence -- there is no event to
-  -- hang it on, every delivery path the firmware offers refuses the key.
-  fftsa.help_main()
+  -- The HELP key, still at the END of the graph update: the glass is complete, so the
+  -- firmware's dialog is either over a finished frame or not there at all, and the check is
+  -- never reading a half-painted screen. There is no event to hang it on; every delivery
+  -- path the firmware offers refuses the key.
+  --
+  -- ONCE A SECOND, not once a frame, and the cost is not the checksum itself. The firmware
+  -- answers that in 0.33 ms. It is the wait: getchecksum returns glass-derived data, so it
+  -- blocks until the display task answers, and at this point in the frame that task owes the
+  -- 255 reading messages the trace fill just batched and the repaint they cause. Measured on
+  -- 1.7.17a at 16,384 samples, 46.1 ms of a 274.3 ms frame, against 0.1 ms with the call
+  -- gone -- a sixth of the frame spent waiting for a keypress poll.
+  --
+  -- A second of latency on a human pressing HELP costs nothing, which is the argument
+  -- sg_slow_tick already makes for reading FRONT/REAR on this clock instead of per frame.
+  local hnow = os.clock()
+  if fftsa.help_last == nil or (hnow - fftsa.help_last) >= fftsa.help_period then
+    fftsa.help_last = hnow
+    fftsa.help_main()
+  end
   -- Phase costs, last frame and the worst seen. Seven clock reads, about 15 us, against a
   -- frame of tens of milliseconds; fftsa.phases() formats them.
   local ph, pk = fftsa.ph, fftsa.ph_peak

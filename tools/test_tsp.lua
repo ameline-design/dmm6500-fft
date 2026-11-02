@@ -1613,6 +1613,10 @@ end)())
 local function help_reset(sum)
   KI.sum, KI.calls, KI.rect, KI.actions = sum, 0, nil, {}
   fftsa.help_shown = 0
+  -- The poll's own cadence gate, cleared so each case starts with it open. Left set, a case
+  -- that drives one frame would find the poll already spent for the second and read as the
+  -- key going unanswered.
+  fftsa.help_last = nil
   display.active = fftsa.sg_scr
   fftsa.help_probe()
 end
@@ -1677,6 +1681,29 @@ check('a screen that is not the help dialog is left alone', (function()
          'got ' .. tostring(got) .. ' calls=' .. KI.calls
          .. ' actions=' .. table.getn(KI.actions)
          .. ' active=' .. tostring(display.active)
+end)())
+
+-- The poll is once a second, not once a frame, and that is a frame-rate fact rather than a
+-- preference: getchecksum returns glass-derived data, so it blocks until the display task
+-- answers, and the frame reaches it owing that task the 255 reading messages the trace fill
+-- just batched. Measured on 1.7.17a at 16,384 samples, 46.1 ms of a 274.3 ms frame, against
+-- 0.1 ms with the call removed. Asserted on KI.calls, which counts the firmware call itself,
+-- so folding the poll back into every frame fails here rather than showing up as a sixth of
+-- the frame rate on the glass.
+check('the help poll runs once a second, not once a frame', (function()
+  help_reset(HSIG + 1)
+  fftsa.help_last = nil
+  local i
+  for i = 1, 6 do fftsa.frame_body() end
+  local once = KI.calls
+  -- And the gate opens again when the period has passed, or the key would be answered only
+  -- on the first frame after a launch.
+  fftsa.help_last = os.clock() - (fftsa.help_period + 0.1)
+  fftsa.frame_body()
+  local twice = KI.calls
+  return once == 1 and twice == 2 and fftsa.help_period == 1.0,
+         string.format('%d calls over six frames, %d after the period elapsed',
+                       once, twice)
 end)())
 
 check('the checksum is taken over the declared title row', (function()
