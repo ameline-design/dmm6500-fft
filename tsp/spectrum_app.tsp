@@ -611,6 +611,15 @@ function fftsa.apply()
   -- count, would pay a frame of latency for an identical timer and throw away the period
   -- frame() had measured. From the model, which frame() replaces on the first real frame.
   fftsa.work_peak, fftsa.work_seen, fftsa.plain_peak = nil, 0, nil
+  -- The diagnostics too, which is not cosmetic. Every one of these is a worst-seen, and a
+  -- worst-seen that outlives the count it was measured at reads as a figure for the count on
+  -- screen. It cost two wrong diagnoses: a 215.5 ms acquisition against a true 169.3, and a
+  -- work_plain of 117.8 ms sitting beside a work_tick of 353.3 as though one frame in eight
+  -- were three times the cost of the others, when they were simply recorded at different
+  -- sample counts. phases() is read to decide what to optimise, so a stale entry sends the
+  -- work somewhere it is not.
+  fftsa.ph_peak = {}
+  fftsa.work_plain, fftsa.work_tick = nil, nil
   fftsa.period_modelled = true
   -- Dropped rather than carried across: the rate the previous sample count ran at is wrong
   -- for this one, and the line is written twice from here, so a stale figure would be on

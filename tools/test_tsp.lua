@@ -1690,6 +1690,28 @@ check('a screen that is not the help dialog is left alone', (function()
          .. ' active=' .. tostring(display.active)
 end)())
 
+-- Every worst-seen figure is cleared at Apply. A worst-seen that outlives the count it was
+-- measured at reads as a figure for the count on screen, and phases() is read to decide what
+-- to optimise: a stale acq of 215.5 ms against a true 169.3, and a work_plain from one count
+-- beside a work_tick from another, both sent real work to the wrong place.
+check('Apply clears the worst-seen figures so they cannot describe another count', (function()
+  local i
+  for i = 1, 4 do fftsa.frame_body() end
+  fftsa.work_plain, fftsa.work_tick = 9.5, 9.75
+  fftsa.ph_peak.acq = 9.25
+  fftsa.ph_peak.spec = 9.125
+  if not fftsa.options_apply() then return false, fftsa.lasterr end
+  local cleared = fftsa.work_plain == nil and fftsa.work_tick == nil
+                  and fftsa.ph_peak.acq == nil and fftsa.ph_peak.spec == nil
+  -- And they fill again from frames that follow, or the clear would just blind the figures.
+  fftsa.frame_body()
+  local refilled = fftsa.ph_peak.acq ~= nil
+  return cleared and refilled,
+         string.format('cleared=%s refilled=%s (plain=%s acq=%s)',
+                       tostring(cleared), tostring(refilled),
+                       tostring(fftsa.work_plain), tostring(fftsa.ph_peak.acq))
+end)())
+
 -- The shipped default, which help_reset turns on for every other case here and so cannot
 -- itself assert. Off because the poll costs 44 ms of a 274 ms frame at 16,384 samples and
 -- the key is not worth that; pressing HELP leaves the firmware's dialog up until EXIT.
