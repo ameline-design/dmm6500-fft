@@ -262,11 +262,13 @@ def main():
     sizes_addr = elf.symbol_named("dsp_native_sizes")
     if sizes_addr is None:
         sys.exit("dsp_native_sizes not found: the Lua side needs the target's struct sizes")
-    raw = elf.read_at(sizes_addr, 24)
-    if raw is None or len(raw) != 24:
+    raw = elf.read_at(sizes_addr, 32)
+    if raw is None or len(raw) != 32:
         sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
-    plan_sz, params_sz, real_sz, align, heap_lo, heap_hi = struct.unpack(">IIIIII", raw)
-    if 0 in (plan_sz, params_sz, real_sz, align, heap_lo, heap_hi):
+    (plan_sz, params_sz, real_sz, align, heap_lo, heap_hi,
+     res_peaks, res_doubles) = struct.unpack(">IIIIIIII", raw)
+    if 0 in (plan_sz, params_sz, real_sz, align, heap_lo, heap_hi,
+             res_peaks, res_doubles):
         sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
                  "rather than an initialised one in .rodata")
     if heap_lo >= heap_hi:
@@ -287,6 +289,9 @@ def main():
         fh.write("-- heap bounds from dsp_native_bounds.h, so Lua holds no second copy\n")
         fh.write("fftsa.nl.HEAP_LO = %d\n" % heap_lo)
         fh.write("fftsa.nl.HEAP_HI = %d\n" % heap_hi)
+        fh.write("-- results block: Lua reserves the memory and decodes what lands in it\n")
+        fh.write("fftsa.nl.RES_PEAKS = %d\n" % res_peaks)
+        fh.write("fftsa.nl.RES_DOUBLES = %d\n" % res_doubles)
 
     print("image      %s  %d bytes" % (bin_path, len(image)))
     print("relocs     %s  %d entries, %d bytes"

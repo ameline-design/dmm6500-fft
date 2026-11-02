@@ -491,15 +491,15 @@ end
 -- Written only when the text changes, like the terminal selection. On the peak table's
 -- clock, not the frame.
 --
--- The figures come from the primitive, over the bins it reduced, and it reports thd as a
--- fraction where this line prints a percentage. The sample count is read off the primitive
--- too, dsp.fft.samples and not fftsa.n: the plan in force is the primitive's own, and a
--- second opinion on it is how the line and the trace end up describing different frames.
+-- The figures come from the primitive that produced the spectrum on screen, over the bins
+-- it reduced, and it reports thd as a fraction where this line prints a percentage. Both go
+-- through fftsa.distortion() and fftsa.plan_n(), which pick the live path: asking dsp.*
+-- directly would describe a transform the native path never ran.
 function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
-  local thd, snr, ndb = dsp.distortion()
+  local thd, snr, ndb = fftsa.distortion()
   if thd ~= nil then thd = thd * 100 end
-  local t = fftsa.sg_thd_text(thd, snr, ndb, dsp.fft.samples, fftsa.overrange)
+  local t = fftsa.sg_thd_text(thd, snr, ndb, fftsa.plan_n(), fftsa.overrange)
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)

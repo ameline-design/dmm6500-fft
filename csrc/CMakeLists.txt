@@ -303,6 +303,29 @@ if(Python3_Interpreter_FOUND)
            COMMAND ${Python3_EXECUTABLE} -I
                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_window_enum.py
                    --root ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+  # dsp_native_params is a wire format: Lua writes a flat sequence of big-endian words and
+  # dsp_native_run reads a struct. A field added, removed or moved on one side only shifts
+  # every word after it, so the entry point reads one heap address where another was meant
+  # -- which passes the bounds test and is simply wrong. Field for field, by name.
+  add_test(NAME params_layout
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_params_layout.py)
+  add_test(NAME params_layout_selftest
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_params_layout.py --self-test)
+
+  # Every double that crosses to the native side -- the bin width, the decibel window, the
+  # voltage floor -- goes as the word pair the Lua packer builds, and comes back through the
+  # reader nl.results() decodes the peaks with. A fault in either is a plausible wrong
+  # number rather than a refusal. Needs Lua 5.0.2, whose math.frexp is the instrument's.
+  if(LUA502)
+    add_test(NAME f64_pack
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_f64.py)
+    set_tests_properties(f64_pack PROPERTIES
+                         ENVIRONMENT "LUA502=${LUA502}")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

@@ -29,7 +29,14 @@ fftsa.nl = {
 fftsa.nl.RC = {
   EMAGIC = -1, EBOUNDS = -2, EPLAN = -3, EGEOM = -4, ECAPTURE = -5,
   EOUTPUT = -6, EDESC = -7, EARENA = -8, ESCRATCH = -9, ERUN = -10, EMATH = -11,
+  EREDUCE = -12, ERESULT = -13,
 }
+
+-- DSP_THD_MAINS_* from csrc/dsp.h. Hum at a multiple of the selected mains frequency is
+-- passed over when the fundamental is sought; BOTH discounts 50 and 60.
+fftsa.nl.MAINS_BOTH = -1
+fftsa.nl.MAINS_A    = 50
+fftsa.nl.MAINS_B    = 60
 
 fftsa.nl.MODE_INIT  = 1
 fftsa.nl.MODE_RUN   = 2
@@ -62,7 +69,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 32
+fftsa.nl.PARAM_WORDS = 51
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -75,6 +82,12 @@ fftsa.nl.SIZEOF_REAL   = 0
 -- refuses every address rather than accepting every address.
 fftsa.nl.HEAP_LO = 0
 fftsa.nl.HEAP_HI = 0
+
+-- Shape of the results block, also from the image: the peak slots it holds and the total
+-- doubles Lua reads back out of it. Zero until the generated module loads, which makes
+-- nl.results() refuse rather than decode a block of some other size.
+fftsa.nl.RES_PEAKS   = 0
+fftsa.nl.RES_DOUBLES = 0
 
 -- Picker index to DSP_WINDOW_*, the enum in csrc/dsp.h. A SEPARATE MAP FROM
 -- fftsa.win_dsp, which goes to Keithley's dsp.WINDOW_*. The two enums coincide today and
@@ -116,8 +129,12 @@ fftsa.nl._DSP_RELOC_BSS_HI = 0
 -- Byte packing helpers.
 -- ---------------------------------------------------------------------------
 
+-- Two's complement for a negative v, which math.mod alone does not give: it is fmod and
+-- keeps the sign, so math.mod(-1, 2^32) is -1 and string.char would then be handed -1 and
+-- raise. dsp_bandmap.sense is -1 in an odd Nyquist zone, so this is reachable.
 local function u32_pack(v)
   v = math.mod(v, 4294967296)
+  if v < 0 then v = v + 4294967296 end
   local b4 = math.mod(v, 256); v = math.floor(v / 256)
   local b3 = math.mod(v, 256); v = math.floor(v / 256)
   local b2 = math.mod(v, 256)
@@ -134,6 +151,37 @@ local function u32_at(s, p)
 end
 
 local function hx(v) return string.format('%X', v) end
+
+-- An IEEE-754 binary64 as the two 32-bit halves the target reads it back from, high half
+-- first. The params struct is a wire format and Lua 5.0.2 has no way to lay out a double,
+-- so every double in it crosses as a word pair; pw_double in dsp_native.c reassembles one.
+--
+-- math.frexp and math.ldexp are both present on 1.7.17a, measured rather than assumed. The
+-- arithmetic is exact: every multiply is by a power of two, so nothing rounds and the
+-- result is the bit pattern a host would have written. Checked against struct.pack in
+-- csrc/tools/test_f64.lua, including the signs, the infinities and a NaN.
+--
+-- SUBNORMALS FLUSH TO ZERO, and so does anything whose exponent overflows, to an infinity.
+-- The smallest normal is 2.2e-308; what crosses here is a frequency, a decibel limit or a
+-- voltage floor, and the closest any of them comes is the squared voltage floor at 1e-18.
+local function f64_words(x)
+  local sign = 0
+  if x < 0 then sign = 2147483648; x = -x end
+  -- A NaN first: it loses every ordered comparison below, so no later test can find it.
+  if x ~= x then return sign + 2146959360, 0 end        -- 0x7FF80000, quiet NaN
+  if x == 0 then return sign, 0 end
+  -- Doubling leaves only zero and an infinity unchanged, and zero is gone. Lua 5.0.2 has
+  -- no math.huge to compare against.
+  if x + x == x then return sign + 2146435072, 0 end    -- 0x7FF00000
+  local m, e = math.frexp(x)              -- 0.5 <= m < 1 and x = m * 2^e
+  local eb = e + 1022                     -- biased exponent of the 1.f form, which is 2m
+  if eb >= 2047 then return sign + 2146435072, 0 end
+  if eb <= 0 then return sign, 0 end
+  local f  = m * 2 - 1                    -- the 52-bit significand, 0 <= f < 1
+  local hi = math.floor(f * 1048576)      -- its top 20 bits
+  return sign + eb * 1048576 + hi, math.floor((f * 1048576 - hi) * 4294967296)
+end
+fftsa.nl._f64_words = f64_words
 
 -- Firmware .text, where a lua_CFunction pointer must land. Anything else written into a
 -- closure's f is a jump into data on the next call.
@@ -169,6 +217,41 @@ end
 local function W(addr)
   return tonumber(ki.peek32(hx(addr)), 16)
 end
+
+-- A double as the eight bytes the target stores it as, for a content scan.
+local function f64_pack(x)
+  local hi, lo = f64_words(x)
+  return u32_pack(hi) .. u32_pack(lo)
+end
+
+-- Is the double at addr this value? Both halves, so a shared exponent is not a match.
+-- addr need only be 4-aligned, which is what the extra value at element+20 is.
+local function eq64(addr, v)
+  local hi, lo = f64_words(v)
+  return W(addr) == hi and W(addr + 4) == lo
+end
+
+-- The inverse of f64_words, out of eight big-endian bytes at p in s. ldexp rather than a
+-- power: m + 2^52 is at most 2^53 - 1 and so exact, and scaling by a power of two rounds
+-- nothing, which makes the round trip bit-exact. check_f64.py tests both directions.
+--
+-- An infinity or a NaN comes back as NIL rather than as a number. Neither can be written
+-- to a display field -- a refused graph parameter is a modal dialog -- and this firmware's
+-- comparisons are not IEEE for a NaN, so a NaN that got past here would not be caught by
+-- the usual v ~= v test downstream either.
+local function f64_unpack(s, p)
+  local b1 = string.byte(s, p)
+  local b2 = string.byte(s, p + 1)
+  local sign = 1
+  if b1 >= 128 then sign = -1; b1 = b1 - 128 end
+  local eb = b1 * 16 + math.floor(b2 / 16)
+  local m = ((math.mod(b2, 16) * 256 + string.byte(s, p + 2)) * 256
+             + string.byte(s, p + 3)) * 4294967296 + u32_at(s, p + 4)
+  if eb == 2047 then return nil end
+  if eb == 0 then return sign * math.ldexp(m, -1074) end
+  return sign * math.ldexp(m + 4503599627370496, eb - 1075)
+end
+fftsa.nl._f64_unpack = f64_unpack
 
 -- ---------------------------------------------------------------------------
 -- FNF: find the firmware function behind a Lua math wrapper.
@@ -305,13 +388,55 @@ function fftsa.nl.FINDS(lo, hi, pat)
   return out
 end
 
--- Element storage of a freshly written buffer, by content scan.
--- Needs three sentinel readings already written. Returns the slot 0 address, or nil.
+-- Element storage of a buffer, by content scan over the buffer's OWN first readings.
 --
--- Two passes: the arena recent allocations land in first, then the wider heap. The
--- narrow pass is 32 MB rather than 126 MB and has found it every time so far.
+-- No fixed sentinel. The needle is reading 1 as the eight bytes the element holds, so this
+-- works on a capture as well as on a buffer seeded for the purpose -- and two buffers
+-- seeded alike cannot be mistaken for one another, which they could when the needle was
+-- the literal 1000001.0 in every call. Only the order of the writes kept that apart: the
+-- image landed on the code buffer's sentinel before the plan buffer was scanned for the
+-- same one.
+--
+-- Returns the slot 0 address, or nil. Two passes: the arena recent allocations land in
+-- first, then the wider heap. The narrow pass is 32 MB rather than 126 MB and has found it
+-- every time so far.
+--
+-- CONFIRMATION USES THE EXTRA VALUES AS WELL AS THE READINGS. fftsa.sg_mkbuf seeds the
+-- trace buffer with the axis floor in every element and a distinct extra in each, so
+-- readings alone match at every element and the scan returns whichever lies lowest in
+-- memory -- which for a two-chunk buffer is not element 0, because the second payload is
+-- often below the first. A trace shifted by a whole chunk is still a plausible trace.
+-- Elements _find_storage confirms a hit against, and so the number of readings nl.init
+-- seeds a buffer with. One name, because a seed shorter than the confirmation makes the
+-- scan refuse the very buffer it was seeded for.
+fftsa.nl.SEED_READS = 6
+local READ_CONFIRM = fftsa.nl.SEED_READS
+
 function fftsa.nl._find_storage(buf)
-  local needle = '\065\046\132\130\000\000\000\000'   -- 1000001.0, big-endian double
+  local n = buf.n
+  if n == nil or n < READ_CONFIRM then return nil end
+  local rd, ex = {}, nil
+  local i
+  for i = 1, READ_CONFIRM do
+    rd[i] = buf.readings[i]
+    if rd[i] == nil then return nil end
+  end
+  -- A STYLE_STANDARD buffer has no extra values, and reading the attribute is the only way
+  -- to find out; a refusal there is an answer, not a failure.
+  local ok, e = pcall(function()
+    return { buf.extravalues[1], buf.extravalues[2], buf.extravalues[3] }
+  end)
+  if ok and e[1] ~= nil and e[2] ~= nil and e[3] ~= nil then ex = e end
+  -- Nothing to discriminate on: identical readings and no extras means every element
+  -- matches and the first hit decides, which is a guess. Refuse instead.
+  if ex == nil then
+    local differs = false
+    for i = 2, READ_CONFIRM do
+      if rd[i] ~= rd[1] then differs = true end
+    end
+    if not differs then return nil end
+  end
+  local needle = f64_pack(rd[1])
   local windows = {
     { 50331648, 83886080 },     -- 0x03000000 - 0x05000000
     { 17825792, 150994944 },    -- 0x01100000 - 0x09000000, both inside .heap
@@ -322,16 +447,16 @@ function fftsa.nl._find_storage(buf)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      -- Confirm stride 32 against readings 2 and 3 before trusting the hit.
-      -- The expected words come from tonumber rather than decimal literals: these were
-      -- mistyped once as 0x412F8484, which made this function silently never match.
-      local v2  = W(h + 32)
-      local v2l = W(h + 36)
-      local v3  = W(h + 64)
-      if v2 == tonumber('412E8484', 16) and v2l == 0 and
-         v3 == tonumber('412E8486', 16) then
-        return h
+      local good = true
+      for i = 2, READ_CONFIRM do
+        if not eq64(h + (i - 1) * 32, rd[i]) then good = false end
       end
+      if good and ex ~= nil then
+        for i = 1, 3 do
+          if not eq64(h + (i - 1) * 32 + 20, ex[i]) then good = false end
+        end
+      end
+      if good then return h end
     end
   end
   return nil
@@ -379,6 +504,20 @@ end
 -- ---------------------------------------------------------------------------
 function fftsa.nl.write_params(t)
   local fn = fftsa.nl.fn
+  -- THE WORD COUNT AGAINST THE STRUCT THE COMPILER LAID OUT. PARAM_WORDS is a number in
+  -- this file and SIZEOF_PARAMS comes out of the linked image, so this is the one check
+  -- that catches a field added on one side only -- which would otherwise shift every word
+  -- after it and hand dsp_native_run a valid-looking address for something else entirely.
+  -- Skipped when SIZEOF_PARAMS is zero, which is a module with no generated code to run.
+  if fftsa.nl.SIZEOF_PARAMS ~= 0 and
+     fftsa.nl.PARAM_WORDS * 4 ~= fftsa.nl.SIZEOF_PARAMS then
+    return false
+  end
+  local f0h, f0l = f64_words(t.red_f0 or 0)
+  local bwh, bwl = f64_words(t.red_binhz or 0)
+  local dnh, dnl = f64_words(t.red_dbmin or 0)
+  local dxh, dxl = f64_words(t.red_dbmax or 0)
+  local vfh, vfl = f64_words(t.red_vfloor or 0)
   local w = {
     fftsa.nl.MAGIC,
     t.mode or 0,
@@ -395,6 +534,10 @@ function fftsa.nl.write_params(t)
     fn.log10 or 0, fn.floor or 0, fn.ceil or 0,
     t.init_kind or 0, t.init_beta_milli or 0,
     t.init_decim or 1, t.init_method or 0,
+    t.red_nseg or 0, t.red_k0 or 0, t.red_k1 or 0,
+    t.red_db or 0, t.red_hz or 0, t.red_sense or 1,
+    f0h, f0l, bwh, bwl, dnh, dnl, dxh, dxl, vfh, vfl,
+    t.res_addr or 0, t.res_npk or 0, t.res_mains or 0,
   }
   if table.getn(w) ~= fftsa.nl.PARAM_WORDS then return false end
   local parts = {}
@@ -496,11 +639,14 @@ function fftsa.nl._abort(cb, pb)
 end
 
 -- ---------------------------------------------------------------------------
--- Init. Called once per boot, at startup, before any frame. Once per boot and not merely
--- once per app start: the IPC barrier drains the store buffer to DRAM but does not
--- invalidate the I-cache, and the trampoline cannot flush a replacement for itself, so a
--- second install at a fresh address wedges the interpreter. Reinstalling needs a power
--- cycle until the invalidate can be bootstrapped out of firmware .text.
+-- Init. Called once per boot, at startup, before any frame.
+--
+-- Once per boot is now a CONSERVATIVE RULE RATHER THAN A NECESSARY ONE. It was written when
+-- a second install wedged the interpreter, which the trampoline flushing its own range is
+-- what caused; with that removed, an image rewritten over an already-fetched range and
+-- flushed through the trampoline was measured computing correctly. The guard stays because
+-- nothing needs a second install -- nl.reinit re-plans without one -- so relaxing it would
+-- buy nothing and give up a backstop.
 --
 -- barrier_buf is accepted and validated but not used as the barrier. init fills its own
 -- code buffer with three readings and uses that, because buffer.getstats is the barrier
@@ -509,7 +655,7 @@ end
 --
 -- Returns true with nl.ready set, or false with every heap-derived field nil'd.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
+function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg)
   local nl = fftsa.nl
 
   -- ONE INSTALL PER BOOT, AND A MODULE FIELD CANNOT ENFORCE IT. fftsa.start() calls this
@@ -535,10 +681,41 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   nl.boot_spent = false
 
   nl.ready = false
+  -- want_n sizes the ARENA, so it is the largest count the app can ask for and not the one
+  -- in force: nl.reinit re-plans for anything at or below it without touching the heap,
+  -- and a count above it has no arena to be planned into.
   want_n = want_n or 512
+  want_nseg = want_nseg or 255
 
   if nl._DSP_CODE == nil or string.len(nl._DSP_CODE) == 0 then return false end
   if nl._DSP_RELOC == nil then return false end
+  -- Zero means the generated module never loaded, and every size below would be wrong in
+  -- a way that still produces addresses.
+  if nl.SIZEOF_REAL == 0 or nl.SIZEOF_PLAN == 0 or nl.SIZEOF_PARAMS == 0 or
+     nl.RES_DOUBLES == 0 or nl.RES_PEAKS == 0 then
+    return false
+  end
+
+  -- THE CHUNK IS WHAT BOUNDS n, and the bound is computed from the sizes the image
+  -- reports rather than written down. The de-strided capture is n doubles and has to be
+  -- contiguous, so it has to fit one 32 KB chunk behind the plan struct; separately
+  -- dsp_plan_init_segs puts the window, n entries of dsp_real, in a chunk of its own.
+  -- With dsp_real as double that is 2048 for both, the next power of two over. Single
+  -- precision would double it, which is one of the things that build variant is for.
+  local nmax = math.floor((nl.CHUNK_BYTES - 32 - align8(nl.SIZEOF_PLAN)) / 8)
+  local sgmax = math.floor((nl.CHUNK_BYTES - 32) / nl.SIZEOF_REAL)
+  if nmax > sgmax then nmax = sgmax end
+  nl.nceil = nmax
+  -- Two arrays of want_nseg dsp_real share the reduction chunk with the results block,
+  -- whose size is fixed by the image. DSPN_RES_BYTES in dsp_native.c, computed from the
+  -- same two figures rather than sent across as a third.
+  local res_bytes = nl.RES_DOUBLES * 8 + nl.RES_PEAKS * 4
+                    + 2 * nl.RES_PEAKS * nl.SIZEOF_REAL
+  nl.nseg_ceil = math.floor((nl.CHUNK_BYTES - 32 - res_bytes) / (2 * nl.SIZEOF_REAL))
+  if want_n > nmax or want_nseg < 2 or want_nseg > nl.nseg_ceil then
+    trace('size.refused', want_n, want_nseg)
+    return false
+  end
 
   -- 1. Firmware math addresses. All six are needed; dsp.c calls every one.
   trace('math')
@@ -569,8 +746,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local cb = buffer.make(1024, buffer.STYLE_WRITABLE_FULL)
   buffer.write.format(cb, buffer.UNIT_VOLT, buffer.DIGITS_6_5,
                       buffer.UNIT_VOLT, buffer.DIGITS_6_5)
+  -- Distinct readings and distinct extras, nl.SEED_READS of each, because _find_storage
+  -- confirms a hit against that many and refuses a buffer it cannot tell apart element
+  -- from element.
   local k
-  for k = 1, 3 do
+  for k = 1, fftsa.nl.SEED_READS do
     buffer.write.reading(cb, 1000000 + k, 3000000 + k, k, 0)
   end
 
@@ -685,14 +865,17 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     return fftsa.nl._abort(cb)
   end
 
-  -- 8. Plan buffer: one chunk per segment, plus one for the plan struct and the
-  --    de-strided scratch, which must not sit inside the arena.
-  local chunks_wanted = nseg + 1
+  -- 8. Plan buffer: one chunk per segment, one for the plan struct and the de-strided
+  --    capture, and one for the reduction's two arrays. Three lifetimes, three chunks:
+  --    sharing the host chunk would make the largest n depend on the largest trace, and a
+  --    refusal there reads as "the native path is unavailable" with nothing to say which
+  --    of the two sizes was the one that did not fit.
+  local chunks_wanted = nseg + 2
   local pb = buffer.make(chunks_wanted * 1024, buffer.STYLE_WRITABLE_FULL)
   buffer.write.format(pb, buffer.UNIT_VOLT, buffer.DIGITS_6_5,
                       buffer.UNIT_VOLT, buffer.DIGITS_6_5)
-  for k = 1, 3 do
-    buffer.write.reading(pb, 1000000 + k, 3000000 + k, k, 0)
+  for k = 1, fftsa.nl.SEED_READS do
+    buffer.write.reading(pb, 2000000 + k, 4000000 + k, k, 0)
   end
   buffer.getstats(bar)
 
@@ -742,11 +925,27 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     end
   end
 
-  -- The last chunk holds the plan struct and the scratch; the first nseg are the arena.
-  local host      = align32(payload[chunks_wanted])
+  -- The first nseg chunks are the arena. Then the plan struct with the de-strided capture
+  -- after it, and the reduction's two arrays in a chunk of their own.
+  local host      = align32(payload[nseg + 1])
   local plan_addr = host
   local src_flat  = host + align8(nl.SIZEOF_PLAN)
-  if (src_flat - payload[chunks_wanted]) + want_n * 8 > nl.CHUNK_BYTES then
+  if (src_flat - payload[nseg + 1]) + want_n * 8 > nl.CHUNK_BYTES then
+    return fftsa.nl._abort(cb, pb)
+  end
+
+  -- dsp_reduce writes nseg entries into each of db and hz, and the trace count is a
+  -- front-panel choice, so the room is reserved for the largest the app can ask for
+  -- rather than for the one in force. Both are dsp_real, which is double in this build;
+  -- SIZEOF_REAL comes out of the image so a single-precision build moves it.
+  local red_host = align32(payload[nseg + 2])
+  local red_db   = red_host
+  local red_hz   = red_host + want_nseg * nl.SIZEOF_REAL
+  -- The results block follows the two arrays. 8-aligned, which the native side requires
+  -- because it reads and writes it as doubles: red_host is 32-aligned and both arrays are
+  -- a whole number of dsp_real, so the sum is.
+  local res_addr = red_hz + want_nseg * nl.SIZEOF_REAL
+  if (res_addr - payload[nseg + 2]) + res_bytes > nl.CHUNK_BYTES then
     return fftsa.nl._abort(cb, pb)
   end
 
@@ -795,6 +994,14 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   nl.nsegs     = nseg
   nl.segs_addr = segs_addr
   nl.src_flat  = src_flat
+  nl.red_db    = red_db
+  nl.red_hz    = red_hz
+  nl.res_addr  = res_addr
+  nl.nseg_max  = want_nseg
+  nl.kind      = kind or 1
+  nl.beta      = beta or 0
+  nl.decim     = decim or 1
+  nl.method    = method or 0
   nl.n         = want_n
   nl.nmax      = want_n
   nl.ready     = true
@@ -803,7 +1010,60 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
 end
 
 -- ---------------------------------------------------------------------------
--- Run one frame. Returns the bin count, or nil with nl.last_rc set.
+-- Re-plan without reinstalling.
+--
+-- Only MODE_INIT depends on the sample count, the window and the beta, and all three are
+-- front-panel choices: fftsa.apply() moves them on a press. The code, the trampoline, the
+-- params struct and the arena are all exactly where init left them, so a press costs one
+-- write_params and one call rather than a content scan, a relocation and an install -- and
+-- an install is the thing that cannot be repeated without the trampoline being right.
+--
+-- The arena was sized for the count init was given, so this only goes DOWN from nl.nmax.
+-- A larger count has no arena to be planned into and is refused here rather than left to
+-- dsp_plan_init_segs, which would zero the plan and leave the app with a status code.
+--
+-- nl.ready is cleared for the duration: a frame dispatched from the timer between the
+-- write and the return would otherwise run against a plan being rebuilt under it.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.reinit(want_n, kind, beta, decim, method)
+  local nl = fftsa.nl
+  if nl.entry == nil or nl.entry == 0 then return false end
+  if nl.plan_addr == nil or nl.segs_addr == nil or nl.nsegs == nil then return false end
+  want_n = want_n or nl.n
+  if nl.nmax == nil or want_n > nl.nmax or want_n < 2 then return false end
+  kind   = kind or nl.kind
+  beta   = beta or nl.beta
+  decim  = decim or nl.decim
+  method = method or nl.method
+
+  nl.ready = false
+  local ok = nl.write_params({
+    mode = nl.MODE_INIT,
+    wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
+    rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
+    out_lo = nl.wr_lo, out_hi = nl.wr_hi,
+    seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
+    plan_addr = nl.plan_addr, src_flat = nl.src_flat, cap_n = want_n,
+    init_kind = kind,
+    init_beta_milli = math.floor(beta * 1000),
+    init_decim = decim, init_method = method,
+  })
+  if not ok then return false end
+  local rc = via_peek8(nl.entry, hx(nl.params))
+  nl.last_rc = rc
+  if rc ~= 0 then return false end
+  nl.n      = want_n
+  nl.kind   = kind
+  nl.beta   = beta
+  nl.decim  = decim
+  nl.method = method
+  nl.ready  = true
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Run one frame. Returns the TRACE POINT count, which is what the app reports as nseg, or
+-- nil with nl.last_rc set. Not the bin count: the run ends in dsp_reduce.
 --
 -- cap and out each describe one buffer's chunk storage:
 --   chunk1, chunk2   payload addresses, chunk2 zero when one chunk holds it all
@@ -817,9 +1077,22 @@ end
 -- each strided access to stay inside the chunk it starts in -- the span alone would permit
 -- whatever else lives between two scattered payloads.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.call_dsp(cap, out)
+-- red carries the reduction, which is everything the trace depends on and nothing the plan
+-- does: nseg, the bin window k0..k1 (ZERO BASED, where the Lua implementation's bins are
+-- one based), the decibel limits, the voltage floor, and the bin-to-hertz map. binhz is
+-- measured per frame off the capture's own timestamps, so it is not a constant and does not
+-- belong in the plan.
+function fftsa.nl.call_dsp(cap, out, red)
   local nl = fftsa.nl
   if not nl.ready then return nil end
+  if cap == nil or out == nil or red == nil then return nil end
+  -- Checked here as well as natively, because a refusal from dsp_native_run arrives as a
+  -- status code after the params have been written and reads the same as a bad address.
+  local ns = red.nseg
+  if ns == nil or ns < 1 or nl.nseg_max == nil or ns > nl.nseg_max then return nil end
+  if red.binhz == nil or not (red.binhz > 0) then return nil end
+  if red.k0 == nil or red.k1 == nil or red.k0 < 0 or red.k1 < red.k0 then return nil end
+  if red.dbmin == nil or red.dbmax == nil or not (red.dbmin < red.dbmax) then return nil end
 
   local ok = nl.write_params({
     mode = nl.MODE_RUN,
@@ -832,12 +1105,76 @@ function fftsa.nl.call_dsp(cap, out)
     cap_n = nl.n, cap_perchunk = cap.perchunk,
     out_chunk1 = out.chunk1, out_chunk2 = out.chunk2,
     out_perchunk = out.perchunk, out_desc = out.desc,
+    red_nseg = ns, red_k0 = red.k0, red_k1 = red.k1,
+    red_db = nl.red_db, red_hz = nl.red_hz,
+    red_sense = red.sense or 1,
+    red_f0 = red.f0 or 0, red_binhz = red.binhz,
+    red_dbmin = red.dbmin, red_dbmax = red.dbmax,
+    red_vfloor = red.vfloor or 0,
+    res_addr = nl.res_addr,
+    res_npk = red.npk or 0,
+    res_mains = red.mains or nl.MAINS_BOTH,
   })
   if not ok then return nil end
 
   local r = via_peek8(nl.entry, hx(nl.params))
   nl.last_rc = r
   if type(r) ~= 'number' or r < 0 then return nil end
+  return r
+end
+
+-- ---------------------------------------------------------------------------
+-- The figures the last run produced that are not the trace: the ranked peaks, and the
+-- distortion and noise measurement.
+--
+-- ONE ki.memread for the whole block and a decode per value, rather than a pair of peek32
+-- per double or a reading buffer of its own. A buffer would need a chunk, a content scan
+-- to find it and a window to validate, and Lua can only read as many elements as the
+-- descriptor says are present -- so the scalars would have to live inside the trace the
+-- graph plots.
+--
+-- The tables are allocated once and refilled, because this runs in a frame and the house
+-- rule is to allocate at Apply. The peak tables are cleared to nil past the count found,
+-- so a frame that finds fewer peaks than the last one cannot leave a stale row on screen.
+--
+-- Returns nil when there is nothing to read, which is what the caller gets before the
+-- first run and after a failure. thd, snr and noise are nil when the measurement did not
+-- apply: 0 dB and 0% are both real answers, so the native side sends a flag per figure
+-- rather than a sentinel value.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.results()
+  local nl = fftsa.nl
+  if nl.res_addr == nil or nl.RES_DOUBLES == 0 then return nil end
+  local nbytes = nl.RES_DOUBLES * 8
+  local s = ki.memread(hx(nl.res_addr), hx(nbytes))
+  if s == nil or string.len(s) ~= nbytes then return nil end
+  if nl._res == nil then
+    nl._res = { hz = {}, v = {} }
+  end
+  local r  = nl._res
+  local np = nl.RES_PEAKS
+  local sc = 2 * np * 8 + 1              -- first scalar, 1-based byte offset
+  local npk = f64_unpack(s, sc)
+  if npk == nil or npk < 0 then npk = 0 end
+  if npk > np then npk = np end
+  local i
+  for i = 1, npk do
+    r.v[i]  = f64_unpack(s, (2 * i - 2) * 8 + 1)
+    r.hz[i] = f64_unpack(s, (2 * i - 1) * 8 + 1)
+  end
+  for i = npk + 1, np do
+    r.v[i], r.hz[i] = nil, nil
+  end
+  r.npk   = npk
+  r.thd   = nil
+  r.snr   = nil
+  r.noise = nil
+  if f64_unpack(s, sc + 16) == 1 then r.thd   = f64_unpack(s, sc + 8)  end
+  if f64_unpack(s, sc + 32) == 1 then r.snr   = f64_unpack(s, sc + 24) end
+  if f64_unpack(s, sc + 48) == 1 then r.noise = f64_unpack(s, sc + 40) end
+  r.f0_hz = f64_unpack(s, sc + 56)
+  r.amp0  = f64_unpack(s, sc + 64)
+  r.nbins = f64_unpack(s, sc + 72)
   return r
 end
 
@@ -856,7 +1193,12 @@ function fftsa.nl.describe(buf)
   local ch2 = 0
   local lo  = elem0
   local hi  = elem0 + fftsa.nl.CHUNK_BYTES
-  if vec ~= nil then
+  -- ONLY WHEN THE DESCRIPTOR SAYS THERE IS A SECOND CHUNK. A one-chunk buffer -- which is
+  -- any capacity up to 1024 elements, so both of the app's -- has a one-entry vector, and
+  -- reading past it returns whatever follows in the heap. That value would widen lo..hi,
+  -- which is the window the native side validates every write against, so it loosens the
+  -- confinement rather than failing closed.
+  if vec ~= nil and nchunks ~= nil and nchunks > 1 then
     local second = W(vec + 4)
     if second ~= nil and second ~= 0 then
       ch2 = second

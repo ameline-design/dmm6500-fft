@@ -296,6 +296,10 @@ function fftsa.dsp_live()
   if cap ~= nil and ncol ~= nil and ncol > cap then ncol = cap end
   if ncol == nil or ncol < 2 then ncol = 2 end
   dsp.out.segments = ncol
+  -- Kept for the native path, which has no dsp.out to read back: these are the CLAMPED
+  -- counts, and a second clamp elsewhere is how the trace and the primitive end up
+  -- disagreeing about how many points there are.
+  fftsa.live_ncol = ncol
   -- The plot's own axis, so trace, peak column and noise figure share one floor.
   dsp.out.dbfloor = fftsa.sg_dbmin
   dsp.out.dbceil  = fftsa.sg_dbmax
@@ -307,6 +311,7 @@ function fftsa.dsp_live()
   if rows ~= nil and rows > 0 and npk > rows then npk = rows end
   if npk == nil or npk < 1 then npk = 1 end
   dsp.peaks.count = npk
+  fftsa.live_npk = npk
   -- The harmonic rules, or a native dsp's own defaults move all three figures on switch day.
   dsp.thd.harmonics = fftsa.thd_hmax_want
   dsp.thd.bins      = fftsa.thd_bins_want
@@ -324,6 +329,97 @@ function fftsa.dsp_window()
   dsp.out.lowfreq  = lo
   dsp.out.highfreq = hi
   return true
+end
+
+-- ---------------------------------------------------------------------------
+-- The native path's plumbing. Three things the compiled primitive cannot discover for
+-- itself: where the two buffers keep their chunk storage, which bins the plotted span
+-- covers, and the bin width this capture actually delivered.
+-- ---------------------------------------------------------------------------
+
+-- The largest sample count the native arena can be built for, and the reason there is a
+-- ceiling at all: the de-strided capture is n doubles and has to be contiguous inside one
+-- 32 KB chunk, while dsp_plan_init_segs puts the window -- also n entries -- in a chunk of
+-- its own. With dsp_real as double that caps n at 2048, the next power of two down from
+-- 4092. Above it there is no arena to plan into and the app runs on Keithley's dsp.*.
+--
+-- This is what nl.init is given, NOT fftsa.n: the arena is sized once per boot and
+-- nl.reinit re-plans inside it for every count at or below, which is what makes a sample
+-- count press cost one call instead of an install.
+fftsa.nl_nmax = 2048
+
+-- fftsa.thd_mains_want holds Keithley's dsp.MAINS_* value and the native side takes
+-- DSP_THD_MAINS_*, which is 50, 60, 0 or BOTH. Those three are the mains frequencies
+-- themselves, so they carry across whatever the firmware numbered its enum; anything else
+-- is taken as BOTH, which is this app's default and the only other thing it offers.
+function fftsa.mains_native(v)
+  if v == 50 or v == 60 or v == 0 then return v end
+  return fftsa.nl.MAINS_BOTH
+end
+
+-- Chunk storage for the capture and the trace buffer. A content scan is SECONDS, so this
+-- must never run in a frame; it runs at Apply, and only for a buffer whose object identity
+-- has changed, which is the one thing that can move the storage. apply() replaces the
+-- capture buffer when the sample count moves.
+--
+-- A 32-byte element is required rather than hoped for: the native side walks elements at a
+-- hard-coded stride of 32, and a buffer style with a different element size would have it
+-- read every sample from the wrong place.
+function fftsa.nl_bind()
+  local nl = fftsa.nl
+  if nl == nil or not nl.ready or fftsa.cap == nil or fftsa.sg_buf == nil then
+    fftsa.nl_cap, fftsa.nl_out = nil, nil
+    return false
+  end
+  if fftsa.nl_cap == nil or fftsa.nl_cap_of ~= fftsa.cap then
+    fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
+    local c = nl.describe(fftsa.cap)
+    if c == nil or c.elemsize ~= 32 then return false end
+    fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
+  end
+  if fftsa.nl_out == nil or fftsa.nl_out_of ~= fftsa.sg_buf then
+    fftsa.nl_out, fftsa.nl_out_of = nil, nil
+    local o = nl.describe(fftsa.sg_buf)
+    if o == nil or o.elemsize ~= 32 then return false end
+    fftsa.nl_out, fftsa.nl_out_of = o, fftsa.sg_buf
+  end
+  return true
+end
+
+-- Is the native path usable for the plan in force? Tested every frame, so it is
+-- comparisons and no work. nl.n is the count the arena was last planned for, which only
+-- nl.reinit moves, so this catches a sample count the install cannot serve.
+function fftsa.nl_usable()
+  local nl = fftsa.nl
+  if nl == nil or not nl.ready then return false end
+  if nl.n ~= fftsa.n then return false end
+  return fftsa.nl_cap ~= nil and fftsa.nl_out ~= nil
+end
+
+-- The reduction, per frame. The table is allocated once and refilled: the house rule is to
+-- allocate at Apply and never in a frame.
+function fftsa.nl_reduction(binhz)
+  local r = fftsa.nl_redt
+  if r == nil then r = {}; fftsa.nl_redt = r end
+  local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, binhz,
+                                          fftsa.sg_flo_hz, fftsa.sg_fhi_hz)
+  -- ONE BASED THERE, ZERO BASED HERE. sg_window_bins counts bins the way the Lua
+  -- implementation indexes its power array, from 1; dsp_reduce indexes from 0. Getting
+  -- this wrong shifts the whole trace by one bin, which no plot would show.
+  r.k0, r.k1 = kmin - 1, kmax - 1
+  r.nseg   = fftsa.live_ncol
+  r.npk    = fftsa.live_npk
+  r.binhz  = binhz
+  -- No decimation on this path yet, so bin k is at k * binhz and frequency rises with the
+  -- index. dsp_reduce reverses the trace itself for an odd Nyquist zone, which is what
+  -- sense is for; nothing here produces one.
+  r.f0     = 0
+  r.sense  = 1
+  r.dbmin  = fftsa.sg_dbmin
+  r.dbmax  = fftsa.sg_dbmax
+  r.vfloor = fftsa.sg_vfloor
+  r.mains  = fftsa.mains_native(fftsa.thd_mains_want)
+  return r
 end
 
 -- Apply the current settings to the hardware and the graph. Safe to repeat: the
@@ -407,10 +503,40 @@ function fftsa.apply()
     fftsa.arm(fftsa.period)
   end
   fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
+  -- The native plan follows the same three attributes dsp.commit() rebuilds from. The code
+  -- and the arena are untouched -- nl.reinit is one params write and one call -- so this is
+  -- microseconds against commit()'s window rebuild, and it has to come after the capture
+  -- above, because nl_bind scans the capture buffer's own readings to find its storage.
+  fftsa.nl_replan()
   -- The LEGEND again, not the axis. What the measured rate refined is binhz, and so the bin
   -- count the legend reports for a narrow span; fftsa.flo and fftsa.fhi have not moved since
   -- the pin above, so re-pinning would be a second 60 ms write of identical limits.
   fftsa.sg_write_xunit()
+end
+
+-- Re-plan the native path for the settings in force, and find the buffers it writes.
+-- Called from apply(), and from start() once the install exists.
+--
+-- A count above what the arena was sized for leaves nl.ready false, which is the whole
+-- mechanism for falling back: nl_usable() then says no and the frame runs dsp.spectrum.
+-- Nothing here raises -- a native path that cannot be built is a slower app, not a broken
+-- one -- so a failure is recorded and swallowed.
+function fftsa.nl_replan()
+  local nl = fftsa.nl
+  if nl == nil or type(nl.reinit) ~= 'function' then return false end
+  if nl.entry == nil or nl.entry == 0 then return false end
+  if nl.nmax == nil or fftsa.n > nl.nmax then
+    nl.ready = false
+    fftsa.nl_cap, fftsa.nl_out = nil, nil
+    return false
+  end
+  local ok = nl.reinit(fftsa.n, nl.win_to_native(fftsa.win_i),
+                       fftsa.kbeta(fftsa.kbeta_i), 1, nl.FFT_FOURSTEP)
+  if not ok then
+    fftsa.nl_lasterr = 'reinit ' .. tostring(nl.last_rc)
+    return false
+  end
+  return fftsa.nl_bind()
 end
 
 -- The peaks the primitive reported, into two tables the display reads. Allocated once: the
@@ -423,10 +549,38 @@ function fftsa.dsp_peaks(count)
   if fftsa.pk_hz == nil then fftsa.pk_hz, fftsa.pk_v = {}, {} end
   local hz, v = fftsa.pk_hz, fftsa.pk_v
   local i
+  -- On the native path the peaks come out of the results block the same call filled, not
+  -- from dsp.peak(): nothing on this path runs Keithley's dsp.spectrum, so its own notion
+  -- of "a spectrum has been computed" is never set and every call would refuse -- one
+  -- posted event per peak per frame.
+  local res = fftsa.nl_res
+  if res ~= nil then
+    for i = 1, count do
+      hz[i], v[i] = res.hz[i], res.v[i]
+    end
+    return hz, v
+  end
   for i = 1, count do
     hz[i], v[i] = dsp.peak(i)
   end
   return hz, v
+end
+
+-- Distortion, signal-to-noise and the noise floor, from whichever path produced the
+-- spectrum on screen. thd is a FRACTION, as dsp.distortion() reports it; the THD line
+-- turns it into a percentage. Each figure is nil where the measurement did not apply.
+function fftsa.distortion()
+  local res = fftsa.nl_res
+  if res ~= nil then return res.thd, res.snr, res.noise end
+  return dsp.distortion()
+end
+
+-- The sample count the spectrum on screen was computed from. The THD line picks its
+-- decimal places off this, and dsp.fft.samples is the OTHER implementation's plan: on the
+-- native path that figure describes a transform nothing ran.
+function fftsa.plan_n()
+  if fftsa.nl_res ~= nil then return fftsa.n end
+  return dsp.fft.samples
 end
 
 -- One frame: acquire, one primitive call, plot. Runs under pcall from fftsa.frame().
@@ -445,28 +599,46 @@ function fftsa.frame_body()
   fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
   local npk = fftsa.dsp_live()
   fftsa.dsp_window()
-  -- Native path: the compiled DSP function writes the spectrum into sg_buf's chunk
-  -- storage in-place and rewinds the descriptor's cursor, so no buffer.clear()
-  -- happens and the graph does not flash blank between frames.
-  -- Falls back to dsp.spectrum when nl.ready is false (binary not installed yet).
+  -- Native path: the compiled DSP writes the trace into sg_buf's chunk storage in place
+  -- and rewinds the descriptor, so no buffer.clear() happens and the graph never paints a
+  -- half-filled trace. Falls back to Keithley's dsp.spectrum whenever the install is not
+  -- usable for the plan in force -- no binary in the archive, a boot that already spent
+  -- its install, or a sample count above what the arena was sized for.
+  --
+  -- nl_res is cleared FIRST and set only on success, so everything that reads it -- the
+  -- peak table, the THD line, plan_n -- is reading this frame or nothing.
   local nseg
-  if fftsa.nl ~= nil and fftsa.nl.ready then
-    -- TODO: populate nl.write_params from the capture and output buffer descriptor
-    -- addresses discovered at startup.  The params struct already contains the
-    -- addresses written by nl.init(); this call updates per-frame fields.
-    nseg = fftsa.nl.call_dsp()
+  fftsa.nl_res = nil
+  if fftsa.nl_usable() then
+    -- A short record is refused rather than transformed: zero-padding the tail gives a
+    -- convincing and false broadband spectrum, and a trigger timeout is the ordinary
+    -- cause. dsp.spectrum makes the same test against its own srclength.
+    if fftsa.cap.n == nil or fftsa.cap.n < fftsa.n then
+      -- Counted on its own name and then mirrored, because the other path reports an
+      -- absolute total of its own: incrementing the shared name on one path and assigning
+      -- it from a different counter on the other makes the figure jump at a demotion.
+      fftsa.nl_shortreads = (fftsa.nl_shortreads or 0) + 1
+      fftsa.shortreads = fftsa.nl_shortreads
+      return
+    end
+    -- The bin width THIS capture delivered, off its own timestamps: the samplerate
+    -- read-back does not match what arrives, so it is never the source. Two table reads.
+    local binhz = fftsa.measure_fs(fftsa.cap) / fftsa.n
+    nseg = fftsa.nl.call_dsp(fftsa.nl_cap, fftsa.nl_out, fftsa.nl_reduction(binhz))
     if nseg == nil then
-      -- demote to the Keithley path for the rest of the session rather than
-      -- erroring on every frame
+      -- Demoted for the rest of the session rather than raising once a frame. last_rc
+      -- carries the reason; fftsa.nl.RC names it.
       fftsa.nl.ready = false
+      fftsa.nl_lasterr = tostring(fftsa.nl.last_rc)
       nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+    else
+      fftsa.binhz = binhz
+      fftsa.nl_res = fftsa.nl.results()
+      -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
+      if nseg > 0 then
+        display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
+      end
     end
-    -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
-    if nseg > 0 then
-      display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
-    end
-    -- binhz does not come from the native function yet; carry the last dsp.fft value.
-    -- TODO: return binhz from the params struct after the call.
   else
     -- Existing path: dsp.spectrum clears sg_buf internally before filling it.
     -- marks = nil deliberately (see comment below).
@@ -480,10 +652,10 @@ function fftsa.frame_body()
     fftsa.shortreads = dsp.shortreads
     return
   end
-  -- binhz: from the native params after the call, or from dsp.fft.binwidth on the
-  -- existing path.  The native path sets this via TODO above once the params layout
-  -- is extended.
-  if not (fftsa.nl ~= nil and fftsa.nl.ready) then
+  -- binhz: measured from the capture's timestamps on the native path, where it is already
+  -- set above and is the figure dsp_reduce was given, so the markers and the trace cannot
+  -- describe different frequencies. From the primitive's own read-back otherwise.
+  if fftsa.nl_res == nil then
     fftsa.binhz = dsp.fft.binwidth
   end
   -- Segments the widget was actually handed, from the primitive's own count rather than
@@ -1728,19 +1900,29 @@ function fftsa.start()
   -- a second install wedges the interpreter, nl.init refuses one, and start() runs on
   -- every app start. In all of those the frame body falls back to dsp.spectrum.
   --
-  -- The size, window and beta have to be passed. Unpassed, nl.init defaults to n = 512 and
-  -- DSP_WINDOW_HANN, so it would compute a spectrum of the wrong length with the wrong
-  -- taper while the panel showed the user's choices. win_to_native is OUR enum map, not
-  -- fftsa.win_to_dsp, which targets Keithley's dsp.WINDOW_* -- the note at the top of this
-  -- file spells out what conflating the two costs.
+  -- SIZED FOR fftsa.nl_nmax, NOT fftsa.n. The arena is built once per boot and nl.reinit
+  -- re-plans inside it, so a sample count press afterwards costs one call rather than
+  -- another install -- and an install is the one thing that cannot be repeated freely.
+  -- nl_replan() below then plans for the count actually selected.
   --
-  -- fftsa.cap is passed and validated but is not the IPC barrier: it holds no readings
-  -- until the first capture completes, and buffer.getstats on an empty buffer need not
-  -- make the service-task call that the barrier is. nl.init barriers on a buffer it fills
-  -- itself.
+  -- The window and beta still have to be passed, because a refusal between here and the
+  -- replan would leave the plan built from defaults: n = 512 and DSP_WINDOW_HANN, which is
+  -- a spectrum of the wrong length with the wrong taper while the panel shows the user's
+  -- choices. win_to_native is OUR enum map, not fftsa.win_to_dsp, which targets Keithley's
+  -- dsp.WINDOW_* -- the note at the top of this file spells out what conflating them costs.
+  --
+  -- The trace point ceiling is sg_maxpts rather than the count in force, so raising
+  -- sg_ncol while the app runs needs no reinstall either.
+  --
+  -- nil for the barrier buffer: nl.init barriers on a buffer it fills itself. fftsa.cap
+  -- holds no readings until the first capture completes, and buffer.getstats on an empty
+  -- buffer need not make the service-task call that the barrier is -- which bluescreened
+  -- the instrument once, from exactly this call site.
   if fftsa.nl ~= nil and type(fftsa.nl.init) == 'function' then
-    fftsa.nl.init(fftsa.cap, fftsa.n, fftsa.nl.win_to_native(fftsa.win_i),
-                  fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP)
+    fftsa.nl.init(nil, fftsa.nl_nmax, fftsa.nl.win_to_native(fftsa.win_i),
+                  fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP,
+                  fftsa.sg_maxpts)
+    fftsa.nl_replan()
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
