@@ -351,16 +351,24 @@ end
 -- covers, and the bin width this capture actually delivered.
 -- ---------------------------------------------------------------------------
 
--- The largest sample count the native arena can be built for, and the reason there is a
--- ceiling at all: the de-strided capture is n doubles and has to be contiguous inside one
--- 32 KB chunk, while dsp_plan_init_segs puts the window -- also n entries -- in a chunk of
--- its own. With dsp_real as double that caps n at 2048, the next power of two down from
--- 4092. Above it there is no arena to plan into and the app runs on Keithley's dsp.*.
+-- The largest sample count the native arena is built for, which is every count the app
+-- offers. No array has to fit a chunk whole: dsp_plan_init_segs slices one that does not,
+-- and the transform reads the capture in place rather than de-striding it into n contiguous
+-- doubles. What bounds the count is the number of chunks dsp_plan_segs reports, and nl.init
+-- refuses a count the image cannot serve. A refusal leaves nl.ready false and the app runs
+-- on Keithley's dsp.*, which is also what an arena that cannot be allocated gives.
 --
 -- This is what nl.init is given, NOT fftsa.n: the arena is sized once per boot and
 -- nl.reinit re-plans inside it for every count at or below, which is what makes a sample
 -- count press cost one call instead of an install.
-fftsa.nl_nmax = 2048
+fftsa.nl_nmax = 16384
+
+-- The count the acquisition buffer's capacity is floored at, which is deliberately not
+-- nl_nmax. Finding a buffer's storage is a content scan of seconds and it runs whenever the
+-- object identity changes, so the buffer is grown and never shrunk and the floor keeps the
+-- small counts sharing one allocation. Flooring at nl_nmax would hold 65,536 readings --
+-- 1.5 MB -- from the first Apply at every count, for a record of 512.
+fftsa.cap_floor_n = 2048
 
 -- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
 --
@@ -405,24 +413,24 @@ function fftsa.mains_native(v)
   return fftsa.nl.MAINS_BOTH
 end
 
--- Chunk storage for the capture and the trace buffer. A content scan is SECONDS, so this
--- must never run in a frame; it runs at Apply, and only for a buffer whose object identity
--- has changed, which is the one thing that can move the storage. apply() replaces the
--- capture buffer when the sample count moves.
+-- Chunk storage for the capture. A content scan takes seconds, so this must never run in a
+-- frame; it runs at Apply, and only for a buffer whose object identity has changed, which is
+-- the one thing that can move the storage.
 --
--- THE SECOND ARGUMENT SAYS WHETHER THE BUFFER STORES EXTRA VALUES, and it is this code's
+-- The trace buffer is not scanned for at all. Its points reach the graph through
+-- buffer.write.reading -- the display task draws from its own copy of a bound buffer and
+-- that call is what feeds it -- so the primitive has no reason to know where the buffer
+-- keeps its elements, and asking would cost a second scan at startup.
+--
+-- The second argument says whether the buffer stores extra values, and it is this code's
 -- answer rather than something describe() may discover: reading .extravalues on a
 -- STYLE_STANDARD buffer posts event 4927, for which the firmware puts a modal dialog on the
 -- glass over the running app. pcall is no defence -- it posts where it does not raise. The
--- capture is STYLE_STANDARD and the trace buffer is STYLE_WRITABLE_FULL, both created here.
---
--- The trace buffer must have a 32-byte element, because the native side writes the
--- frequency to the extra value at +20 and only an element that long has one. The capture's
--- element size is whatever its style gives and is passed through to the primitive.
+-- capture is STYLE_STANDARD.
 function fftsa.nl_bind()
   local nl = fftsa.nl
   if nl == nil or not nl.ready or fftsa.cap == nil or fftsa.sg_buf == nil then
-    fftsa.nl_cap, fftsa.nl_out = nil, nil
+    fftsa.nl_cap = nil
     return false
   end
   if fftsa.nl_cap == nil or fftsa.nl_cap_of ~= fftsa.cap then
@@ -430,12 +438,6 @@ function fftsa.nl_bind()
     local c = nl.describe(fftsa.cap, false)
     if c == nil then return false end
     fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
-  end
-  if fftsa.nl_out == nil or fftsa.nl_out_of ~= fftsa.sg_buf then
-    fftsa.nl_out, fftsa.nl_out_of = nil, nil
-    local o = nl.describe(fftsa.sg_buf, true)
-    if o == nil or o.elemsize ~= 32 then return false end
-    fftsa.nl_out, fftsa.nl_out_of = o, fftsa.sg_buf
   end
   return true
 end
@@ -448,7 +450,7 @@ function fftsa.nl_usable()
   local nl = fftsa.nl
   if nl == nil or not nl.ready then return false end
   if nl.n ~= fftsa.n then return false end
-  return fftsa.nl_cap ~= nil and fftsa.nl_out ~= nil
+  return fftsa.nl_cap ~= nil
 end
 
 -- The reduction, per frame. The table is allocated once and refilled: the house rule is to
@@ -532,10 +534,10 @@ function fftsa.apply()
   dmm.digitize.count      = need
   -- Capacity, never the record length, and grown but never shrunk: nl_bind's content scan
   -- for this buffer's storage takes seconds and runs whenever its object identity changes,
-  -- so replacing it per sample count puts that scan on every size change. The floor is the
-  -- native ceiling, so every count the compiled path can serve shares one allocation.
+  -- so replacing it per sample count puts that scan on every size change. Going up to a
+  -- larger count pays one scan; coming back down pays none.
   local want = need
-  if want < fftsa.nl_nmax then want = fftsa.nl_nmax end
+  if want < fftsa.cap_floor_n then want = fftsa.cap_floor_n end
   want = want * 4
   if fftsa.cap ~= nil and (fftsa.cap_cap == nil or fftsa.cap_cap < want) then
     fftsa.del_buf(fftsa.cap)
@@ -719,7 +721,7 @@ function fftsa.frame_body()
     -- The bin width THIS capture delivered, off its own timestamps: the samplerate
     -- read-back does not match what arrives, so it is never the source. Two table reads.
     local binhz = fftsa.measure_fs(fftsa.cap) / fftsa.n
-    nseg = fftsa.nl.call_dsp(fftsa.nl_cap, fftsa.nl_out, fftsa.nl_reduction(binhz))
+    nseg = fftsa.nl.call_dsp(fftsa.nl_cap, nil, fftsa.nl_reduction(binhz))
     if nseg == nil then
       -- Demoted for the rest of the session rather than raising once a frame. last_rc
       -- carries the reason; fftsa.nl.RC names it.

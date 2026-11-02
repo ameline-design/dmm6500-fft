@@ -2217,7 +2217,11 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
 /* ------------------------------------------------------------------------- */
 
 int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double *mean_out) {
-    dsp_src from;
+    /* A pointer and not a copy: dsp_src carries DSP_MAX_SRC_BLOCKS addresses, and assigning
+     * one is a structure copy the compiler emits a memcpy for -- which the freestanding
+     * target does not link. */
+    const dsp_src *from = src;
+    dsp_src filtered;
     int need, rc;
     if (p == NULL || src == NULL || src->nblock < 1)
         return DSP_EARG;
@@ -2250,14 +2254,13 @@ int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double
                            : DSP_EUNSUPPORTED;
         if (ny < p->n)
             return (ny < 0) ? ny : DSP_ESHORT;
-        dsp_src_flat(&from, p->fir_out, p->n);
+        dsp_src_flat(&filtered, p->fir_out, p->n);
+        from = &filtered;
         /* The filter is the longest single stretch in a decimating frame: 384 taps over
          * 16,384 outputs is 6.3 M multiply-accumulates. */
         dsp_do_yield(p);
-    } else {
-        from = *src;
     }
-    rc = dsp_load_vec(&from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
+    rc = dsp_load_vec(from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
     if (rc != DSP_OK)
         return rc;
     dsp_do_yield(p);

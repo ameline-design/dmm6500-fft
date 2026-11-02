@@ -4779,6 +4779,23 @@ size_t SliceBytes(const dsp_vec &v, int s) {
     return take > 0 ? static_cast<size_t>(take) * sizeof(dsp_real) : 0u;
 }
 
+TEST(Segments, TheInstrumentsGeometryServesEveryCountTheApplicationOffers) {
+    // The instrument's segment is the 32,768-byte chunk payload less the slack the Lua side
+    // reserves to reach a DSP_ALIGN boundary, and dsp_native.c admits DSPN_MAX_SEGS of them.
+    // Both numbers are the shipped ones; this is the arithmetic that decides whether a
+    // sample count is on the compiled path at all.
+    const size_t seg = 32768u - 32u;
+    const int maxsegs = 32;
+    const int counts[] = {512, 1024, 2048, 4096, 8192, 16384};
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+        const int n = counts[i];
+        const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, seg);
+        EXPECT_GT(segs, 0) << "n=" << n << " lays out in no number of segments";
+        EXPECT_LE(segs, maxsegs) << "n=" << n << " needs " << segs
+                                 << " segments against DSPN_MAX_SEGS " << maxsegs;
+    }
+}
+
 TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
     // The instrument's capture: 24-byte elements with the reading at offset zero, packed into
     // chunks. per is deliberately ODD, so an even/odd sample pair straddles a block boundary

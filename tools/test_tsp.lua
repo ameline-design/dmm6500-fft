@@ -4445,16 +4445,16 @@ check('all size transitions keep the original trace bound and plot without leaks
   local graphbuf0 = fftsa.sg_buf
   local adds0, removes0 = OBJ[graph0].adds, OBJ[graph0].removes
   local transitions = {1, 2, 1, 3, 1, 4, 1, 5, 1, 6, 1, 6, 5, 4, 3, 2, 1}
-  -- The acquisition buffer's capacity is four times the record, floored at four times the
-  -- native ceiling and never shrunk, so a count the compiled path can serve always finds
-  -- the buffer it already scanned. Tracked rather than restated per size, because the exact
-  -- figure at any point depends on the largest count visited so far.
+  -- The acquisition buffer's capacity is four times the record, floored at four times
+  -- fftsa.cap_floor_n and never shrunk, so the small counts share one allocation and the
+  -- content scan that finding its storage needs runs once. Tracked rather than restated per
+  -- size, because the figure at any point depends on the largest count visited so far.
   local capmax = 0
   for _, i in ipairs(transitions) do
     local oldcap = fftsa.cap
     local n = fftsa.sample_counts[i]
     local wantcap = n * 4
-    if wantcap < fftsa.nl_nmax * 4 then wantcap = fftsa.nl_nmax * 4 end
+    if wantcap < fftsa.cap_floor_n * 4 then wantcap = fftsa.cap_floor_n * 4 end
     if wantcap < capmax then wantcap = capmax end
     capmax = wantcap
     display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])

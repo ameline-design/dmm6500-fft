@@ -174,7 +174,7 @@ def main():
         'if nl == nil then print("no nl table") else '
         'print(string.format("ready=%s n=%s nmax=%s nseg_max=%s bound=%s rc=%s err=%s", '
         'tostring(nl.ready), tostring(nl.n), tostring(nl.nmax), tostring(nl.nseg_max), '
-        'tostring(fftsa.nl_cap ~= nil and fftsa.nl_out ~= nil), tostring(nl.last_rc), '
+        'tostring(fftsa.nl_cap ~= nil), tostring(nl.last_rc), '
         'tostring(fftsa.nl_lasterr))) end', timeout=60))
     # nl_res is set by the frame body only on the native path, and cleared at the head of
     # every frame, so this says which path ran the frame just captured.
@@ -184,15 +184,16 @@ def main():
         'print(string.format("native: npk=%d nbins=%s thd=%s snr=%s floor=%s", '
         'r.npk, tostring(r.nbins), tostring(r.thd), tostring(r.snr), '
         'tostring(r.noise))) end', timeout=60))
-    # The two buffers' storage as the bind resolved it. The capture's element size is the
-    # interesting one: STYLE_STANDARD stores no extra value, so it is not 32, and the
-    # primitive strides by whatever this says.
-    print('  buffers  :', d.q(
-        'local c, o = fftsa.nl_cap, fftsa.nl_out '
-        'local function f(t) if t == nil then return "unbound" end '
-        'return string.format("elem %d perchunk %d chunks %s at %X", '
-        't.elemsize, t.perchunk, tostring(t.nchunks), t.chunk1) end '
-        'print("cap " .. f(c) .. " | out " .. f(o))', timeout=60))
+    # The capture's storage as the bind resolved it. Its element size is the interesting
+    # figure: STYLE_STANDARD stores no extra value, so it is not 32, and the primitive
+    # strides by whatever this says. The trace buffer is not scanned for -- its points go
+    # through buffer.write.reading -- so there is nothing to report for it.
+    print('  capture  :', d.q(
+        'local c = fftsa.nl_cap '
+        'if c == nil then print("unbound") else '
+        'print(string.format("elem %d perchunk %d chunks %s at %X", '
+        'c.elemsize, c.perchunk, tostring(c.nchunks), c.chunk1)) end', timeout=60))
+    print('  phases   :', d.q('print(fftsa.phases())', timeout=60))
     print('  trace    :', d.q(
         'print(string.format("nwrote=%s n=%s first=(%.2f dB, %.1f Hz) last=(%.2f dB, %.1f Hz)", '
         'tostring(fftsa.sg_nwrote), tostring(fftsa.sg_buf.n), '

@@ -69,7 +69,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 52
+fftsa.nl.PARAM_WORDS = 54
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -648,9 +648,10 @@ function fftsa.nl.write_params(t)
     t.out_lo or 0, t.out_hi or 0,
     t.seg_bytes or 0, t.nsegs or 0, t.segs_addr or 0,
     t.plan_addr or 0,
-    t.src_flat or 0,
+    t.src_flat or 0,              -- unused: the capture is read in place
     t.cap_chunk1 or 0, t.cap_chunk2 or 0, t.cap_n or 0, t.cap_perchunk or 0,
     t.cap_stride or 32,
+    t.cap_vec or 0, t.cap_nchunks or 0,
     t.out_chunk1 or 0, t.out_chunk2 or 0, t.out_perchunk or 0, t.out_desc or 0,
     fn.lua_pushnumber or 0,
     fn.sin or 0, fn.cos or 0, fn.sqrt or 0,
@@ -757,7 +758,6 @@ function fftsa.nl._abort(cb, pb)
   nl.plan_buf  = nil
   nl.plan_addr = nil
   nl.segs_addr = nil
-  nl.src_flat  = nil
   return false
 end
 
@@ -828,16 +828,19 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     return false
   end
 
-  -- THE CHUNK IS WHAT BOUNDS n, and the bound is computed from the sizes the image
-  -- reports rather than written down. The de-strided capture is n doubles and has to be
-  -- contiguous, so it has to fit one 32 KB chunk behind the plan struct; separately
-  -- dsp_plan_init_segs puts the window, n entries of dsp_real, in a chunk of its own.
-  -- With dsp_real as double that is 2048 for both, the next power of two over. Single
-  -- precision would double it, which is one of the things that build variant is for.
-  local nmax = math.floor((nl.CHUNK_BYTES - 32 - align8(nl.SIZEOF_PLAN)) / 8)
-  local sgmax = math.floor((nl.CHUNK_BYTES - 32) / nl.SIZEOF_REAL)
-  if nmax > sgmax then nmax = sgmax end
+  -- No array has to fit a chunk whole: dsp_plan_init_segs cuts one too long for a segment
+  -- into slices, and the transform reads the capture in place rather than de-striding it.
+  -- What bounds n is the number of chunks the image reports from dsp_plan_segs at step 7,
+  -- against DSPN_MAX_SEGS; a count needing more is refused there. DSP_N_MAX is the
+  -- library's own ceiling.
+  local nmax = 65536
   nl.nceil = nmax
+  -- The plan struct has a chunk to itself, which is the one size still checked here: it
+  -- grew when the slice tables went into it.
+  if align8(nl.SIZEOF_PLAN) + 32 > nl.CHUNK_BYTES then
+    trace('size.plan', nl.SIZEOF_PLAN)
+    return false
+  end
   -- Two arrays of want_nseg dsp_real share the reduction chunk with the results block,
   -- whose size is fixed by the image. DSPN_RES_BYTES in dsp_native.c, computed from the
   -- same two figures rather than sent across as a third.
@@ -1066,12 +1069,13 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     end
   end
 
-  -- The first nseg chunks are the arena. Then the plan struct with the de-strided capture
-  -- after it, and the reduction's two arrays in a chunk of their own.
+  -- The first nseg chunks are the arena, then the plan struct, then the reduction's two
+  -- arrays. The struct has its chunk to itself: the transform reads the capture in place,
+  -- so there is no de-strided copy to place after it, and the room for that copy -- n
+  -- doubles -- is what used to bound n at 4092 whatever the arena could hold.
   local host      = align32(payload[nseg + 1])
   local plan_addr = host
-  local src_flat  = host + align8(nl.SIZEOF_PLAN)
-  if (src_flat - payload[nseg + 1]) + want_n * 8 > nl.CHUNK_BYTES then
+  if (host - payload[nseg + 1]) + align8(nl.SIZEOF_PLAN) > nl.CHUNK_BYTES then
     return fftsa.nl._abort(cb, pb)
   end
 
@@ -1117,7 +1121,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
     out_lo = nl.wr_lo, out_hi = nl.wr_hi,
     seg_bytes = nl.SEG_BYTES, nsegs = nseg, segs_addr = segs_addr,
-    plan_addr = plan_addr, src_flat = src_flat, cap_n = want_n,
+    plan_addr = plan_addr, cap_n = want_n,
     init_kind = kind or 1,
     init_beta_milli = math.floor((beta or 0) * 1000),
     init_decim = decim or 1, init_method = method or 0,
@@ -1134,7 +1138,6 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.seg_bytes = nl.SEG_BYTES
   nl.nsegs     = nseg
   nl.segs_addr = segs_addr
-  nl.src_flat  = src_flat
   nl.red_db    = red_db
   nl.red_hz    = red_hz
   nl.res_addr  = res_addr
@@ -1184,7 +1187,7 @@ function fftsa.nl.reinit(want_n, kind, beta, decim, method)
     rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
     out_lo = nl.wr_lo, out_hi = nl.wr_hi,
     seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
-    plan_addr = nl.plan_addr, src_flat = nl.src_flat, cap_n = want_n,
+    plan_addr = nl.plan_addr, cap_n = want_n,
     init_kind = kind,
     init_beta_milli = math.floor(beta * 1000),
     init_decim = decim, init_method = method,
@@ -1226,7 +1229,10 @@ end
 function fftsa.nl.call_dsp(cap, out, red)
   local nl = fftsa.nl
   if not nl.ready then return nil end
-  if cap == nil or out == nil or red == nil then return nil end
+  if cap == nil or red == nil then return nil end
+  -- The record is read in place through the chunk vector, so a descriptor without one is
+  -- refused here rather than reaching the entry point as a zero address.
+  if cap.vec == nil or cap.nchunks == nil or cap.nchunks < 1 then return nil end
   -- Checked here as well as natively, because a refusal from dsp_native_run arrives as a
   -- status code after the params have been written and reads the same as a bad address.
   local ns = red.nseg
@@ -1234,18 +1240,29 @@ function fftsa.nl.call_dsp(cap, out, red)
   if red.binhz == nil or not (red.binhz > 0) then return nil end
   if red.k0 == nil or red.k1 == nil or red.k0 < 0 or red.k1 < red.k0 then return nil end
   if red.dbmin == nil or red.dbmax == nil or not (red.dbmin < red.dbmax) then return nil end
+  -- out nil asks for the reduction and nothing else. The trace reaches the graph through
+  -- buffer.write.reading, so there is nothing for the primitive to write into a reading
+  -- buffer, and a descriptor of zero is what tells it so -- which also means no content
+  -- scan to find that buffer's storage.
+  local out_lo, out_hi, out_ch1, out_ch2, out_per, out_desc = 0, 0, 0, 0, 0, 0
+  if out ~= nil then
+    out_lo, out_hi = out.lo, out.hi
+    out_ch1, out_ch2, out_per, out_desc = out.chunk1, out.chunk2, out.perchunk, out.desc
+    if out_desc == nil or out_desc == 0 then return nil end
+  end
 
   local ok = nl.write_params({
     mode = nl.MODE_RUN,
     wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
     rd_lo = cap.lo, rd_hi = cap.hi,
-    out_lo = out.lo, out_hi = out.hi,
+    out_lo = out_lo, out_hi = out_hi,
     seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
-    plan_addr = nl.plan_addr, src_flat = nl.src_flat,
+    plan_addr = nl.plan_addr,
     cap_chunk1 = cap.chunk1, cap_chunk2 = cap.chunk2,
     cap_n = nl.n, cap_perchunk = cap.perchunk, cap_stride = cap.elemsize,
-    out_chunk1 = out.chunk1, out_chunk2 = out.chunk2,
-    out_perchunk = out.perchunk, out_desc = out.desc,
+    cap_vec = cap.vec, cap_nchunks = cap.nchunks,
+    out_chunk1 = out_ch1, out_chunk2 = out_ch2,
+    out_perchunk = out_per, out_desc = out_desc,
     red_nseg = ns, red_k0 = red.k0, red_k1 = red.k1,
     red_db = nl.red_db, red_hz = nl.red_hz,
     red_sense = red.sense or 1,
@@ -1381,17 +1398,23 @@ function fftsa.nl.describe(buf, has_extras)
   local ch2 = 0
   local lo  = elem0
   local hi  = elem0 + fftsa.nl.CHUNK_BYTES
-  -- ONLY WHEN THE DESCRIPTOR SAYS THERE IS A SECOND CHUNK. A one-chunk buffer -- which is
-  -- any capacity up to 1024 elements, so both of the app's -- has a one-entry vector, and
-  -- reading past it returns whatever follows in the heap. That value would widen lo..hi,
-  -- which is the window the native side validates every write against, so it loosens the
-  -- confinement rather than failing closed.
-  if vec ~= nil and nchunks ~= nil and nchunks > 1 then
-    local second = W(vec + 4)
-    if second ~= nil and second ~= 0 then
-      ch2 = second
-      if second < lo then lo = second end
-      if second + fftsa.nl.CHUNK_BYTES > hi then hi = second + fftsa.nl.CHUNK_BYTES end
+  -- Every chunk the vector holds, because the native side reads the record in place and a
+  -- long one spans many: 16,384 readings of 24 bytes is twelve chunks. The window is what
+  -- it validates each payload address against, so a chunk left out of lo..hi is a refusal
+  -- from the entry point rather than a bad read.
+  --
+  -- Bounded by the descriptor's own chunk count at +0x10, not by the capacity asked for.
+  -- Reading one entry past the end returns whatever follows the vector in the heap, and a
+  -- value that happened to look like a heap address would widen the window -- loosening
+  -- the confinement instead of failing closed.
+  if vec ~= nil and nchunks ~= nil and nchunks >= 1 then
+    local i
+    for i = 1, nchunks do
+      local a = W(vec + (i - 1) * 4)
+      if a == nil or a == 0 then return nil end
+      if a < lo then lo = a end
+      if a + fftsa.nl.CHUNK_BYTES > hi then hi = a + fftsa.nl.CHUNK_BYTES end
+      if i == 2 then ch2 = a end
     end
   end
   return { chunk1 = elem0, chunk2 = ch2, perchunk = perchunk,

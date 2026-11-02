@@ -123,6 +123,10 @@ typedef struct {
                            /* smaller, and the capture is one.  Measured by          */
                            /* nl._find_storage and cross-checked against the         */
                            /* descriptor's own field.                                */
+    uint32_t cap_vec;      /* chunk pointer vector: cap_nchunks big-endian words.    */
+                           /* A 16,384-sample record at 24 bytes an element is 12     */
+                           /* chunks, so two payload addresses do not reach it.       */
+    uint32_t cap_nchunks;  /* chunks the record spans, at most DSP_MAX_SRC_BLOCKS     */
 
     uint32_t out_chunk1;   /* graph buffer chunk payloads                           */
     uint32_t out_chunk2;
@@ -254,7 +258,7 @@ const uint32_t dsp_native_sizes[8] = {
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  52
+#define DSP_NATIVE_PARAM_WORDS  54
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -363,22 +367,6 @@ void *memset(void *s, int c, size_t n)
 /* -------------------------------------------------------------------------
  * Reading buffer element access: elements of `stride` bytes, reading double at +0.
  * -------------------------------------------------------------------------*/
-
-/* The capture's stride is whatever its style gives, so the reading at +0 of element k is
- * only 4-aligned in general and a `double *` there would be undefined.  Two words through
- * a union instead: the de-stride is n iterations against a transform of n log n, so the
- * extra load pair is not measurable, and it makes any 4-aligned stride legal. */
-static double rb_read(uint32_t ch1, uint32_t ch2, uint32_t perchunk, uint32_t stride, int k)
-{
-    union { double d; uint32_t w[2]; } u;
-    uint32_t idx  = (uint32_t)k;
-    uint32_t base = (idx < perchunk) ? ch1 : ch2;
-    uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
-    const uint32_t *p = (const uint32_t *)(uintptr_t)(base + off * stride);
-    u.w[0] = p[0];
-    u.w[1] = p[1];
-    return u.d;
-}
 
 static void rb_write(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k, double v)
 {
@@ -497,7 +485,7 @@ int dsp_native_run(void *L)
     const dsp_native_params *p;
     const dsp_plan *plan;
     dsp_plan *plan_w;
-    double *src;
+    dsp_src cap_src;
     uint32_t paddr;
     uint32_t segs[DSPN_MAX_SEGS];
     uint32_t seg_bytes = 0U;
@@ -541,8 +529,13 @@ int dsp_native_run(void *L)
     /* The declared windows have to be sane in themselves, and inside the backstop,
      * before they are trusted to validate anything else. */
     if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < HEAP_LO || p->wr_hi  > HEAP_HI ||
-        p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI ||
         p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END) {
+        push(L, (double)DSPN_EBOUNDS); return 1;
+    }
+    /* The output window only has to be anything when a reading buffer is being written,
+     * which out_desc is what says.  A caller writing the trace itself declares none. */
+    if (p->out_desc != 0U &&
+        (p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI)) {
         push(L, (double)DSPN_EBOUNDS); return 1;
     }
 
@@ -618,8 +611,7 @@ int dsp_native_run(void *L)
     if (p->mode != DSPN_MODE_RUN) { push(L, (double)DSPN_EBOUNDS); return 1; }
 
     m = plan->m;
-    if (plan->n == 0 || plan->n != n || m <= 0 || p->cap_perchunk == 0U ||
-        p->out_perchunk == 0U) {
+    if (plan->n == 0 || plan->n != n || m <= 0 || p->cap_perchunk == 0U) {
         push(L, (double)DSPN_EGEOM); return 1;
     }
 
@@ -627,30 +619,60 @@ int dsp_native_run(void *L)
         push(L, (double)DSPN_EARENA); return 1;
     }
 
-    /* Scratch for the de-strided capture: n doubles, contiguous, and it must not
-     * overlap the arena -- dsp.c's overlap checks assume src is separate. */
-    if (!wr_ok(p, p->src_flat, (uint32_t)n * 8U) ||
-        hits_arena(p->src_flat, (uint32_t)n * 8U, segs, nsegs, seg_bytes)) {
-        push(L, (double)DSPN_ESCRATCH); return 1;
-    }
-
-    /* Capture storage: read only, and only within what Lua declared.
+    /* Capture storage, read in place through the chunk vector.
+     *
+     * Two payload addresses do not reach a long record: at 24 bytes an element a chunk
+     * holds 1365, so 16,384 samples span twelve.  Reading in place is also what removes
+     * the de-strided copy -- n contiguous doubles, 131 kB at 16,384, longer than any
+     * segment -- from the frame.
      *
      * The stride is the capture's own element size, not 32: a STYLE_STANDARD buffer stores
-     * no extra value and is smaller.  It has to hold a double at +0, be 4-aligned so the
-     * pair of word loads is legal, and tile the chunk exactly -- which is the descriptor's
-     * own invariant, so a stride that fails it is not this buffer's. */
+     * no extra value and is smaller.  It has to tile the chunk exactly, which is the
+     * descriptor's own invariant, so a stride that fails it is not this buffer's.  And it
+     * has to be a multiple of eight, as does every payload base: the elements are then as
+     * aligned as the base and the double load inside dsp.c is legal.  A 4-aligned stride
+     * is refused here rather than read as a pair of words, which is what the copy did. */
     {
-        uint32_t in_first  = (uint32_t)n < p->cap_perchunk ? (uint32_t)n : p->cap_perchunk;
-        uint32_t in_second = (uint32_t)n - in_first;
-        if (p->cap_stride < 8U || (p->cap_stride & 3U) != 0U ||
-            p->cap_perchunk == 0U ||
+        uint32_t nch = p->cap_nchunks, want, i, left = (uint32_t)n;
+        if (p->cap_perchunk == 0U || p->cap_stride < 8U || (p->cap_stride & 7U) != 0U ||
             p->cap_stride * p->cap_perchunk > DSPN_CHUNK_BYTES ||
-            p->cap_stride * (p->cap_perchunk + 1U) <= DSPN_CHUNK_BYTES ||
-            !stride_ok_rd(p, p->cap_chunk1, in_first, p->cap_stride) ||
-            !stride_ok_rd(p, p->cap_chunk2, in_second, p->cap_stride)) {
+            p->cap_stride * (p->cap_perchunk + 1U) <= DSPN_CHUNK_BYTES) {
             push(L, (double)DSPN_ECAPTURE); return 1;
         }
+        /* Blocks the record actually occupies, which is what dsp_src addresses; nch is the
+         * vector's length and only has to be at least that. */
+        want = ((uint32_t)n + p->cap_perchunk - 1U) / p->cap_perchunk;
+        if (nch == 0U || want > nch || want > (uint32_t)DSP_MAX_SRC_BLOCKS ||
+            (p->cap_vec & 3U) != 0U ||
+            !range_ok(p->cap_vec, nch * 4U, HEAP_LO, HEAP_HI)) {
+            push(L, (double)DSPN_ECAPTURE); return 1;
+        }
+        for (i = 0; i < (uint32_t)DSP_MAX_SRC_BLOCKS; i++) {
+            cap_src.blk[i] = NULL;
+        }
+        {
+            const uint32_t *cvec = (const uint32_t *)(uintptr_t)p->cap_vec;
+            for (i = 0; i < want; i++) {
+                /* Element 0 is where the content scan found it, not where the first chunk's
+                 * payload begins: it is measured 8-aligned against a 16-aligned payload, so
+                 * the record does not start at the base of its chunk.  Later chunks hold
+                 * elements from their payload base.  That is the mapping the two-chunk form
+                 * used and had verified on the instrument, generalised to a long record;
+                 * taking the first block from the vector as well would read a fixed offset
+                 * early and be a wrong spectrum rather than a refusal. */
+                const uint32_t base = (i == 0U) ? p->cap_chunk1 : cvec[i];
+                const uint32_t take = (left < p->cap_perchunk) ? left : p->cap_perchunk;
+                if ((base & 7U) != 0U || !stride_ok_rd(p, base, take, p->cap_stride)) {
+                    push(L, (double)DSPN_ECAPTURE); return 1;
+                }
+                cap_src.blk[i] = (const unsigned char *)(uintptr_t)base;
+                left -= take;
+            }
+        }
+        cap_src.nblock = (int)want;
+        cap_src.per    = (int)p->cap_perchunk;
+        cap_src.stride = (int)p->cap_stride;
+        cap_src.len    = n;
     }
 
     /* The reduction's geometry, all of it unsigned so the int casts below cannot turn a
@@ -688,38 +710,40 @@ int dsp_native_run(void *L)
         }
     }
 
-    /* Output storage: written, so the output window and the heap backstop.  The trace is
-     * nseg points and not m bins -- the reduction is what the graph reads -- and one
-     * element beyond it has to exist too, because the cursor rewind stores the address of
-     * the slot after the last one written. */
-    {
+    /* out_desc zero asks for the reduction and nothing else: the two arrays are filled and
+     * no reading buffer is touched.  That is what the caller wants when it writes the trace
+     * itself, which it has to -- a graph draws from the display task's own copy of a bound
+     * buffer, fed by buffer.write.reading, so points put straight into chunk storage are
+     * never drawn.  Asking for the write as well costs a content scan at startup to find
+     * that storage, and the write is then overwritten.
+     *
+     * Output storage, when it is asked for: written, so the output window and the heap
+     * backstop.  The trace is nseg points and not m bins -- the reduction is what the graph
+     * reads -- and one element beyond it has to exist too, because the cursor rewind stores
+     * the address of the slot after the last one written. */
+    if (p->out_desc != 0U) {
         uint32_t want     = p->red_nseg + 1U;
         uint32_t o_first  = want < p->out_perchunk ? want : p->out_perchunk;
         uint32_t o_second = want - o_first;
-        if (!stride_ok_out(p, p->out_chunk1, o_first, 32U) ||
+        if (p->out_perchunk == 0U ||
+            !stride_ok_out(p, p->out_chunk1, o_first, 32U) ||
             !stride_ok_out(p, p->out_chunk2, o_second, 32U)) {
             push(L, (double)DSPN_EOUTPUT); return 1;
         }
-    }
-
-    /* The descriptor is a separate allocation from the chunk storage, so it is checked
-     * against the heap backstop rather than the bulk window, and only its base is
-     * trusted: the field offsets are compiled in.  4-aligned because the rewind writes it
-     * as words, and clear of the arena, which it would otherwise be free to overwrite. */
-    if (!range_ok(p->out_desc, DESC_SPAN, HEAP_LO, HEAP_HI) ||
-        (p->out_desc & 3U) != 0U ||
-        hits_arena(p->out_desc, DESC_SPAN, segs, nsegs, seg_bytes)) {
-        push(L, (double)DSPN_EDESC); return 1;
+        /* The descriptor is a separate allocation from the chunk storage, so it is checked
+         * against the heap backstop rather than the bulk window, and only its base is
+         * trusted: the field offsets are compiled in.  4-aligned because the rewind writes
+         * it as words, and clear of the arena, which it would otherwise be free to
+         * overwrite. */
+        if (!range_ok(p->out_desc, DESC_SPAN, HEAP_LO, HEAP_HI) ||
+            (p->out_desc & 3U) != 0U ||
+            hits_arena(p->out_desc, DESC_SPAN, segs, nsegs, seg_bytes)) {
+            push(L, (double)DSPN_EDESC); return 1;
+        }
     }
 
     /* Every address has passed.  From here on memory is touched. */
-    src = (double *)(uintptr_t)p->src_flat;
-    for (k = 0; k < n; k++) {
-        src[k] = rb_read(p->cap_chunk1, p->cap_chunk2, p->cap_perchunk,
-                         p->cap_stride, k);
-    }
-
-    nbins = dsp_spectrum_run(plan_w, src, n, NULL);
+    nbins = dsp_spectrum_run_src(plan_w, &cap_src, n, NULL);
     if (nbins <= 0) { push(L, (double)DSPN_ERUN); return 1; }
 
     /* Bins to the trace the graph reads: nseg maxima, in decibels, against the segment's
@@ -736,7 +760,7 @@ int dsp_native_run(void *L)
         map.binhz = pw_double(p->red_binhz_hi, p->red_binhz_lo);
         map.sense = (int)(int32_t)p->red_sense;
         map.zone  = 0;
-        if (dsp_reduce(plan->pwr, nbins, (int)p->red_k0, (int)p->red_k1, ntrace, &map,
+        if (dsp_reduce_vec(&plan->pwr_v, nbins, (int)p->red_k0, (int)p->red_k1, ntrace, &map,
                        pw_double(p->red_dbmin_hi, p->red_dbmin_lo),
                        pw_double(p->red_dbmax_hi, p->red_dbmax_lo),
                        pw_double(p->red_vfloor_hi, p->red_vfloor_lo),
@@ -745,10 +769,12 @@ int dsp_native_run(void *L)
         }
         /* The decibel value in the reading field and the frequency in the extra value,
          * which is the pair display.graph.add was given at build time. */
-        for (k = 0; k < ntrace; k++) {
-            rb_write(p->out_chunk1, p->out_chunk2, p->out_perchunk, k, (double)db[k]);
-            rb_write_extra(p->out_chunk1, p->out_chunk2, p->out_perchunk, k,
-                           (double)hz[k]);
+        if (p->out_desc != 0U) {
+            for (k = 0; k < ntrace; k++) {
+                rb_write(p->out_chunk1, p->out_chunk2, p->out_perchunk, k, (double)db[k]);
+                rb_write_extra(p->out_chunk1, p->out_chunk2, p->out_perchunk, k,
+                               (double)hz[k]);
+            }
         }
     }
 
@@ -774,7 +800,7 @@ int dsp_native_run(void *L)
         int npk = 0;
         for (k = 0; k < DSPN_RES_DOUBLES; k++) { res[k] = 0.0; }
         if (want > 0) {
-            npk = dsp_peaks(plan->pwr, nbins, (int)p->red_k0, (int)p->red_k1, plan->kdc,
+            npk = dsp_peaks_vec(&plan->pwr_v, nbins, (int)p->red_k0, (int)p->red_k1, plan->kdc,
                             want, &plan->ip, pbin, pfrac, pamp);
             if (npk < 0) { npk = 0; }
             for (k = 0; k < npk; k++) {
@@ -789,7 +815,7 @@ int dsp_native_run(void *L)
         /* A refusal leaves every figure zero with its flag clear, which is what an
          * unmeasured distortion is: 0% and 0 dB are both real answers, so the flags are
          * the only honest way to say "not measured". */
-        if (dsp_thd_noise(plan->pwr, nbins, (int)p->red_k0, (int)p->red_k1, plan->kdc,
+        if (dsp_thd_noise_vec(&plan->pwr_v, nbins, (int)p->red_k0, (int)p->red_k1, plan->kdc,
                           binhz, (int)(int32_t)p->res_mains, &plan->ip, &td) == DSP_OK) {
             res[s + 1] = td.thd;
             res[s + 2] = (td.signal != 0 && td.nharm > 0) ? 1.0 : 0.0;
@@ -809,7 +835,7 @@ int dsp_native_run(void *L)
      * buffer.clear(), which is what would let the graph paint a half-filled trace.  The
      * iterators point at the slot AFTER the last written element, which is why they are
      * computed from ntrace and the lagging pair from ntrace-1. */
-    {
+    if (p->out_desc != 0U) {
         const uint32_t ch1 = p->out_chunk1, ch2 = p->out_chunk2;
         const uint32_t per = p->out_perchunk;
         const uint32_t nt  = (uint32_t)ntrace;
