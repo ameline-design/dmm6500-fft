@@ -1,13 +1,16 @@
 # toolchain-ppc-clang.cmake -- clang/llvm cross-compilation to PowerPC e300.
 #
-# Requires Homebrew LLVM (not Apple clang, which has no PPC backend):
-#   brew install llvm
+# Requires Homebrew LLVM and lld, which are separate formulae -- llvm alone leaves ld.lld
+# missing, and the link is done by ld.lld directly:
+#   brew install llvm lld
 #
-# Usage:
-#   cmake -B build-ppc \
-#         -DCMAKE_TOOLCHAIN_FILE=csrc/toolchain-ppc-clang.cmake \
+# Usage. The toolchain path must be absolute: CMake resolves a relative
+# CMAKE_TOOLCHAIN_FILE against the build directory, not the source directory, so
+# csrc/toolchain-ppc-clang.cmake is looked for under build-ppc/ and not found.
+#   cmake -B build-ppc -S csrc \
+#         -DCMAKE_TOOLCHAIN_FILE=$PWD/csrc/toolchain-ppc-clang.cmake \
 #         -DDSP_DST_NATIVE=ON
-#   cmake --build build-ppc --target dsp_native_bin
+#   cmake --build build-ppc
 #
 # Processor notes
 # ---------------

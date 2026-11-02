@@ -295,16 +295,19 @@ endif()
 # ---------------------------------------------------------------------------
 # PPC cross-compilation target for the DMM6500 instrument.
 #
-# Prerequisites:
-#   brew install powerpc-elf-binutils   # or crosstool-ng for a full toolchain
+# Prerequisites. Two separate Homebrew formulae: llvm supplies the PPC backend Apple clang
+# does not have, and lld supplies ld.lld, which the toolchain file invokes directly.
+#   brew install llvm lld
 #
-# Build the flat binary:
-#   cmake -B build-ppc \
-#         -DCMAKE_TOOLCHAIN_FILE=csrc/toolchain-ppc.cmake \
+# Build the flat binary. CMAKE_TOOLCHAIN_FILE has to be absolute -- CMake resolves a
+# relative one against the build directory rather than the source directory.
+#   cmake -B build-ppc -S csrc \
+#         -DCMAKE_TOOLCHAIN_FILE=$PWD/csrc/toolchain-ppc-clang.cmake \
 #         -DDSP_DST_NATIVE=ON
-#   cmake --build build-ppc --target dsp_native_bin
+#   cmake --build build-ppc
 #
-# The output is build-ppc/dsp_native.bin (flat binary, entry at offset 0).
+# The output is build-ppc/dsp_native.bin (flat binary, entry at offset 0), plus
+# dsp_native_reloc.lua. tools/embed_native.py turns both into tsp/native_code.tsp.
 # ---------------------------------------------------------------------------
 option(DSP_DST_NATIVE "Build dsp_native.c for the DMM6500 instrument" OFF)
 if(DSP_DST_NATIVE)
