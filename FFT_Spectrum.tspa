@@ -1942,8 +1942,14 @@ end
 -- Measured at 2048 samples, this is neutral from 5 to 20 ms -- 9.53, 9.51 and 9.52 frames a
 -- second -- and costs a whole tick at 30. At 5 ms the frame grew by about 50 ms at 16,384,
 -- because the task does not finish inside the shorter slice and the remainder contends with
--- the next frame's work, which is ten times what the yield saved. So 10 ms is not a figure
--- to shave: the saving is nothing and the loss is a torn trace and event 1706.
+-- the next frame's work, which is ten times what the yield saved.
+--
+-- And the failure is recorded, not inferred: docs/PERFORMANCE.md measures a 5 ms yield at
+-- 35.6 Hz in Lua, 194 dropped-message events (1706), and a trace updating about three times
+-- a second. Nothing in the app can see that happen -- fftsa.fps counts completed Lua frames
+-- against the wall clock, so it would have read 35.6 while the glass showed 3. So this is
+-- not a figure to shave: the saving is nothing, the loss is a stale trace, and the settings
+-- line would go on reporting the rate Lua achieved.
 fftsa.sg_yield = 0.010
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
