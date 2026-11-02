@@ -1617,6 +1617,10 @@ local function help_reset(sum)
   -- that drives one frame would find the poll already spent for the second and read as the
   -- key going unanswered.
   fftsa.help_last = nil
+  -- The recogniser ships off. Turned on for these cases so the mechanism stays covered: the
+  -- shipped default is pinned by its own check below, so enabling it here cannot hide a
+  -- change to it.
+  fftsa.help_enabled = true
   display.active = fftsa.sg_scr
   fftsa.help_probe()
 end
@@ -1625,6 +1629,9 @@ local HSIG = fftsa.help_sigs[1]
 -- The capability check is resolved once at start, so these are about fftsa.help_probe, and
 -- the tick below is about it costing nothing once the answer is no.
 check('the probe finds the names this firmware has', (function()
+  -- The switch on, because this case is about discovering the ki names and not about the
+  -- shipped default, which has a check of its own further down.
+  fftsa.help_enabled = true
   local got = fftsa.help_probe()
   return got == true and fftsa.help_ok == true,
          tostring(got) .. ' / ' .. tostring(fftsa.help_ok)
@@ -1681,6 +1688,27 @@ check('a screen that is not the help dialog is left alone', (function()
          'got ' .. tostring(got) .. ' calls=' .. KI.calls
          .. ' actions=' .. table.getn(KI.actions)
          .. ' active=' .. tostring(display.active)
+end)())
+
+-- The shipped default, which help_reset turns on for every other case here and so cannot
+-- itself assert. Off because the poll costs 44 ms of a 274 ms frame at 16,384 samples and
+-- the key is not worth that; pressing HELP leaves the firmware's dialog up until EXIT.
+-- Asserted on the source rather than on the live field, which the cases above have moved.
+check('the help recogniser ships off, and the probe answers no when it is', (function()
+  local src = io.open('tsp/spectrum_graph.tsp')
+  if src == nil then return false, 'cannot read tsp/spectrum_graph.tsp' end
+  local text = src:read('*a')
+  src:close()
+  local shipped = string.find(text, 'fftsa.help_enabled = false', 1, true) ~= nil
+  local keep = fftsa.help_enabled
+  fftsa.help_enabled = false
+  local probed = fftsa.help_probe()
+  local flag = fftsa.help_ok
+  fftsa.help_enabled = keep
+  fftsa.help_probe()
+  return shipped and probed == false and flag == false,
+         string.format('shipped off=%s probe=%s help_ok=%s',
+                       tostring(shipped), tostring(probed), tostring(flag))
 end)())
 
 -- The poll is once a second, not once a frame, and that is a frame-rate fact rather than a

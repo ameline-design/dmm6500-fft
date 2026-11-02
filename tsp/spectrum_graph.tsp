@@ -897,6 +897,13 @@ fftsa.help_x2,  fftsa.help_y2 = 108, 66
 fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
 fftsa.help_shown = 0            -- times the key has been answered
 fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
+-- OFF, by the operator's decision, because the key is not worth what it costs the frame
+-- rate. The poll waits on the display task -- see help_period below -- and measured 44 ms of
+-- a 274 ms frame at 16,384 samples. What it buys back is that pressing HELP now leaves the
+-- firmware's own dialog on the glass until EXIT is pressed, instead of the app noticing and
+-- dismissing it. Set this true to get the recogniser back; it then runs at help_period, not
+-- once a frame, so the cost is a dropped tick once a second rather than a sixth of the rate.
+fftsa.help_enabled = false
 -- How often the frame polls for the dialog. Not once a frame: getchecksum waits on the
 -- display task, which at that point owes the trace fill's batched messages, and the wait
 -- measured 46.1 ms of a 274.3 ms frame at 16,384 samples against 0.1 ms with the call gone.
@@ -919,6 +926,10 @@ end
 -- without these loses the feature and nothing else.
 function fftsa.help_probe()
   fftsa.help_ok = false
+  -- The switch first, so a disabled recogniser costs one comparison at start and nothing
+  -- per frame. Tested through help_enabled rather than by stubbing the ki names, so the
+  -- recogniser stays covered while it ships off.
+  if not fftsa.help_enabled then return false end
   if fftsa.help_sigs == nil or table.getn(fftsa.help_sigs) == 0 then return false end
   if ki == nil or ki.display == nil then return false end
   local k = ki.display
