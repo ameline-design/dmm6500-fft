@@ -2450,10 +2450,20 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
             break;
         a = dsp_ifloor(c - (double)DSP_THD_HALFW + 0.5);
         b = dsp_ifloor(c + (double)DSP_THD_HALFW + 0.5);
-        /* Only the lower bound needs clamping. The break above has already established
-         * c + HALFW <= k1, and k1 is an integer, so b = floor(c + HALFW + 0.5) <= k1. */
+        /* Both bounds clamped. The upper one looks redundant -- the break above establishes
+         * c + HALFW <= k1 with k1 an integer, so floor(c + HALFW + 0.5) <= k1 -- but that
+         * argument holds only while the guard and this line agree to the last bit about
+         * c + HALFW, and they are separate expressions. An optimiser free to inline c and
+         * fuse the multiply into the add at one site and not the other makes them disagree,
+         * and a value sitting exactly on k1 then gives b = k1 + 1 and a read one element
+         * past the window. It would be a wrong distortion figure rather than a fault, since
+         * the read stays inside the arena, which is why it is cheaper to clamp than to
+         * reason about: an array bound should not rest on two floating-point expressions
+         * rounding identically. */
         if (a < k0)
             a = k0;
+        if (b > k1)
+            b = k1;
         for (k = a; k <= b; k++) {
             double v = (double)DSP_AT(pwr, k);
             if (v > bp) {
