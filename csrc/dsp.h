@@ -1305,6 +1305,27 @@ int dsp_thd_noise(const dsp_real *DSP_RESTRICT pwr, int nbins, int k0, int k1, i
  */
 int dsp_window_lobe(int kind, double beta);
 
+/**
+ * @name The power-spectrum readers, over a split array
+ *
+ * The same functions as the four above, taking the power spectrum as the ::dsp_vec the
+ * arena may have had to cut it into. Each of those is this one over a one-slice vector, so
+ * a caller with a contiguous array has nothing to change; a caller holding a plan reads
+ * @c pwr_v, which is the whole spectrum however the segments fell.
+ * @{
+ */
+int dsp_reduce_vec(const dsp_vec *pwr, int nbins, int k0, int k1, int nseg,
+                   const dsp_bandmap *map, double dbmin, double dbmax, double vfloor,
+                   dsp_real *DSP_RESTRICT db, dsp_real *DSP_RESTRICT hz);
+int dsp_peaks_vec(const dsp_vec *pwr, int nbins, int k0, int k1, int kdc, int want,
+                  const dsp_interp *ip, int *DSP_RESTRICT bin, dsp_real *DSP_RESTRICT frac,
+                  dsp_real *DSP_RESTRICT amp);
+int dsp_thd_noise_vec(const dsp_vec *pwr, int nbins, int k0, int k1, int kdc, double binhz,
+                      int mains, const dsp_interp *ip, dsp_thdn *DSP_RESTRICT out);
+int dsp_peak_interp_vec(const dsp_interp *ip, const dsp_vec *pwr, int k, int nbins,
+                        double *d_out, double *amp_out);
+/** @} */
+
 #ifdef __cplusplus
 }
 #endif

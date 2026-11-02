@@ -110,6 +110,11 @@ static int dsp_is_odd(const int v) {
  *
  * Applied only to pairs where at least one side is written. Two read-only buffers sharing
  * bytes cannot produce a wrong answer, so checking them would cost code for no failure. */
+/* Defined below, beside the bump walk they share their geometry with. Declared here because
+ * the forms taking a plain pointer are defined above it. */
+static void dsp_vec_flat(dsp_vec *v, dsp_real *p, int len);
+static void dsp_vec_flat_ro(dsp_vec *v, const dsp_real *p, int len);
+
 static int dsp_overlaps(const void *a, const size_t na, const void *b, const size_t nb) {
     uintptr_t pa, pb;
     if (a == NULL || b == NULL || na == 0U || nb == 0U)
@@ -461,7 +466,7 @@ int dsp_win_offset(const dsp_interp *ip, double r, double *d_out) {
 int dsp_peak_interp_vec(const dsp_interp *ip, const dsp_vec *pwr, const int k, const int nbins,
                         double *d_out, double *amp_out) {
     double pc, pl, pr, cc, ll, rr, den, d, g;
-    if (ip == NULL || pwr == NULL)
+    if (ip == NULL || pwr == NULL || pwr->nslice < 1)
         return DSP_EARG;
 #if DSP_CHECK_OVERLAP
     /* Both outputs in one object would have the amplitude overwrite the offset, and either
@@ -497,6 +502,13 @@ int dsp_peak_interp_vec(const dsp_interp *ip, const dsp_vec *pwr, const int k, c
     return DSP_OK;
 }
 
+int dsp_peak_interp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, const int k,
+                    const int nbins, double *d_out, double *amp_out) {
+    dsp_vec v;
+    dsp_vec_flat_ro(&v, pwr, nbins);
+    return dsp_peak_interp_vec(ip, &v, k, nbins, d_out, amp_out);
+}
+
 /* ------------------------------------------------------------------------- */
 /* arena layout                                                              */
 /* ------------------------------------------------------------------------- */
@@ -523,7 +535,7 @@ typedef struct {
 typedef struct {
     size_t at;
     size_t seg;
-    int    fail; /* an array larger than one segment; no placement exists */
+    int    fail; /* no slicing of some array fits the segments */
 } dsp_walk;
 
 static size_t dsp_bump(dsp_walk *wk, const size_t bytes) {
@@ -555,8 +567,6 @@ static int dsp_log2_of(const int v) {
 /* A contiguous array as a one-slice vector, so that the functions taking a plain pointer and
  * the ones taking a plan share a body. per is rounded up past len, which is what makes the
  * shift zero and the mask the identity for every index the caller can pass. */
-static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len);
-
 /* The read-only form. The table is non-const because the writing forms share the type, and
  * a vector built here is only ever read; the union carries the value across without a cast
  * that drops the qualifier. */
@@ -568,12 +578,15 @@ static void dsp_vec_flat_ro(dsp_vec *v, const dsp_real *p, const int len) {
 
 static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len) {
     int s, per = 1;
-    while (per < len)
+    while (per < len && per < (1 << 30))
         per <<= 1;
     for (s = 0; s < DSP_MAX_SLICES; s++)
         v->tab[s] = NULL;
     v->tab[0]  = p;
-    v->nslice  = (len > 0 && p != NULL) ? 1 : 0;
+    /* An array or not, which is what the pointer beside it says. Not whether len is
+     * positive: a hostile bin count has to reach the check that declines it, and answering
+     * DSP_EARG from here instead would change what the published refusals mean. */
+    v->nslice  = (p != NULL) ? 1 : 0;
     v->per     = per;
     v->sh      = dsp_log2_of(per);
     v->mask    = per - 1;
@@ -1709,7 +1722,7 @@ const char *dsp_strerror(const int code) {
     case DSP_EZONE:
         return "band spans a Nyquist zone";
     case DSP_ESEG:
-        return "array larger than one segment";
+        return "no slice layout fits the segments";
     case DSP_EDIRTY:
         return "settings moved, commit again";
     default:
@@ -1914,7 +1927,7 @@ int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, co
     double vfl = vfloor * vfloor; /* squared: the bins are power */
     double fstep, f0, binhz, dc;
     int npts, c, qstep, rstep, q0, q1, r1;
-    if (pwr == NULL || db == NULL || hz == NULL || map == NULL)
+    if (pwr == NULL || pwr->nslice < 1 || db == NULL || hz == NULL || map == NULL)
         return DSP_EARG;
     if (nbins < 1 || k0 < 0 || k0 >= nbins || nseg < 1 || nseg > DSP_NSEG_MAX)
         return DSP_EARG;
@@ -2036,12 +2049,20 @@ int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, co
     return nseg;
 }
 
+int dsp_reduce(const dsp_real *DSP_RESTRICT pwr, const int nbins, const int k0, int k1,
+               const int nseg, const dsp_bandmap *map, const double dbmin, const double dbmax,
+               const double vfloor, dsp_real *DSP_RESTRICT db, dsp_real *DSP_RESTRICT hz) {
+    dsp_vec v;
+    dsp_vec_flat_ro(&v, pwr, nbins);
+    return dsp_reduce_vec(&v, nbins, k0, k1, nseg, map, dbmin, dbmax, vfloor, db, hz);
+}
+
 int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, const int want,
                   const dsp_interp *ip, int *DSP_RESTRICT bin, dsp_real *DSP_RESTRICT frac,
                   dsp_real *DSP_RESTRICT amp) {
     int kfloor, k, s, found = 0;
     double bv[DSP_PEAKS_MAX];
-    if (pwr == NULL || bin == NULL || want < 1)
+    if (pwr == NULL || pwr->nslice < 1 || bin == NULL || want < 1)
         return DSP_EARG;
     if (want > DSP_PEAKS_MAX)
         return DSP_EARG;
@@ -2057,10 +2078,10 @@ int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, 
     {
         const size_t zb = (size_t)want * sizeof(*bin);
         const size_t zf = (size_t)want * sizeof(*frac);
-        const size_t zp = (size_t)nbins * sizeof(*pwr);
+
         if (dsp_overlaps(bin, zb, frac, zf) || dsp_overlaps(bin, zb, amp, zf)
-            || dsp_overlaps(frac, zf, amp, zf) || dsp_overlaps(bin, zb, pwr, zp)
-            || dsp_overlaps(frac, zf, pwr, zp) || dsp_overlaps(amp, zf, pwr, zp))
+            || dsp_overlaps(frac, zf, amp, zf) || dsp_vec_hits(pwr, bin, zb)
+            || dsp_vec_hits(pwr, frac, zf) || dsp_vec_hits(pwr, amp, zf))
             return DSP_EARG;
     }
 #endif
@@ -2144,6 +2165,14 @@ int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, 
     return found;
 }
 
+int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1, int kdc,
+              const int want, const dsp_interp *ip, int *DSP_RESTRICT bin,
+              dsp_real *DSP_RESTRICT frac, dsp_real *DSP_RESTRICT amp) {
+    dsp_vec v;
+    dsp_vec_flat_ro(&v, pwr, nbins);
+    return dsp_peaks_vec(&v, nbins, k0, k1, kdc, want, ip, bin, frac, amp);
+}
+
 /* ------------------------------------------------------------------------- */
 /* one frame                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -2199,7 +2228,7 @@ int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc
 
 /* The amplitude of the line at bin k, interpolated where the tables allow it: a bin
  * maximum alone reads up to 3.9 dB low on a tone sitting between bins. */
-static double dsp_line_amp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, const int k,
+static double dsp_line_amp(const dsp_interp *ip, const dsp_vec *pwr, const int k,
                            const int nbins, const double p, double *d_out) {
     double amp = DSP_SQRT(p);
     if (d_out != NULL)
@@ -2218,7 +2247,7 @@ static double dsp_line_amp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pw
 /* Sum and count the bins that are neither a line nor a skirt and do not exceed ceil_v.
  * The line list is ascending, so it is walked alongside the bins: one comparison a bin,
  * not one a line a bin. */
-static void dsp_noise_pass(const dsp_real *DSP_RESTRICT pwr, const int k0, const int k1,
+static void dsp_noise_pass(const dsp_vec *pwr, const int k0, const int k1,
                            const int *DSP_RESTRICT line, const int nline, const int skirt, const double ceil_v,
                            const int stride, double *DSP_RESTRICT sum_out,
                            int *DSP_RESTRICT cnt_out) {
@@ -2280,7 +2309,7 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
     int nline, kfloor, k, h, kf = -1, cnt = 0, skirt, nh = 0, stride;
     double pf = 0.0, vf, d0 = 0.0, fb = 0.0, hsum = 0.0, sum = 0.0;
 
-    if (pwr == NULL || out == NULL)
+    if (pwr == NULL || pwr->nslice < 1 || out == NULL)
         return DSP_EARG;
     /* Before every refusal below, so that `out` is zeroed on all of them and not only on
      * the late ones. A caller that reads the struct after an EARG sees zeros, never the
@@ -2289,7 +2318,7 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
 #if DSP_CHECK_OVERLAP
     /* The figures against the bins they are taken from: the zeroing above would otherwise
      * blank part of the spectrum before it is read. */
-    if (dsp_overlaps(out, sizeof(*out), pwr, (size_t)nbins * sizeof(*pwr)))
+    if (dsp_vec_hits(pwr, out, sizeof(*out)))
         return DSP_EARG;
 #endif
     if (nbins < 8)
@@ -2450,4 +2479,12 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         out->amp0 = 0.0;
     }
     return DSP_OK;
+}
+
+int dsp_thd_noise(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1, int kdc,
+                  const double binhz, const int mains, const dsp_interp *ip,
+                  dsp_thdn *DSP_RESTRICT out) {
+    dsp_vec v;
+    dsp_vec_flat_ro(&v, pwr, nbins);
+    return dsp_thd_noise_vec(&v, nbins, k0, k1, kdc, binhz, mains, ip, out);
 }

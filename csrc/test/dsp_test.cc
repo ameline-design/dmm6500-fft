@@ -4767,20 +4767,116 @@ TEST(Segments, OneShortIsEnomem) {
     EXPECT_EQ(0, p->n) << "a refused plan must be left zeroed";
 }
 
-TEST(Segments, ArrayLargerThanASegmentIsRefused) {
-    // No array is ever split, so the window -- n entries, the largest -- has to fit one
-    // segment. That is the bound on n, and it is the whole cost of the approach.
-    const size_t nmax = kSeg / sizeof(dsp_real);
-    const int at_limit = static_cast<int>(nmax);
+// One element of a possibly-split array, the way DSP_AT reaches it.
+dsp_real VecAt(const dsp_vec &v, int i) {
+    return v.tab[i >> v.sh][i & v.mask];
+}
+
+// Bytes slice s holds, the last one carrying only the remainder.
+size_t SliceBytes(const dsp_vec &v, int s) {
+    const int rest = v.len - s * v.per;
+    const int take = (rest < v.per) ? rest : v.per;
+    return take > 0 ? static_cast<size_t>(take) * sizeof(dsp_real) : 0u;
+}
+
+TEST(Segments, AnArrayLongerThanASegmentIsSplitRatherThanRefused) {
+    // The window is n entries and the longest array, so it is the first to cross a segment.
+    // Splitting it is what puts n = 8192 and n = 16,384 on this path at all: at 32,736 bytes
+    // a segment is 32 bytes short of the 8192-sample window in single precision and three
+    // segments short of the 16,384-sample one in double, so no precision reaches either.
+    const int at_limit = static_cast<int>(kSeg / sizeof(dsp_real));
     const int over = at_limit * 2;
 
     EXPECT_GT(dsp_plan_segs(at_limit, 1, DSP_FFT_DEFAULT, kSeg), 0)
         << "n = seg_bytes/sizeof(dsp_real) must still lay out";
-    EXPECT_EQ(0, dsp_plan_segs(over, 1, DSP_FFT_DEFAULT, kSeg));
+    const int segs = dsp_plan_segs(over, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0) << "an array longer than a segment is sliced, not refused";
 
-    SegPlan p(over, DSP_WINDOW_HANN, kSeg, 64);
-    EXPECT_EQ(DSP_ESEG, p.rc()) << "and plenty of segments does not help";
-    EXPECT_STREQ("array larger than one segment", dsp_strerror(DSP_ESEG));
+    SegPlan p(over, DSP_WINDOW_HANN, kSeg, segs);
+    ASSERT_EQ(DSP_OK, p.rc());
+    EXPECT_GT(p->w_v.nslice, 1) << "the window is the array that had to split";
+    EXPECT_EQ(over, p->w_v.len);
+    // The slice length is a power of two and covers every run a kernel asks for, which is
+    // what keeps the hot loops taking a row pointer.
+    EXPECT_EQ(0, p->w_v.per & (p->w_v.per - 1)) << "per must be a power of two";
+    EXPECT_GE(p->re_v.per, p->m2) << "a row of m2 has to lie inside one slice";
+    EXPECT_GE(p->re_v.per, p->m1) << "a row of m1 has to lie inside one slice";
+    EXPECT_GE(p->re_v.per, DSP_FS_BLOCK);
+    EXPECT_EQ(p->w_v.per - 1, p->w_v.mask);
+    EXPECT_EQ(1 << p->w_v.sh, p->w_v.per);
+}
+
+TEST(Segments, EverySliceOfASplitArrayLiesWhollyInOneSegment) {
+    const int over = static_cast<int>(kSeg / sizeof(dsp_real)) * 2;
+    const int segs = dsp_plan_segs(over, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0);
+    SegPlan p(over, DSP_WINDOW_HANN, kSeg, segs);
+    ASSERT_EQ(DSP_OK, p.rc());
+    const dsp_vec *all[] = {&p->w_v,  &p->twr_v, &p->twi_v, &p->utr_v, &p->uti_v,
+                            &p->re_v, &p->im_v,  &p->wkr_v, &p->wki_v, &p->pwr_v};
+    const char *names[] = {"w", "twr", "twi", "utr", "uti", "re", "im", "wkr", "wki", "pwr"};
+    for (size_t a = 0; a < sizeof(all) / sizeof(all[0]); a++) {
+        for (int sl = 0; sl < all[a]->nslice; sl++) {
+            EXPECT_TRUE(p.InOneSegment(all[a]->tab[sl], SliceBytes(*all[a], sl)))
+                << names[a] << " slice " << sl;
+        }
+        for (int sl = all[a]->nslice; sl < DSP_MAX_SLICES; sl++) {
+            EXPECT_EQ(nullptr, all[a]->tab[sl]) << names[a] << " slice " << sl;
+        }
+    }
+}
+
+TEST(Segments, RadixTwoIsRefusedAnArenaThatSplitsItsWorkingArrays) {
+    // Its butterflies index re, im and the twiddles across the whole transform, so a split
+    // one has runs with no single row pointer. m entries is what has to cross: at kSeg that
+    // is n above 2 * kSeg / sizeof(dsp_real).
+    const int n = static_cast<int>(kSeg / sizeof(dsp_real)) * 4;
+    if (n > DSP_N_MAX)
+        GTEST_SKIP() << "the precision's m-array fits a segment at every legal n";
+    SegPlan p(n, DSP_WINDOW_HANN, kSeg, 64, 12.0, 1, DSP_FFT_RADIX2);
+    EXPECT_EQ(DSP_ESEG, p.rc());
+    EXPECT_EQ(0, p->n) << "a refused plan must be left zeroed";
+}
+
+TEST(Segments, ASplitArenaGivesBitIdenticalResultsToAContiguousOne) {
+    // The proof the slicing is inert: same samples, same plan, one arena contiguous and the
+    // other cut into 32 kB segments. Slicing changes which address an element lives at and
+    // nothing about the order of the arithmetic, so the two spectra must agree bit for bit.
+    const int n = static_cast<int>(kSeg / sizeof(dsp_real)) * 2;
+    const int segs = dsp_plan_segs(n, 1, DSP_FFT_DEFAULT, kSeg);
+    ASSERT_GT(segs, 0);
+    Plan flat(n, DSP_WINDOW_HANN);
+    ASSERT_EQ(DSP_OK, flat.rc()) << "the contiguous reference must build";
+    SegPlan split(n, DSP_WINDOW_HANN, kSeg, segs);
+    ASSERT_EQ(DSP_OK, split.rc());
+    ASSERT_GT(split->w_v.nslice, 1) << "nothing split, so this proves nothing";
+
+    std::vector<double> x(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+        const double t = static_cast<double>(i);
+        x[static_cast<size_t>(i)] = 0.9 * std::sin(2.0 * M_PI * 37.0 * t / n) +
+                                   0.05 * std::sin(2.0 * M_PI * 311.0 * t / n) + 0.01;
+    }
+    double mean_a = 0.0, mean_b = 0.0;
+    ASSERT_GT(dsp_spectrum_run(&flat.get(), x.data(), n, &mean_a), 0);
+    ASSERT_GT(dsp_spectrum_run(&split.get(), x.data(), n, &mean_b), 0);
+    EXPECT_EQ(mean_a, mean_b);
+
+    const int m = flat->m;
+    ASSERT_EQ(m, split->m);
+    int differing = 0, first = -1;
+    for (int k = 0; k < m; k++) {
+        if (VecAt(split->pwr_v, k) != flat->pwr[k]) {
+            if (first < 0)
+                first = k;
+            differing++;
+        }
+    }
+    EXPECT_EQ(0, differing) << differing << " bins differ, first at " << first;
+    // And the window itself, which is the array that had to split.
+    for (int i = 0; i < n; i++) {
+        ASSERT_EQ(flat->w[i], VecAt(split->w_v, i)) << "window entry " << i;
+    }
 }
 
 TEST(Segments, EveryArrayLiesWhollyInOneSegment) {
