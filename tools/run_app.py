@@ -15,12 +15,23 @@ from screenshot import capture               # noqa: E402
 from siglent import SDG                       # noqa: E402
 
 ROOT = __file__.rsplit('/', 2)[0]
-# Loaded and run in this order, one named script each. dsplua has to precede specapp: the
-# capability gate at the head of spectrum_app.tsp calls fftsa.dsp_install() as that module
-# runs, and the installer is defined by this one.
+# Loaded and run in this order, one named script each. THE SAME ORDER AS
+# tools/package_tspa.py's MODULES, which is what the archive ships and so the only order
+# the app is ever tested in: natlink creates fftsa.nl and natcode assigns the compiled
+# image into it, so natcode has to follow it, and both have to precede specapp, which
+# reaches nl.init from fftsa.start().
+#
+# dsplua has to precede specapp and it is NOT optional: THE DMM6500 HAS NO FIRMWARE dsp
+# MODULE. Measured on 1.7.17a -- `dsp` is nil, so with this file out of the list specapp
+# raises at load (-286, "attempt to index global `dsp'") on the window enum map, and the app
+# never appears. dsp.* is the interface this app is written against; dsp_lua.tsp is what
+# provides it, and the compiled image is a faster implementation of the same work, not a
+# replacement for the names.
 MODULES = [('fftcore', 'tsp/fft_core.tsp'),
            ('specui', 'tsp/spectrum_ui.tsp'),
            ('specgr', 'tsp/spectrum_graph.tsp'),
+           ('natlink', 'tsp/native_link.tsp'),
+           ('natcode', 'tsp/native_code.tsp'),
            ('dsplua', 'tsp/dsp_lua.tsp'),
            ('specapp', 'tsp/spectrum_app.tsp')]
 
@@ -77,16 +88,27 @@ def cap(d, path, live=False, tries=3):
 
 
 def main():
-    g = SDG()
-    g.sine(12500, 2.0, ch=1)
-    g.output(True, ch=1, load='HZ')
-    g.close()
-    print('generator : 12500 Hz 2 Vpp')
+    # The generator is a convenience, not a dependency: with it the screenshots show a
+    # known tone, without it the app is verified against whatever is on the leads, which
+    # is mains pickup and the instrument's own floor. Refusing to run at all when it is
+    # switched off meant no app test rather than a slightly weaker one, and the weaker one
+    # still exercises every path the app has.
+    try:
+        g = SDG()
+        g.sine(12500, 2.0, ch=1)
+        g.output(True, ch=1, load='HZ')
+        g.close()
+        print('generator : 12500 Hz 2 Vpp')
+    except Exception as exc:
+        print('generator : unreachable (%s) -- running against the open leads'
+              % type(exc).__name__)
 
     clear_dead_sockets()
     d = DMM(timeout=180)
     d.q('reset()')
-    d.q('display.lightstate = display.STATE_LCD_100')
+    # 25%, the lowest step above off. The LXI screenshot does not read the backlight, so
+    # nothing here needs the panel bright.
+    d.q('display.lightstate = display.STATE_LCD_25')
     d.q('eventlog.clear()')
 
     print('modules   :')
@@ -113,6 +135,53 @@ def main():
 
     cap(d, '/tmp/app_spectrum.png', live=True)
     print('  spectrum -> /tmp/app_spectrum.png')
+
+    # ---- which primitive produced that spectrum ----
+    # Asked rather than assumed: a native path that failed to install falls back silently,
+    # which is the point of the fallback and also the thing that would make every
+    # measurement below describe the wrong implementation.
+    print('\n=== native path ===')
+    print('  state    :', d.q(
+        'local nl = fftsa.nl '
+        'if nl == nil then print("no nl table") else '
+        'print(string.format("ready=%s n=%s nmax=%s nseg_max=%s bound=%s rc=%s err=%s", '
+        'tostring(nl.ready), tostring(nl.n), tostring(nl.nmax), tostring(nl.nseg_max), '
+        'tostring(fftsa.nl_cap ~= nil and fftsa.nl_out ~= nil), tostring(nl.last_rc), '
+        'tostring(fftsa.nl_lasterr))) end', timeout=60))
+    # nl_res is set by the frame body only on the native path, and cleared at the head of
+    # every frame, so this says which path ran the frame just captured.
+    print('  live     :', d.q(
+        'local r = fftsa.nl_res '
+        'if r == nil then print("fell back to dsp.spectrum") else '
+        'print(string.format("native: npk=%d nbins=%s thd=%s snr=%s floor=%s", '
+        'r.npk, tostring(r.nbins), tostring(r.thd), tostring(r.snr), '
+        'tostring(r.noise))) end', timeout=60))
+    print('  trace    :', d.q(
+        'print(string.format("nwrote=%s n=%s first=(%.2f dB, %.1f Hz) last=(%.2f dB, %.1f Hz)", '
+        'tostring(fftsa.sg_nwrote), tostring(fftsa.sg_buf.n), '
+        'fftsa.sg_buf.readings[1], fftsa.sg_buf.extravalues[1], '
+        'fftsa.sg_buf.readings[fftsa.sg_buf.n], '
+        'fftsa.sg_buf.extravalues[fftsa.sg_buf.n]))', timeout=60))
+    print('  peaks    :', d.q(
+        'if fftsa.pk_hz == nil then print("no frame has run") else '
+        'local t = {} local i '
+        'for i = 1, fftsa.sg_npeak do '
+        'if fftsa.pk_hz[i] == nil then t[i] = "-" else '
+        't[i] = string.format("%.0fHz/%.4gV", fftsa.pk_hz[i], fftsa.pk_v[i]) end end '
+        'print(table.concat(t, "  ")) end', timeout=60))
+    # The line as the glass shows it, through the same two shims the display uses, so a
+    # native path reporting nothing would read "---" here rather than silently.
+    print('  thd line :', d.q(
+        'do local thd, snr, nf = fftsa.distortion() '
+        'if thd ~= nil then thd = thd * 100 end '
+        'print(fftsa.sg_thd_text(thd, snr, nf, fftsa.plan_n(), fftsa.overrange)) end',
+        timeout=60))
+    # One frame, timed on the instrument's own clock, with the timer frozen so nothing
+    # else is competing for the interpreter.
+    print('  frame    :', d.q(
+        'local t0 = os.clock() local i for i = 1, 5 do fftsa.saved_frame() end '
+        'print(string.format("%.1f ms a frame over five, n=%d", '
+        '(os.clock() - t0) * 200, fftsa.n))', timeout=300))
 
     # ---- learn the edit-option index base (0- vs 1-based) ----
     print('\n=== options form ===')
@@ -144,6 +213,22 @@ def main():
         'local bi,bv=fftsa.find_peaks(nb,fftsa.sg_npeak,k0,k1) '
         'print(string.format("%.3f kHz @ %.4f V  (bins %d..%d)", '
         '(bi[1]-1)*fftsa.binhz/1000, bv[1], k0, k1))', timeout=90))
+
+    # ---- a sample count press, which is what nl.reinit exists for ----
+    # The arena is sized once per boot for fftsa.nl_nmax; a count at or below it re-plans
+    # with one params write and one call, where an install would need a fresh boot. 16384
+    # is above the ceiling and has to fall back cleanly rather than fail.
+    print('\n=== sample count ===')
+    for n in (1024, 16384, 512):
+        print('  n=%-5d :' % n, d.q(
+            'fftsa.n = %d fftsa.apply() '
+            'print(string.format("nl.ready=%%s nl.n=%%s bound=%%s binhz=%%.3f", '
+            'tostring(fftsa.nl.ready), tostring(fftsa.nl.n), '
+            'tostring(fftsa.nl_usable()), fftsa.binhz))' % n, timeout=300))
+        print('          ', d.q('fftsa.saved_frame() '
+                                'if fftsa.nl_res == nil then print("  frame: dsp.spectrum") '
+                                'else print(string.format("  frame: native, npk=%d", '
+                                'fftsa.nl_res.npk)) end', timeout=300))
 
     # ---- back to full span, leave running ----
     d.q('fftsa.flo=0 fftsa.fhi=50000 fftsa.range=10 fftsa.apply() print("full")', timeout=120)

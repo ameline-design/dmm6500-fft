@@ -56,11 +56,20 @@ end
 --
 -- Index-parallel to fftsa.win_names: a window added to one and not the other falls back to
 -- Hann without saying so, which is what the length check in the proto suite is for.
+--
+-- GUARDED, because dsp CAN be nil and this is load-time code. The gate above sets
+-- fftsa.dsp_absent in that case and said so; the next statement then indexed the nil
+-- anyway. Measured on 1.7.17a, which has NO FIRMWARE dsp MODULE: with dsp_lua.tsp left out
+-- of the module list this file raised "-286 attempt to index global `dsp'" at this line
+-- while the archive was still loading, so every function below it was never defined and
+-- fftsa.start was nil. The refusal the gate promised has to be a refusal, not a raise.
 fftsa.win_dsp = {}
-fftsa.win_dsp[1] = dsp.WINDOW_HANN
-fftsa.win_dsp[2] = dsp.WINDOW_BLACKMAN
-fftsa.win_dsp[3] = dsp.WINDOW_BLACKMAN_HARRIS
-fftsa.win_dsp[4] = dsp.WINDOW_KAISER
+if not fftsa.dsp_absent then
+  fftsa.win_dsp[1] = dsp.WINDOW_HANN
+  fftsa.win_dsp[2] = dsp.WINDOW_BLACKMAN
+  fftsa.win_dsp[3] = dsp.WINDOW_BLACKMAN_HARRIS
+  fftsa.win_dsp[4] = dsp.WINDOW_KAISER
+end
 
 function fftsa.win_to_dsp(wi)
   local k = fftsa.win_dsp[wi or fftsa.win_i]
@@ -73,7 +82,12 @@ end
 -- After the gate, the mains selection being one of its enums.
 fftsa.thd_hmax_want  = 20              -- harmonics counted; the window top usually stops first
 fftsa.thd_bins_want  = 1024            -- bins sampled for the floor; 0 means every bin
-fftsa.thd_mains_want = dsp.MAINS_BOTH  -- hum discounted at 50 and at 60 Hz
+-- -1 is DSP_THD_MAINS_BOTH and is what dsp.MAINS_BOTH is set to, taken literally here for
+-- the same reason as the window map above: this is load-time code and dsp can be nil.
+fftsa.thd_mains_want = -1              -- hum discounted at 50 and at 60 Hz
+if not fftsa.dsp_absent and dsp.MAINS_BOTH ~= nil then
+  fftsa.thd_mains_want = dsp.MAINS_BOTH
+end
 
 -- A refusal as something that can go on the glass. The primitives post an event and return a
 -- negative code, and "-2" tells an operator nothing; dsp.lastevent() carries the reason the
@@ -550,13 +564,16 @@ function fftsa.dsp_peaks(count)
   local hz, v = fftsa.pk_hz, fftsa.pk_v
   local i
   -- On the native path the peaks come out of the results block the same call filled, not
-  -- from dsp.peak(): nothing on this path runs Keithley's dsp.spectrum, so its own notion
-  -- of "a spectrum has been computed" is never set and every call would refuse -- one
-  -- posted event per peak per frame.
-  local res = fftsa.nl_res
-  if res ~= nil then
+  -- from dsp.peak(): no dsp.spectrum ran on this path, so that implementation's notion of
+  -- "a spectrum has been computed" is never set and every call would refuse -- one posted
+  -- event per peak per frame. Keyed on nl_frame, not on nl_res: if the trace came from the
+  -- native path and the results did not read back, the answer is no peaks, not a question
+  -- put to a primitive that cannot answer it.
+  if fftsa.nl_frame then
+    local res = fftsa.nl_res
     for i = 1, count do
-      hz[i], v[i] = res.hz[i], res.v[i]
+      if res == nil then hz[i], v[i] = nil, nil
+      else hz[i], v[i] = res.hz[i], res.v[i] end
     end
     return hz, v
   end
@@ -568,10 +585,14 @@ end
 
 -- Distortion, signal-to-noise and the noise floor, from whichever path produced the
 -- spectrum on screen. thd is a FRACTION, as dsp.distortion() reports it; the THD line
--- turns it into a percentage. Each figure is nil where the measurement did not apply.
+-- turns it into a percentage. Each figure is nil where the measurement did not apply, and
+-- all three are nil on a native frame whose results block did not read back.
 function fftsa.distortion()
-  local res = fftsa.nl_res
-  if res ~= nil then return res.thd, res.snr, res.noise end
+  if fftsa.nl_frame then
+    local res = fftsa.nl_res
+    if res == nil then return nil, nil, nil end
+    return res.thd, res.snr, res.noise
+  end
   return dsp.distortion()
 end
 
@@ -579,7 +600,7 @@ end
 -- decimal places off this, and dsp.fft.samples is the OTHER implementation's plan: on the
 -- native path that figure describes a transform nothing ran.
 function fftsa.plan_n()
-  if fftsa.nl_res ~= nil then return fftsa.n end
+  if fftsa.nl_frame then return fftsa.n end
   return dsp.fft.samples
 end
 
@@ -605,9 +626,16 @@ function fftsa.frame_body()
   -- usable for the plan in force -- no binary in the archive, a boot that already spent
   -- its install, or a sample count above what the arena was sized for.
   --
-  -- nl_res is cleared FIRST and set only on success, so everything that reads it -- the
-  -- peak table, the THD line, plan_n -- is reading this frame or nothing.
+  -- BOTH FLAGS ARE CLEARED FIRST and set only on success, so everything that reads them --
+  -- the peak table, the THD line, plan_n -- is reading this frame or nothing.
+  --
+  -- Two flags and not one: nl_frame says which primitive produced the spectrum, nl_res
+  -- holds the figures that came with it. They can disagree -- a trace written and the
+  -- results block failing to read back -- and keying the peak table on nl_res alone would
+  -- then send it to dsp.peak(), which has run no transform on this path and posts
+  -- "no spectrum yet" once per peak per frame.
   local nseg
+  fftsa.nl_frame = false
   fftsa.nl_res = nil
   if fftsa.nl_usable() then
     -- A short record is refused rather than transformed: zero-padding the tail gives a
@@ -633,6 +661,7 @@ function fftsa.frame_body()
       nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
     else
       fftsa.binhz = binhz
+      fftsa.nl_frame = true
       fftsa.nl_res = fftsa.nl.results()
       -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
       if nseg > 0 then
@@ -655,7 +684,7 @@ function fftsa.frame_body()
   -- binhz: measured from the capture's timestamps on the native path, where it is already
   -- set above and is the figure dsp_reduce was given, so the markers and the trace cannot
   -- describe different frequencies. From the primitive's own read-back otherwise.
-  if fftsa.nl_res == nil then
+  if not fftsa.nl_frame then
     fftsa.binhz = dsp.fft.binwidth
   end
   -- Segments the widget was actually handed, from the primitive's own count rather than
@@ -1871,6 +1900,15 @@ end
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
+
+  -- The refusal the capability gate promised, taken before anything is built. Without it
+  -- the first dsp.* write is inside apply(), so the whole screen set is created and then
+  -- torn down again by start_failed -- and a create/delete cycle risks part of the
+  -- 463-object pool for the rest of the power cycle.
+  if fftsa.dsp_absent then
+    return fftsa.start_failed("no DSP implementation: the archive was built without "
+                              .. "dsp_lua.tsp and this instrument has no dsp module")
+  end
 
   -- The display object pool running out is a RETURN, not a raise: display.create answers
   -- nil and posts one event, and build() passes that up as false and a reason. Handled

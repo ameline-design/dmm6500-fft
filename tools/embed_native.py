@@ -20,10 +20,12 @@ so the embedded NUL bytes a binary is full of are copied faithfully. Lua 5.0.2 h
 """
 
 import argparse
+import base64
 import os
 import sys
 
-PIECE = 2048  # bytes of binary per Lua string literal
+PIECE = 2048   # bytes of binary per Lua string literal
+B64_PIECE = 3072   # base64 characters per literal, a multiple of 4 so pieces concatenate
 
 
 def lua_pieces(data, var, piece=PIECE):
@@ -37,6 +39,33 @@ def lua_pieces(data, var, piece=PIECE):
     for i in range(0, len(data), piece):
         lit = ''.join('\\%03d' % b for b in data[i:i + piece])
         out.append("'%s'," % lit)
+    out.append('})')
+    return out
+
+
+def lua_b64(data, var, piece=B64_PIECE):
+    """`var` assigned from a table.concat of base64 literals, plus `var`_LEN.
+
+    FOUR CHARACTERS PER THREE BYTES instead of four per one. Decimal escapes are what
+    ki.memwrite needs and Lua 5.0.2 has no \\xNN, so the blob used to cost 4.0 characters a
+    byte: 27 KB of image became 109 KB of script source, which the instrument reads and
+    parses at every app launch. This is 1.34, and nl.init decodes it once.
+
+    No '=' padding: the binary is padded to a multiple of three and the true length is
+    emitted beside it, so the decoder is a flat four-to-three loop with no tail case. A
+    decoder with a tail case is a decoder with a branch nothing exercises until the day the
+    image length changes residue.
+
+    Each piece is a whole number of base64 quanta, so concatenating them is the same string
+    as encoding the whole blob.
+    """
+    pad = (3 - len(data) % 3) % 3
+    text = base64.b64encode(data + b'\0' * pad).decode('ascii')
+    assert '=' not in text, 'padded to a multiple of three, so there can be no ='
+    out = ['%s_LEN = %d' % (var, len(data)),
+           '%s = table.concat({' % var]
+    for i in range(0, len(text), piece):
+        out.append("'%s'," % text[i:i + piece])
     out.append('})')
     return out
 
@@ -75,7 +104,7 @@ def main():
         '-- %d bytes of image, %d relocation bytes.' % (len(image), 0),
         '',
     ]
-    lines.extend(lua_pieces(image, 'fftsa.nl._DSP_CODE'))
+    lines.extend(lua_b64(image, 'fftsa.nl._DSP_CODE_B64'))
     lines.append('')
     lines.append('-- Relocation table and the target struct sizes, from emit_reloc.py.')
     # The generated file assigns _DSP_RELOC as one literal; re-emit it in pieces for the
@@ -95,7 +124,7 @@ def main():
     if reloc_bytes is None:
         sys.exit('no _DSP_RELOC assignment found in %s' % lua_path)
 
-    lines.extend(lua_pieces(reloc_bytes, 'fftsa.nl._DSP_RELOC'))
+    lines.extend(lua_b64(reloc_bytes, 'fftsa.nl._DSP_RELOC_B64'))
     lines.append('')
     lines.extend(passthrough)
     lines.append('')
@@ -108,11 +137,13 @@ def main():
         fh.write(body)
 
     longest = max(len(x) for x in lines)
+    blob = len(image) + len(reloc_bytes)
     print('%s' % args.out)
-    print('  image   %7d bytes -> %d literal(s)'
-          % (len(image), (len(image) + PIECE - 1) // PIECE))
-    print('  relocs  %7d bytes -> %d entries' % (len(reloc_bytes), len(reloc_bytes) // 9))
-    print('  module  %7d bytes, longest line %d' % (len(body), longest))
+    print('  image   %7d bytes' % len(image))
+    print('  relocs  %7d bytes, %d entries' % (len(reloc_bytes), len(reloc_bytes) // 9))
+    print('  module  %7d bytes, longest line %d  (%.2f characters a byte against %.2f '
+          'for decimal escapes)'
+          % (len(body), longest, float(len(body)) / blob, 4.0))
 
 
 if __name__ == '__main__':

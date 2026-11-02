@@ -211,7 +211,9 @@ class DMM:
         cycle is never needed.
         """
         try:
-            self.q('display.lightstate = display.STATE_LCD_100', timeout=20)
+            # 25%, the lowest step above off. Visible is the whole requirement here, and
+            # the panel sits on a bench for hours at a time.
+            self.q('display.lightstate = display.STATE_LCD_25', timeout=20)
             self.q('display.changescreen(display.SCREEN_HOME)', timeout=20)
         except Exception:
             pass

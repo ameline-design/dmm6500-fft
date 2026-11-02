@@ -323,7 +323,17 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME f64_pack
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_f64.py)
-    set_tests_properties(f64_pack PROPERTIES
+
+    # The archive carries the image as base64, so there is a decoder between the compiler
+    # and the CPU. A wrong byte there is not a failure to load: it is one instruction or
+    # one float constant quietly different, which relocation then places perfectly.
+    add_test(NAME b64_blob
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_b64.py)
+    add_test(NAME b64_blob_selftest
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_b64.py --self-test)
+    set_tests_properties(f64_pack b64_blob b64_blob_selftest PROPERTIES
                          ENVIRONMENT "LUA502=${LUA502}")
   endif()
 endif()

@@ -9,6 +9,11 @@ The short version: **precision is not what this app pays for, and neither is the
 It pays for interpreter dispatch and for marshalled calls across the TSP API. Every lever below is
 about doing fewer operations, not cheaper ones.
 
+The compiled path, added at the end of this file, confirms that from the other side: the same
+transform, power pass, reduction and peak search, compiled for the e300c4 and branched into from
+Lua, is **3.1 ms** where the interpreted versions of those four phases cost 32.6 ms between them.
+The arithmetic was never the price.
+
 ## The displayed frame rate is quantised, and the app chooses which tick it lands on
 
 The app offers 512 through 16,384 samples in Options, retaining 512 as the default. Every size was
@@ -564,3 +569,51 @@ Two arguments only -- `bit.bitand(255, 60, 15)` returns 60, silently ignoring th
 range works and results come back unsigned: `bit.bitor(2147483648, 1)` is 2147483649. There is no
 `bitnot`; complement is `bit.bitxor(x, 0xFFFFFFFF)`. A non-number raises `-104` "Data type error",
 and a bad index or width raises `-222` "Parameter data out of range".
+
+## The compiled path: 3.1 ms for the whole DSP stage
+
+Measured 2026-11-02 on the same instrument, at N = 512 with 127 trace points, over ten calls timed
+on the instrument's own `os.clock`. `csrc/dsp.c` compiled for the e300c4, loaded into a reading
+buffer's chunk storage and branched into from Lua (`notes/firmware/fwmem-CODEXEC.md` in the
+serial-decode repo has the mechanism). One call does the whole stage:
+
+| phase | interpreted, from the table above | compiled |
+|---|---|---|
+| `fft_load` | 14.3 ms | |
+| `fft_run` | 14.4 ms | |
+| `fft_power` | 2.0 ms | |
+| `find_peaks` | 1.9 ms | |
+| the 255-point trace fill, inside `sg_update` | ~1.8 ms | |
+| distortion and noise | not measured; a second pass over the bins | |
+| **total** | **34.4 ms** | **3.1 ms** |
+
+The compiled figure includes work the interpreted column does not: `dsp_reduce` writes the trace
+straight into the graph buffer's chunk storage as `(dB, Hz)` pairs, and `dsp_thd_noise` runs as well,
+so the single call leaves the trace, the ranked peaks and the THD/SNR/noise figures all ready.
+
+**What that does and does not buy, arithmetically.** `digitize.read` is still 6.4 ms and the paint
+inside `sg_update` is still proportional to graph area, so the frame does not fall by 31 ms. Taking
+the 81.8 ms column and substituting: minus the four interpreted phases (32.6), minus the 255-point
+fill the reduction now does itself (~1.8), plus the one call (3.1), is **about 50 ms**.
+
+**Which is the bucket boundary itself, and that is not a result.** `displayed = 1 / (0.05 *
+ceil(frame / 0.05))` admits 20 fps at or under 50 ms and 10 fps at anything above, so a frame
+landing at 50.5 displays exactly as slowly as one at 81.8. The substitution above is also arithmetic
+on a table taken at a 784x272 graph where the app now ships 784x312, which is 7.4 % more paint. So
+the honest statement is that the compiled path brings N = 512 **to** the boundary the rest of this
+document concluded nothing smaller could reach, and whether it crosses it has to be counted on the
+instrument -- completed frames against the wall clock, which is the measurement the "not yet
+verified on hardware" section above already asks for.
+
+### The ceiling is the chunk, not the arithmetic
+
+The native path tops out at **N = 2048**, and the reason is memory geometry rather than speed. A
+reading buffer's chunk payload is a fixed 32,768 bytes; the de-strided capture is `n` doubles and has
+to be contiguous inside one of them, and `dsp_plan_init_segs` separately puts the window -- also `n`
+entries -- in a chunk of its own. With `dsp_real` as `double` both bound `n` at 4,092, so the next
+power of two down is 2048. Above that the app runs the interpreted path, which is why it is still in
+the archive.
+
+`dsp.c` builds in single precision as well, and the test suite passes in both. That would double the
+ceiling to 4096 and put the transform on the e300c4's single-precision multiply-add array, which
+issues and completes one per cycle. It is the obvious next measurement and has not been taken.
