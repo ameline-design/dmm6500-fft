@@ -376,9 +376,15 @@ end
 -- has changed, which is the one thing that can move the storage. apply() replaces the
 -- capture buffer when the sample count moves.
 --
--- A 32-byte element is required rather than hoped for: the native side walks elements at a
--- hard-coded stride of 32, and a buffer style with a different element size would have it
--- read every sample from the wrong place.
+-- THE SECOND ARGUMENT SAYS WHETHER THE BUFFER STORES EXTRA VALUES, and it is this code's
+-- answer rather than something describe() may discover: reading .extravalues on a
+-- STYLE_STANDARD buffer posts event 4927, for which the firmware puts a modal dialog on the
+-- glass over the running app. pcall is no defence -- it posts where it does not raise. The
+-- capture is STYLE_STANDARD and the trace buffer is STYLE_WRITABLE_FULL, both created here.
+--
+-- The trace buffer must have a 32-byte element, because the native side writes the
+-- frequency to the extra value at +20 and only an element that long has one. The capture's
+-- element size is whatever its style gives and is passed through to the primitive.
 function fftsa.nl_bind()
   local nl = fftsa.nl
   if nl == nil or not nl.ready or fftsa.cap == nil or fftsa.sg_buf == nil then
@@ -387,13 +393,13 @@ function fftsa.nl_bind()
   end
   if fftsa.nl_cap == nil or fftsa.nl_cap_of ~= fftsa.cap then
     fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
-    local c = nl.describe(fftsa.cap)
-    if c == nil or c.elemsize ~= 32 then return false end
+    local c = nl.describe(fftsa.cap, false)
+    if c == nil then return false end
     fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
   end
   if fftsa.nl_out == nil or fftsa.nl_out_of ~= fftsa.sg_buf then
     fftsa.nl_out, fftsa.nl_out_of = nil, nil
-    local o = nl.describe(fftsa.sg_buf)
+    local o = nl.describe(fftsa.sg_buf, true)
     if o == nil or o.elemsize ~= 32 then return false end
     fftsa.nl_out, fftsa.nl_out_of = o, fftsa.sg_buf
   end
@@ -637,7 +643,19 @@ function fftsa.frame_body()
   local nseg
   fftsa.nl_frame = false
   fftsa.nl_res = nil
-  if fftsa.nl_usable() then
+  local native = fftsa.nl_usable()
+  -- A WRAPPED capture comes back ROTATED: readings[1] is the ring's physical slot 1 and the
+  -- oldest reading sits at startindex, so a linear walk over the storage transforms the
+  -- record in the wrong order -- every frequency wrong, and nothing on the plot to say so.
+  -- Only a full buffer can have wrapped and this one is four times the record, so this is
+  -- expected never to fire; it is one attribute read and the failure it guards is silent.
+  -- Not a demotion: the next capture may well be in order, so the frame falls back and the
+  -- occurrence is counted.
+  if native and fftsa.cap.startindex ~= nil and fftsa.cap.startindex ~= 1 then
+    fftsa.nl_rotated = (fftsa.nl_rotated or 0) + 1
+    native = false
+  end
+  if native then
     -- A short record is refused rather than transformed: zero-padding the tail gives a
     -- convincing and false broadband spectrum, and a trigger timeout is the ordinary
     -- cause. dsp.spectrum makes the same test against its own srclength.

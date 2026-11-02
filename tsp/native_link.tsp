@@ -69,7 +69,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 51
+fftsa.nl.PARAM_WORDS = 52
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -465,7 +465,14 @@ end
 fftsa.nl.SEED_READS = 6
 local READ_CONFIRM = fftsa.nl.SEED_READS
 
-function fftsa.nl._find_storage(buf)
+-- Returns the slot 0 address and the MEASURED element stride, or nil.
+--
+-- has_extras IS THE CALLER'S KNOWLEDGE, not something to discover. Reading .extravalues on
+-- a STYLE_STANDARD buffer posts event 4927 and the firmware puts a MODAL DIALOG on the
+-- glass for it, over the running app. pcall does not help -- the firmware posts where it
+-- does not raise, so the call succeeds and returns nil while the operator gets a dialog.
+-- Every caller created the buffer it is asking about and knows the style it asked for.
+function fftsa.nl._find_storage(buf, has_extras)
   local n = buf.n
   if n == nil or n < READ_CONFIRM then return nil end
   local rd, ex = {}, nil
@@ -474,20 +481,26 @@ function fftsa.nl._find_storage(buf)
     rd[i] = buf.readings[i]
     if rd[i] == nil then return nil end
   end
-  -- A STYLE_STANDARD buffer has no extra values, and reading the attribute is the only way
-  -- to find out; a refusal there is an answer, not a failure.
-  local ok, e = pcall(function()
-    return { buf.extravalues[1], buf.extravalues[2], buf.extravalues[3] }
-  end)
-  if ok and e[1] ~= nil and e[2] ~= nil and e[3] ~= nil then ex = e end
-  -- Nothing to discriminate on: identical readings and no extras means every element
-  -- matches and the first hit decides, which is a guess. Refuse instead.
-  if ex == nil then
-    local differs = false
-    for i = 2, READ_CONFIRM do
-      if rd[i] ~= rd[1] then differs = true end
+  if has_extras then
+    ex = {}
+    for i = 1, 3 do
+      ex[i] = buf.extravalues[i]
+      if ex[i] == nil then return nil end
     end
-    if not differs then return nil end
+  end
+  -- A READING FROM THE FAR END, which is what no small record can imitate. The firmware
+  -- keeps separate 16-byte records of the same values -- the extra-value records and the
+  -- statistics accumulators -- and a seeded buffer's first six readings were MEASURED at
+  -- stride 16 at an address that is not element storage at all. Six consecutive values
+  -- prove very little; the same series still holding at index 256 proves it is an array of
+  -- at least that many. Capped at 256 so the index is inside the FIRST chunk whatever the
+  -- element size turns out to be: the smallest plausible element is 8 bytes, which still
+  -- puts 4096 elements in a chunk.
+  local far = {}
+  local fn = 0
+  for i = 1, 2 do
+    local j = (i == 1) and 64 or 256
+    if j > READ_CONFIRM and j <= n then fn = fn + 1; far[fn] = j end
   end
   local needle = f64_pack(rd[1])
   local windows = {
@@ -500,16 +513,50 @@ function fftsa.nl._find_storage(buf)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      local good = true
-      for i = 2, READ_CONFIRM do
-        if not eq64(h + (i - 1) * 32, rd[i]) then good = false end
-      end
-      if good and ex ~= nil then
-        for i = 1, 3 do
-          if not eq64(h + (i - 1) * 32 + 20, ex[i]) then good = false end
+      -- Element 0 is a chunk payload, and the allocator guarantees 16. A hit that is not
+      -- 16-aligned cannot be one, whatever else it holds -- which is how the first of the
+      -- two measured decoys, at 0x03219B08, is refused before any value is compared.
+      if math.mod(h, 16) == 0 then
+        -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
+        -- measures, the extra value at +20 only exists in an element that long, and
+        -- assuming it was load-bearing: measuring the stride from the spacing of the
+        -- readings instead found a 16-byte record holding the same six values. So 32 is
+        -- tried first and the measured offsets are the fallback, for a STYLE_STANDARD
+        -- buffer whose element really is smaller. Each candidate gets the FULL
+        -- confirmation before it is accepted.
+        local cands, cn = { 32 }, 1
+        if rd[2] ~= rd[1] then
+          local off
+          for off = 8, 64, 4 do
+            if off ~= 32 and eq64(h + off, rd[2]) then cn = cn + 1; cands[cn] = off end
+          end
+        end
+        local ci
+        for ci = 1, cn do
+          local s = cands[ci]
+          local good = true
+          for i = 2, READ_CONFIRM do
+            if not eq64(h + (i - 1) * s, rd[i]) then good = false end
+          end
+          -- The far readings, which is the check a 16-byte record cannot pass.
+          for i = 1, fn do
+            if not eq64(h + (far[i] - 1) * s, buf.readings[far[i]]) then good = false end
+          end
+          -- The extra values, which also tell two elements of a seeded buffer apart when
+          -- every reading in it is the same. They only exist in an element long enough to
+          -- hold one, so a buffer that HAS them is a buffer whose element is at least 28 --
+          -- which makes this a stride test as well as a value test.
+          if ex ~= nil then
+            if s < 28 then good = false
+            else
+              for i = 1, 3 do
+                if not eq64(h + (i - 1) * s + 20, ex[i]) then good = false end
+              end
+            end
+          end
+          if good then return h, s end
         end
       end
-      if good then return h end
     end
   end
   return nil
@@ -537,9 +584,17 @@ function fftsa.nl._find_desc(elem0)
         local elemsize = W(base + 8)
         local perchunk = W(base + 12)
         local nchunks  = W(base + 16)   -- 0x10, chunk count
+        -- PERCHUNK IS HOW MANY ELEMENTS FIT IN A CHUNK, NOT CHUNK_BYTES / 32. The payload
+        -- is a fixed 32,768 bytes but the element size is a runtime field, and a
+        -- STYLE_STANDARD element is 24 -- measured -- which does not divide it: 1365
+        -- elements fill 32,760 and leave 8 spare. Demanding an exact product was demanding
+        -- a 32-byte element, so the capture buffer's descriptor was refused and the native
+        -- path silently fell back. The test below still pins perchunk exactly: one more
+        -- element would not fit.
         if elemsize ~= nil and perchunk ~= nil and nchunks ~= nil and
-           nchunks > 0 and nchunks < 4096 and
-           elemsize * perchunk == fftsa.nl.CHUNK_BYTES then
+           nchunks > 0 and nchunks < 4096 and elemsize >= 8 and perchunk > 0 and
+           elemsize * perchunk <= fftsa.nl.CHUNK_BYTES and
+           elemsize * (perchunk + 1) > fftsa.nl.CHUNK_BYTES then
           -- 0x44 is the chunk vector. The count comes back with it because a caller
           -- indexing the vector has no other way to know where it ends: reading one
           -- entry too far returns whatever follows it in the heap, and an address that
@@ -581,6 +636,7 @@ function fftsa.nl.write_params(t)
     t.plan_addr or 0,
     t.src_flat or 0,
     t.cap_chunk1 or 0, t.cap_chunk2 or 0, t.cap_n or 0, t.cap_perchunk or 0,
+    t.cap_stride or 32,
     t.out_chunk1 or 0, t.out_chunk2 or 0, t.out_perchunk or 0, t.out_desc or 0,
     fn.lua_pushnumber or 0,
     fn.sin or 0, fn.cos or 0, fn.sqrt or 0,
@@ -831,7 +887,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   buffer.getstats(bar)
 
   trace('scan.code')
-  local code_base = nl._find_storage(cb)
+  -- true: cb is STYLE_WRITABLE_FULL, seeded with distinct readings AND distinct extras.
+  local code_base, code_stride = nl._find_storage(cb, true)
+  if code_stride ~= nil and code_stride ~= 32 then
+    -- The layout below places the trampoline and the params struct by byte offset inside
+    -- this chunk, which is true whatever the element size is -- but a WRITABLE_FULL element
+    -- being anything but 32 would mean the measured layout has moved under us.
+    trace('code.stride.BAD', code_stride)
+    return fftsa.nl._abort(cb)
+  end
   if not code_base then return fftsa.nl._abort(cb) end
   trace('code_base', hx(code_base))
   nl.code_buf  = cb
@@ -942,7 +1006,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   buffer.getstats(bar)
 
   trace('scan.plan')
-  local pdesc = nl.describe(pb)
+  -- STYLE_WRITABLE_FULL, so it does store extra values and asking for them is safe.
+  local pdesc = nl.describe(pb, true)
   if pdesc == nil or pdesc.vec == nil then return fftsa.nl._abort(cb, pb) end
   trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
 
@@ -1164,7 +1229,7 @@ function fftsa.nl.call_dsp(cap, out, red)
     seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
     plan_addr = nl.plan_addr, src_flat = nl.src_flat,
     cap_chunk1 = cap.chunk1, cap_chunk2 = cap.chunk2,
-    cap_n = nl.n, cap_perchunk = cap.perchunk,
+    cap_n = nl.n, cap_perchunk = cap.perchunk, cap_stride = cap.elemsize,
     out_chunk1 = out.chunk1, out_chunk2 = out.chunk2,
     out_perchunk = out.perchunk, out_desc = out.desc,
     red_nseg = ns, red_k0 = red.k0, red_k1 = red.k1,
@@ -1242,11 +1307,16 @@ end
 
 -- Describe a buffer's storage for call_dsp, from the content scan and descriptor walk.
 -- Returns nil if either step fails, so a caller cannot build a half-filled table.
-function fftsa.nl.describe(buf)
-  local elem0 = fftsa.nl._find_storage(buf)
+function fftsa.nl.describe(buf, has_extras)
+  local elem0, stride = fftsa.nl._find_storage(buf, has_extras)
   if not elem0 then return nil end
   local desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
   if not desc then return nil end
+  -- TWO INDEPENDENT ANSWERS TO THE SAME QUESTION, so they have to agree: the stride the
+  -- content scan measured from the spacing of the readings, and the element size the
+  -- descriptor states. Disagreement means the hit is not this buffer's storage, or the
+  -- descriptor is not this buffer's descriptor, and either way nothing below is safe.
+  if elemsize ~= stride then return nil end
   -- The window must cover both payloads, and they are scattered: the second is often
   -- BELOW the first, measured at 0x360D600 and 0x36055F0. Taking hi from the second
   -- unconditionally gave hi < lo, which dsp_native_run rejects as EBOUNDS, so the native

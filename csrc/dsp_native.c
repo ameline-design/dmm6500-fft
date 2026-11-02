@@ -114,10 +114,15 @@ typedef struct {
     uint32_t plan_addr;    /* dsp_plan, initialised by dsp_plan_init at startup      */
     uint32_t src_flat;     /* scratch for the de-strided capture, cap_n doubles      */
 
-    uint32_t cap_chunk1;   /* capture chunk payloads, stride 32, reading at +0       */
+    uint32_t cap_chunk1;   /* capture chunk payloads, reading at +0                  */
     uint32_t cap_chunk2;   /* 0 when the capture fits one chunk                     */
     uint32_t cap_n;        /* samples, a power of two                               */
     uint32_t cap_perchunk; /* elements per chunk, from the descriptor               */
+    uint32_t cap_stride;   /* capture element size in bytes.  NOT ASSUMED TO BE 32: */
+                           /* a STYLE_STANDARD buffer stores no extra value and is  */
+                           /* smaller, and the capture is one.  Measured by          */
+                           /* nl._find_storage and cross-checked against the         */
+                           /* descriptor's own field.                                */
 
     uint32_t out_chunk1;   /* graph buffer chunk payloads                           */
     uint32_t out_chunk2;
@@ -249,7 +254,7 @@ const uint32_t dsp_native_sizes[8] = {
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  51
+#define DSP_NATIVE_PARAM_WORDS  52
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -358,12 +363,21 @@ void *memset(void *s, int c, size_t n)
 /* -------------------------------------------------------------------------
  * Reading buffer element access: elements of `stride` bytes, reading double at +0.
  * -------------------------------------------------------------------------*/
-static double rb_read(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k)
+
+/* The capture's stride is whatever its style gives, so the reading at +0 of element k is
+ * only 4-aligned in general and a `double *` there would be undefined.  Two words through
+ * a union instead: the de-stride is n iterations against a transform of n log n, so the
+ * extra load pair is not measurable, and it makes any 4-aligned stride legal. */
+static double rb_read(uint32_t ch1, uint32_t ch2, uint32_t perchunk, uint32_t stride, int k)
 {
-    uint32_t idx = (uint32_t)k;
+    union { double d; uint32_t w[2]; } u;
+    uint32_t idx  = (uint32_t)k;
     uint32_t base = (idx < perchunk) ? ch1 : ch2;
     uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
-    return *(const double *)(uintptr_t)(base + off * 32U);
+    const uint32_t *p = (const uint32_t *)(uintptr_t)(base + off * stride);
+    u.w[0] = p[0];
+    u.w[1] = p[1];
+    return u.d;
 }
 
 static void rb_write(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k, double v)
@@ -620,12 +634,21 @@ int dsp_native_run(void *L)
         push(L, (double)DSPN_ESCRATCH); return 1;
     }
 
-    /* Capture storage: read only, and only within what Lua declared. */
+    /* Capture storage: read only, and only within what Lua declared.
+     *
+     * The stride is the capture's own element size, not 32: a STYLE_STANDARD buffer stores
+     * no extra value and is smaller.  It has to hold a double at +0, be 4-aligned so the
+     * pair of word loads is legal, and tile the chunk exactly -- which is the descriptor's
+     * own invariant, so a stride that fails it is not this buffer's. */
     {
         uint32_t in_first  = (uint32_t)n < p->cap_perchunk ? (uint32_t)n : p->cap_perchunk;
         uint32_t in_second = (uint32_t)n - in_first;
-        if (!stride_ok_rd(p, p->cap_chunk1, in_first, 32U) ||
-            !stride_ok_rd(p, p->cap_chunk2, in_second, 32U)) {
+        if (p->cap_stride < 8U || (p->cap_stride & 3U) != 0U ||
+            p->cap_perchunk == 0U ||
+            p->cap_stride * p->cap_perchunk > DSPN_CHUNK_BYTES ||
+            p->cap_stride * (p->cap_perchunk + 1U) <= DSPN_CHUNK_BYTES ||
+            !stride_ok_rd(p, p->cap_chunk1, in_first, p->cap_stride) ||
+            !stride_ok_rd(p, p->cap_chunk2, in_second, p->cap_stride)) {
             push(L, (double)DSPN_ECAPTURE); return 1;
         }
     }
@@ -692,7 +715,8 @@ int dsp_native_run(void *L)
     /* Every address has passed.  From here on memory is touched. */
     src = (double *)(uintptr_t)p->src_flat;
     for (k = 0; k < n; k++) {
-        src[k] = rb_read(p->cap_chunk1, p->cap_chunk2, p->cap_perchunk, k);
+        src[k] = rb_read(p->cap_chunk1, p->cap_chunk2, p->cap_perchunk,
+                         p->cap_stride, k);
     }
 
     nbins = dsp_spectrum_run(plan_w, src, n, NULL);

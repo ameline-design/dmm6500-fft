@@ -72,7 +72,7 @@ def cap(d, path, live=False, tries=3):
     time.sleep(0.25)
     if live:
         try:
-            d.q('fftsa.saved_frame()', timeout=60)
+            d.exec('fftsa.saved_frame()', timeout=120)
         except Exception:
             pass
         time.sleep(0.3)
@@ -105,26 +105,36 @@ def main():
 
     clear_dead_sockets()
     d = DMM(timeout=180)
-    d.q('reset()')
+    d.exec('reset()', timeout=60)
     # 25%, the lowest step above off. The LXI screenshot does not read the backlight, so
     # nothing here needs the panel bright.
-    d.q('display.lightstate = display.STATE_LCD_25')
-    d.q('eventlog.clear()')
+    d.exec('display.lightstate = display.STATE_LCD_25')
+    d.exec('eventlog.clear()')
+    # The app's single global, dropped before the modules are reloaded. A previous run that
+    # raised part-way through a module leaves fftsa holding whatever it had defined by then,
+    # and the fields a half-loaded module left behind are indistinguishable from the ones
+    # this load is about to write.
+    d.exec('fftsa = nil')
 
     print('modules   :')
     for name, path in MODULES:
         print(f'  {name:8}: {load_file(d, name, f"{ROOT}/{path}")}')
     print('  log     :', log(d))
-    d.q('eventlog.clear()')
+    d.exec('eventlog.clear()')
 
     d.q('pcall(function() fftsa.stop() end) print("cleaned")', timeout=120)
     if not alive(d):
         print('unresponsive after cleanup'); return 2
 
     # ---- the one build ----
-    print('start     :', d.q('fftsa.start()', timeout=300))
+    # 900 s, not 300: start() installs the native image, and that costs FOUR content scans
+    # over the heap -- two inside nl.init to find the code and plan buffers, two more in
+    # nl_bind for the capture and trace buffers. Each is about a minute. A timeout shorter
+    # than the work does not just lose the answer: the late reply arrives while the next
+    # query is waiting and every read after it is one behind.
+    print('start     :', d.q('fftsa.start()', timeout=900))
     print('  log     :', log(d))
-    d.q('eventlog.clear()')
+    d.exec('eventlog.clear()')
     # Freeze the frame loop for the whole verification: while the timer runs, its
     # per-frame digitize collides with host queries ("a command from another
     # interface is running"). Thawed at the very end so the app runs on its own.
@@ -156,6 +166,15 @@ def main():
         'print(string.format("native: npk=%d nbins=%s thd=%s snr=%s floor=%s", '
         'r.npk, tostring(r.nbins), tostring(r.thd), tostring(r.snr), '
         'tostring(r.noise))) end', timeout=60))
+    # The two buffers' storage as the bind resolved it. The capture's element size is the
+    # interesting one: STYLE_STANDARD stores no extra value, so it is not 32, and the
+    # primitive strides by whatever this says.
+    print('  buffers  :', d.q(
+        'local c, o = fftsa.nl_cap, fftsa.nl_out '
+        'local function f(t) if t == nil then return "unbound" end '
+        'return string.format("elem %d perchunk %d chunks %s at %X", '
+        't.elemsize, t.perchunk, tostring(t.nchunks), t.chunk1) end '
+        'print("cap " .. f(c) .. " | out " .. f(o))', timeout=60))
     print('  trace    :', d.q(
         'print(string.format("nwrote=%s n=%s first=(%.2f dB, %.1f Hz) last=(%.2f dB, %.1f Hz)", '
         'tostring(fftsa.sg_nwrote), tostring(fftsa.sg_buf.n), '

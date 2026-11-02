@@ -288,8 +288,17 @@ find_program(LUA502 lua HINTS $ENV{HOME}/tmp/lua502/lua-5.0.2/bin NO_DEFAULT_PAT
 if(LUA502)
   add_test(NAME relocate_applier
            COMMAND ${LUA502} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_relocate.lua)
+
+  # The app's own suite, which loads the REAL tsp/*.tsp against a mock of the instrument
+  # API -- 456 assertions including the object-lifetime invariant and a direct DFT against
+  # the shipped transform. It was runnable by hand and in no gate, so a change to
+  # spectrum_app.tsp could pass everything this file knew about. It needs the repo root as
+  # its working directory, because it loads the modules by relative path.
+  add_test(NAME app_tsp
+           COMMAND ${LUA502} tools/test_tsp.lua
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 else()
-  message(STATUS "Lua 5.0.2 not found; the relocate_applier gate will not run")
+  message(STATUS "Lua 5.0.2 not found; the relocate_applier and app_tsp gates will not run")
 endif()
 
 # The picker index and DSP_WINDOW_* are different numbers that currently coincide, and
