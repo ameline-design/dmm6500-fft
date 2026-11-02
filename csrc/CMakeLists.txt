@@ -413,11 +413,18 @@ if(DSP_DST_NATIVE)
       DSP_NO_SINGLE_MATH
       DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
       )
+  # -ffp-contract=fast HERE and nowhere else. The reason the host variants hold it off is to
+  # keep the single-against-double comparison honest -- an FMA makes the single build more
+  # accurate than a plain compiler would and hides what that comparison exists to measure.
+  # The target image is not in that comparison, and the e300c4 has a fused multiply-add that
+  # retires one a cycle, which is the butterfly's inner operation. Fusing is also strictly
+  # more accurate, one rounding rather than two, so the error bounds the host suite measures
+  # with contraction off remain upper bounds on what the target does.
   target_compile_options(dsp_native_elf PRIVATE
       -Os -fno-common -Wno-int-to-pointer-cast
       -ffunction-sections  # lets the linker script place dsp_native_run first
       -Wall -Wextra -Wconversion -Wdouble-promotion
-      -ffp-contract=off
+      -ffp-contract=fast
       -fno-builtin)
   # --unresolved-symbols=report-all so a libm call dsp.c makes that dsp_native.c does not
   # define is a build error rather than a branch to address zero.
