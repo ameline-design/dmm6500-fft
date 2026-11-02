@@ -409,17 +409,40 @@ local function via_peek8(addr, a1, a2)
     ok, r = pcall(ki.peek8, a1)
   end
   ki.poke32(slot, orig)
-  if not ok then return nil, r end
+  -- nl.last_call records whether the branch returned normally, because the return value
+  -- cannot. The trampoline ends in `li r3,0`, so a successful flush yields zero Lua values
+  -- and r is nil -- which is precisely what a raised error produces here too. Three runs
+  -- of probe_native.py reported the self-flush "clean" on the strength of a nil that
+  -- proved nothing, and it went into the notes as an established result. Callers that care
+  -- whether the code actually ran must read nl.last_call, not the return value.
+  fftsa.nl.last_call = ok
+  if not ok then
+    fftsa.nl.last_err = tostring(r)
+    return nil, r
+  end
+  fftsa.nl.last_err = nil
   return r
 end
 fftsa.nl._via_peek8 = via_peek8
 
 -- Flush written code out of the D-cache and invalidate the I-cache for it.
 local function flush(addr, len)
-  if fftsa.nl.tramp == 0 then return false end
-  via_peek8(fftsa.nl.tramp, hx(addr), hx(len))
-  return true
+  local nl = fftsa.nl
+  if nl.tramp == nil or nl.tramp == 0 then return false end
+  if addr == nil or len == nil or len <= 0 then return false end
+  -- REFUSE TO FLUSH THE TRAMPOLINE'S OWN RANGE. icbi on a line the CPU is executing from,
+  -- followed by isync, forces a re-fetch mid-function; that is the fault behind two
+  -- bluescreens. The caller has no business asking for it -- the barrier alone bootstraps
+  -- a fresh line -- so this is a refusal rather than a special case.
+  local tlo = nl.tramp
+  local thi = nl.tramp + string.len(nl._TRAMP)
+  if addr < thi and addr + len > tlo then return false end
+  via_peek8(nl.tramp, hx(addr), hx(len))
+  -- last_call, not the return value: the trampoline returns zero Lua values on success, so
+  -- nil cannot distinguish a clean flush from a raised error.
+  return nl.last_call == true
 end
+fftsa.nl.flush = flush
 
 -- Put ki.peek8 back. Refuses rather than writing a value that is not a .text address:
 -- a restore that writes garbage is worse than no restore, because the closure still
@@ -580,9 +603,30 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   trace('tramp.write', hx(tramp_at), string.len(nl._TRAMP))
   ki.memwrite(hx(tramp_at), nl._TRAMP)
   buffer.getstats(bar)
+
+  -- Confirm the bytes are where we think before branching to them. A read goes through the
+  -- D-cache so this cannot prove DRAM visibility -- that is the barrier's job -- but it does
+  -- catch a write that landed somewhere else entirely, which otherwise costs a bluescreen
+  -- and a power cycle to discover.
+  local back = ki.memread(hx(tramp_at), hx(string.len(nl._TRAMP)))
+  if back ~= nl._TRAMP then
+    trace('tramp.readback.BAD', (back == nil) and 'nil' or string.len(back))
+    return fftsa.nl._abort(cb)
+  end
+  trace('tramp.readback.ok')
+
   nl.tramp = tramp_at
-  trace('tramp.selfflush')
-  via_peek8(tramp_at, hx(tramp_at), hx(string.len(nl._TRAMP)))
+  -- NO SELF-FLUSH. The trampoline used to be asked to flush its own range as its first
+  -- act, and that is what bluescreened twice: dcbst_icbi_isync_range runs icbi on the
+  -- cache lines the CPU is executing from and then isync, which forces a re-fetch of the
+  -- instruction stream in the middle of the function. PC 0x035DA468 was trampoline+64, an
+  -- `mr r30,r3` that cannot fault as a data access but can certainly fail to be fetched.
+  --
+  -- It was never needed either. probe_tramp.py ran a 184-byte stub at a heap address with
+  -- the barrier alone and no flush of any kind, and it returned correct values -- the first
+  -- instruction fetch of a line that has not been fetched since boot snoops the D-cache,
+  -- so the barrier is sufficient to bootstrap. The trampoline earns its keep flushing
+  -- OTHER ranges, which is what the image needs; it must never be pointed at itself.
   trace('tramp.ok')
 
   -- 6. The image, patched for this load address.
@@ -592,8 +636,16 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   trace('img.reloc', string.len(img))
   ki.memwrite(hx(code_base), img)
   buffer.getstats(bar)
+  -- The image is a different range from the trampoline, so this is the trampoline's
+  -- legitimate use. The result is checked: a silent failure here leaves the I-cache able
+  -- to serve stale lines for the image, which is a wrong answer rather than a fault.
+  --
+  -- A failure is not fatal on a first install, because the image's lines have not been
+  -- fetched since boot either and the barrier covers them -- which is why this worked
+  -- before the flush result was ever examined. It is recorded rather than ignored.
   trace('img.flush')
-  flush(code_base, string.len(img))
+  nl.flushed = flush(code_base, string.len(img))
+  trace('img.flush.ok', tostring(nl.flushed))
   nl.entry = code_base
   trace('img.ok')
 
