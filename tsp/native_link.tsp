@@ -566,8 +566,11 @@ end
 --   lo, hi           the span the native code may touch in that buffer
 --   out.desc         the column descriptor base, for the cursor rewind
 --
--- Chunk payloads sit at a 0x8010 pitch, so [chunk1, chunk2 + 32768) is one contiguous
--- span covering both and the header between them.
+-- Chunk payloads are placed independently by the allocator: 0x8010 is the block size, not
+-- a pitch, and the second payload can sit below the first. So lo and hi span from the
+-- lowest payload to the highest plus CHUNK_BYTES, and the native side additionally requires
+-- each strided access to stay inside the chunk it starts in -- the span alone would permit
+-- whatever else lives between two scattered payloads.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.call_dsp(cap, out)
   local nl = fftsa.nl
@@ -600,16 +603,23 @@ function fftsa.nl.describe(buf)
   if not elem0 then return nil end
   local desc, elemsize, perchunk, vec = fftsa.nl._find_desc(elem0)
   if not desc then return nil end
+  -- The window must cover both payloads, and they are scattered: the second is often
+  -- BELOW the first, measured at 0x360D600 and 0x36055F0. Taking hi from the second
+  -- unconditionally gave hi < lo, which dsp_native_run rejects as EBOUNDS, so the native
+  -- path would have failed closed on every frame and fallen back to dsp.spectrum. Span
+  -- from the lowest to the highest, the same way nl.init does it.
   local ch2 = 0
+  local lo  = elem0
   local hi  = elem0 + fftsa.nl.CHUNK_BYTES
   if vec ~= nil then
     local second = W(vec + 4)
     if second ~= nil and second ~= 0 then
       ch2 = second
-      hi  = second + fftsa.nl.CHUNK_BYTES
+      if second < lo then lo = second end
+      if second + fftsa.nl.CHUNK_BYTES > hi then hi = second + fftsa.nl.CHUNK_BYTES end
     end
   end
   return { chunk1 = elem0, chunk2 = ch2, perchunk = perchunk,
            elemsize = elemsize, desc = desc, vec = vec,
-           lo = elem0, hi = hi }
+           lo = lo, hi = hi }
 end

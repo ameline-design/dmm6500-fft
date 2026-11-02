@@ -39,6 +39,12 @@
 #define DSPN_TEXT_LO   0x00004000U
 #define DSPN_TEXT_HI   0x00527000U
 
+/* One reading-buffer chunk payload.  0x8010 is the allocator's block size, not a pitch:
+ * payloads are placed independently and the second can sit below the first.  So a window
+ * covering several chunks necessarily also covers whatever lies between them, and the
+ * window alone is not a tight enough bound for a chunk access. */
+#define DSPN_CHUNK_BYTES  32768U
+
 /* Is [a, a+n) wholly inside [lo, hi)?  A zero-length range touches nothing and is
  * permitted anywhere; a range that wraps at 32 bits is not. */
 static int dspn_range_ok(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi)
@@ -91,8 +97,37 @@ static int dspn_stride_ok(uint32_t base, uint32_t k, uint32_t stride,
     if (k == 0U)         { return 1; }
     if (stride == 0U)    { return 0; }
     if (k > 0xFFFFFFFFU / stride) { return 0; }
-    return writable ? dspn_write_ok(base, k * stride, lo, hi)
-                    : dspn_read_ok(base, k * stride, lo, hi);
+    return (writable != 0) ? dspn_write_ok(base, k * stride, lo, hi)
+                           : dspn_read_ok(base, k * stride, lo, hi);
+}
+
+/* A strided walk over one chunk payload: inside the declared window, AND inside the single
+ * chunk it starts in.  The second test is what the window cannot do.  Payloads are
+ * scattered, so a window covering two of them also covers whatever the allocator put
+ * between -- for the pair measured on the instrument, 0x360D600 and 0x36055F0, the span is
+ * 65,552 bytes to hold 32,768 bytes of payload each, and 16 bytes of block header in
+ * between are not ours.  Without this, a walk could start at one payload and stride across
+ * that header into the other, and the window would permit it.
+ *
+ * It bounds the extent from the base; it does NOT authenticate the base.  There is no list
+ * of real payloads here, so an address in the inter-payload header looks like a chunk base
+ * and a short walk from it is accepted.  dsp_native_run only ever passes cap_chunk1/2 and
+ * out_chunk1/2 straight from the params struct, so a bad base means Lua declared a bad
+ * payload -- the same trust boundary as declaring a bad window.  Hence this tightens the
+ * window rather than replacing it, and both tests have to pass.
+ *
+ * base == 0 means "this buffer has no second chunk", which is only consistent with k == 0;
+ * a positive count from a null base is a caller bug and is refused rather than clamped. */
+static int dspn_chunk_stride_ok(uint32_t base, uint32_t k, uint32_t stride,
+                                uint32_t lo, uint32_t hi, int writable)
+{
+    if (k == 0U)    { return 1; }
+    if (base == 0U) { return 0; }
+    if (base > 0xFFFFFFFFU - DSPN_CHUNK_BYTES) { return 0; }
+    if (dspn_stride_ok(base, k, stride, base, base + DSPN_CHUNK_BYTES, writable) == 0) {
+        return 0;
+    }
+    return dspn_stride_ok(base, k, stride, lo, hi, writable);
 }
 
 #endif

@@ -252,3 +252,99 @@ TEST(StrideOk, ReadSideUsesTheReadGate) {
   // But not for the write side.
   EXPECT_FALSE(dspn_stride_ok(kText, 4, 32, 0U, DSPN_DRAM_END, 1));
 }
+
+// ---------------------------------------------------------------------------
+// Per-chunk containment. The declared window has to cover every chunk of a buffer and the
+// payloads are scattered -- 0x8010 is the allocator's block size, not a pitch -- so the
+// window is necessarily wider than the payloads it describes. The addresses here are the
+// real pair from E4c, where the second payload sits BELOW the first.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr uint32_t kChunk1 = 0x0360D600U;   // measured on the instrument
+constexpr uint32_t kChunk2 = 0x036055F0U;   // measured, 32784 bytes BELOW kChunk1
+constexpr uint32_t kSpanLo = kChunk2;
+constexpr uint32_t kSpanHi = kChunk1 + 32768U;
+}  // namespace
+
+TEST(ChunkStride, BothMeasuredChunksAcceptedWholeAndFull) {
+  EXPECT_TRUE(dspn_chunk_stride_ok(kChunk1, 1024, 32, kSpanLo, kSpanHi, 1));
+  EXPECT_TRUE(dspn_chunk_stride_ok(kChunk2, 1024, 32, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, OneElementPastEitherChunkRefused) {
+  // The window alone would permit this: kChunk2 + 32768 is still well below kSpanHi, so
+  // only the per-chunk bound refuses it. That gap is the reason the helper exists.
+  EXPECT_TRUE(dspn_range_ok(kChunk2, 1025 * 32, kSpanLo, kSpanHi));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk2, 1025, 32, kSpanLo, kSpanHi, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 1025, 32, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, AWalkCannotCrossFromOnePayloadIntoTheOther) {
+  // The span is 65,552 bytes to hold two 32,768-byte payloads, so between them sit 16
+  // bytes of allocator block header that the window covers and we do not own. This is the
+  // access the window cannot refuse: start at the lower payload and run long enough to
+  // reach the higher one. 1026 elements of 32 bytes from kChunk2 covers the header and the
+  // first 48 bytes of kChunk1.
+  constexpr uint32_t kReach = 1026;
+  static_assert(kChunk2 + kReach * 32 > kChunk1, "the walk must reach the other payload");
+  EXPECT_TRUE(dspn_range_ok(kChunk2, kReach * 32, kSpanLo, kSpanHi));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk2, kReach, 32, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, BoundsTheExtentButDoesNotAuthenticateTheBase) {
+  // A documented limitation, asserted so it cannot change silently. The helper confines a
+  // walk to DSPN_CHUNK_BYTES from wherever it starts; it has no list of real payloads, so
+  // a base in the inter-payload header looks like a chunk base to it and a short walk from
+  // there is accepted. That is not a hole in practice -- dsp_native_run only ever passes
+  // p->cap_chunk1/2 and p->out_chunk1/2, so a bad base means Lua declared a bad payload,
+  // which is the same trust boundary as declaring a bad window -- but it is the reason
+  // this check tightens the window rather than replacing it.
+  const uint32_t header = kChunk2 + 32768U;
+  EXPECT_TRUE(dspn_chunk_stride_ok(header, 1, 16, kSpanLo, kSpanHi, 1));
+  // What it still guarantees from that base: the extent, and the declared window.
+  EXPECT_FALSE(dspn_chunk_stride_ok(header, 1025, 32, kSpanLo, kSpanHi, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(header, 1, 16, kHeapLo, kChunk2, 1));
+}
+
+TEST(ChunkStride, AbsentSecondChunkIsZeroCountNotZeroBase) {
+  // chunk2 == 0 means "one chunk holds it all", which is only consistent with a zero
+  // count. A positive count from a null base is a caller bug, not an empty walk.
+  EXPECT_TRUE(dspn_chunk_stride_ok(0, 0, 32, kSpanLo, kSpanHi, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(0, 1, 32, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, StillRefusesEverythingTheWindowRefuses) {
+  // The per-chunk bound is an addition, never a replacement: a chunk-shaped access at a
+  // forbidden address stays refused even though it is internally self-consistent.
+  EXPECT_FALSE(dspn_chunk_stride_ok(kBss, 1024, 32, kBss, kBss + 32768, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kRodata, 1024, 32, kRodata, kRodata + 32768, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kMmio1, 1024, 32, kMmio1, kMmio1 + 32768, 0));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kStack, 1024, 32, kStack, kStack + 32768, 1));
+}
+
+TEST(ChunkStride, BaseNearTheTopOfTheAddressSpaceRefused) {
+  // base + DSPN_CHUNK_BYTES must not wrap when the per-chunk extent is formed.
+  EXPECT_FALSE(dspn_chunk_stride_ok(0xFFFFF000U, 1, 32, 0U, DSPN_DRAM_END, 0));
+  EXPECT_FALSE(dspn_chunk_stride_ok(0xFFFFFFFFU, 1, 1, 0U, DSPN_DRAM_END, 0));
+}
+
+TEST(ChunkStride, MultiplyOverflowStillRefused) {
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 0xFFFFFFFFU, 32, kSpanLo, kSpanHi, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 0x80000000U, 2, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, ZeroStrideRefused) {
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 10, 0, kSpanLo, kSpanHi, 1));
+}
+
+TEST(ChunkStride, InvertedWindowRefusesEverything) {
+  // The bug this was added alongside: describe() took hi from the second payload
+  // unconditionally, so with the measured pair hi came out below lo. It fails closed --
+  // every frame refused, native path dead, silent fallback to dsp.spectrum.
+  constexpr uint32_t bad_lo = kChunk1;
+  constexpr uint32_t bad_hi = kChunk2 + 32768U;   // 0x360D5F0, below bad_lo
+  static_assert(bad_hi < bad_lo, "the measured pair must invert, or this tests nothing");
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 1024, 32, bad_lo, bad_hi, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kChunk2, 1024, 32, bad_lo, bad_hi, 1));
+}

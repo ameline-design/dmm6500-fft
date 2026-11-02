@@ -201,17 +201,22 @@ static int wr_ok(const dsp_native_params *p, uint32_t a, uint32_t n)
 }
 
 /* Strided element ranges: k elements of `stride` bytes from base.  The capture is read
- * and the output is written, so the two sides go through different gates. */
+ * and the output is written, so the two sides go through different gates.
+ *
+ * Both bases are chunk payloads, so both go through the per-chunk form: the declared
+ * window has to cover every chunk of the buffer and the chunks are scattered, which makes
+ * the window wider than the payloads it is there to describe. Requiring the walk to stay
+ * inside the one chunk it starts in closes that gap. */
 static int stride_ok_out(const dsp_native_params *p, uint32_t base,
                          uint32_t k, uint32_t stride)
 {
-    return dspn_stride_ok(base, k, stride, p->out_lo, p->out_hi, 1);
+    return dspn_chunk_stride_ok(base, k, stride, p->out_lo, p->out_hi, 1);
 }
 
 static int stride_ok_rd(const dsp_native_params *p, uint32_t base,
                         uint32_t k, uint32_t stride)
 {
-    return dspn_stride_ok(base, k, stride, p->rd_lo, p->rd_hi, 0);
+    return dspn_chunk_stride_ok(base, k, stride, p->rd_lo, p->rd_hi, 0);
 }
 
 /* -------------------------------------------------------------------------
