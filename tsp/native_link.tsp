@@ -459,11 +459,19 @@ end
 -- readings alone match at every element and the scan returns whichever lies lowest in
 -- memory -- which for a two-chunk buffer is not element 0, because the second payload is
 -- often below the first. A trace shifted by a whole chunk is still a plausible trace.
--- Elements _find_storage confirms a hit against, and so the number of readings nl.init
--- seeds a buffer with. One name, because a seed shorter than the confirmation makes the
--- scan refuse the very buffer it was seeded for.
-fftsa.nl.SEED_READS = 6
-local READ_CONFIRM = fftsa.nl.SEED_READS
+-- Readings nl.init seeds a buffer it means to find. It has to be at least the largest
+-- FAR_INDEX below, or the one check that no small record can imitate does not apply to the
+-- buffers we create for ourselves -- which are exactly the ones whose readings are a
+-- regular series and so most likely to be mimicked by a statistics record. 256 writes is
+-- under two milliseconds, once, at install.
+fftsa.nl.SEED_READS = 256
+
+-- Consecutive readings a hit is confirmed against, and the far indices confirmed as well.
+-- Six consecutive values prove very little; the same series still holding at index 256
+-- proves an array of at least that many. Both are cheap -- seven double comparisons a
+-- candidate -- where confirming all 256 would be 510 peek32 calls per hit.
+local READ_CONFIRM = 6
+local FAR_INDEX = { 64, 256 }
 
 -- Returns the slot 0 address and the MEASURED element stride, or nil.
 --
@@ -488,19 +496,22 @@ function fftsa.nl._find_storage(buf, has_extras)
       if ex[i] == nil then return nil end
     end
   end
-  -- A READING FROM THE FAR END, which is what no small record can imitate. The firmware
+  -- READINGS FROM THE FAR END, which is what no small record can imitate. The firmware
   -- keeps separate 16-byte records of the same values -- the extra-value records and the
   -- statistics accumulators -- and a seeded buffer's first six readings were MEASURED at
-  -- stride 16 at an address that is not element storage at all. Six consecutive values
-  -- prove very little; the same series still holding at index 256 proves it is an array of
-  -- at least that many. Capped at 256 so the index is inside the FIRST chunk whatever the
-  -- element size turns out to be: the smallest plausible element is 8 bytes, which still
-  -- puts 4096 elements in a chunk.
-  local far = {}
-  local fn = 0
-  for i = 1, 2 do
-    local j = (i == 1) and 64 or 256
-    if j > READ_CONFIRM and j <= n then fn = fn + 1; far[fn] = j end
+  -- stride 16 at an address that is not element storage at all.
+  --
+  -- The largest index is 256, which is inside the FIRST chunk whatever the element size
+  -- turns out to be: the smallest plausible element is 8 bytes, which still puts 4096 in a
+  -- chunk. Only indices the buffer actually has are used.
+  local far, fn = {}, 0
+  for i = 1, table.getn(FAR_INDEX) do
+    local j = FAR_INDEX[i]
+    if j > READ_CONFIRM and j <= n then
+      fn = fn + 1
+      far[fn] = j
+      if buf.readings[j] == nil then return nil end
+    end
   end
   local needle = f64_pack(rd[1])
   local windows = {
@@ -513,10 +524,13 @@ function fftsa.nl._find_storage(buf, has_extras)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      -- Element 0 is a chunk payload, and the allocator guarantees 16. A hit that is not
-      -- 16-aligned cannot be one, whatever else it holds -- which is how the first of the
-      -- two measured decoys, at 0x03219B08, is refused before any value is compared.
-      if math.mod(h, 16) == 0 then
+      -- 8, NOT 16. The reading at +0 is a double the firmware itself loads, so element 0
+      -- is 8-aligned; it is NOT 16-aligned, which a 16-byte filter cost an hour to learn --
+      -- the trace buffer's element 0 was measured at 0x037C71C8 and refused by its own
+      -- scan. Element 0 is not the chunk payload, so the allocator's guarantee does not
+      -- reach it. This rejects nothing real and costs nothing; the discrimination is the
+      -- extras and the far readings below.
+      if math.mod(h, 8) == 0 then
         -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
         -- measures, the extra value at +20 only exists in an element that long, and
         -- assuming it was load-bearing: measuring the stride from the spacing of the

@@ -105,6 +105,24 @@ def main():
 
     clear_dead_sockets()
     d = DMM(timeout=180)
+
+    # ONE RUN PER BOOT, AND THE TOOL HAS TO SAY SO. fftsa.nl.init installs heap code and
+    # claims the NLBOOT global, which nothing but a restart clears, so a second run comes
+    # back with the native path refused -- ready=false, nmax=0, rc=nil -- and every figure
+    # below describing the interpreted path instead. That reads as a regression in the
+    # native path and is not one. The app's own screen set is one build per power cycle for
+    # the same reason: a create/delete cycle risks part of the 463-object pool.
+    spent = d.q("print('BT|'..tostring(NLBOOT))", timeout=30)
+    if spent != 'BT|nil':
+        print('boot      : already spent (NLBOOT=%s)' % (spent or '?')[3:])
+        print('            A second run in one boot cannot install the native path, and')
+        print('            every reading below would describe the fallback. Restart first:')
+        print('            python3 -u -I ../dmm6500-serial-decode/notes/firmware/'
+              'dmmreboot.py')
+        d.close()
+        return 2
+    print('boot      : clean')
+
     d.exec('reset()', timeout=60)
     # 25%, the lowest step above off. The LXI screenshot does not read the backlight, so
     # nothing here needs the panel bright.

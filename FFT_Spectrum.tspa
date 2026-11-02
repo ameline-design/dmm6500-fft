@@ -2535,11 +2535,19 @@ end
 -- readings alone match at every element and the scan returns whichever lies lowest in
 -- memory -- which for a two-chunk buffer is not element 0, because the second payload is
 -- often below the first. A trace shifted by a whole chunk is still a plausible trace.
--- Elements _find_storage confirms a hit against, and so the number of readings nl.init
--- seeds a buffer with. One name, because a seed shorter than the confirmation makes the
--- scan refuse the very buffer it was seeded for.
-fftsa.nl.SEED_READS = 6
-local READ_CONFIRM = fftsa.nl.SEED_READS
+-- Readings nl.init seeds a buffer it means to find. It has to be at least the largest
+-- FAR_INDEX below, or the one check that no small record can imitate does not apply to the
+-- buffers we create for ourselves -- which are exactly the ones whose readings are a
+-- regular series and so most likely to be mimicked by a statistics record. 256 writes is
+-- under two milliseconds, once, at install.
+fftsa.nl.SEED_READS = 256
+
+-- Consecutive readings a hit is confirmed against, and the far indices confirmed as well.
+-- Six consecutive values prove very little; the same series still holding at index 256
+-- proves an array of at least that many. Both are cheap -- seven double comparisons a
+-- candidate -- where confirming all 256 would be 510 peek32 calls per hit.
+local READ_CONFIRM = 6
+local FAR_INDEX = { 64, 256 }
 
 -- Returns the slot 0 address and the MEASURED element stride, or nil.
 --
@@ -2564,19 +2572,22 @@ function fftsa.nl._find_storage(buf, has_extras)
       if ex[i] == nil then return nil end
     end
   end
-  -- A READING FROM THE FAR END, which is what no small record can imitate. The firmware
+  -- READINGS FROM THE FAR END, which is what no small record can imitate. The firmware
   -- keeps separate 16-byte records of the same values -- the extra-value records and the
   -- statistics accumulators -- and a seeded buffer's first six readings were MEASURED at
-  -- stride 16 at an address that is not element storage at all. Six consecutive values
-  -- prove very little; the same series still holding at index 256 proves it is an array of
-  -- at least that many. Capped at 256 so the index is inside the FIRST chunk whatever the
-  -- element size turns out to be: the smallest plausible element is 8 bytes, which still
-  -- puts 4096 elements in a chunk.
-  local far = {}
-  local fn = 0
-  for i = 1, 2 do
-    local j = (i == 1) and 64 or 256
-    if j > READ_CONFIRM and j <= n then fn = fn + 1; far[fn] = j end
+  -- stride 16 at an address that is not element storage at all.
+  --
+  -- The largest index is 256, which is inside the FIRST chunk whatever the element size
+  -- turns out to be: the smallest plausible element is 8 bytes, which still puts 4096 in a
+  -- chunk. Only indices the buffer actually has are used.
+  local far, fn = {}, 0
+  for i = 1, table.getn(FAR_INDEX) do
+    local j = FAR_INDEX[i]
+    if j > READ_CONFIRM and j <= n then
+      fn = fn + 1
+      far[fn] = j
+      if buf.readings[j] == nil then return nil end
+    end
   end
   local needle = f64_pack(rd[1])
   local windows = {
@@ -2589,10 +2600,13 @@ function fftsa.nl._find_storage(buf, has_extras)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      -- Element 0 is a chunk payload, and the allocator guarantees 16. A hit that is not
-      -- 16-aligned cannot be one, whatever else it holds -- which is how the first of the
-      -- two measured decoys, at 0x03219B08, is refused before any value is compared.
-      if math.mod(h, 16) == 0 then
+      -- 8, NOT 16. The reading at +0 is a double the firmware itself loads, so element 0
+      -- is 8-aligned; it is NOT 16-aligned, which a 16-byte filter cost an hour to learn --
+      -- the trace buffer's element 0 was measured at 0x037C71C8 and refused by its own
+      -- scan. Element 0 is not the chunk payload, so the allocator's guarantee does not
+      -- reach it. This rejects nothing real and costs nothing; the discrimination is the
+      -- extras and the far readings below.
+      if math.mod(h, 8) == 0 then
         -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
         -- measures, the extra value at +20 only exists in an element that long, and
         -- assuming it was load-bearing: measuring the stride from the spacing of the
@@ -4359,6 +4373,31 @@ end
 -- count press cost one call instead of an install.
 fftsa.nl_nmax = 2048
 
+-- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
+--
+-- Everything else about the native path is measured and correct. On the instrument it
+-- installs, plans, re-plans through nl.reinit across a sample-count press, computes the
+-- whole frame in 3.1 ms where the interpreted phases are 32.6 ms between them, and leaves a
+-- trace buffer holding 255 (dB, Hz) points at the right frequencies with the descriptor
+-- rewound so buf.n reads 255. Lua reads those points back correctly. THE WIDGET DOES NOT.
+--
+-- Three notify calls were tried, same conditions, five frames each:
+--
+--   display.graph.scaletrace   126.6 ms a frame, and it UNPINS BOTH AXES
+--   display.graph.drawstyle     46.6 ms a frame, axes correct, nothing drawn
+--   none at all                 21.4 ms a frame, axes correct, nothing drawn
+--
+-- spectrum_graph.tsp:69 said why before any of them was tried: the clear is the only notify
+-- compatible with FILL_ONCE, and not clearing is the entire point of writing in place. The
+-- remaining lever is the buffer's fill mode, and FILL_ONCE is a tested invariant in
+-- tools/test_tsp.lua -- "the trace buffer is FILL_ONCE, never a ring" -- so changing it
+-- needs the wrap-line artefact measured on the glass first, not argued away.
+--
+-- Set this true to run the native path and see that for yourself; the app is correct and
+-- slower with it false, and fast with an empty plot with it true. That is not a trade
+-- anybody wants shipped, so it ships off.
+fftsa.nl_enable = false
+
 -- fftsa.thd_mains_want holds Keithley's dsp.MAINS_* value and the native side takes
 -- DSP_THD_MAINS_*, which is 50, 60, 0 or BOTH. Those three are the mains frequencies
 -- themselves, so they carry across whatever the firmware numbered its enum; anything else
@@ -4407,6 +4446,7 @@ end
 -- comparisons and no work. nl.n is the count the arena was last planned for, which only
 -- nl.reinit moves, so this catches a sample count the install cannot serve.
 function fftsa.nl_usable()
+  if not fftsa.nl_enable then return false end
   local nl = fftsa.nl
   if nl == nil or not nl.ready then return false end
   if nl.n ~= fftsa.n then return false end
@@ -4678,10 +4718,28 @@ function fftsa.frame_body()
       fftsa.binhz = binhz
       fftsa.nl_frame = true
       fftsa.nl_res = fftsa.nl.results()
-      -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
-      if nseg > 0 then
-        display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
-      end
+      -- NO NOTIFY CALL, and display.graph.scaletrace in particular. It was here on the
+      -- claim that it "makes the widget re-read sg_buf without a clear", and that claim was
+      -- never tested. MEASURED: it UNPINS BOTH AXES. The first native frame on the glass
+      -- came back with the x axis auto-scaled to +000.0..+560.0 Hz -- the range of the
+      -- extra values sg_mkbuf seeded, not the 195 Hz..49.8 kHz the trace holds -- the
+      -- decibel labels gone from the y axis, and so no trace visible at all, because the
+      -- points were off the right-hand edge. The peak table and the THD line, which do not
+      -- go through the widget, were correct throughout.
+      --
+      -- NO NOTIFY CALL HERE, because none of them works and two of them cost real time.
+      -- Measured, three runs, same conditions and the same five-frame method:
+      --
+      --   scaletrace per frame   126.6 ms, axes UNPINNED, no trace
+      --   drawstyle per frame     46.6 ms, axes correct, no trace
+      --   nothing                 21.4 ms, axes correct, no trace
+      --
+      -- In all three the buffer itself was right: 255 points at the right frequencies,
+      -- readable from Lua, with the descriptor rewound so buf.n says 255. The widget does
+      -- not re-read it. spectrum_graph.tsp:69 says why and said so before any of this --
+      -- the clear is the only notify compatible with FILL_ONCE, and the whole point of
+      -- this path is not to clear. So the remaining lever is the buffer's fill mode, not a
+      -- call from here, and that belongs in sg_mkbuf where the mode is set.
     end
   else
     -- Existing path: dsp.spectrum clears sg_buf internally before filling it.

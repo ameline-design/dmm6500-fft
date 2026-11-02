@@ -596,7 +596,18 @@ inside `sg_update` is still proportional to graph area, so the frame does not fa
 the 81.8 ms column and substituting: minus the four interpreted phases (32.6), minus the 255-point
 fill the reduction now does itself (~1.8), plus the one call (3.1), is **about 50 ms**.
 
-**Which is the bucket boundary itself, and that is not a result.** `displayed = 1 / (0.05 *
+**Measured on the instrument, 2026-11-02: 21.4 ms a frame at N = 512**, five frames called
+synchronously with the timer parked. Not 50. The substitution above was too pessimistic
+because it assumed the rest of the frame was irreducible, and one call in it was not: the app
+was calling `display.graph.scaletrace` once a frame as a graph notify, and **that call alone
+cost about 105 ms** -- the same frame measured 126.6 ms with it and 21.4 ms without. It also
+unpinned both axes, which is the defect that found it. See the E7 section of
+`EXPERIMENTS-native.md` in the serial-decode repo.
+
+So the quantisation argument below was about the wrong number, and is kept because the
+reasoning still holds for anything that does not clear a 100 ms obstacle out of the way.
+
+**50 ms is the bucket boundary itself, and arithmetic about it is not a result.** `displayed = 1 / (0.05 *
 ceil(frame / 0.05))` admits 20 fps at or under 50 ms and 10 fps at anything above, so a frame
 landing at 50.5 displays exactly as slowly as one at 81.8. The substitution above is also arithmetic
 on a table taken at a 784x272 graph where the app now ships 784x312, which is 7.4 % more paint. So

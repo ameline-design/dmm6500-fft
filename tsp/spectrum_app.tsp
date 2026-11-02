@@ -362,6 +362,31 @@ end
 -- count press cost one call instead of an install.
 fftsa.nl_nmax = 2048
 
+-- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
+--
+-- Everything else about the native path is measured and correct. On the instrument it
+-- installs, plans, re-plans through nl.reinit across a sample-count press, computes the
+-- whole frame in 3.1 ms where the interpreted phases are 32.6 ms between them, and leaves a
+-- trace buffer holding 255 (dB, Hz) points at the right frequencies with the descriptor
+-- rewound so buf.n reads 255. Lua reads those points back correctly. THE WIDGET DOES NOT.
+--
+-- Three notify calls were tried, same conditions, five frames each:
+--
+--   display.graph.scaletrace   126.6 ms a frame, and it UNPINS BOTH AXES
+--   display.graph.drawstyle     46.6 ms a frame, axes correct, nothing drawn
+--   none at all                 21.4 ms a frame, axes correct, nothing drawn
+--
+-- spectrum_graph.tsp:69 said why before any of them was tried: the clear is the only notify
+-- compatible with FILL_ONCE, and not clearing is the entire point of writing in place. The
+-- remaining lever is the buffer's fill mode, and FILL_ONCE is a tested invariant in
+-- tools/test_tsp.lua -- "the trace buffer is FILL_ONCE, never a ring" -- so changing it
+-- needs the wrap-line artefact measured on the glass first, not argued away.
+--
+-- Set this true to run the native path and see that for yourself; the app is correct and
+-- slower with it false, and fast with an empty plot with it true. That is not a trade
+-- anybody wants shipped, so it ships off.
+fftsa.nl_enable = false
+
 -- fftsa.thd_mains_want holds Keithley's dsp.MAINS_* value and the native side takes
 -- DSP_THD_MAINS_*, which is 50, 60, 0 or BOTH. Those three are the mains frequencies
 -- themselves, so they carry across whatever the firmware numbered its enum; anything else
@@ -410,6 +435,7 @@ end
 -- comparisons and no work. nl.n is the count the arena was last planned for, which only
 -- nl.reinit moves, so this catches a sample count the install cannot serve.
 function fftsa.nl_usable()
+  if not fftsa.nl_enable then return false end
   local nl = fftsa.nl
   if nl == nil or not nl.ready then return false end
   if nl.n ~= fftsa.n then return false end
@@ -681,10 +707,28 @@ function fftsa.frame_body()
       fftsa.binhz = binhz
       fftsa.nl_frame = true
       fftsa.nl_res = fftsa.nl.results()
-      -- Notify the graph: scaletrace makes the widget re-read sg_buf without a clear.
-      if nseg > 0 then
-        display.graph.scaletrace(fftsa.sg_graph, display.TRACE_ALL)
-      end
+      -- NO NOTIFY CALL, and display.graph.scaletrace in particular. It was here on the
+      -- claim that it "makes the widget re-read sg_buf without a clear", and that claim was
+      -- never tested. MEASURED: it UNPINS BOTH AXES. The first native frame on the glass
+      -- came back with the x axis auto-scaled to +000.0..+560.0 Hz -- the range of the
+      -- extra values sg_mkbuf seeded, not the 195 Hz..49.8 kHz the trace holds -- the
+      -- decibel labels gone from the y axis, and so no trace visible at all, because the
+      -- points were off the right-hand edge. The peak table and the THD line, which do not
+      -- go through the widget, were correct throughout.
+      --
+      -- NO NOTIFY CALL HERE, because none of them works and two of them cost real time.
+      -- Measured, three runs, same conditions and the same five-frame method:
+      --
+      --   scaletrace per frame   126.6 ms, axes UNPINNED, no trace
+      --   drawstyle per frame     46.6 ms, axes correct, no trace
+      --   nothing                 21.4 ms, axes correct, no trace
+      --
+      -- In all three the buffer itself was right: 255 points at the right frequencies,
+      -- readable from Lua, with the descriptor rewound so buf.n says 255. The widget does
+      -- not re-read it. spectrum_graph.tsp:69 says why and said so before any of this --
+      -- the clear is the only notify compatible with FILL_ONCE, and the whole point of
+      -- this path is not to clear. So the remaining lever is the buffer's fill mode, not a
+      -- call from here, and that belongs in sg_mkbuf where the mode is set.
     end
   else
     -- Existing path: dsp.spectrum clears sg_buf internally before filling it.
