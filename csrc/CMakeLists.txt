@@ -396,8 +396,21 @@ if(DSP_DST_NATIVE)
   target_include_directories(dsp_native_elf PUBLIC
       ${CMAKE_CURRENT_SOURCE_DIR}/freestanding
       ${CMAKE_CURRENT_SOURCE_DIR})
+  # Single precision, which is dsp_real's default. The e300c4 issues and completes a
+  # single-precision multiply-add every cycle where a double takes several, and every array
+  # the transform sweeps halves, so single is the arithmetic fast path and the bandwidth one
+  # at once. Add DSP_DOUBLE back to build the same code in double; the host suite runs both
+  # variants, and nl.SIZEOF_REAL comes out of the image, so the Lua read-back follows
+  # whichever is built without being told.
+  #
+  # DSP_NO_SINGLE_MATH because the transcendentals have to stay on the double entry points:
+  # the six firmware addresses are discovered by FNF from Lua's own math wrappers, and there
+  # is no math.sinf to discover, so sinf/cosf/sqrtf/log10f could only come from addresses
+  # typed in here. It costs nothing that matters -- sin and cos run once a plan building the
+  # window and the twiddles, and log10 runs once a trace point either way -- and computing
+  # the window in double before storing it to float is the accurate direction.
   target_compile_definitions(dsp_native_elf PUBLIC
-      DSP_DOUBLE
+      DSP_NO_SINGLE_MATH
       DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
       )
   target_compile_options(dsp_native_elf PRIVATE

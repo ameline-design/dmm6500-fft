@@ -7,6 +7,11 @@ buffer.write.reading. A value decoded wrong is a plausible wrong trace rather th
 refusal, and a nil that got through would reach buffer.write.reading as a nil argument,
 which is a posted event per point.
 
+The reduced arrays are dsp_real, so they are binary64 in a double image and binary32 in a
+single one, and the width comes from the image rather than from the Lua. Every case below
+runs at both widths against values packed at that width, because a decoder picked for the
+wrong width reads a plausible wrong trace too.
+
 The function under test is extracted from the shipping module, not copied into this file,
 because a copy is a thing that passes while the original has moved. The byte images are
 built here by struct.pack rather than tabulated, and the fake ki.memread serves them.
@@ -27,11 +32,12 @@ MODULE = os.path.join(ROOT, 'tsp', 'native_link.tsp')
 LUA502 = os.environ.get('LUA502',
                         os.path.expanduser('~/tmp/lua502/lua-5.0.2/bin/lua'))
 
-# Two spans: the packing helpers the decode needs, and the function itself. Markers rather
-# than line numbers, and a miss is a failure rather than a silent empty extraction.
+# Three spans: the packing helpers the decode needs, both unpackers, and the function
+# itself. Markers rather than line numbers, and a miss is a failure rather than a silent
+# empty extraction.
 SPANS = [
     ('local function hx', '\n-- An IEEE-754 binary64 as the two'),
-    ('local function u32_pack', '\nfftsa.nl._f64_unpack'),
+    ('local function u32_pack', '\nfftsa.nl._f32_unpack'),
     ('function fftsa.nl.reduce(nseg)', "\n-- Describe a buffer's storage"),
 ]
 
@@ -46,6 +52,10 @@ HZ_ADDR = DB_ADDR + NSEG_MAX * 8
 DB = [-120.0, -119.5, 20.0, 0.0, -0.001, -73.25, -1.0 / 3.0, 1e-9, -99.9999999]
 HZ = [0.0, 1953.125, 61.03515625, 1000000.0 / 512.0, 49800.0, 1.0 / 3.0, 1e-9,
       123456.789, 500000.0]
+
+# Both widths dsp_real can be. A width the image never reports is refused, which is the
+# third case: the decoder has to be chosen, not guessed.
+WIDTHS = (8, 4)
 
 PRELUDE = """fftsa = { nl = {} }
 local MEM = {}
@@ -87,8 +97,24 @@ def extract(module):
     return '\n'.join(out)
 
 
-def image(values):
-    return b''.join(struct.pack('>d', v) for v in values)
+def fmt_of(width):
+    return '>d' if width == 8 else '>f'
+
+
+def image(values, width):
+    f = fmt_of(width)
+    return b''.join(struct.pack(f, v) for v in values)
+
+
+def at_width(values, width):
+    """The values as the image actually holds them: packing to binary32 rounds."""
+    if width == 8:
+        return list(values)
+    return [struct.unpack('>f', struct.pack('>f', v))[0] for v in values]
+
+
+def luanums(values):
+    return ','.join('%.17g' % v for v in values)
 
 
 def esc(data):
@@ -96,19 +122,25 @@ def esc(data):
     return ''.join('\\%d' % b for b in data)
 
 
-def build(module):
-    body = extract(module)
-
-    db_img = image(DB)
-    hz_img = image(HZ)
+def cases_for(width):
+    """Every case at one dsp_real width, with the values the image holds at that width."""
+    db_img = image(DB, width)
+    hz_img = image(HZ, width)
+    want_db = at_width(DB, width)
+    want_hz = at_width(HZ, width)
     n = len(DB)
+    tag = 'f%d' % (width * 8)
     cases = []
 
+    # Common preamble: the two arrays in place and the image reporting this width.
+    setup = ("setmem(%d, '%s'); setmem(%d, '%s')\n"
+             "local nl = fftsa.nl\n"
+             "nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, %d\n"
+             % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
+                DB_ADDR, HZ_ADDR, NSEG_MAX, width))
+
     # Round trip: every value back bit-exact, in both arrays, at the real count.
-    cases.append(('round trip %d points' % n, """
-setmem(%d, '%s'); setmem(%d, '%s')
-local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+    cases.append(('%s: round trip %d points' % (tag, n), setup + """
 local r = nl.reduce(%d)
 if r == nil then return 'reduce returned nil' end
 if r.nseg ~= %d then return 'nseg ' .. tostring(r.nseg) end
@@ -124,16 +156,11 @@ for i = 1, %d do
   end
 end
 return nil
-""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, n, n,
-       ','.join('%.17g' % v for v in DB), ','.join('%.17g' % v for v in HZ), n)))
+""" % (n, n, luanums(want_db), luanums(want_hz), n)))
 
     # The tables are reused across calls, and a shorter run must not leave the previous
     # run's tail where the write loop would read it.
-    cases.append(('the table is the same object across calls', """
-setmem(%d, '%s'); setmem(%d, '%s')
-local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+    cases.append(('%s: the table is the same object across calls' % tag, setup + """
 local a = nl.reduce(%d)
 local first = a.db
 local b = nl.reduce(2)
@@ -142,31 +169,23 @@ if b.db ~= first then return 'a fresh table per call' end
 if b.nseg ~= 2 then return 'nseg ' .. tostring(b.nseg) end
 if b.db[1] ~= %.17g or b.hz[2] ~= %.17g then return 'wrong values after the short call' end
 return nil
-""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, n, DB[0], HZ[1])))
+""" % (n, want_db[0], want_hz[1])))
 
-    # The frequencies are an affine series the plan fixes, so they are decoded once a plan and
-    # reused. Two properties matter. The steady state must not re-read the array -- that is
-    # the whole point, and nothing about the returned values would show its loss. And a plan
-    # whose series differs must be noticed, or the trace plots against the wrong axis. The
-    # detector reads elements 1 and 2, which are f0 and f0 + fstep, so it is exercised on each
-    # of them on its own: a key that watched only one would pass a test that moved both.
-    # One element moved per variant, so each case can only be caught by the half of the key
-    # that watches that element. Moving both would let either half pass the pair.
-    hz_f0 = [HZ[0] + 1.0] + HZ[1:]
-    hz_fstep = [HZ[0], HZ[1] + 7.0] + HZ[2:]
-
-    cases.append(('the frequencies are decoded once a plan, not once a call', """
-setmem(%d, '%s'); setmem(%d, '%s')
-local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+    # The frequencies are an affine series the plan fixes, so they are decoded once a plan
+    # and reused. Two properties matter. The steady state must not re-read the array -- that
+    # is the whole point, and nothing about the returned values would show its loss. And a
+    # plan whose series differs must be noticed, or the trace plots against the wrong axis.
+    # The detector reads elements 1 and 2, which are f0 and f0 + fstep, so it is exercised on
+    # each of them on its own: a key that watched only one would pass a test that moved both.
+    cases.append(('%s: the frequencies are decoded once a plan, not once a call' % tag,
+                  setup + """
 if nl.reduce(%d) == nil then return 'first call returned nil' end
 RBYTES = 0
 local r = nl.reduce(%d)
 if r == nil then return 'second call returned nil' end
 -- The decibels in full, plus a two-element probe of the frequencies. Re-reading the whole
 -- frequency array would add as much again.
-local want = %d * 8 + 16
+local want = %d
 if RBYTES ~= want then
   return string.format('%%d bytes on the second call, wanted %%d', RBYTES, want)
 end
@@ -178,15 +197,15 @@ for i = 1, %d do
   end
 end
 return nil
-""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, n, n, n,
-       ','.join('%.17g' % v for v in HZ), n)))
+""" % (n, n, n * width + 2 * width, luanums(want_hz), n)))
 
-    for label, vals in (('f0', hz_f0), ('fstep', hz_fstep)):
-        cases.append(('a plan with a new %s refills the frequencies' % label, """
-setmem(%d, '%s'); setmem(%d, '%s')
-local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+    # One element moved per variant, so each case can only be caught by the half of the key
+    # that watches that element. Moving both would let either half pass the pair.
+    for label, vals in (('f0', [HZ[0] + 1.0] + HZ[1:]),
+                        ('fstep', [HZ[0], HZ[1] + 7.0] + HZ[2:])):
+        want = at_width(vals, width)
+        cases.append(('%s: a plan with a new %s refills the frequencies' % (tag, label),
+                      setup + """
 if nl.reduce(%d) == nil then return 'the first plan returned nil' end
 setmem(%d, '%s')
 local r = nl.reduce(%d)
@@ -199,10 +218,7 @@ for i = 1, %d do
   end
 end
 return nil
-""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, n,
-       HZ_ADDR, esc(image(vals)), n,
-       ','.join('%.17g' % v for v in vals), n)))
+""" % (n, HZ_ADDR, esc(image(vals, width)), n, luanums(want), n)))
 
     # Fails closed, one case per refusal. Each must be nil, not a table with a hole and not
     # an error: the caller falls back to the interpreted primitive on nil.
@@ -211,42 +227,51 @@ return nil
         ('nseg zero', 'nl.reduce(0)'),
         ('nseg negative', 'nl.reduce(-1)'),
         ('nseg nil', 'nl.reduce(nil)'),
-        ('a single-precision image', 'nl.SIZEOF_REAL = 4; return nl.reduce(%d)' % n),
+        ('a width that is neither', 'nl.SIZEOF_REAL = 6; return nl.reduce(%d)' % n),
+        ('an unreported width', 'nl.SIZEOF_REAL = 0; return nl.reduce(%d)' % n),
         ('an unplanned arena', 'nl.red_db = nil; return nl.reduce(%d)' % n),
         ('no frequency array', 'nl.red_hz = nil; return nl.reduce(%d)' % n),
         ('a short read', 'nl.red_db = %d; return nl.reduce(%d)'
-                         % (DB_ADDR + 8, n)),
+                         % (DB_ADDR + width, n)),
         ('an address that reads nothing', 'nl.red_hz = %d; return nl.reduce(%d)'
                                          % (DB_ADDR + 0x1000, n)),
     ]
     for name, stmt in refusals:
         body_stmt = stmt if stmt.startswith('nl.') and 'return' in stmt else 'return ' + stmt
-        cases.append(('refused: ' + name, """
-setmem(%d, '%s'); setmem(%d, '%s')
-local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+        cases.append(('%s: refused: %s' % (tag, name), setup + """
 local r = (function() %s end)()
 if r ~= nil then return 'returned a table' end
 return nil
-""" % (DB_ADDR, esc(db_img), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, body_stmt)))
+""" % body_stmt))
 
-    # An infinity and a NaN in the array: f64_unpack returns nil for both, and the whole
+    # An infinity and a NaN in the array: the unpacker returns nil for both, and the whole
     # call has to fail rather than hand the frame a table with a hole in it.
-    for name, pattern in (('an infinity', 0x7FF0000000000000),
-                          ('a quiet NaN', 0x7FF8000000000000)):
+    patterns = {8: (('an infinity', '>Q', 0x7FF0000000000000),
+                    ('a quiet NaN', '>Q', 0x7FF8000000000000)),
+                4: (('an infinity', '>I', 0x7F800000),
+                    ('a quiet NaN', '>I', 0x7FC00000))}[width]
+    for name, pfmt, pattern in patterns:
         poisoned = bytearray(db_img)
-        poisoned[16:24] = struct.pack('>Q', pattern)
-        cases.append(('refused: %s among the decibels' % name, """
+        poisoned[2 * width:3 * width] = struct.pack(pfmt, pattern)
+        cases.append(('%s: refused: %s among the decibels' % (tag, name), """
 setmem(%d, '%s'); setmem(%d, '%s')
 local nl = fftsa.nl
-nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, 8
+nl.red_db, nl.red_hz, nl.nseg_max, nl.SIZEOF_REAL = %d, %d, %d, %d
 local r = nl.reduce(%d)
 if r ~= nil then return 'returned a table' end
 if nl.reduce(2) == nil then return 'the clean head is refused too' end
 return nil
 """ % (DB_ADDR, esc(bytes(poisoned)), HZ_ADDR, esc(hz_img),
-       DB_ADDR, HZ_ADDR, NSEG_MAX, n)))
+       DB_ADDR, HZ_ADDR, NSEG_MAX, width, n)))
+
+    return cases
+
+
+def build(module):
+    body = extract(module)
+    cases = []
+    for width in WIDTHS:
+        cases.extend(cases_for(width))
 
     lua = [PRELUDE, body, 'local fails = 0']
     for name, src in cases:
@@ -275,20 +300,27 @@ def run(module):
 
 
 # Each mutation has to break at least one case above. A gate whose cases all pass against a
-# wrong module is the failure mode worth testing for. The first four are faults the decode
-# could acquire -- a wrong stride through either image, a short read taken as a whole one,
-# the finite check dropped. The last three are the cache: one per input of its key, so a key
-# that watched the count and the address but not the series would be caught, plus a cache
-# that stops hitting, which costs what it was built to save and shows in nothing it returns.
+# wrong module is the failure mode worth testing for. The decode faults come first -- a
+# wrong stride through either image, a short read taken as a whole one, the finite check
+# dropped, and each unpacker's exponent field. Then the cache: one per input of its key, so
+# a key that watched the count and the address but not the series would be caught, plus a
+# cache that stops hitting, which costs what it was built to save and shows in nothing it
+# returns. Then the width dispatch, where picking the wrong decoder is a wrong trace.
 MUTATIONS = [
-    ('the decibel stride', 'db[i] = v\n    p = p + 8', 'db[i] = v\n    p = p + 4'),
-    ('the frequency stride', 'hz[i] = f\n      p = p + 8', 'hz[i] = f\n      p = p + 4'),
+    ('the decibel stride', 'db[i] = v\n    p = p + sz', 'db[i] = v\n    p = p + 8'),
+    ('the frequency stride', 'hz[i] = f\n      p = p + sz', 'hz[i] = f\n      p = p + 8'),
     ('a short read accepted', 'string.len(sd) ~= nbytes', 'string.len(sd) < 0'),
     ('the finite check dropped', 'if v == nil then return nil end',
      'if v ~= nil and v == nil then return nil end'),
+    ('the binary32 exponent', 'local eb = b1 * 2 + math.floor(b2 / 128)',
+     'local eb = b1 * 2 + math.floor(b2 / 64)'),
+    ('the binary32 significand', 'local m = (math.mod(b2, 128) * 256',
+     'local m = (math.mod(b2, 64) * 256'),
     ('the cache ignores f0', ' or r.hz_1 ~= h1', ''),
     ('the cache ignores fstep', ' or r.hz_2 ~= h2', ''),
     ('the cache never hits', 'if r.hz_nseg ~= nseg or', 'if true or'),
+    ('the width dispatch', 'elseif sz == 4 then f_unpack = f32_unpack',
+     'elseif sz == 4 then f_unpack = f64_unpack'),
 ]
 
 

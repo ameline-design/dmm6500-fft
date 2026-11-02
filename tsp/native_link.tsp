@@ -321,6 +321,27 @@ local function f64_unpack(s, p)
 end
 fftsa.nl._f64_unpack = f64_unpack
 
+-- The same, out of four big-endian bytes, for a single-precision image. The reduced trace
+-- is the one place dsp_real crosses to Lua as its own width: everything else in the wire
+-- format is a double whatever the image was built in.
+--
+-- Subnormals decode exactly here rather than flushing, because unlike f64_words this is a
+-- read and the values are a decibel figure and a frequency. An infinity or a NaN comes back
+-- as nil, on the same grounds as above.
+local function f32_unpack(s, p)
+  local b1 = string.byte(s, p)
+  local b2 = string.byte(s, p + 1)
+  local sign = 1
+  if b1 >= 128 then sign = -1; b1 = b1 - 128 end
+  local eb = b1 * 2 + math.floor(b2 / 128)
+  local m = (math.mod(b2, 128) * 256 + string.byte(s, p + 2)) * 256
+            + string.byte(s, p + 3)
+  if eb == 255 then return nil end
+  if eb == 0 then return sign * math.ldexp(m, -149) end
+  return sign * math.ldexp(m + 8388608, eb - 150)
+end
+fftsa.nl._f32_unpack = f32_unpack
+
 -- ---------------------------------------------------------------------------
 -- FNF: find the firmware function behind a Lua math wrapper.
 --
@@ -1509,10 +1530,15 @@ function fftsa.nl.reduce(nseg)
   local nl = fftsa.nl
   if nl.red_db == nil or nl.red_hz == nil then return nil end
   if nseg == nil or nl.nseg_max == nil or nseg < 1 or nseg > nl.nseg_max then return nil end
-  -- f64_unpack reads eight bytes; a single-precision image moves SIZEOF_REAL and its words
-  -- decoded as a double would be silent nonsense.
-  if nl.SIZEOF_REAL ~= 8 then return nil end
-  local nbytes = nseg * 8
+  -- The reduced arrays are dsp_real, so their width comes from the image rather than from
+  -- here. A decoder picked for the wrong width reads a plausible wrong trace, not a
+  -- refusal, so an image reporting neither width is refused outright.
+  local sz = nl.SIZEOF_REAL
+  local f_unpack
+  if sz == 8 then f_unpack = f64_unpack
+  elseif sz == 4 then f_unpack = f32_unpack
+  else return nil end
+  local nbytes = nseg * sz
   local sd = ki.memread(hx(nl.red_db), hx(nbytes))
   if sd == nil or string.len(sd) ~= nbytes then return nil end
   if nl._red == nil then nl._red = { db = {}, hz = {} } end
@@ -1529,35 +1555,39 @@ function fftsa.nl.reduce(nseg)
   -- series to the last bit. Asking the array rather than recomputing the series from the
   -- span keeps one owner of the arithmetic: a cache that agreed with a formula here and not
   -- with the primitive would plot the right trace against the wrong axis.
-  local probe = 16
-  if nseg < 2 then probe = 8 end
+  local probe = 2 * sz
+  if nseg < 2 then probe = sz end
   local sp = ki.memread(hx(nl.red_hz), hx(probe))
   if sp == nil or string.len(sp) ~= probe then return nil end
-  local h1 = f64_unpack(sp, 1)
+  local h1 = f_unpack(sp, 1)
   local h2 = nil
-  if nseg >= 2 then h2 = f64_unpack(sp, 9) end
+  if nseg >= 2 then h2 = f_unpack(sp, 1 + sz) end
   if h1 == nil or (nseg >= 2 and h2 == nil) then return nil end
-  if r.hz_nseg ~= nseg or r.hz_at ~= nl.red_hz or r.hz_1 ~= h1 or r.hz_2 ~= h2 then
+  -- The width is in the key as well, because an image rebuilt in the other precision keeps
+  -- the same arena addresses: the series would read as unchanged while every stride moved.
+  if r.hz_nseg ~= nseg or r.hz_at ~= nl.red_hz or r.hz_sz ~= sz
+     or r.hz_1 ~= h1 or r.hz_2 ~= h2 then
     -- Cleared before the read, so a short read or an undecodable value cannot leave the
     -- key describing a table that was only half refilled.
-    r.hz_nseg, r.hz_at, r.hz_1, r.hz_2 = nil, nil, nil, nil
+    r.hz_nseg, r.hz_at, r.hz_sz, r.hz_1, r.hz_2 = nil, nil, nil, nil, nil
     local sf = ki.memread(hx(nl.red_hz), hx(nbytes))
     if sf == nil or string.len(sf) ~= nbytes then return nil end
     p = 1
     for i = 1, nseg do
-      local f = f64_unpack(sf, p)
+      local f = f_unpack(sf, p)
       if f == nil then return nil end
       hz[i] = f
-      p = p + 8
+      p = p + sz
     end
-    r.hz_nseg, r.hz_at, r.hz_1, r.hz_2 = nseg, nl.red_hz, h1, h2
+    r.hz_nseg, r.hz_at, r.hz_sz = nseg, nl.red_hz, sz
+    r.hz_1, r.hz_2 = h1, h2
   end
   p = 1
   for i = 1, nseg do
-    local v = f64_unpack(sd, p)
+    local v = f_unpack(sd, p)
     if v == nil then return nil end
     db[i] = v
-    p = p + 8
+    p = p + sz
   end
   r.nseg = nseg
   return r
