@@ -556,6 +556,10 @@ ki = {display = {ACTION_PRESS_ENTER = 'press_enter',
 function ki.display.getchecksum(x1, y1, x2, y2)
   KI.calls = KI.calls + 1
   KI.rect = {x1, y1, x2, y2}
+  -- When the call happened, measured in paint yields rather than in time. The poll has to
+  -- run after the frame's delay() so it never reads a half-painted screen, and DELAYS is the
+  -- only thing that can see that ordering from here.
+  KI.delays = DELAYS
   return KI.sum
 end
 function ki.display.generate(a)
@@ -1698,18 +1702,23 @@ check('Apply clears the worst-seen figures so they cannot describe another count
   local i
   for i = 1, 4 do fftsa.frame_body() end
   fftsa.work_plain, fftsa.work_tick = 9.5, 9.75
-  fftsa.ph_peak.acq = 9.25
-  fftsa.ph_peak.spec = 9.125
+  -- A key no frame ever writes, and emptiness asserted with pairs rather than by naming two
+  -- entries. ph_peak holds six and four frames fill all six, so seeding only the names this
+  -- case goes on to check would pass a clear that enumerates the names it knows about and
+  -- leaves the rest describing the previous count -- which is the defect itself.
+  fftsa.ph_peak.never_written_by_a_frame = 9.0
   if not fftsa.options_apply() then return false, fftsa.lasterr end
-  local cleared = fftsa.work_plain == nil and fftsa.work_tick == nil
-                  and fftsa.ph_peak.acq == nil and fftsa.ph_peak.spec == nil
+  local left, k, v = nil, nil, nil
+  for k, v in pairs(fftsa.ph_peak) do left = tostring(k) end
+  local cleared = fftsa.work_plain == nil and fftsa.work_tick == nil and left == nil
   -- And they fill again from frames that follow, or the clear would just blind the figures.
   fftsa.frame_body()
   local refilled = fftsa.ph_peak.acq ~= nil
   return cleared and refilled,
-         string.format('cleared=%s refilled=%s (plain=%s acq=%s)',
+         string.format('cleared=%s refilled=%s (plain=%s acq=%s left=%s)',
                        tostring(cleared), tostring(refilled),
-                       tostring(fftsa.work_plain), tostring(fftsa.ph_peak.acq))
+                       tostring(fftsa.work_plain), tostring(fftsa.ph_peak.acq),
+                       tostring(left))
 end)())
 
 -- The shipped default, which help_reset turns on for every other case here and so cannot
@@ -1751,9 +1760,16 @@ check('the help poll runs once a second, not once a frame', (function()
   fftsa.help_last = os.clock() - (fftsa.help_period + 0.1)
   fftsa.frame_body()
   local twice = KI.calls
-  return once == 1 and twice == 2 and fftsa.help_period == 1.0,
-         string.format('%d calls over six frames, %d after the period elapsed',
-                       once, twice)
+  -- And it ran AFTER the frame's paint yield, which is two paragraphs of the comment at the
+  -- call site and the reason the poll sits where it does: the glass has to be complete or the
+  -- checksum describes a half-painted screen. Counted in yields, not time, so it cannot
+  -- flake -- DELAYS stops moving once the frame's delay() is behind it, so a poll at the top
+  -- of frame_body records one fewer.
+  local after_paint = (KI.delays == DELAYS)
+  return once == 1 and twice == 2 and fftsa.help_period == 1.0 and after_paint,
+         string.format('%d calls over six frames, %d after the period elapsed, '
+                       .. 'poll at yield %s of %s',
+                       once, twice, tostring(KI.delays), tostring(DELAYS))
 end)())
 
 check('the checksum is taken over the declared title row', (function()
@@ -3355,6 +3371,7 @@ check('the opening count is 2048 only where the compiled path will serve it', (f
                        tostring(no_version), tostring(known),
                        tostring(no_blob), tostring(unknown))
 end)())
+
 
 -- The split that keeps a compiled frame out of the interpreter: dsp_live computes the
 -- clamped counts and writes no dsp.* attribute, and dsp_live_push writes them. Put back the
@@ -5809,6 +5826,37 @@ do
   fftsa.fft_init(512)
   dmm.digitize.count = 512
 end
+
+-- LAST IN THE FILE, because it calls fftsa.stop() and fftsa.start(). That rebuilds the
+-- screens, so every graph handle captured earlier -- gh above, graph0 in the transition
+-- cases -- stops describing the graph the app is now using, and a case holding one reads
+-- zero traces through no fault of its own.
+-- And the count is actually opened at, which the predicate check above says nothing about.
+-- Three facts, because two of them miss the dangerous mutation: fftsa.n is what the panel
+-- shows, defaults.n is what Reset restores, and dsp.fft.samples is what Apply committed. Move
+-- the assignment after start()'s pcall and the first two read 2048 while the plan, the
+-- record length and sg_nbins are all still 512 -- so cap.n < fftsa.n fires the short-read
+-- return on every frame and the trace never updates again, for the life of the app.
+check('start() opens at the compiled count before its only Apply', (function()
+  local real, keep_def = fftsa.native_likely, fftsa.defaults.n
+  fftsa.native_likely = function() return true end
+  fftsa.stop()
+  local ok = fftsa.start()
+  local n, dn, committed = fftsa.n, fftsa.defaults.n, dsp.fft.samples
+  fftsa.native_likely = real
+  fftsa.stop()
+  fftsa.start()
+  fftsa.defaults.n = keep_def
+  display.setvalue(fftsa.opt_n, 1)
+  fftsa.options_apply()
+  -- One frame before leaving, so the trace buffer holds points again. A rebind over an empty
+  -- buffer binds nothing, so a freshly started app left here fails the cases below rather
+  -- than this one.
+  fftsa.frame_body()
+  return ok and n == 2048 and dn == 2048 and committed == 2048,
+         string.format('start=%s n=%s defaults.n=%s committed=%s',
+                       tostring(ok), tostring(n), tostring(dn), tostring(committed))
+end)())
 
 print()
 print(string.format('%d passed, %d failed', pass, fail))
