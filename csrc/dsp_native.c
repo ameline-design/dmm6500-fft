@@ -112,7 +112,10 @@ typedef struct {
     uint32_t segs_addr;    /* nsegs big-endian words: the payload addresses         */
 
     uint32_t plan_addr;    /* dsp_plan, initialised by dsp_plan_init at startup      */
-    uint32_t src_flat;     /* scratch for the de-strided capture, cap_n doubles      */
+    uint32_t src_flat;     /* unread.  The record is read in place through cap_vec,  */
+                           /* so there is no de-strided copy; the field stays because */
+                           /* the struct is a wire format and removing it would shift */
+                           /* every word after it.  write_params sends zero.          */
 
     uint32_t cap_chunk1;   /* capture chunk payloads, reading at +0                  */
     uint32_t cap_chunk2;   /* 0 when the capture fits one chunk                     */

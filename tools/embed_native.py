@@ -4,17 +4,25 @@
 Writes tsp/native_code.tsp, which the packager concatenates after native_link.tsp (which
 creates the fftsa.nl table) and before spectrum_app.tsp (which reads nl.ready).
 
-The image is emitted as a table of string literals joined with table.concat rather than
-one long literal. Two reasons, both about what the instrument's loader will accept:
+Both blobs go in as base64, each with a _LEN beside it, and fftsa.nl._b64decode turns them
+back into bytes once at startup. ki.memwrite takes its length from lua_strlen rather than
+strlen, so the NUL bytes a binary is full of survive a Lua string whichever encoding is
+used; what decides it is size. Lua 5.0.2 has no \\xNN escape, which leaves decimal as the
+only literal form for raw bytes, at 4.00 characters a byte against base64's 1.37.
 
-  - 25 KB of \\NNN escapes is about 103,000 characters, and nothing establishes that a
-    line that long survives the script path. Pieces keep every line under 8 KB.
-  - A chain of `..` instead would nest the expression 50 deep and Lua 5.0.2 bounds
-    parser recursion (LUAI_MAXCCALLS); table.concat has no such limit.
+Each blob is a table of string literals joined with table.concat rather than one literal.
+Two reasons, both about what the instrument's loader will accept:
 
-Decimal escapes because ki.memwrite takes its length from lua_strlen rather than strlen,
-so the embedded NUL bytes a binary is full of are copied faithfully. Lua 5.0.2 has no
-\\xNN escape, so decimal is also the only option. See fwmem-DISPATCH.md.
+  - nothing establishes that a line of tens of thousands of characters survives the script
+    path. Pieces of B64_PIECE characters keep every line near 3 kB.
+  - a chain of `..` instead would nest the expression 50 deep and Lua 5.0.2 bounds parser
+    recursion (LUAI_MAXCCALLS); table.concat has no such limit.
+
+B64_PIECE is a multiple of 4, so each piece is a whole number of base64 quanta and
+concatenating the pieces gives the same string as encoding the whole blob at once.
+
+csrc/tools/check_b64.py gates both ends: the emitted text against Python's base64 of the
+built binary, and the Lua decoder against the same bytes. See fwmem-NATIVEC.md.
 
     python3 tools/embed_native.py --build build-ppc
 """
@@ -24,23 +32,7 @@ import base64
 import os
 import sys
 
-PIECE = 2048   # bytes of binary per Lua string literal
 B64_PIECE = 3072   # base64 characters per literal, a multiple of 4 so pieces concatenate
-
-
-def lua_pieces(data, var, piece=PIECE):
-    """`var` assigned from a table.concat of decimal-escape literals.
-
-    A table constructor rather than a named temporary: tools/lint_tsp.py refuses a bare
-    global assignment, and it reads the source textually, so even `local _p` followed by
-    `_p = nil` trips it. Nothing is named here, so there is nothing to refuse.
-    """
-    out = ['%s = table.concat({' % var]
-    for i in range(0, len(data), piece):
-        lit = ''.join('\\%03d' % b for b in data[i:i + piece])
-        out.append("'%s'," % lit)
-    out.append('})')
-    return out
 
 
 def lua_b64(data, var, piece=B64_PIECE):

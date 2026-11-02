@@ -2,13 +2,12 @@
 """Gate: the archive's base64 image decodes, under Lua 5.0.2, to the bytes that were built.
 
 tsp/native_code.tsp carries the compiled image as base64 because decimal escapes cost four
-characters a byte and base64 costs 1.34 -- 125 KB of script source down to 43 KB, read and
-parsed at every app launch. The price is a decoder, and a decoder is a place a wrong byte
-comes from. A wrong byte in a 27 KB PowerPC image is not a failure to load: it is one
-instruction or one float constant quietly different, which relocation then places perfectly
-and the CPU executes.
+characters a byte and base64 costs 1.37, and that source is read and parsed at every app
+launch. The price is a decoder, and a decoder is a place a wrong byte comes from. A wrong
+byte in a PowerPC image is not a failure to load: it is one instruction or one float
+constant quietly different, which relocation then places perfectly and the CPU executes.
 
-So this runs the decoder THE INSTRUMENT RUNS, extracted from tsp/native_link.tsp rather
+So this runs the decoder the instrument runs, extracted from tsp/native_link.tsp rather
 than copied here, over the blob the archive actually carries, and compares the result byte
 for byte with build-ppc/dsp_native.bin. Both ends of the pipe:
 

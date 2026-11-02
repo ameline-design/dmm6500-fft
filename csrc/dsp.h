@@ -673,15 +673,19 @@ int dsp_plan_init(dsp_plan *p, void *arena, size_t bytes, int n, int kind, doubl
  * independently by the allocator, so a multi-chunk arena is not one region; see
  * `notes/firmware/fwmem-BUFFER.md`.
  *
- * The layout walk then places each array wholly inside one segment, skipping to the next
- * when the remainder of the current one is too small. Every array stays flat and
- * contiguous, so nothing in the transform changes -- only where the arrays sit. The cost
- * is the skipped tail of each segment, which ::dsp_plan_segs accounts for.
+ * The layout walk places an array that fits inside one segment, skipping to the next when
+ * the remainder of the current one is too small, and cuts one that does not fit into the
+ * slices ::dsp_vec describes. The cost is the skipped tail of each segment, which
+ * ::dsp_plan_segs accounts for.
  *
- * Because an array is never split, **the largest one has to fit a single segment**. That
- * is the window at `n * sizeof(dsp_real)`, so `n <= seg_bytes / sizeof(dsp_real)`: with
- * 32,768-byte segments, 4096 in a double build and 8192 in a single one. A larger @p n
- * is ::DSP_ESEG from ::dsp_plan_init_segs and 0 here.
+ * So @p n is bounded by the number of segments rather than by the size of one. The slice
+ * length is a power of two at least as long as the longest run a kernel addresses, and no
+ * array may need more than ::DSP_MAX_SLICES of them; the longest is the window at @p n
+ * entries. Against 32,736-byte segments the double build needs 2 segments at `n = 1024`,
+ * 4 at 2048, 10 at 4096, 13 at 8192 and 26 at 16,384. A configuration no slicing fits is
+ * ::DSP_ESEG from ::dsp_plan_init_segs and 0 here, as is ::DSP_FFT_RADIX2 over a split
+ * arena -- its butterflies index across the whole transform, so there is no row for the
+ * kernel to take.
  *
  * @param n         Sample count; a power of two in `4..DSP_N_MAX`.
  * @param decim     Decimation the FIR output scratch must hold; 1 for none.

@@ -2235,15 +2235,15 @@ fftsa.nl._DSP_RELOC_BSS_LO = 0
 fftsa.nl._DSP_RELOC_BSS_HI = 0
 
 -- ---------------------------------------------------------------------------
--- Base64, so the image is 1.34 characters a byte in the archive instead of 4.
+-- Base64, so the image costs 1.37 characters a byte in the archive instead of 4.
 --
 -- ki.memwrite takes its length from lua_strlen rather than strlen, so the embedded NULs a
--- binary is full of survive a Lua string; what does not survive is Lua 5.0.2 having no
--- \xNN escape, which left decimal as the only literal form and made 27 KB of image into
--- 109 KB of script source. That source is read and parsed at every app launch. This is
--- decoded once, in nl.init.
+-- binary is full of survive a Lua string either way; what does not survive is Lua 5.0.2
+-- having no \xNN escape, which leaves decimal as the only literal form for raw bytes. The
+-- archive's source is read and parsed at every app launch, where this is decoded once in
+-- nl.init. The byte figures move with every rebuild of the image; the ratio does not.
 --
--- NO PADDING AND NO TAIL CASE: embed_native.py pads the binary to a multiple of three and
+-- No padding and no tail case: embed_native.py pads the binary to a multiple of three and
 -- emits the true length beside it, so this is a flat four-to-three mapping and the length
 -- trims the padding. A tail case would be a branch nothing exercises until the day the
 -- image length changes residue.
