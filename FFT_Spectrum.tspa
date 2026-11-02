@@ -2114,6 +2114,11 @@ fftsa.nl.MODE_SEGS  = 4
 
 fftsa.nl.MAGIC = 1146310705   -- 0x44535031, 'DSP1'
 
+-- DSP_FFT_* from csrc/dsp.h. Four-step is the default there and the only one measured on
+-- the instrument; radix-2 is kept because the equivalence tests run both.
+fftsa.nl.FFT_RADIX2   = 0
+fftsa.nl.FFT_FOURSTEP = 1
+
 -- Chunk payload is a fixed 32,768 bytes; 1024 elements follows from 32768/32.
 fftsa.nl.CHUNK_BYTES = 32768
 fftsa.nl.PARAM_WORDS = 32
@@ -2124,6 +2129,33 @@ fftsa.nl.PARAM_WORDS = 32
 fftsa.nl.SIZEOF_PLAN   = 0
 fftsa.nl.SIZEOF_PARAMS = 0
 fftsa.nl.SIZEOF_REAL   = 0
+
+-- Heap bounds, also overwritten from the image. Zero here so an un-generated module
+-- refuses every address rather than accepting every address.
+fftsa.nl.HEAP_LO = 0
+fftsa.nl.HEAP_HI = 0
+
+-- Picker index to DSP_WINDOW_*, the enum in csrc/dsp.h. A SEPARATE MAP FROM
+-- fftsa.win_dsp, which goes to Keithley's dsp.WINDOW_*. The two enums coincide today and
+-- nothing holds them together: spectrum_app.tsp:49 spells out what a mismatch costs --
+-- the wrong window selected with nothing on the glass to say so, every amplitude out by a
+-- scalloping factor. Our side of the seam gets its own map for the same reason theirs
+-- does, and the window_enum gate compares this table against dsp.h so a renumbering is a
+-- build failure rather than a measurement error. Index-parallel to fftsa.win_names.
+fftsa.nl.WIN = {}
+fftsa.nl.WIN[1] = 1    -- DSP_WINDOW_HANN
+fftsa.nl.WIN[2] = 2    -- DSP_WINDOW_BLACKMAN
+fftsa.nl.WIN[3] = 3    -- DSP_WINDOW_BLACKMAN_HARRIS
+fftsa.nl.WIN[4] = 4    -- DSP_WINDOW_KAISER
+
+-- Falls back to Hann on an index with no mapping, which is what fftsa.win_to_dsp does on
+-- the other side. A silent fallback is wrong but bounded; an unmapped nil reaches the
+-- params struct as a zero and selects DSP_WINDOW_RECT, which is no window at all.
+function fftsa.nl.win_to_native(wi)
+  local k = fftsa.nl.WIN[wi]
+  if k == nil then k = fftsa.nl.WIN[1] end
+  return k
+end
 
 -- The 164-byte cache-flush trampoline for 1.7.17a. Reads two hex strings from the Lua
 -- stack (address, count) and calls dcbst_icbi_isync_range. Position-independent: it has
@@ -2497,6 +2529,29 @@ end
 -- ---------------------------------------------------------------------------
 function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local nl = fftsa.nl
+
+  -- ONE INSTALL PER BOOT, AND A MODULE FIELD CANNOT ENFORCE IT. fftsa.start() calls this
+  -- on every app start, and a stop/restart with no power cycle reloads the script, so any
+  -- flag kept in nl is gone while the heap code and its I-cache lines are not. A second
+  -- install at a fresh address wedges the interpreter: the IPC barrier drains the store
+  -- buffer to DRAM but does not invalidate the I-cache, and the trampoline cannot flush a
+  -- replacement for itself. A Lua global is the only storage scoped to the boot rather
+  -- than to the script, so that is what holds it.
+  --
+  -- Refusing leaves the app on dsp.spectrum -- degraded, and the alternative is an
+  -- instrument that answers ping and nothing else. NLBOOT is shared with the probes on
+  -- purpose: both install heap code, so either blocks the other.
+  --
+  -- THIS IS THE FIRST STATEMENT, ahead of nl.ready = false, so a refusal cannot damage an
+  -- install that is already working. Within one script session a second call would
+  -- otherwise clear ready on a good install and drop the app to the fallback for no
+  -- reason.
+  if NLBOOT ~= nil then
+    nl.boot_spent = true
+    return false
+  end
+  nl.boot_spent = false
+
   nl.ready = false
   want_n = want_n or 512
 
@@ -2568,6 +2623,13 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
 
   -- 5. Trampoline first, so later writes can be flushed properly. Its own first
   --    execution rides on the IPC barrier alone.
+  --
+  -- The boot is claimed here, in its own statement, before the first write rather than
+  -- after the last. A failure or a wedge from this point on has still consumed the one
+  -- install the boot allows, so refusing a retry that might have been safe is the right
+  -- way round: that costs a power cycle, and allowing one that is not costs a wedge and a
+  -- power cycle. Nothing clears NLBOOT, including _abort.
+  NLBOOT = tramp_at
   ki.memwrite(hx(tramp_at), nl._TRAMP)
   buffer.getstats(bar)
   nl.tramp = tramp_at
@@ -4536,12 +4598,24 @@ function fftsa.start()
   end)
   if not ok then return fftsa.start_failed(tostring(err)) end
 
-  -- Attempt to initialise the native DSP path.  fftsa.cap is a live reading buffer
-  -- after apply(), so it serves as the IPC barrier buffer.
-  -- nl.ready stays false if the binary has not been loaded; the frame body falls back
-  -- to dsp.spectrum.
-  if fftsa.cap ~= nil and fftsa.nl ~= nil then
-    fftsa.nl.init(fftsa.cap)
+  -- Attempt to initialise the native DSP path. nl.ready stays false if the binary is not
+  -- in the archive, if the install fails, or if this boot has already installed heap code:
+  -- a second install wedges the interpreter, nl.init refuses one, and start() runs on
+  -- every app start. In all of those the frame body falls back to dsp.spectrum.
+  --
+  -- The size, window and beta have to be passed. Unpassed, nl.init defaults to n = 512 and
+  -- DSP_WINDOW_HANN, so it would compute a spectrum of the wrong length with the wrong
+  -- taper while the panel showed the user's choices. win_to_native is OUR enum map, not
+  -- fftsa.win_to_dsp, which targets Keithley's dsp.WINDOW_* -- the note at the top of this
+  -- file spells out what conflating the two costs.
+  --
+  -- fftsa.cap is passed and validated but is not the IPC barrier: it holds no readings
+  -- until the first capture completes, and buffer.getstats on an empty buffer need not
+  -- make the service-task call that the barrier is. nl.init barriers on a buffer it fills
+  -- itself.
+  if fftsa.nl ~= nil and type(fftsa.nl.init) == 'function' then
+    fftsa.nl.init(fftsa.cap, fftsa.n, fftsa.nl.win_to_native(fftsa.win_i),
+                  fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP)
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))

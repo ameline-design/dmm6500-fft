@@ -292,6 +292,19 @@ else()
   message(STATUS "Lua 5.0.2 not found; the relocate_applier gate will not run")
 endif()
 
+# The picker index and DSP_WINDOW_* are different numbers that currently coincide, and
+# native_link.tsp carries a hand-maintained map between them. A hand-maintained map is
+# worth only what checks it: a renumbered enumerator would select the wrong window with
+# nothing on the glass to say so, every amplitude out by a scalloping factor. Not gated on
+# the PPC target, and not on the host either -- it compares two text files.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME window_enum
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_window_enum.py
+                   --root ${CMAKE_CURRENT_SOURCE_DIR}/..)
+endif()
+
 # ---------------------------------------------------------------------------
 # PPC cross-compilation target for the DMM6500 instrument.
 #

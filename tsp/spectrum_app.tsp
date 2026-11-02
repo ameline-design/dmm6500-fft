@@ -1723,12 +1723,24 @@ function fftsa.start()
   end)
   if not ok then return fftsa.start_failed(tostring(err)) end
 
-  -- Attempt to initialise the native DSP path.  fftsa.cap is a live reading buffer
-  -- after apply(), so it serves as the IPC barrier buffer.
-  -- nl.ready stays false if the binary has not been loaded; the frame body falls back
-  -- to dsp.spectrum.
-  if fftsa.cap ~= nil and fftsa.nl ~= nil then
-    fftsa.nl.init(fftsa.cap)
+  -- Attempt to initialise the native DSP path. nl.ready stays false if the binary is not
+  -- in the archive, if the install fails, or if this boot has already installed heap code:
+  -- a second install wedges the interpreter, nl.init refuses one, and start() runs on
+  -- every app start. In all of those the frame body falls back to dsp.spectrum.
+  --
+  -- The size, window and beta have to be passed. Unpassed, nl.init defaults to n = 512 and
+  -- DSP_WINDOW_HANN, so it would compute a spectrum of the wrong length with the wrong
+  -- taper while the panel showed the user's choices. win_to_native is OUR enum map, not
+  -- fftsa.win_to_dsp, which targets Keithley's dsp.WINDOW_* -- the note at the top of this
+  -- file spells out what conflating the two costs.
+  --
+  -- fftsa.cap is passed and validated but is not the IPC barrier: it holds no readings
+  -- until the first capture completes, and buffer.getstats on an empty buffer need not
+  -- make the service-task call that the barrier is. nl.init barriers on a buffer it fills
+  -- itself.
+  if fftsa.nl ~= nil and type(fftsa.nl.init) == 'function' then
+    fftsa.nl.init(fftsa.cap, fftsa.n, fftsa.nl.win_to_native(fftsa.win_i),
+                  fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP)
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
