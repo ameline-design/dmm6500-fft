@@ -129,6 +129,24 @@ end
 
 local function align8(v) return v + math.mod(8 - math.mod(v, 8), 8) end
 
+-- Progress breadcrumbs for nl.init, off unless fftsa.nl.trace is set.
+--
+-- nl.init is one Lua call that installs code and then branches into it, so when it
+-- bluescreens the Lua state goes with the instrument and there is nothing left to ask.
+-- A PC on the glass in the heap says only that something executed garbage, and init has
+-- three places that branch to a heap address. print() in TSP reaches the socket as the
+-- statement runs, so a trace crosses the wire BEFORE the crash and the last line received
+-- names the step. That is the only diagnostic available here short of splitting init into
+-- separately-callable stages, which is worth doing for nl.reinit but would not have been
+-- worth doing blind.
+local function trace(tag, a, b)
+  if not fftsa.nl.trace then return end
+  local s = 'NLT|' .. tostring(tag)
+  if a ~= nil then s = s .. '|' .. tostring(a) end
+  if b ~= nil then s = s .. '|' .. tostring(b) end
+  print(s)
+end
+
 -- Read a word from the instrument, or nil. Reads are DRAM-only by construction here:
 -- every address passed in comes from the heap scan window or a descriptor inside it.
 local function W(addr)
@@ -483,7 +501,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   if nl._DSP_RELOC == nil then return false end
 
   -- 1. Firmware math addresses. All six are needed; dsp.c calls every one.
+  trace('math')
   if nl.resolve_math() < 6 then return false end
+  trace('math.ok')
 
   -- 2. The ki.peek8 closure, and its original f pointer.
   local s = tostring(ki.peek8)
@@ -528,8 +548,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   if bar.n == nil or bar.n < 1 then return fftsa.nl._abort(cb) end
   buffer.getstats(bar)
 
+  trace('scan.code')
   local code_base = nl._find_storage(cb)
   if not code_base then return fftsa.nl._abort(cb) end
+  trace('code_base', hx(code_base))
   nl.code_buf  = cb
   nl.code_base = code_base
 
@@ -544,6 +566,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   local span       = (params_at - code_base) + nl.PARAM_WORDS * 4
   if span > nl.CHUNK_BYTES then return fftsa.nl._abort(cb) end
   nl.params = params_at
+  trace('layout', hx(tramp_at), hx(params_at))
 
   -- 5. Trampoline first, so later writes can be flushed properly. Its own first
   --    execution rides on the IPC barrier alone.
@@ -554,19 +577,25 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   -- way round: that costs a power cycle, and allowing one that is not costs a wedge and a
   -- power cycle. Nothing clears NLBOOT, including _abort.
   NLBOOT = tramp_at
+  trace('tramp.write', hx(tramp_at), string.len(nl._TRAMP))
   ki.memwrite(hx(tramp_at), nl._TRAMP)
   buffer.getstats(bar)
   nl.tramp = tramp_at
+  trace('tramp.selfflush')
   via_peek8(tramp_at, hx(tramp_at), hx(string.len(nl._TRAMP)))
+  trace('tramp.ok')
 
   -- 6. The image, patched for this load address.
   local img, err = nl.relocate(nl._DSP_CODE, nl._DSP_RELOC, code_base,
                                nl._DSP_RELOC_BSS_HI)
   if img == nil then return fftsa.nl._abort(cb) end
+  trace('img.reloc', string.len(img))
   ki.memwrite(hx(code_base), img)
   buffer.getstats(bar)
+  trace('img.flush')
   flush(code_base, string.len(img))
   nl.entry = code_base
+  trace('img.ok')
 
   -- 7. How many chunks the arena needs, asked of the binary rather than guessed.
   --    The arrays are laid out one per chunk by dsp_plan_init_segs, so the arena does
@@ -575,7 +604,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   nl.write_params({ mode = nl.MODE_SEGS, cap_n = want_n,
                     seg_bytes = nl.CHUNK_BYTES,
                     init_decim = decim or 1, init_method = method or 0 })
+  trace('call.segs', hx(code_base), hx(nl.params))
   local nseg = via_peek8(code_base, hx(nl.params))
+  trace('call.segs.ret', tostring(nseg))
   if type(nseg) ~= 'number' or nseg <= 0 then
     -- Zero means no chunk can hold one of the arrays: the window is n * 8 bytes, so
     -- this is the bound on n rather than a failure of the mechanism.
@@ -594,8 +625,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   end
   buffer.getstats(bar)
 
+  trace('scan.plan')
   local pdesc = nl.describe(pb)
   if pdesc == nil or pdesc.vec == nil then return fftsa.nl._abort(cb, pb) end
+  trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
 
   -- The vector has to actually hold the entries about to be read out of it. The chunk
   -- count is the descriptor's own field at +0x10, so this is the allocator's answer and
@@ -641,6 +674,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   end
   local sv = {}
   for i = 1, nseg do sv[i] = u32_pack(payload[i]) end
+  trace('segs.write', hx(segs_addr), nseg)
   ki.memwrite(hx(segs_addr), table.concat(sv))
 
   -- The writable window has to cover every chunk of this buffer, and the chunks are
@@ -665,7 +699,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
     init_beta_milli = math.floor((beta or 0) * 1000),
     init_decim = decim or 1, init_method = method or 0,
   })
+  trace('call.init')
   local rc = via_peek8(code_base, hx(nl.params))
+  trace('call.init.ret', tostring(rc))
   nl.last_rc = rc
   if rc ~= 0 then
     return fftsa.nl._abort(cb, pb)
@@ -679,6 +715,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method)
   nl.n         = want_n
   nl.nmax      = want_n
   nl.ready     = true
+  trace('done')
   return true
 end
 
