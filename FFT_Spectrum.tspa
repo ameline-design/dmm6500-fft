@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 5.9
+-- $Version: 6.0
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -4427,10 +4427,35 @@ function fftsa.dsp_why(what, code)
 end
 
 -- Every table, window and twiddle is sized from the selected power-of-two count.
--- 512 remains the default; larger records trade update speed for finer bins.
-fftsa.n       = 512
+--
+-- Two defaults, chosen between in start(). On the compiled path 512, 1024 and 2048 all run
+-- at the same measured frame rate, because what sets it below 4096 is per-frame work that
+-- does not depend on the count at all -- so 2048 is four times the frequency resolution for
+-- nothing, 48.8 Hz bins against 195.3 at the 100 kS/s floor. The interpreted primitive does
+-- scale with the count, and at 2048 it costs about four times what it does at 512, so that
+-- is the count to open at when the compiled path will not be there.
+fftsa.n          = 512
+fftsa.n_compiled = 2048
 fftsa.sample_counts = {512, 1024, 2048, 4096, 8192, 16384}
 fftsa.sample_labels = {"512", "1024", "2048", "4096", "8192", "16384"}
+
+-- Will the compiled path install on this instrument? The blob has to be in the archive and
+-- the firmware has to be one whose addresses are known, which is the same table resolve_math
+-- gates the install on -- so this is a table lookup and needs no part of the install to have
+-- run yet.
+--
+-- Necessary and not sufficient: the install can still fail, and a boot that has already
+-- spent one refuses a second. So this decides a default and never a correctness question,
+-- and a wrong answer costs a slower first screen rather than a wrong spectrum.
+function fftsa.native_likely()
+  local nl = fftsa.nl
+  if nl == nil or nl.FW == nil then return false end
+  if nl.SIZEOF_REAL == nil or nl.SIZEOF_REAL == 0 then return false end
+  local v = nil
+  if localnode ~= nil then v = localnode.version end
+  if v == nil then return false end
+  return nl.FW[v] ~= nil
+end
 
 -- Floor for the start frequency. A start of 0 would admit bin 1, which is DC and,
 -- with the mean removed by fftsa.fft_load(), holds only window leakage.
@@ -4618,40 +4643,60 @@ function fftsa.measure_fs(buf)
   return (n - 1) / (tN - t1)
 end
 
--- Every frame-class attribute the display owns, written every frame: all are settable while
--- the app runs and an unchanged write costs a comparison, so syncing one and not the rest is
--- what makes sg_ncol live and sg_dbmin dead with nothing to say which. Both counts are clamped
--- to what was built, being refused above it. The peak count is returned so the display loops
--- ask for the same number -- read separately, a raised sg_npeak asks dsp.peak() for a peak it
--- never found, and that posts an event per peak per frame.
+-- The clamped frame-class counts, recomputed every frame so every knob stays live. Both are
+-- clamped to what was built, being refused above it. The peak count is returned so the
+-- display loops ask for the same number -- read separately, a raised sg_npeak asks
+-- dsp.peak() for a peak it never found, and that posts an event per peak per frame.
+--
+-- This writes no dsp.* attribute. The eleven of them the interpreted primitive reads are
+-- pushed by dsp_live_push, which runs immediately before that primitive and nowhere else:
+-- the compiled path reads none of them, taking fftsa.live_ncol and fftsa.live_npk and the
+-- axis fields straight from Lua, so on a recognised firmware -- where the compiled path
+-- serves every count -- writing them once a frame was eleven property writes into the
+-- interpreter that nothing afterwards read. Pushing at the point of use rather than once a
+-- frame keeps every one of them live, which is what writing them all together was for.
 function fftsa.dsp_live()
   local ncol = fftsa.sg_ncol
   local cap = nil
   if fftsa.sg_buf ~= nil then cap = fftsa.sg_buf.capacity end
   if cap ~= nil and ncol ~= nil and ncol > cap then ncol = cap end
   if ncol == nil or ncol < 2 then ncol = 2 end
-  dsp.out.segments = ncol
   -- Kept for the native path, which has no dsp.out to read back: these are the CLAMPED
   -- counts, and a second clamp elsewhere is how the trace and the primitive end up
   -- disagreeing about how many points there are.
   fftsa.live_ncol = ncol
-  -- The plot's own axis, so trace, peak column and noise figure share one floor.
-  dsp.out.dbfloor = fftsa.sg_dbmin
-  dsp.out.dbceil  = fftsa.sg_dbmax
-  dsp.out.vfloor  = fftsa.sg_vfloor
   -- Ceiling is the rows build() made: a row that does not exist cannot be written.
   local npk = fftsa.sg_npeak
   local rows = nil
   if fftsa.sg_pk_f ~= nil then rows = table.getn(fftsa.sg_pk_f) end
   if rows ~= nil and rows > 0 and npk > rows then npk = rows end
   if npk == nil or npk < 1 then npk = 1 end
-  dsp.peaks.count = npk
   fftsa.live_npk = npk
+  return npk
+end
+
+-- Hand dsp_live's counts and the plot's own limits to the interpreted primitive. Called
+-- from dsp_commit() and from spectrum_interp(), so nothing reaches dsp.spectrum or
+-- dsp.commit without them current.
+function fftsa.dsp_live_push()
+  dsp.out.segments = fftsa.live_ncol
+  -- The plot's own axis, so trace, peak column and noise figure share one floor.
+  dsp.out.dbfloor = fftsa.sg_dbmin
+  dsp.out.dbceil  = fftsa.sg_dbmax
+  dsp.out.vfloor  = fftsa.sg_vfloor
+  dsp.peaks.count = fftsa.live_npk
   -- The harmonic rules, or a native dsp's own defaults move all three figures on switch day.
   dsp.thd.harmonics = fftsa.thd_hmax_want
   dsp.thd.bins      = fftsa.thd_bins_want
   dsp.thd.mains     = fftsa.thd_mains_want
-  return npk
+end
+
+-- The only route to the interpreted primitive, so the attributes it reads cannot be left
+-- behind by a caller that forgot them. Every fallback in the frame goes through here.
+function fftsa.spectrum_interp(cap, buf)
+  fftsa.dsp_live_push()
+  fftsa.dsp_window()
+  return dsp.spectrum(cap, buf, nil)
 end
 
 -- The plotted window, written per frame. An adopted gesture moves the axis without re-planning, so a
@@ -4827,11 +4872,14 @@ function fftsa.apply()
   dsp.out.lowfreq  = fftsa.flo
   dsp.out.highfreq = fftsa.fhi
   -- The axis floor follows the range: a DMM7510 plots to -140 dBV on 1 V and 0.1 V, where its
-  -- noise floor measures -129 and -134. Ahead of dsp_live(), which hands the floor to the
-  -- primitive, and ahead of the capture for the same reason the X pin is; the pin is
+  -- noise floor measures -129 and -134. Ahead of dsp_live(), whose floor dsp_live_push hands
+  -- to the primitive, and ahead of the capture for the same reason the X pin is; the pin is
   -- conditional because an axis write costs 60 ms.
   if fftsa.sg_dbmin_set(fftsa.range) then fftsa.sg_pin_y() end
   fftsa.dsp_live()
+  -- dsp.commit() rebuilds from these, so they are pushed here and not left to the first
+  -- frame that happens to need the interpreted primitive.
+  fftsa.dsp_live_push()
   local rc = dsp.commit()
   if rc ~= dsp.OK then error(fftsa.dsp_why("commit", rc), 0) end
   local need = dsp.fft.srclength
@@ -4998,8 +5046,10 @@ function fftsa.frame_body()
   -- buffer's min and max current as the readings land, so this is one call rather than a pass.
   fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
   local t_b = os.clock()
+  -- The counts only. The attributes the interpreted primitive reads, including the plotted
+  -- window, are pushed by spectrum_interp at the point of use, so a compiled frame writes
+  -- none of them.
   local npk = fftsa.dsp_live()
-  fftsa.dsp_window()
   -- Native path: the compiled DSP writes the trace into sg_buf's chunk storage in place
   -- and rewinds the descriptor, so no buffer.clear() happens and the graph never paints a
   -- half-filled trace. Falls back to Keithley's dsp.spectrum whenever the install is not
@@ -5050,7 +5100,7 @@ function fftsa.frame_body()
       -- carries the reason; fftsa.nl.RC names it.
       fftsa.nl.ready = false
       fftsa.nl_lasterr = tostring(fftsa.nl.last_rc)
-      nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+      nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
     else
       -- The trace reaches the graph through buffer.write.reading, from the values the same
       -- call reduced. The display task works from its own copy of a bound buffer and that
@@ -5063,7 +5113,7 @@ function fftsa.frame_body()
       if rd == nil then
         fftsa.nl.ready = false
         fftsa.nl_lasterr = 'reduce'
-        nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+        nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
       else
         fftsa.binhz = binhz
         fftsa.nl_frame = true
@@ -5080,7 +5130,7 @@ function fftsa.frame_body()
   else
     -- Existing path: dsp.spectrum clears sg_buf internally before filling it.
     -- marks = nil deliberately (see comment below).
-    nseg = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+    nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
   end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
   -- ZERO SEGMENTS IS A SHORT RECORD, not a failure: nothing was written, the previous
@@ -6457,6 +6507,13 @@ function fftsa.start()
   -- fft_init builds, so a defect in OUR code raises here. A raise escaping a timer or
   -- button callback on this firmware posts -286 and leaves the app on screen and dead,
   -- so one backstop per entry point stays until those paths are proved non-raising.
+  -- The opening count, before the only Apply start() runs, so choosing it costs no second
+  -- capture and no reordering of the install below. Both names move together or Reset would
+  -- restore a count this never opened at.
+  if fftsa.native_likely() then
+    fftsa.n = fftsa.n_compiled
+    fftsa.defaults.n = fftsa.n_compiled
+  end
   local ok, err = pcall(function()
     fftsa.apply()
     fftsa.period = fftsa.frame_period(fftsa.n)

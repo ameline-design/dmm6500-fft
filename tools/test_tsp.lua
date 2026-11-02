@@ -3247,6 +3247,72 @@ check('and that check fails when the per-frame write is removed', (function()
                               tostring(dsp.out.lowfreq), tostring(dsp.out.highfreq))
 end)())
 
+-- The opening count depends on whether the compiled path will be there, because below 4096
+-- that path runs every count at one rate while the interpreted one scales with the count.
+-- Exercised by injecting the version, since this harness's localnode carries none -- which
+-- is itself the false case, and is why the rest of the suite still opens at 512.
+check('the opening count is 2048 only where the compiled path will serve it', (function()
+  local node, fw = localnode, nil
+  if fftsa.nl ~= nil then fw = fftsa.nl.FW end
+  local sz = nil
+  if fftsa.nl ~= nil then sz = fftsa.nl.SIZEOF_REAL end
+  local no_version = fftsa.native_likely()
+  -- A known firmware with the blob present.
+  if fftsa.nl == nil then fftsa.nl = {} end
+  fftsa.nl.FW = {['9.9.9z'] = 1}
+  fftsa.nl.SIZEOF_REAL = 4
+  localnode = {model = 'DMM6500', version = '9.9.9z'}
+  local known = fftsa.native_likely()
+  -- The same firmware with no blob in the archive, which is the interpreted build.
+  fftsa.nl.SIZEOF_REAL = 0
+  local no_blob = fftsa.native_likely()
+  -- A firmware the table does not know, which is the upgrade case.
+  fftsa.nl.SIZEOF_REAL = 4
+  localnode = {model = 'DMM6500', version = '9.9.9-unknown'}
+  local unknown = fftsa.native_likely()
+  localnode = node
+  fftsa.nl.FW, fftsa.nl.SIZEOF_REAL = fw, sz
+  return no_version == false and known == true and no_blob == false
+         and unknown == false and fftsa.n_compiled == 2048,
+         string.format('no version=%s known=%s no blob=%s unknown=%s',
+                       tostring(no_version), tostring(known),
+                       tostring(no_blob), tostring(unknown))
+end)())
+
+-- The split that keeps a compiled frame out of the interpreter: dsp_live computes the
+-- clamped counts and writes no dsp.* attribute, and dsp_live_push writes them. Put back the
+-- other way round -- the push folded into dsp_live, as it was -- a compiled frame pays
+-- eleven property writes nothing afterwards reads. Pinned on both halves, because a split
+-- where the push happens to be unreachable is the same bug with the opposite symptom.
+check('dsp_live computes the counts and writes no interpreted attribute', (function()
+  dsp.out.segments, dsp.out.dbfloor, dsp.peaks.count = -1, -1, -1
+  dsp.thd.harmonics = -1
+  local npk = fftsa.dsp_live()
+  local untouched = dsp.out.segments == -1 and dsp.out.dbfloor == -1
+                    and dsp.peaks.count == -1 and dsp.thd.harmonics == -1
+  local counted = fftsa.live_ncol == fftsa.sg_ncol and fftsa.live_npk == npk
+  fftsa.dsp_live_push()
+  local pushed = dsp.out.segments == fftsa.live_ncol
+                 and dsp.out.dbfloor == fftsa.sg_dbmin
+                 and dsp.peaks.count == fftsa.live_npk
+                 and dsp.thd.harmonics == fftsa.thd_hmax_want
+  return untouched and counted and pushed,
+         string.format('untouched=%s counted=%s pushed=%s (segments=%s)',
+                       tostring(untouched), tostring(counted), tostring(pushed),
+                       tostring(dsp.out.segments))
+end)())
+
+-- And the interpreted primitive is never reached without them: spectrum_interp is the only
+-- route to dsp.spectrum in the frame, so a fallback cannot run against whatever the last
+-- push happened to leave behind.
+check('a fallback frame pushes the attributes before the primitive runs', (function()
+  dsp.out.segments, dsp.out.dbfloor = -1, -1
+  fftsa.frame_body()
+  return dsp.out.segments == fftsa.live_ncol and dsp.out.dbfloor == fftsa.sg_dbmin,
+         string.format('segments=%s dbfloor=%s after a frame',
+                       tostring(dsp.out.segments), tostring(dsp.out.dbfloor))
+end)())
+
 -- The icons, which a focus repaint covers. The frame puts them back at the peak cadence,
 -- so the assertion is that a frame redraws them at all -- setstate to a state the object
 -- already holds may be taken as nothing to do, hence the invisible-then-enable pair.
