@@ -382,10 +382,19 @@ fftsa.nl_nmax = 2048
 -- tools/test_tsp.lua -- "the trace buffer is FILL_ONCE, never a ring" -- so changing it
 -- needs the wrap-line artefact measured on the glass first, not argued away.
 --
--- Set this true to run the native path and see that for yourself; the app is correct and
--- slower with it false, and fast with an empty plot with it true. That is not a trade
--- anybody wants shipped, so it ships off.
-fftsa.nl_enable = false
+-- ON, TO BE TESTED FROM THE KEY, which is the install path none of the above was measured
+-- on. Every one of those three readings came from tools/run_app.py, which pushes the
+-- modules over the control socket -- and on that path the whole display EVENT system was
+-- measured dead afterwards: a brand new OBJ_TIMER fired zero times in four seconds, and
+-- zero during a blocking delay(3), while painting carried on normally. Both buttons were
+-- dead too. So "the widget does not re-read the buffer" and "nothing in the display
+-- dispatches at all" are not separated yet, and the second explanation fits every
+-- observation including the ones that have nothing to do with the native path.
+--
+-- Installed from the key the firmware's own installer runs, the loadimage blocks register,
+-- and there is no socket session holding the instrument. If the trace draws there, the
+-- conclusion above was an artefact of the harness.
+fftsa.nl_enable = true
 
 -- fftsa.thd_mains_want holds Keithley's dsp.MAINS_* value and the native side takes
 -- DSP_THD_MAINS_*, which is 50, 60, 0 or BOTH. Those three are the mains frequencies
