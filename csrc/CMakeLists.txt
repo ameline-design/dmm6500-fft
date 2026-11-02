@@ -11,15 +11,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE MinSizeRel CACHE STRING "" FORCE)
 endif()
 
-include(FetchContent)
-FetchContent_Declare(
-  googletest
-  GIT_REPOSITORY https://github.com/google/googletest.git
-  GIT_TAG v1.15.2
-  GIT_SHALLOW TRUE)
-set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(googletest)
+# googletest only in a host tree. The PPC tree has no hosted C++ runtime to link it against,
+# and a gtest binary built for powerpc-unknown-elf could not be run anyway.
+if(NOT CMAKE_CROSSCOMPILING)
+  include(FetchContent)
+  FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.15.2
+    GIT_SHALLOW TRUE)
+  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googletest)
+endif()
 
 enable_testing()
 
@@ -182,6 +186,11 @@ else()
   set(DSP_COV_FLAGS "")
 endif()
 
+# Everything from here to the PPC section is host-only: it is compiled to be run, and a
+# cross tree cannot run it. Registering it there put nine permanent failures in the cross
+# tree's ctest output, which is how a red gate stops being read.
+if(NOT CMAKE_CROSSCOMPILING)
+
 # dsp.c compiled twice: dsp_real is float by default and double under DSP_DOUBLE. Both
 # variants run the same test source, which scales its precision-dependent bounds off
 # sizeof(dsp_real), so the suite measures what single precision costs rather than assuming
@@ -268,6 +277,8 @@ target_include_directories(dsp_native_bounds_test PRIVATE ${CMAKE_CURRENT_SOURCE
 target_link_libraries(dsp_native_bounds_test PRIVATE GTest::gtest_main)
 target_compile_options(dsp_native_bounds_test PRIVATE ${DSP_CXX_FLAGS})
 add_test(NAME dsp_native_bounds COMMAND dsp_native_bounds_test)
+
+endif()  # NOT CMAKE_CROSSCOMPILING
 
 # The relocation applier runs on the instrument under Lua 5.0.2, where a wrong patch is a
 # silently wrong address rather than a failure. Its checks run against hand-computed

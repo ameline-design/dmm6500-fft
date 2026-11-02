@@ -36,6 +36,11 @@ notes/
 # Build output: regenerable by re-running the harness, and it dates immediately.
 out/
 
+# CMake trees for csrc/: build/ is the host test tree, build-ppc/ the cross tree. Both are
+# regenerable, and the host tree carries a fetched googletest checkout.
+build/
+build-ppc/
+
 # Local tooling and OS noise
 .claude/
 .DS_Store
