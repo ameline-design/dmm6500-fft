@@ -1068,7 +1068,14 @@ function fftsa.frame()
     -- Re-bind the trace after a failure so the graph is never left without one, and only
     -- while the bound buffer still holds points: adding over an empty one binds nothing
     -- and never draws again.
-    if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
+    --
+    -- Once per run of failures, not once per failure. Each add allocates an 82,464-byte
+    -- display-side trace object against a ceiling of 30 across all graphs, so a run of
+    -- twenty rebinding frames spends most of that pool for nothing, and the axis re-pin in
+    -- every one of them is visible as the scales walking across the screen. errrun still
+    -- holds the previous value here, so zero is the first failure of a run.
+    if fftsa.errrun == 0 and fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil
+       and fftsa.sg_buf.n > 0 then
       fftsa.sg_rebind()
     end
     fftsa.lasterr  = tostring(err)
@@ -2266,6 +2273,9 @@ function fftsa.start()
     -- and an add, which is the trace-object churn this path exists to avoid, so the only
     -- things re-asserted are the buffers' names and the cover that apply() runs behind.
     fftsa.sg_name_buffers()
+    -- The gesture report, which sg_bind() would have re-asserted. Idempotent, and the
+    -- scale read-back needs the registration to answer at all.
+    fftsa.sg_hook_scale()
     if fftsa.loading_build() == nil then
       return fftsa.start_failed("display object pool exhausted building the cover")
     end

@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 7.1
+-- $Version: 7.2
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -292,8 +292,19 @@ end
 fftsa.fft_built_n = nil
 
 function fftsa.fft_init(N)
+  -- The tables are asked for alongside the three keys, because the keys outlive them.
+  -- This file's own body nils fft_x, fft_re, fft_im and fft_pwr while fftsa itself
+  -- survives, so re-running the modules -- which opening the app as an installed App does
+  -- -- leaves the keys describing tables that are gone. The memo then reports the
+  -- transform ready and the first frame indexes a nil array: "attempt to index local `re'
+  -- (a nil value)", once a frame, with the failed-frame path re-pinning the axes after
+  -- each one. dsp.release() clears the keys with the tables and is not the only way they
+  -- part company.
   if fftsa.fft_built_n == N and fftsa.fft_built_win == fftsa.win_i
-     and fftsa.fft_built_beta == fftsa.kbeta_i then
+     and fftsa.fft_built_beta == fftsa.kbeta_i
+     and fftsa.fft_x ~= nil and fftsa.fft_re ~= nil and fftsa.fft_im ~= nil
+     and fftsa.fft_pwr ~= nil and fftsa.fft_win ~= nil
+     and fftsa.fft_swp_a ~= nil and fftsa.fft_twr ~= nil and fftsa.fft_utr ~= nil then
     return
   end
   fftsa.fft_built_n = nil
@@ -5470,7 +5481,14 @@ function fftsa.frame()
     -- Re-bind the trace after a failure so the graph is never left without one, and only
     -- while the bound buffer still holds points: adding over an empty one binds nothing
     -- and never draws again.
-    if fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0 then
+    --
+    -- Once per run of failures, not once per failure. Each add allocates an 82,464-byte
+    -- display-side trace object against a ceiling of 30 across all graphs, so a run of
+    -- twenty rebinding frames spends most of that pool for nothing, and the axis re-pin in
+    -- every one of them is visible as the scales walking across the screen. errrun still
+    -- holds the previous value here, so zero is the first failure of a run.
+    if fftsa.errrun == 0 and fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil
+       and fftsa.sg_buf.n > 0 then
       fftsa.sg_rebind()
     end
     fftsa.lasterr  = tostring(err)
@@ -6668,6 +6686,9 @@ function fftsa.start()
     -- and an add, which is the trace-object churn this path exists to avoid, so the only
     -- things re-asserted are the buffers' names and the cover that apply() runs behind.
     fftsa.sg_name_buffers()
+    -- The gesture report, which sg_bind() would have re-asserted. Idempotent, and the
+    -- scale read-back needs the registration to answer at all.
+    fftsa.sg_hook_scale()
     if fftsa.loading_build() == nil then
       return fftsa.start_failed("display object pool exhausted building the cover")
     end

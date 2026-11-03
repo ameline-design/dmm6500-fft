@@ -5693,6 +5693,46 @@ check('the relaunched app runs frames again',
       end)(),
       string.format('timer=%s errrun=%s n=%s', tostring(fftsa.timer),
                     tostring(fftsa.errrun), tostring(fftsa.sg_buf.n)))
+
+-- Opening the app as an installed App re-runs the modules, and fft_core.tsp's own body
+-- nils fft_x, fft_re, fft_im and fft_pwr while fftsa keeps fft_init's three keys. So the
+-- memo has to ask for the tables too. Reproduced by nilling exactly what that body nils:
+-- with the keys alone fft_init returns at once, and the first frame raises "attempt to
+-- index local `re' (a nil value)" once a frame for the whole launch.
+check('fft_init rebuilds when a reload took the arrays and left the keys', (function()
+  local n = fftsa.fft_n
+  local keyed = fftsa.fft_built_n == n
+  fftsa.fft_x, fftsa.fft_re, fftsa.fft_im, fftsa.fft_pwr = nil, nil, nil, nil
+  fftsa.fft_init(n)
+  local rebuilt = fftsa.fft_x ~= nil and fftsa.fft_re ~= nil
+                  and fftsa.fft_im ~= nil and fftsa.fft_pwr ~= nil
+  fftsa.frame()
+  return keyed and rebuilt and fftsa.errrun == 0 and fftsa.sg_buf.n > 0,
+         string.format('keyed=%s rebuilt=%s errrun=%s lasterr=%s', tostring(keyed),
+                       tostring(rebuilt), tostring(fftsa.errrun),
+                       tostring(fftsa.lasterr))
+end)())
+
+-- A failing frame re-binds the trace, and each add allocates an 82 KB display-side trace
+-- object against a ceiling of 30 across all graphs. Once per run of failures, not once a
+-- frame: five failures must cost one add, and the axis re-pin that comes with each is what
+-- the operator sees as the scales walking.
+check('a run of failed frames rebinds the trace once, not once a frame', (function()
+  fftsa.frame()                                  -- points in the buffer, so a bind takes
+  local adds0 = OBJ[fftsa.sg_graph].adds
+  local real = dmm.digitize.read
+  dmm.digitize.read = function() error('boom', 0) end
+  local i
+  for i = 1, 5 do fftsa.frame() end
+  dmm.digitize.read = real
+  local adds = OBJ[fftsa.sg_graph].adds - adds0
+  local failed = fftsa.errrun
+  fftsa.errcount, fftsa.errrun, fftsa.halted = 0, 0, false
+  fftsa.frame()
+  return adds == 1 and failed == 5 and fftsa.sg_buf.n > 0,
+         string.format('adds=%d over %d failures, recovered n=%s', adds, failed,
+                       tostring(fftsa.sg_buf.n))
+end)())
 fftsa.stop()
 
 -- Frames must give up and say so rather than fail silently forever.

@@ -282,8 +282,19 @@ end
 fftsa.fft_built_n = nil
 
 function fftsa.fft_init(N)
+  -- The tables are asked for alongside the three keys, because the keys outlive them.
+  -- This file's own body nils fft_x, fft_re, fft_im and fft_pwr while fftsa itself
+  -- survives, so re-running the modules -- which opening the app as an installed App does
+  -- -- leaves the keys describing tables that are gone. The memo then reports the
+  -- transform ready and the first frame indexes a nil array: "attempt to index local `re'
+  -- (a nil value)", once a frame, with the failed-frame path re-pinning the axes after
+  -- each one. dsp.release() clears the keys with the tables and is not the only way they
+  -- part company.
   if fftsa.fft_built_n == N and fftsa.fft_built_win == fftsa.win_i
-     and fftsa.fft_built_beta == fftsa.kbeta_i then
+     and fftsa.fft_built_beta == fftsa.kbeta_i
+     and fftsa.fft_x ~= nil and fftsa.fft_re ~= nil and fftsa.fft_im ~= nil
+     and fftsa.fft_pwr ~= nil and fftsa.fft_win ~= nil
+     and fftsa.fft_swp_a ~= nil and fftsa.fft_twr ~= nil and fftsa.fft_utr ~= nil then
     return
   end
   fftsa.fft_built_n = nil
