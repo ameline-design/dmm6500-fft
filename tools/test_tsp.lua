@@ -5640,9 +5640,60 @@ check('End App is hooked on the options screen too',
 if ev ~= nil and ev['endapp'] ~= nil then
   loadstring(ev['endapp'])()
 end
-check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
-check('End App from the options screen frees every buffer', livebufs() == base_bufs,
-      'buffers=' .. livebufs())
+-- End App PARKS. It stops the frames and puts the panel back, and the screen set and the
+-- three buffers stay allocated for the next launch to reuse -- fftsa.park() says why, and
+-- "a relaunch reuses the screen set" below is the other half of the same contract. What
+-- End App must leave behind is a stopped app, not a freed one.
+check('End App from the options screen stops the frames', fftsa.timer == nil
+      and fftsa.busy == false and fftsa.halted == false,
+      string.format('timer=%s busy=%s halted=%s', tostring(fftsa.timer),
+                    tostring(fftsa.busy), tostring(fftsa.halted)))
+check('End App from the options screen keeps the screen set for the next launch',
+      fftsa.sg_scr ~= nil and fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil
+      and fftsa.sg_mk ~= nil and fftsa.optscr ~= nil and live() > 0,
+      'live=' .. live())
+-- And an explicit stop is still the full release, which is the only way back to a bare
+-- instrument without a power cycle.
+check('an explicit stop after End App frees every object and every buffer',
+      (function() fftsa.stop(); return live() == 0 and livebufs() == base_bufs end)(),
+      'live=' .. live() .. ' buffers=' .. livebufs())
+
+-- A relaunch reuses rather than rebuilds: no new graph, no new trace object, the same
+-- buffers, and the trace still bound to the graph it was bound to. Asserted on identity
+-- and on the object and buffer counts, because a rebuild that happened to land on the
+-- same counts would still have churned the display side.
+fftsa.start()
+local reuse_scr, reuse_graph = fftsa.sg_scr, fftsa.sg_graph
+local reuse_buf, reuse_mk = fftsa.sg_buf, fftsa.sg_mk
+local reuse_objs, reuse_bufs = live(), livebufs()
+local reuse_adds = OBJ[reuse_graph].adds
+fftsa.cleanup()                                  -- End App
+local started = fftsa.start()                    -- and open it again
+check('a relaunch reuses the screen set rather than building a second one',
+      started == true and fftsa.reused == true
+      and fftsa.sg_scr == reuse_scr and fftsa.sg_graph == reuse_graph
+      and fftsa.sg_buf == reuse_buf and fftsa.sg_mk == reuse_mk
+      and live() == reuse_objs and livebufs() == reuse_bufs
+      and OBJ[reuse_graph].adds == reuse_adds
+      and OBJ[reuse_graph].buffer == fftsa.sg_buf
+      and FFTSA_TRACE == fftsa.sg_buf,
+      string.format('started=%s reused=%s scr=%s graph=%s buf=%s objs %d/%d bufs %d/%d'
+                    .. ' adds %s/%s bound=%s',
+                    tostring(started), tostring(fftsa.reused),
+                    tostring(fftsa.sg_scr == reuse_scr),
+                    tostring(fftsa.sg_graph == reuse_graph),
+                    tostring(fftsa.sg_buf == reuse_buf), live(), reuse_objs,
+                    livebufs(), reuse_bufs, tostring(OBJ[reuse_graph].adds),
+                    tostring(reuse_adds),
+                    tostring(OBJ[reuse_graph].buffer == fftsa.sg_buf)))
+check('the relaunched app runs frames again',
+      (function()
+        fftsa.frame()
+        return fftsa.timer ~= nil and fftsa.errrun == 0 and fftsa.sg_buf.n > 0
+      end)(),
+      string.format('timer=%s errrun=%s n=%s', tostring(fftsa.timer),
+                    tostring(fftsa.errrun), tostring(fftsa.sg_buf.n)))
+fftsa.stop()
 
 -- Frames must give up and say so rather than fail silently forever.
 fftsa.start()

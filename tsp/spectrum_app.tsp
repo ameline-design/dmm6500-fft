@@ -1116,10 +1116,17 @@ function fftsa.frame()
     end
   end
   fftsa.busy = false
-  -- A teardown that arrived mid-frame waits here, where nothing is in flight.
+  -- A teardown that arrived mid-frame waits here, where nothing is in flight. Whichever
+  -- of the two deferred runs now: End App parks and keeps the glass, and only an explicit
+  -- stop releases it.
   if fftsa.stop_pending then
     fftsa.stop_pending = false
-    fftsa.stop()
+    if fftsa.park_wanted then
+      fftsa.park_wanted = false
+      fftsa.park()
+    else
+      fftsa.stop()
+    end
   end
 end
 
@@ -2166,8 +2173,37 @@ function fftsa.arm(period_s)
   return fftsa.timer
 end
 
+-- What End App does: stop the frames, put the panel back, and keep every handle.
+--
+-- Rebuilding the screen set in one power cycle is the fault this avoids. A build allocates
+-- another graph and another display-side trace object -- 82,464 bytes each, with ceilings
+-- of 20 traces a graph, 30 trace objects across all graphs and 10 graphs -- while the
+-- previous launch's may not have been released, and that path bluescreened the instrument
+-- at pc=00318FC0 twice. It also hands the display task's name-based trace subscription a
+-- second buffer to resolve, which comes up as a blank plot with the dB axis relabelled in
+-- volts while every reading in the buffer is correct. A reused screen set has neither
+-- problem, and it is what lets the app be restarted without a power cycle.
+--
+-- The cost is that the screens and the three buffers stay allocated after the app exits,
+-- about a hundred of the 463 display objects and 66,000 of 7,080,255 readings, until a
+-- power cycle or an explicit fftsa.stop(). That is the trade: hold the pool, or crash.
+function fftsa.park()
+  -- Not underneath a running frame, for the same reason as fftsa.stop().
+  if fftsa.busy and not fftsa.stop_pending then
+    fftsa.stop_pending, fftsa.park_wanted = true, true
+    return false
+  end
+  fftsa.stop_pending, fftsa.park_wanted = false, false
+  if fftsa.timer ~= nil then fftsa.del_obj(fftsa.timer) end
+  fftsa.timer = nil
+  fftsa.busy, fftsa.halted, fftsa.errrun = false, false, 0
+  fftsa.retune_pending, fftsa.armed_n = false, nil
+  display.changescreen(display.SCREEN_HOME)
+  return true
+end
+
 function fftsa.cleanup()
-  fftsa.stop()
+  fftsa.park()
 end
 
 -- Hooked as soon as the spectrum screen exists, so a later startup failure still
@@ -2192,11 +2228,24 @@ function fftsa.start_failed(why)
 end
 
 -- Startup, guarded end to end so a failure part-way leaves nothing without a teardown.
--- The opening fftsa.stop() reclaims a previous launch's handles: as an installed App the
--- script re-runs on every open, and an exit that skipped EVENT_ENDAPP (the Home screen,
--- another App) leaves them behind.
+--
+-- A screen set this power cycle already built is reused: as an installed App the script
+-- re-runs on every open, the module bodies keep their handles, and fftsa.park() says why
+-- building a second one is the fault rather than the fix. Everything else about startup is
+-- the same either way, because apply() and arm() do not care which launch built the glass.
+--
+-- Where there is nothing to reuse -- a fresh power cycle, or a previous launch that did
+-- tear down -- the opening fftsa.stop() reclaims whatever is left and build() runs.
 function fftsa.start()
-  fftsa.stop()
+  local reuse = fftsa.sg_scr ~= nil and fftsa.sg_graph ~= nil and fftsa.sg_buf ~= nil
+                and fftsa.sg_mk ~= nil and fftsa.sg_pk_f ~= nil
+                and fftsa.optscr ~= nil and fftsa.loadscr ~= nil
+  if reuse then
+    fftsa.park()
+  else
+    fftsa.stop()
+  end
+  fftsa.reused = reuse
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
 
   -- The refusal the capability gate promised, taken before anything is built. Without it
@@ -2212,8 +2261,19 @@ function fftsa.start()
   -- nil and posts one event, and build() passes that up as false and a reason. Handled
   -- here directly rather than raised into the boundary below, which would be reporting a
   -- condition to ourselves.
-  local built, why = fftsa.build()
-  if built == false then return fftsa.start_failed(why or "build failed") end
+  if reuse then
+    -- The trace stays bound to the graph it was already bound to. A rebind is a removeall
+    -- and an add, which is the trace-object churn this path exists to avoid, so the only
+    -- things re-asserted are the buffers' names and the cover that apply() runs behind.
+    fftsa.sg_name_buffers()
+    if fftsa.loading_build() == nil then
+      return fftsa.start_failed("display object pool exhausted building the cover")
+    end
+    fftsa.loading_front()
+  else
+    local built, why = fftsa.build()
+    if built == false then return fftsa.start_failed(why or "build failed") end
+  end
 
   -- Resolved once, here, so the 1 Hz tick tests one boolean instead of the six names the
   -- HELP recogniser needs out of the undocumented ki namespace.
@@ -2288,7 +2348,9 @@ function fftsa.stop()
     fftsa.stop_pending = true
     return false
   end
-  fftsa.stop_pending = false
+  -- park_wanted with it: a park deferred by a running frame and then overtaken by a stop
+  -- would otherwise keep the glass that the stop is here to release.
+  fftsa.stop_pending, fftsa.park_wanted = false, false
   -- Timer first: stop frames before removing what the frames use.
   if fftsa.timer ~= nil then fftsa.del_obj(fftsa.timer) end
   fftsa.timer = nil
