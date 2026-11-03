@@ -224,7 +224,7 @@ end
 -- THD and the noise floor over the plotted bins, as a percentage and dBV.
 --
 -- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
--- tone between bins. The noise floor is the MEAN POWER of every bin that is not a line or
+-- tone between bins. The noise floor is the mean power of every bin that is not a line or
 -- its skirt: averaging decibels instead lets one deep null drag it down several dB.
 --
 -- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
@@ -250,7 +250,7 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
     -- Strict > rejects a NaN correctly on this firmware where >= does not.
     if p ~= nil and p > pf then
-      -- A LOCAL MAXIMUM, or the shoulder of a louder line qualifies. Measured with the
+      -- A local maximum, or the shoulder of a louder line qualifies. Measured with the
       -- inputs floating: the 60 Hz line sat in bin 11 and was discounted as mains, but
       -- bin 12 at 67.1 Hz -- its own skirt, 8 dB down -- missed the mains tolerance by
       -- 1 Hz and became the fundamental, giving 21.4% distortion on no signal at all.

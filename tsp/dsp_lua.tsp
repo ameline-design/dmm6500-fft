@@ -44,7 +44,7 @@ function fftsa.dsp_install()
   -- a timer or button callback posts -286 and leaves the app on screen and dead. The list
   -- stands in for the instrument's event log so a test can assert that a refusal posted AND
   -- returned a code.
-  -- ONE RECORD, not a list. nevents stays monotonic, so a test can assert that a refusal
+  -- One record, not a list. nevents stays monotonic, so a test can assert that a refusal
   -- posted and a caller can tell a fresh one from a stale one, but the records cannot
   -- accumulate: this app runs unattended for the rest of a power cycle and nothing reads an
   -- event except the one lastevent() returns. Natively these go to the instrument's own

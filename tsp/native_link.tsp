@@ -235,7 +235,7 @@ local function hx(v) return string.format('%X', v) end
 -- result is the bit pattern a host would have written. Checked against struct.pack in
 -- csrc/tools/test_f64.lua, including the signs, the infinities and a NaN.
 --
--- SUBNORMALS FLUSH TO ZERO, and so does anything whose exponent overflows, to an infinity.
+-- Subnormals flush to zero, and so does anything whose exponent overflows, to an infinity.
 -- The smallest normal is 2.2e-308; what crosses here is a frequency, a decibel limit or a
 -- voltage floor, and the closest any of them comes is the squared voltage floor at 1e-18.
 local function f64_words(x)
@@ -617,7 +617,7 @@ function fftsa.nl._find_storage(buf, has_extras)
       if math.mod(h, 8) == 0 then
         -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
         -- measures, the extra value at +20 only exists in an element that long, and
-        -- assuming it was load-bearing: measuring the stride from the spacing of the
+        -- assuming it was necessary: measuring the stride from the spacing of the
         -- readings instead found a 16-byte record holding the same six values. So 32 is
         -- tried first and the measured offsets are the fallback, for a STYLE_STANDARD
         -- buffer whose element really is smaller. Each candidate gets the FULL
@@ -906,7 +906,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Init. Called once per boot, at startup, before any frame.
 --
--- Once per boot is now a CONSERVATIVE RULE RATHER THAN A NECESSARY ONE. It was written when
+-- Once per boot is a conservative rule rather than a necessary one. It was written when
 -- a second install wedged the interpreter, which the trampoline flushing its own range is
 -- what caused; with that removed, an image rewritten over an already-fetched range and
 -- flushed through the trampoline was measured computing correctly. The guard stays because
@@ -1376,7 +1376,7 @@ function fftsa.nl.reinit(want_n, kind, beta, decim, method)
 end
 
 -- ---------------------------------------------------------------------------
--- Run one frame. Returns the TRACE POINT count, which is what the app reports as nseg, or
+-- Run one frame. Returns the trace point count, which is what the app reports as nseg, or
 -- nil with nl.last_rc set. Not the bin count: the run ends in dsp_reduce.
 --
 -- cap and out each describe one buffer's chunk storage:
@@ -1392,7 +1392,7 @@ end
 -- whatever else lives between two scattered payloads.
 -- ---------------------------------------------------------------------------
 -- red carries the reduction, which is everything the trace depends on and nothing the plan
--- does: nseg, the bin window k0..k1 (ZERO BASED, where the Lua implementation's bins are
+-- does: nseg, the bin window k0..k1 (zero based, where the Lua implementation's bins are
 -- one based), the decibel limits, the voltage floor, and the bin-to-hertz map. binhz is
 -- measured per frame off the capture's own timestamps, so it is not a constant and does not
 -- belong in the plan.

@@ -17,7 +17,7 @@ fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 -- high. Settable up to sg_maxpts while running: FILL_ONCE and cleared, so n follows.
 fftsa.sg_ncol    = 255
 
--- PEAK MARKERS, off by default. A second trace of one point a peak, carrying the
+-- Peak markers, off by default. A second trace of one point a peak, carrying the
 -- interpolated frequency and amplitude the peak table reports -- so a marker sits where
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
@@ -444,7 +444,7 @@ function fftsa.sg_write_xunit()
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end)
   if not ok then
-    -- EVERY INPUT, not just the message. A "bad argument #2 to format (string expected,
+    -- Every input, not just the message. A "bad argument #2 to format (string expected,
     -- got nil)" was seen here once and could not be reproduced or explained: the call it
     -- names cannot return nil for any value this records. If it recurs, the values come
     -- with it rather than needing another afternoon.
@@ -537,7 +537,7 @@ function fftsa.sg_bind()
   if fftsa.sg_markers and fftsa.sg_mk ~= nil then
     display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
                       fftsa.sg_mk, display.ELEMENT_EXTRA)
-    -- ONE SCALE FOR EVERY TRACE. A custom graph starts at TRACE_ACTIVE, where a scale
+    -- One scale for every trace. A custom graph starts at TRACE_ACTIVE, where a scale
     -- call reaches only the selected trace -- so the second trace keeps auto-scaling and
     -- its points are stretched across the whole plot, landing nowhere near the spectrum.
     -- TRACE_ALL syncs them: "as scale settings for X and Y change they will get applied

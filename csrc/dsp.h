@@ -1276,7 +1276,7 @@ typedef struct {
 /**
  * @brief Measure harmonic distortion and noise over bins `k0..k1` of @p pwr.
  *
- * The fundamental is the strongest bin in the window that is also a LOCAL MAXIMUM and clears
+ * The fundamental is the strongest bin in the window that is also a local maximum and clears
  * ::DSP_THD_MINRATIO. Strongest alone is not enough: on a monotonic skirt it picks the
  * shoulder of a louder line, which measured 21.4% distortion on no signal. Harmonics are sought at `h * f0` for
  * rising @c h, each taken as the largest bin within ::DSP_THD_HALFW of the prediction, and
@@ -1286,11 +1286,11 @@ typedef struct {
  * window; ::DSP_THD_SKIRT is only the fallback where @p ip is NULL. Amplitudes come from ::dsp_peak_interp, because a bin maximum alone reads
  * up to 3.9 dB low on a tone sitting between bins.
  *
- * The noise figures use the MEAN POWER of every bin that is neither a line nor a skirt.
+ * The noise figures use the mean power of every bin that is neither a line nor a skirt.
  * A mean of powers and not of decibels: averaging logarithms lets one deep null drag the
  * result down by several dB, where power is the quantity that adds.
  *
- * MAINS PICKUP IS PASSED OVER. A floating input carries 50 or 60 Hz and its harmonics --
+ * Mains pickup is passed over. A floating input carries 50 or 60 Hz and its harmonics --
  * measured on the instrument, 60 Hz at -25.4 dBV with harmonics out to 540 -- and taking
  * the hum as the fundamental reports the hum's own distortion, 11.04% over a -105.2 dBV
  * floor. A candidate at a multiple of the selected mains frequency, under

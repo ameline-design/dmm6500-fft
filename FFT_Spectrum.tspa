@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 6.9
+-- $Version: 7.0
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -766,7 +766,7 @@ end
 -- THD and the noise floor over the plotted bins, as a percentage and dBV.
 --
 -- Amplitudes come from fftsa.peak_interp, not bin maxima, which read up to 3.9 dB low on a
--- tone between bins. The noise floor is the MEAN POWER of every bin that is not a line or
+-- tone between bins. The noise floor is the mean power of every bin that is not a line or
 -- its skirt: averaging decibels instead lets one deep null drag it down several dB.
 --
 -- Both nil with nothing to measure. THD alone is nil when no harmonic fits in the window,
@@ -792,7 +792,7 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     -- A partial fftsa.fft_pwr after a short read holds nils, and comparing one raises.
     -- Strict > rejects a NaN correctly on this firmware where >= does not.
     if p ~= nil and p > pf then
-      -- A LOCAL MAXIMUM, or the shoulder of a louder line qualifies. Measured with the
+      -- A local maximum, or the shoulder of a louder line qualifies. Measured with the
       -- inputs floating: the 60 Hz line sat in bin 11 and was discounted as mains, but
       -- bin 12 at 67.1 Hz -- its own skirt, 8 dB down -- missed the mains tolerance by
       -- 1 Hz and became the fundamental, giving 21.4% distortion on no signal at all.
@@ -917,7 +917,7 @@ fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 -- high. Settable up to sg_maxpts while running: FILL_ONCE and cleared, so n follows.
 fftsa.sg_ncol    = 255
 
--- PEAK MARKERS, off by default. A second trace of one point a peak, carrying the
+-- Peak markers, off by default. A second trace of one point a peak, carrying the
 -- interpolated frequency and amplitude the peak table reports -- so a marker sits where
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
@@ -1344,7 +1344,7 @@ function fftsa.sg_write_xunit()
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end)
   if not ok then
-    -- EVERY INPUT, not just the message. A "bad argument #2 to format (string expected,
+    -- Every input, not just the message. A "bad argument #2 to format (string expected,
     -- got nil)" was seen here once and could not be reproduced or explained: the call it
     -- names cannot return nil for any value this records. If it recurs, the values come
     -- with it rather than needing another afternoon.
@@ -1437,7 +1437,7 @@ function fftsa.sg_bind()
   if fftsa.sg_markers and fftsa.sg_mk ~= nil then
     display.graph.add(g, fftsa.sg_mk, display.ELEMENT_DATA,
                       fftsa.sg_mk, display.ELEMENT_EXTRA)
-    -- ONE SCALE FOR EVERY TRACE. A custom graph starts at TRACE_ACTIVE, where a scale
+    -- One scale for every trace. A custom graph starts at TRACE_ACTIVE, where a scale
     -- call reaches only the selected trace -- so the second trace keeps auto-scaling and
     -- its points are stretched across the whole plot, landing nowhere near the spectrum.
     -- TRACE_ALL syncs them: "as scale settings for X and Y change they will get applied
@@ -2362,7 +2362,7 @@ local function hx(v) return string.format('%X', v) end
 -- result is the bit pattern a host would have written. Checked against struct.pack in
 -- csrc/tools/test_f64.lua, including the signs, the infinities and a NaN.
 --
--- SUBNORMALS FLUSH TO ZERO, and so does anything whose exponent overflows, to an infinity.
+-- Subnormals flush to zero, and so does anything whose exponent overflows, to an infinity.
 -- The smallest normal is 2.2e-308; what crosses here is a frequency, a decibel limit or a
 -- voltage floor, and the closest any of them comes is the squared voltage floor at 1e-18.
 local function f64_words(x)
@@ -2744,7 +2744,7 @@ function fftsa.nl._find_storage(buf, has_extras)
       if math.mod(h, 8) == 0 then
         -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
         -- measures, the extra value at +20 only exists in an element that long, and
-        -- assuming it was load-bearing: measuring the stride from the spacing of the
+        -- assuming it was necessary: measuring the stride from the spacing of the
         -- readings instead found a 16-byte record holding the same six values. So 32 is
         -- tried first and the measured offsets are the fallback, for a STYLE_STANDARD
         -- buffer whose element really is smaller. Each candidate gets the FULL
@@ -3033,7 +3033,7 @@ end
 -- ---------------------------------------------------------------------------
 -- Init. Called once per boot, at startup, before any frame.
 --
--- Once per boot is now a CONSERVATIVE RULE RATHER THAN A NECESSARY ONE. It was written when
+-- Once per boot is a conservative rule rather than a necessary one. It was written when
 -- a second install wedged the interpreter, which the trampoline flushing its own range is
 -- what caused; with that removed, an image rewritten over an already-fetched range and
 -- flushed through the trampoline was measured computing correctly. The guard stays because
@@ -3503,7 +3503,7 @@ function fftsa.nl.reinit(want_n, kind, beta, decim, method)
 end
 
 -- ---------------------------------------------------------------------------
--- Run one frame. Returns the TRACE POINT count, which is what the app reports as nseg, or
+-- Run one frame. Returns the trace point count, which is what the app reports as nseg, or
 -- nil with nl.last_rc set. Not the bin count: the run ends in dsp_reduce.
 --
 -- cap and out each describe one buffer's chunk storage:
@@ -3519,7 +3519,7 @@ end
 -- whatever else lives between two scattered payloads.
 -- ---------------------------------------------------------------------------
 -- red carries the reduction, which is everything the trace depends on and nothing the plan
--- does: nseg, the bin window k0..k1 (ZERO BASED, where the Lua implementation's bins are
+-- does: nseg, the bin window k0..k1 (zero based, where the Lua implementation's bins are
 -- one based), the decibel limits, the voltage floor, and the bin-to-hertz map. binhz is
 -- measured per frame off the capture's own timestamps, so it is not a constant and does not
 -- belong in the plan.
@@ -3884,7 +3884,7 @@ function fftsa.dsp_install()
   -- a timer or button callback posts -286 and leaves the app on screen and dead. The list
   -- stands in for the instrument's event log so a test can assert that a refusal posted AND
   -- returned a code.
-  -- ONE RECORD, not a list. nevents stays monotonic, so a test can assert that a refusal
+  -- One record, not a list. nevents stays monotonic, so a test can assert that a refusal
   -- posted and a caller can tell a fresh one from a stale one, but the records cannot
   -- accumulate: this app runs unattended for the rest of a power cycle and nothing reads an
   -- event except the one lastevent() returns. Natively these go to the instrument's own
@@ -4789,7 +4789,7 @@ fftsa.cap_floor_n = fftsa.nl_nmax
 --
 -- Three notify calls were tried, same conditions, five frames each:
 --
---   display.graph.scaletrace   126.6 ms a frame, and it UNPINS BOTH AXES
+--   display.graph.scaletrace   126.6 ms a frame, and it unpins both axes
 --   display.graph.drawstyle     46.6 ms a frame, axes correct, nothing drawn
 --   none at all                 21.4 ms a frame, axes correct, nothing drawn
 --
@@ -4871,7 +4871,7 @@ function fftsa.nl_reduction(binhz)
   if r == nil then r = {}; fftsa.nl_redt = r end
   local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, binhz,
                                           fftsa.sg_flo_hz, fftsa.sg_fhi_hz)
-  -- ONE BASED THERE, ZERO BASED HERE. sg_window_bins counts bins the way the Lua
+  -- One based there, zero based here. sg_window_bins counts bins the way the Lua
   -- implementation indexes its power array, from 1; dsp_reduce indexes from 0. Getting
   -- this wrong shifts the whole trace by one bin, which no plot would show.
   r.k0, r.k1 = kmin - 1, kmax - 1
@@ -4970,7 +4970,7 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
-  -- Re-armed only when the SAMPLE COUNT moved, which is the only thing the period is
+  -- Re-armed only when the sample count moved, which is the only thing the period is
   -- derived from. arm() deletes the timer and creates a replacement, so re-arming restarts
   -- the period and churns the object pool: an adopted gesture, which cannot change the
   -- count, would pay a frame of latency for an identical timer and throw away the period
@@ -5115,7 +5115,7 @@ function fftsa.frame_body()
   -- usable for the plan in force -- no binary in the archive, a boot that already spent
   -- its install, or a sample count above what the arena was sized for.
   --
-  -- BOTH FLAGS ARE CLEARED FIRST and set only on success, so everything that reads them --
+  -- Both flags are cleared first and set only on success, so everything that reads them --
   -- the peak table, the THD line, plan_n -- is reading this frame or nothing.
   --
   -- Two flags and not one: nl_frame says which primitive produced the spectrum, nl_res
@@ -5192,7 +5192,7 @@ function fftsa.frame_body()
     nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
   end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
-  -- ZERO SEGMENTS IS A SHORT RECORD, not a failure: nothing was written, the previous
+  -- Zero segments is a short record, not a failure: nothing was written, the previous
   -- spectrum is still on screen, and a trigger timeout is the ordinary cause. Counted by the
   -- primitive, mirrored here because the settings line and the suite read this name.
   if nseg == 0 then
@@ -5526,7 +5526,7 @@ function fftsa.opt_layout()
   local nrows = math.ceil(fftsa.opt_nf / fftsa.opt_cols)
   local eh, edy = fftsa.opt_edit_h, fftsa.opt_edit_dy
   local y0, dy  = fftsa.opt_y0, fftsa.opt_dy
-  -- The last box has to end above the READBACK LINE, which sits above the buttons: at
+  -- The last box has to end above the readback line, which sits above the buttons: at
   -- seven fields the button row alone leaves the bottom box over the top of it.
   local floor_y = fftsa.opt_info_y - fftsa.opt_info_h
   if nrows > 1 then
@@ -5740,7 +5740,7 @@ end
 -- form. Same shape as About -- rows of text, a page counter, PgUp, PgDn and Back -- so the
 -- geometry constants above are shared rather than restated, and one builder makes both.
 --
--- Which screen a press lands on is decided by WHICH TIMER ran, not by tracking the visible
+-- Which screen a press lands on is decided by which timer ran, not by tracking the visible
 -- screen: a display timer only fires while its own screen is showing, measured on the
 -- instrument -- the frame timer freezes the moment Options or About is raised. So the
 -- spectrum screen's frame timer asks for "main" and the options form's preview timer asks

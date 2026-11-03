@@ -767,7 +767,7 @@ int dsp_native_run(void *L)
     /* Bins to the trace the graph reads: nseg maxima, in decibels, against the segment's
      * own frequency.  dsp_reduce rather than a loop here, because it is the reduction the
      * host suite covers -- the NaN handling, the descending Nyquist zone and the floor are
-     * all load-bearing and none of them is obvious. */
+     * all necessary and none of them is obvious. */
     {
         dsp_bandmap map;
         dsp_real *db = (dsp_real *)(uintptr_t)p->red_db;

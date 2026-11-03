@@ -2402,7 +2402,7 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
      * against the 102 dB the window allows. One bin of guard past the null. */
     skirt = (ip != NULL && ip->lobe > 0) ? ip->lobe + 1 : DSP_THD_SKIRT;
 
-    /* The fundamental, which must be a LOCAL MAXIMUM. Otherwise the shoulder of a louder
+    /* The fundamental, which must be a local maximum. Otherwise the shoulder of a louder
      * line qualifies: measured on the instrument with its inputs floating, the 60 Hz line
      * was discounted as mains but the bin one along -- its own skirt, 8 dB down and a hertz
      * outside the mains tolerance -- became the fundamental and reported 21.4% distortion

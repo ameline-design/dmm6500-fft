@@ -425,7 +425,7 @@ fftsa.cap_floor_n = fftsa.nl_nmax
 --
 -- Three notify calls were tried, same conditions, five frames each:
 --
---   display.graph.scaletrace   126.6 ms a frame, and it UNPINS BOTH AXES
+--   display.graph.scaletrace   126.6 ms a frame, and it unpins both axes
 --   display.graph.drawstyle     46.6 ms a frame, axes correct, nothing drawn
 --   none at all                 21.4 ms a frame, axes correct, nothing drawn
 --
@@ -507,7 +507,7 @@ function fftsa.nl_reduction(binhz)
   if r == nil then r = {}; fftsa.nl_redt = r end
   local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, binhz,
                                           fftsa.sg_flo_hz, fftsa.sg_fhi_hz)
-  -- ONE BASED THERE, ZERO BASED HERE. sg_window_bins counts bins the way the Lua
+  -- One based there, zero based here. sg_window_bins counts bins the way the Lua
   -- implementation indexes its power array, from 1; dsp_reduce indexes from 0. Getting
   -- this wrong shifts the whole trace by one bin, which no plot would show.
   r.k0, r.k1 = kmin - 1, kmax - 1
@@ -606,7 +606,7 @@ function fftsa.apply()
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame
   -- cost with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
-  -- Re-armed only when the SAMPLE COUNT moved, which is the only thing the period is
+  -- Re-armed only when the sample count moved, which is the only thing the period is
   -- derived from. arm() deletes the timer and creates a replacement, so re-arming restarts
   -- the period and churns the object pool: an adopted gesture, which cannot change the
   -- count, would pay a frame of latency for an identical timer and throw away the period
@@ -751,7 +751,7 @@ function fftsa.frame_body()
   -- usable for the plan in force -- no binary in the archive, a boot that already spent
   -- its install, or a sample count above what the arena was sized for.
   --
-  -- BOTH FLAGS ARE CLEARED FIRST and set only on success, so everything that reads them --
+  -- Both flags are cleared first and set only on success, so everything that reads them --
   -- the peak table, the THD line, plan_n -- is reading this frame or nothing.
   --
   -- Two flags and not one: nl_frame says which primitive produced the spectrum, nl_res
@@ -828,7 +828,7 @@ function fftsa.frame_body()
     nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
   end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
-  -- ZERO SEGMENTS IS A SHORT RECORD, not a failure: nothing was written, the previous
+  -- Zero segments is a short record, not a failure: nothing was written, the previous
   -- spectrum is still on screen, and a trigger timeout is the ordinary cause. Counted by the
   -- primitive, mirrored here because the settings line and the suite read this name.
   if nseg == 0 then
@@ -1162,7 +1162,7 @@ function fftsa.opt_layout()
   local nrows = math.ceil(fftsa.opt_nf / fftsa.opt_cols)
   local eh, edy = fftsa.opt_edit_h, fftsa.opt_edit_dy
   local y0, dy  = fftsa.opt_y0, fftsa.opt_dy
-  -- The last box has to end above the READBACK LINE, which sits above the buttons: at
+  -- The last box has to end above the readback line, which sits above the buttons: at
   -- seven fields the button row alone leaves the bottom box over the top of it.
   local floor_y = fftsa.opt_info_y - fftsa.opt_info_h
   if nrows > 1 then
@@ -1376,7 +1376,7 @@ end
 -- form. Same shape as About -- rows of text, a page counter, PgUp, PgDn and Back -- so the
 -- geometry constants above are shared rather than restated, and one builder makes both.
 --
--- Which screen a press lands on is decided by WHICH TIMER ran, not by tracking the visible
+-- Which screen a press lands on is decided by which timer ran, not by tracking the visible
 -- screen: a display timer only fires while its own screen is showing, measured on the
 -- instrument -- the frame timer freezes the moment Options or About is raised. So the
 -- spectrum screen's frame timer asks for "main" and the options form's preview timer asks
