@@ -941,6 +941,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- reason.
   if NLBOOT ~= nil then
     nl.boot_spent = true
+    -- Spent means installed, not unusable. nl.reattach resumes the install this boot
+    -- already made, which is what lets a relaunch run compiled instead of dropping to
+    -- dsp.spectrum for the rest of the power cycle. It validates before it believes, and
+    -- on any doubt answers false and leaves the app on the interpreted path.
+    if nl.reattach(want_n, kind, beta, decim, method) then return true end
     return false
   end
   nl.boot_spent = false
@@ -1319,7 +1324,122 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.n         = want_n
   nl.nmax      = want_n
   nl.ready     = true
+  nl.stash()
   trace('done')
+  return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Keeping an install across a relaunch.
+--
+-- The code, the trampoline, the params struct and the arena all live in the chunk storage
+-- of two reading buffers, and a reading buffer outlives the script that made it. So a
+-- relaunch has not lost the install -- it has lost the Lua side of it, because the module
+-- body rebuilds fftsa.nl and takes every address with it. Nothing but a power cycle clears
+-- a global, which is where NLBOOT already lives, so the addresses go beside it.
+--
+-- What this buys: a second launch in one power cycle runs compiled instead of falling back
+-- to dsp.spectrum, which at 2048 samples is about 9.5 frames a second against 2.4. And it
+-- needs no second install, so the hazard the one-install-per-boot rule exists for -- a
+-- replacement image whose I-cache lines the trampoline cannot flush for itself -- never
+-- arises. No cap on relaunches follows from that, because nothing is being allocated.
+--
+-- Scalars, the two buffer handles, and fn, which holds the resolved firmware math
+-- addresses. Functions are deliberately not copied: they must come from the module being
+-- loaded, or a relaunch would run the previous build's Lua.
+function fftsa.nl.stash()
+  local nl, out = fftsa.nl, {}
+  local k, v
+  for k, v in pairs(nl) do
+    local t = type(v)
+    if t == 'number' or t == 'string' or t == 'boolean' then
+      out[k] = v
+    elseif k == 'fn' and t == 'table' then
+      local fn, k2, v2 = {}, nil, nil
+      for k2, v2 in pairs(v) do
+        if type(v2) == 'number' then fn[k2] = v2 end
+      end
+      out[k] = fn
+    elseif k == 'code_buf' or k == 'plan_buf' then
+      out[k] = v
+    end
+  end
+  NLSTASH = out
+  return true
+end
+
+-- A buffer the firmware has dropped raises on a capacity read, which is the only liveness
+-- test there is: the handle itself goes on answering.
+local function buf_alive(b)
+  if b == nil then return false end
+  local ok, cap = pcall(function() return b.capacity end)
+  return ok and type(cap) == 'number' and cap > 0
+end
+
+-- Resume the install this boot already made. Returns true with nl.ready set, or false,
+-- having changed nothing that matters -- the caller then runs on dsp.spectrum.
+--
+-- Four things are checked before any of it is believed, because the alternative to a
+-- refusal here is a call into whatever now occupies those addresses:
+--
+--   1. both buffers are still alive, so their chunk storage is still ours
+--   2. the trampoline's own bytes still match the literal this module carries
+--   3. the params address still sits in the image's slot
+--   4. reinit, which calls the installed code, returns a zero status
+--
+-- 2 is the one that matters most: it reads the heap where the image was written and
+-- compares it with what was written there, so an image that has been overwritten fails
+-- before anything is called rather than after.
+function fftsa.nl.reattach(want_n, kind, beta, decim, method)
+  local nl = fftsa.nl
+  local s = NLSTASH
+  if type(s) ~= 'table' then return false end
+  -- Everything the checks below need, including the two constants that come from the
+  -- generated module: they are taken from the stash rather than from nl, because the stash
+  -- is what the install actually used and a relaunch reloads the modules in an order this
+  -- has no business depending on.
+  if s.entry == nil or s.params == nil or s.tramp == nil or s.code_base == nil
+     or s.PARAMS_SLOT == nil or s.TRAMP_RANGE == nil or s._TRAMP == nil then
+    return false
+  end
+  if not buf_alive(s.code_buf) or not buf_alive(s.plan_buf) then
+    trace('reattach.dead')
+    return false
+  end
+  -- The trampoline's code, byte for byte, read back rather than trusted.
+  --
+  -- Every byte except the two range words at nl.TRAMP_RANGE. Those are the trampoline's
+  -- arguments: nl.flush writes the address and the length into them before each call, so
+  -- the zeros the literal carries there are stale from the first flush onwards and a whole
+  -- compare can never pass. One-based here, so the words occupy TRAMP_RANGE+1 through
+  -- TRAMP_RANGE+8 and the code resumes at TRAMP_RANGE+9.
+  local want = s._TRAMP
+  local got = ki.memread(hx(s.tramp), hx(string.len(want)))
+  local head, tail = s.TRAMP_RANGE, s.TRAMP_RANGE + 9
+  if string.len(got) ~= string.len(want)
+     or string.sub(got, 1, head) ~= string.sub(want, 1, head)
+     or string.sub(got, tail) ~= string.sub(want, tail) then
+    trace('reattach.tramp', hx(s.tramp))
+    return false
+  end
+  -- The params address, in the word the image reads it from.
+  local slot = W(s.code_base + s.PARAMS_SLOT)
+  if slot ~= s.params then
+    trace('reattach.params', hx(slot or 0))
+    return false
+  end
+  local k, v
+  for k, v in pairs(s) do nl[k] = v end
+  nl.ready = false
+  -- And the plan, rebuilt by the code itself. A count above what the arena was sized for
+  -- is refused in there, which is the same answer init would have given.
+  if not nl.reinit(want_n or s.n, kind, beta, decim, method) then
+    trace('reattach.replan', tostring(nl.last_rc))
+    nl.ready = false
+    return false
+  end
+  nl.reattached = true
+  trace('reattach.ok', hx(s.entry))
   return true
 end
 
