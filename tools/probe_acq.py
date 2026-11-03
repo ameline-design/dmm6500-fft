@@ -40,7 +40,7 @@ CAPS = (8192, 65536)
 RATES = (100000, 200000, 500000, 1000000)
 
 
-def ask(d, cmd, tag, tries=5, timeout=300):
+def ask(d, cmd, tag, tries=2, timeout=90):
     """A tagged read, checked: the instrument volunteers event lines and one arriving
     mid-exchange shifts every reply after it."""
     r = None
@@ -51,49 +51,54 @@ def ask(d, cmd, tag, tries=5, timeout=300):
     return 'DESYNC(%s) last=%r' % (tag, r)
 
 
-SETUP = """
-if PB ~= nil then pcall(function() PB.clear() buffer.delete(PB) end) end
-PB = buffer.make(%(cap)d, buffer.STYLE_STANDARD)
-dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE
-dmm.digitize.range = 10
-dmm.digitize.samplerate = %(rate)d
-dmm.digitize.count = %(count)d
-PB.clear()
-dmm.digitize.read(PB)
-print("ready|" .. tostring(PB.n) .. "|" .. tostring(PB.capacity))
-"""
+# ONE LINE PER STATEMENT. The control socket treats every line it receives as a separate
+# TSP statement, so a multi-line block loses its locals between lines: a timing loop written
+# over several lines reported "attempt to perform arithmetic on field `?'" because t0 was
+# gone by the time t1 was subtracted from it. Keep each of these under the 1024-byte
+# one-line probe limit too.
+SETUP = ('if PB ~= nil then pcall(function() PB.clear() buffer.delete(PB) end) end '
+         'PB = buffer.make(%(cap)d, buffer.STYLE_STANDARD) '
+         'dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE dmm.digitize.range = 10 '
+         'dmm.digitize.samplerate = %(rate)d dmm.digitize.count = %(count)d '
+         'PB.clear() dmm.digitize.read(PB) '
+         'print("ready|" .. tostring(PB.n) .. "|" .. tostring(PB.capacity) .. "|" '
+         '.. tostring(dmm.digitize.samplerate))')
 
-# One timing pass. The three statements are timed apart and over the same number of
-# repetitions, so a fixed per-call cost shows up in all three alike.
-TIME = """
-local i
-local t0 = os.clock()
-for i = 1, %(reps)d do PB.clear() dmm.digitize.read(PB) end
-local t1 = os.clock()
-for i = 1, %(reps)d do PB.clear() end
-local t2 = os.clock()
-for i = 1, %(reps)d do local lo, hi = PB.minreading, PB.maxreading end
-local t3 = os.clock()
-local n = PB.n
-local span = (PB.relativetimestamps[n] - PB.relativetimestamps[1]) / (n - 1)
-print(string.format("t|%%.3f|%%.3f|%%.3f|%%.4f|%%d",
-      (t1 - t0) * 1000 / %(reps)d, (t2 - t1) * 1000 / %(reps)d,
-      (t3 - t2) * 1000 / %(reps)d, span * 1000000, n))
-"""
+# The frame pays clear and capture together, so they are timed together; the over-range read
+# and the sample interval are taken while the buffer is still full, because both raise 4914
+# on an empty one.
+TIME_A = ('local i local t0 = os.clock() '
+          'for i = 1, %(reps)d do PB.clear() dmm.digitize.read(PB) end '
+          'local t1 = os.clock() local n = PB.n '
+          'local iv = (PB.relativetimestamps[n] - PB.relativetimestamps[1]) / (n - 1) '
+          'local t2 = os.clock() '
+          'for i = 1, %(reps)d do local lo, hi = PB.minreading, PB.maxreading end '
+          'local t3 = os.clock() '
+          'print(string.format("a|%%.3f|%%.4f|%%.4f|%%d", (t1 - t0) * 1000 / %(reps)d, '
+          '(t3 - t2) * 1000 / %(reps)d, iv * 1000000, n))')
+
+# clear() on its own, refilled before each one so every clear is of a full buffer. Clearing
+# an already-empty buffer is a different measurement.
+TIME_B = ('local i local tc = 0 '
+          'for i = 1, %(reps)d do dmm.digitize.read(PB) local ta = os.clock() PB.clear() '
+          'tc = tc + (os.clock() - ta) end '
+          'print(string.format("b|%%.4f", tc * 1000 / %(reps)d))')
 
 
 def one(d, count, cap, rate):
-    r = ask(d, SETUP % {'cap': cap, 'rate': rate, 'count': count}, 'ready|', timeout=600)
+    r = ask(d, SETUP % {'cap': cap, 'rate': rate, 'count': count}, 'ready|', timeout=120)
     if not r.startswith('ready|'):
         return None, r
-    r = ask(d, TIME % {'reps': REPS}, 't|', timeout=600)
-    if not r.startswith('t|'):
+    asked = r.split('|')[3]
+    r = ask(d, TIME_A % {'reps': REPS}, 'a|', timeout=120)
+    if not r.startswith('a|'):
         return None, r
     f = r.split('|')
-    both, clear, over, interval, n = (float(f[1]), float(f[2]), float(f[3]),
-                                      float(f[4]), int(f[5]))
+    both, over, interval, n = float(f[1]), float(f[2]), float(f[3]), int(f[4])
+    r = ask(d, TIME_B % {'reps': REPS}, 'b|', timeout=120)
+    clear = float(r.split('|')[1]) if r.startswith('b|') else float('nan')
     return {'both': both, 'clear': clear, 'over': over, 'interval': interval,
-            'n': n, 'read': both - clear,
+            'n': n, 'read': both - clear, 'asked': asked,
             'record': count * 1000.0 / rate}, None
 
 
