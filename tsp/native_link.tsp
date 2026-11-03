@@ -3,12 +3,17 @@
 -- Called once at startup; sets fftsa.nl.ready when the native path is available.
 -- Falls back silently on any failure: the app then uses dsp.spectrum as before.
 --
--- Four addresses belong to one firmware build and none of them is discovered at runtime.
--- Three are encoded in the trampoline bytes: dcbst_icbi_isync_range at 0x004A9840, and the
--- two Lua helpers at 0x0021E868 and 0x004BFE9C that it reads its hex-string arguments
--- through. The fourth is lua_pushnumber at 0x0021EF24, which the image calls to return its
--- status. nl.FW names the build they were measured on and nothing installs on another one.
--- Everything else -- the closure, the six libm entries -- is resolved at runtime.
+-- No firmware address is written down here. The six libm entries come from FNF, which
+-- finds them in the code of Lua's own math wrappers; the ki.peek8 closure and its f
+-- pointer come from tostring and a read; the trampoline is self-contained PowerPC that
+-- flushes the cache itself; and neither it nor the image reads the Lua stack, so the two
+-- helpers that used to transport their arguments are not needed. What the call reports
+-- comes back through a word of the params struct.
+--
+-- What remains firmware-shaped is ranges and layouts, not entry points: the .text extent
+-- in TEXT_LO and TEXT_HI, the heap extent the image is compiled with, the closure's f at
+-- +12 and the reading-buffer descriptor offsets. Every one of those is a test that
+-- refuses, so a build that moves them loses the native path and keeps the interpreter.
 --
 -- Lua 5.0.2: no '#', no hex literals, no multi-return string.byte, math.mod not fmod.
 
@@ -16,7 +21,7 @@ fftsa = fftsa or {}
 fftsa.nl = {
   ready     = false,  -- true once the binary is loaded, relocated and the plan is built
   fn        = {},     -- firmware math addresses resolved by FNF
-  tramp     = 0,      -- heap address of the 164-byte cache-flush trampoline
+  tramp     = 0,      -- heap address of the cache-flush trampoline
   entry     = 0,      -- heap address of dsp_native_run, which is image offset 0
   code_base = 0,      -- heap address the image is loaded at
   params    = 0,      -- heap address of the dsp_native_params struct
@@ -28,7 +33,7 @@ fftsa.nl = {
   last_rc   = nil,    -- status from the most recent native call
 }
 
--- Status codes dsp_native.c pushes back. Non-negative is a result.
+-- Status codes dsp_native.c writes into the params struct. Non-negative is a result.
 fftsa.nl.RC = {
   EMAGIC = -1, EBOUNDS = -2, EPLAN = -3, EGEOM = -4, ECAPTURE = -5,
   EOUTPUT = -6, EDESC = -7, EARENA = -8, ESCRATCH = -9, ERUN = -10, EMATH = -11,
@@ -114,23 +119,24 @@ function fftsa.nl.win_to_native(wi)
   return k
 end
 
--- The build these addresses were measured on, against localnode.version.
---
--- A build not listed here gets no native path. The four addresses would be wrong, and
--- calling a wrong one is a bluescreen rather than a refusal -- which ki.reboot cannot
--- recover. The interpreted path is slower and correct, so that is what an unrecognised
--- build runs. The value is lua_pushnumber; the other three live in the trampoline bytes,
--- which is why a new build needs both this entry and a trampoline rebuilt for it.
-fftsa.nl.FW = { ['1.7.17a'] = 2223908 }   -- lua_pushnumber at 0x0021EF24
-
--- What localnode.version answered, listed or not, so a refusal can say which build it was.
+-- What localnode.version answered, for a probe to report. Nothing is gated on it.
 fftsa.nl.fw_seen = nil
 
--- The 164-byte cache-flush trampoline for 1.7.17a. Reads two hex strings from the Lua
--- stack (address, count) and calls dcbst_icbi_isync_range. Position-independent: it has
--- no data references and reaches the firmware through lis/ori/mtctr/bctrl.
--- Rebuild with probe_codexec.py for other firmware versions.
-fftsa.nl._TRAMP = '\148\033\255\208\124\008\002\166\144\001\000\052\147\225\000\044\147\193\000\040\124\127\027\120\056\128\000\001\061\128\000\033\097\140\232\104\125\137\003\166\078\128\004\033\056\129\000\008\061\128\000\075\097\140\254\156\125\137\003\166\078\128\004\033\124\126\027\120\127\227\251\120\056\128\000\002\061\128\000\033\097\140\232\104\125\137\003\166\078\128\004\033\056\129\000\008\061\128\000\075\097\140\254\156\125\137\003\166\078\128\004\033\124\100\027\120\127\195\243\120\061\128\000\074\097\140\152\064\125\137\003\166\078\128\004\033\056\096\000\000\128\001\000\052\124\008\003\166\131\225\000\044\131\193\000\040\056\033\000\048\078\128\000\032'
+-- The cache-flush trampoline, assembled from csrc/flush_tramp.S. It pushes a range out of
+-- the D-cache with dcbst, invalidates the same range in the I-cache with icbi and isyncs,
+-- all in instructions of its own, so it depends on no firmware address. It takes no Lua
+-- arguments: the range is the two words at TRAMP_RANGE, which nl.flush writes before the
+-- call and the code reaches through a bl/mflr pair.
+--
+-- Position-independent and relocation-free, which csrc/tools/emit_tramp.py checks when it
+-- regenerates this literal. That tool is also the gate that keeps the two in step; the
+-- bytes are not editable by hand.
+fftsa.nl._TRAMP = '\072\000\000\012\000\000\000\000\000\000\000\000\125\104\002\166\072\000\000\005\125\040\002\166\128\105\255\240\128\137\255\244\125\104\003\166\040\004\000\000\065\130\000\068\124\163\034\020\056\165\000\031\084\165\000\052\084\099\000\052\124\102\027\120\124\000\024\108\056\099\000\032\124\003\040\064\065\128\255\244\124\000\004\172\124\000\055\172\056\198\000\032\124\006\040\064\065\128\255\244\124\000\004\172\076\000\001\044\056\096\000\000\078\128\000\032'
+fftsa.nl.TRAMP_RANGE = 4
+
+-- What write_params leaves in the status word, and no exit of dsp_native_run writes. A
+-- status still reading this after a call means the call never reached an exit.
+fftsa.nl.STATUS_UNSET = 2147483647
 
 -- The compiled image and its relocation table, both generated by
 -- csrc/tools/emit_reloc.py and embedded by tools/embed_native.py as base64. Nil means no
@@ -262,6 +268,16 @@ end
 
 local function align8(v) return v + math.mod(8 - math.mod(v, 8), 8) end
 
+-- To a cache line. A flush works in whole lines, so anything that must not be invalidated
+-- along with the image has to start on a line the image does not reach into.
+local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
+fftsa.nl._align32 = align32
+
+-- The 32-byte line a byte belongs to, and one past the last line a range touches. The
+-- range a flush covers is wider than the range asked for, by up to 31 bytes at each end.
+local function line_lo(a) return a - math.mod(a, 32) end
+local function line_hi(a, n) return line_lo(a + n - 1) + 32 end
+
 -- Progress breadcrumbs for nl.init, off unless fftsa.nl.trace is set.
 --
 -- nl.init is one Lua call that installs code and then branches into it, so when it
@@ -373,22 +389,17 @@ function fftsa.nl.FNF(fn)
 end
 
 -- Resolve the six functions dsp.c calls. Returns the count found.
+fftsa.nl.MATH_NAMES = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+
 function fftsa.nl.resolve_math()
   local fn = fftsa.nl.fn
-  -- The build first. The trampoline's three addresses and lua_pushnumber below belong to
-  -- it and to no other, and there is nothing here that would notice them having moved: a
-  -- wrong flush routine is a call into whatever occupies that address now. Answering zero
-  -- leaves nl.init short of its six and the native path unbuilt.
+  -- Recorded, not tested against anything: every address below is found by reading this
+  -- build's own code, so a build this has never seen either yields six addresses or
+  -- yields fewer and loses the native path.
   local v = nil
   if localnode ~= nil then v = localnode.version end
   fftsa.nl.fw_seen = tostring(v)
-  local pn = nil
-  if v ~= nil then pn = fftsa.nl.FW[tostring(v)] end
-  if pn == nil then
-    trace('fw.unknown', fftsa.nl.fw_seen)
-    return 0
-  end
-  local names = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+  local names = fftsa.nl.MATH_NAMES
   local found = 0
   local k
   for k = 1, table.getn(names) do
@@ -396,135 +407,34 @@ function fftsa.nl.resolve_math()
     fn[nm] = fftsa.nl.FNF(math[nm])
     if fn[nm] then found = found + 1 end
   end
-  -- lua_pushnumber is not behind a math wrapper, so it is the one address FNF cannot
-  -- reach. Identified by disassembly: li r0,3; stfd f1,8(r11).
-  fn.lua_pushnumber = pn
   return found
 end
 
--- The instruction words at the four build-specific addresses, as hex, for a probe to
--- report. A fingerprint read back here is what would let a later release verify an address
--- still holds the routine it was measured at instead of trusting a version string.
+-- The resolved math addresses and the first words at each, as hex, for a probe to report.
+-- Reading the entry back is the only check available on an address FNF derived: two of
+-- them answering the same address, or one landing somewhere that is not a function
+-- prologue, is visible here and nowhere else.
 function fftsa.nl.fw_probe(words)
-  -- 0x0021E868 and 0x0021EF24 are the two Lua entries, 0x004A9840 the flush routine and
-  -- 0x004BFE9C the second helper. Lua 5.0.2 has no hex literals.
-  local at = { 2222184, 2223908, 4888640, 4980380 }
+  local fn = fftsa.nl.fn
+  local names = fftsa.nl.MATH_NAMES
   local n = words or 4
   local out, i, j = '', nil, nil
-  for i = 1, table.getn(at) do
-    out = out .. string.format('%X:', at[i])
-    for j = 0, n - 1 do
-      local w = W(at[i] + j * 4)
-      if w == nil then out = out .. '????????'
-      else out = out .. string.format('%08X', w) end
+  for i = 1, table.getn(names) do
+    local a = fn[names[i]]
+    out = out .. names[i] .. ' '
+    if a == nil then
+      out = out .. 'unresolved'
+    else
+      out = out .. string.format('%X:', a)
+      for j = 0, n - 1 do
+        local w = W(a + j * 4)
+        if w == nil then out = out .. '????????'
+        else out = out .. string.format('%08X', w) end
+      end
     end
     out = out .. ' '
   end
-  return fftsa.nl.fw_seen .. ' ' .. out
-end
-
--- ---------------------------------------------------------------------------
--- Finding the cache-flush routine by what it does.
---
--- A range flush has to push the data range out of the D-cache with dcbst, invalidate the
--- same range in the I-cache with icbi, and isync before returning so the next fetch sees
--- the new bytes. Nothing else in an interpreter's text does all three, which makes the
--- combination an identity rather than a guess -- and one that survives a firmware build
--- moving the routine, because it describes the instructions and not the address.
---
--- isync is a fixed word, so string.find sweeps for it at C speed and only the few words
--- around each hit are read one at a time. Both other opcodes carry register fields, so they
--- are matched on the primary opcode and the extended opcode with the registers masked out.
---
--- Lua 5.0.2 has no bitwise operators and the instrument's bit library is not present on a
--- host, so the masks are arithmetic: a divide for the primary opcode and math.mod for the
--- low eleven bits.
--- ---------------------------------------------------------------------------
-fftsa.nl.OP_ISYNC  = 1275068716   -- 0x4C00012C, fixed
-fftsa.nl.OP_BLR    = 1317011488   -- 0x4E800020, fixed
-fftsa.nl.OP_NOP    = 1610612736   -- 0x60000000, ori r0,r0,0
-fftsa.nl.XO_ICBI   = 1964         -- 0x7AC, extended opcode 982 shifted
-fftsa.nl.XO_DCBST  = 108          -- 0x6C,  extended opcode 54 shifted
-fftsa.nl.ISYNC_STR = '\076\000\001\044'
-
--- Primary opcode 31 with the given extended opcode, registers and Rc ignored.
-local function is_x31(w, xo)
-  if w == nil then return false end
-  if math.floor(w / 67108864) ~= 31 then return false end
-  return math.mod(w, 2048) == xo
-end
-fftsa.nl._is_x31 = is_x31
-
--- The entry of the routine an isync at `at` belongs to, or nil if it is not a range flush.
---
--- Walks back word by word: an icbi and a dcbst have to appear before the previous function
--- ends, and the entry is the first word after that function's blr with any padding skipped.
--- A window rather than the whole text because a flush loop is a few dozen instructions, and
--- stopping at the blr is what keeps the search inside one function.
-function fftsa.nl._flush_entry(at, win)
-  local nl = fftsa.nl
-  local icbi, dcbst, back = false, false, nil
-  local i
-  for i = 1, win do
-    local a = at - i * 4
-    local w = W(a)
-    if w == nil then return nil end
-    if w == nl.OP_BLR then back = a; break end
-    if is_x31(w, nl.XO_ICBI) then icbi = true end
-    if is_x31(w, nl.XO_DCBST) then dcbst = true end
-  end
-  if not (icbi and dcbst) then return nil end
-  -- No blr inside the window means the function is longer than the window or the text
-  -- before it is not a function that returns; either way the entry is not established.
-  if back == nil then return nil end
-  local a = back + 4
-  for i = 1, 8 do
-    local w = W(a)
-    if w == nil then return nil end
-    if w ~= nl.OP_NOP then break end
-    a = a + 4
-  end
-  if a > at then return nil end
-  return a
-end
-
--- Sweep a text range for the flush routine. Returns the address and how many candidates
--- were seen; two different candidates is an answer this refuses, because picking one would
--- be a branch into the wrong function and that is a bluescreen rather than a refusal.
-function fftsa.nl.find_flush(lo, hi, chunk, win)
-  local nl = fftsa.nl
-  lo = lo or nl.TEXT_LO
-  hi = hi or nl.TEXT_HI
-  chunk = chunk or 32768
-  win = win or 96
-  local found, seen, base = nil, 0, lo
-  while base < hi do
-    local n = chunk
-    if base + n > hi then n = hi - base end
-    local s = ki.memread(hx(base), hx(n))
-    if s == nil then return nil, seen end
-    local len = string.len(s)
-    if len < 4 then return nil, seen end
-    local p = 1
-    while true do
-      local i = string.find(s, nl.ISYNC_STR, p, true)
-      if i == nil then break end
-      -- 4-aligned only, which every instruction is. The chunk base and length are
-      -- multiples of four, so no instruction straddles a chunk and the sweep needs no
-      -- overlap; an unaligned hit is data that happens to read as isync.
-      if math.mod(i - 1, 4) == 0 then
-        local e = nl._flush_entry(base + i - 1, win)
-        if e ~= nil then
-          seen = seen + 1
-          if found == nil then found = e
-          elseif found ~= e then return nil, seen end
-        end
-      end
-      p = i + 1
-    end
-    base = base + n
-  end
-  return found, seen
+  return tostring(fftsa.nl.fw_seen) .. ' ' .. out
 end
 
 -- ---------------------------------------------------------------------------
@@ -858,7 +768,7 @@ function fftsa.nl.write_params(t)
     t.cap_stride or 32,
     t.cap_vec or 0, t.cap_nchunks or 0,
     t.out_chunk1 or 0, t.out_chunk2 or 0, t.out_perchunk or 0, t.out_desc or 0,
-    fn.lua_pushnumber or 0,
+    fftsa.nl.STATUS_UNSET,
     fn.sin or 0, fn.cos or 0, fn.sqrt or 0,
     fn.log10 or 0, fn.floor or 0, fn.ceil or 0,
     t.init_kind or 0, t.init_beta_milli or 0,
@@ -882,35 +792,29 @@ end
 -- The restore writes back the pointer captured before the redirect, never a recomputed
 -- one, so a failure inside the call cannot leave ki.peek8 pointing at our code.
 -- ---------------------------------------------------------------------------
-local function via_peek8(addr, a1, a2)
+local function via_peek8(addr)
   local nl = fftsa.nl
-  if nl.peek8_cls == 0 then return nil, 'no closure' end
+  if nl.peek8_cls == 0 then return false, 'no closure' end
   -- Checked on the way in, not just at capture: the restore below is unconditional, so
   -- if this is wrong the redirect must not happen at all.
-  if not nl._text_ok(nl.peek8_f) then return nil, 'restore value not in .text' end
+  if not nl._text_ok(nl.peek8_f) then return false, 'restore value not in .text' end
   local slot = hx(nl.peek8_cls + 12)
   local orig = string.format('%08X', nl.peek8_f)
   ki.poke32(slot, string.format('%08X', addr))
-  local ok, r
-  if a2 ~= nil then
-    ok, r = pcall(ki.peek8, a1, a2)
-  else
-    ok, r = pcall(ki.peek8, a1)
-  end
+  -- No arguments. Neither the trampoline nor the image reads the Lua stack, so there is
+  -- nothing to pass; both take what they need from memory Lua wrote beforehand.
+  local ok, r = pcall(ki.peek8)
   ki.poke32(slot, orig)
-  -- nl.last_call records whether the branch returned normally, because the return value
-  -- cannot. The trampoline ends in `li r3,0`, so a successful flush yields zero Lua values
-  -- and r is nil -- which is precisely what a raised error produces here too. Three runs
-  -- of probe_native.py reported the self-flush "clean" on the strength of a nil that
-  -- proved nothing, and it went into the notes as an established result. Callers that care
-  -- whether the code actually ran must read nl.last_call, not the return value.
+  -- Whether the branch returned normally, which is all the return value can say: both
+  -- pieces of native code leave zero Lua values, so r is nil on success and nil on a
+  -- raised error. What they computed is read out of memory afterwards.
   fftsa.nl.last_call = ok
   if not ok then
     fftsa.nl.last_err = tostring(r)
-    return nil, r
+    return false, r
   end
   fftsa.nl.last_err = nil
-  return r
+  return true
 end
 fftsa.nl._via_peek8 = via_peek8
 
@@ -919,19 +823,52 @@ local function flush(addr, len)
   local nl = fftsa.nl
   if nl.tramp == nil or nl.tramp == 0 then return false end
   if addr == nil or len == nil or len <= 0 then return false end
-  -- REFUSE TO FLUSH THE TRAMPOLINE'S OWN RANGE. icbi on a line the CPU is executing from,
+  -- Refuse to flush the trampoline's own range. icbi on a line the CPU is executing from,
   -- followed by isync, forces a re-fetch mid-function; that is the fault behind two
   -- bluescreens. The caller has no business asking for it -- the barrier alone bootstraps
   -- a fresh line -- so this is a refusal rather than a special case.
+  --
+  -- Line by line, not byte by byte. The flush works in whole lines, so a range ending a
+  -- few bytes short of the trampoline still invalidates its first line, and a byte test
+  -- passes that straight through. The image's length is whatever the compiler makes it.
   local tlo = nl.tramp
-  local thi = nl.tramp + string.len(nl._TRAMP)
-  if addr < thi and addr + len > tlo then return false end
-  via_peek8(nl.tramp, hx(addr), hx(len))
-  -- last_call, not the return value: the trampoline returns zero Lua values on success, so
-  -- nil cannot distinguish a clean flush from a raised error.
+  if line_hi(addr, len) > line_lo(tlo) and
+     line_lo(addr) < line_hi(tlo, string.len(nl._TRAMP)) then
+    return false
+  end
+  -- The range, into the two words the trampoline loads it from. A plain store read back by
+  -- a plain load on the same core, so it needs no barrier of its own.
+  ki.memwrite(hx(tlo + nl.TRAMP_RANGE), u32_pack(addr) .. u32_pack(len))
+  via_peek8(tlo)
   return nl.last_call == true
 end
 fftsa.nl.flush = flush
+
+-- Call native code at addr and read back the status it wrote into the params struct.
+--
+-- Returns the status as a signed number, or nil and a reason. Three distinct failures and
+-- each says which: the branch raised, the word could not be read, and the word still
+-- holds STATUS_UNSET -- the last meaning the code ran and returned without passing
+-- through any exit of dsp_native_run, which is what landing in the wrong place looks
+-- like from here.
+local function call_native(addr)
+  local nl = fftsa.nl
+  local function refuse(why)
+    nl.last_err = why
+    return nil, why
+  end
+  if nl.params == nil or nl.params == 0 then return refuse('no params') end
+  if nl.STATUS_OFF == nil or nl.STATUS_OFF == 0 then return refuse('no status offset') end
+  local ok, err = via_peek8(addr)
+  if not ok then return nil, err end
+  local s = ki.memread(hx(nl.params + nl.STATUS_OFF), hx(4))
+  if s == nil or string.len(s) < 4 then return refuse('status unreadable') end
+  local v = u32_at(s, 1)
+  if v == nl.STATUS_UNSET then return refuse('no status') end
+  if v >= 2147483648 then v = v - 4294967296 end
+  return v
+end
+fftsa.nl.call_native = call_native
 
 -- Put ki.peek8 back. Refuses rather than writing a value that is not a .text address:
 -- a restore that writes garbage is worse than no restore, because the closure still
@@ -1026,10 +963,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
   if nl._DSP_CODE == nil or string.len(nl._DSP_CODE) == 0 then return false end
   if nl._DSP_RELOC == nil then return false end
-  -- Zero means the generated module never loaded, and every size below would be wrong in
-  -- a way that still produces addresses.
+  -- Zero or nil means the generated module never loaded, and every size below would be
+  -- wrong in a way that still produces addresses. PARAMS_SLOT and STATUS_OFF are in the
+  -- list because without them the image gets no params address and reports nothing: that
+  -- is a call into code whose one pointer is zero, which is worth refusing here rather
+  -- than discovering at the entry.
   if nl.SIZEOF_REAL == 0 or nl.SIZEOF_PLAN == 0 or nl.SIZEOF_PARAMS == 0 or
-     nl.RES_DOUBLES == 0 or nl.RES_PEAKS == 0 then
+     nl.RES_DOUBLES == 0 or nl.RES_PEAKS == 0 or
+     nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
+     nl.STATUS_OFF == nil or nl.STATUS_OFF == 0 then
     return false
   end
 
@@ -1125,11 +1067,18 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
 
   -- 4. Layout, derived from the image rather than fixed: the image is tens of
   --    kilobytes, so a trampoline at a fixed +256 sits inside it.
+  --
+  -- The trampoline starts on a cache line, aligned on the absolute address rather than on
+  -- an offset, so it holds whatever the chunk payload is aligned to. The flush of the
+  -- image rounds up to a whole line, and the image ends wherever the compiler leaves it:
+  -- without this, flushing the image invalidates the trampoline's first line while the
+  -- CPU is fetching from it. nl.flush refuses that case too, so a layout mistake costs an
+  -- unflushed image rather than a bluescreen.
   local img_span   = align8(nl._DSP_RELOC_BSS_HI)
   if img_span < align8(string.len(nl._DSP_CODE)) then
     img_span = align8(string.len(nl._DSP_CODE))
   end
-  local tramp_at   = code_base + img_span
+  local tramp_at   = align32(code_base + img_span)
   local params_at  = tramp_at + align8(string.len(nl._TRAMP))
   local span       = (params_at - code_base) + nl.PARAM_WORDS * 4
   if span > nl.CHUNK_BYTES then return fftsa.nl._abort(cb) end
@@ -1161,17 +1110,12 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('tramp.readback.ok')
 
   nl.tramp = tramp_at
-  -- NO SELF-FLUSH. The trampoline used to be asked to flush its own range as its first
-  -- act, and that is what bluescreened twice: dcbst_icbi_isync_range runs icbi on the
-  -- cache lines the CPU is executing from and then isync, which forces a re-fetch of the
-  -- instruction stream in the middle of the function. PC 0x035DA468 was trampoline+64, an
-  -- `mr r30,r3` that cannot fault as a data access but can certainly fail to be fetched.
-  --
-  -- It was never needed either. probe_tramp.py ran a 184-byte stub at a heap address with
-  -- the barrier alone and no flush of any kind, and it returned correct values -- the first
-  -- instruction fetch of a line that has not been fetched since boot snoops the D-cache,
-  -- so the barrier is sufficient to bootstrap. The trampoline earns its keep flushing
-  -- OTHER ranges, which is what the image needs; it must never be pointed at itself.
+  -- The trampoline is never flushed, and nl.flush refuses a range covering it. icbi on a
+  -- line the core is executing from, followed by isync, re-fetches the instruction stream
+  -- mid-function; that is the fault behind two bluescreens, PC trampoline+64 in one of
+  -- them. It does not need flushing either: the barrier above puts the bytes in DRAM, and
+  -- a line that has not been instruction-fetched since boot fills from there. It earns
+  -- its keep on other ranges, which is what the image needs.
   trace('tramp.ok')
 
   -- 6. The image, patched for this load address.
@@ -1179,7 +1123,28 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
                                nl._DSP_RELOC_BSS_HI)
   if img == nil then return fftsa.nl._abort(cb) end
   trace('img.reloc', string.len(img))
+  -- The params address into the word the image reads it from, patched into the bytes
+  -- before they are written so the image is never in memory with the slot unset. The
+  -- offset comes out of the linked image, from the symbol, so it follows a rebuild.
+  if nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
+     nl.PARAMS_SLOT + 4 > string.len(img) then
+    trace('params.slot.BAD', tostring(nl.PARAMS_SLOT))
+    return fftsa.nl._abort(cb)
+  end
+  img = string.sub(img, 1, nl.PARAMS_SLOT) .. u32_pack(params_at) ..
+        string.sub(img, nl.PARAMS_SLOT + 5)
+  trace('params.slot', nl.PARAMS_SLOT, hx(params_at))
   ki.memwrite(hx(code_base), img)
+
+  -- The slot read back before anything is called. It is the one pointer the image takes
+  -- on trust, and the entry writes a word through it: an address that landed wrong but
+  -- still inside the heap would pass the bounds test there and put that word in somebody
+  -- else's allocation. Four bytes to rule it out.
+  local slot = ki.memread(hx(code_base + nl.PARAMS_SLOT), hx(4))
+  if slot == nil or string.len(slot) < 4 or u32_at(slot, 1) ~= params_at then
+    trace('params.slot.readback.BAD', (slot == nil) and 'nil' or hx(u32_at(slot, 1)))
+    return fftsa.nl._abort(cb)
+  end
   buffer.getstats(bar)
   -- The image is a different range from the trampoline, so this is the trampoline's
   -- legitimate use. The result is checked: a silent failure here leaves the I-cache able
@@ -1204,7 +1169,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
                     seg_bytes = nl.SEG_BYTES,
                     init_decim = decim or 1, init_method = method or 0 })
   trace('call.segs', hx(code_base), hx(nl.params))
-  local nseg = via_peek8(code_base, hx(nl.params))
+  local nseg = call_native(code_base)
   trace('call.segs.ret', tostring(nseg))
   if type(nseg) ~= 'number' or nseg <= 0 then
     -- Zero means no chunk can hold one of the arrays: the window is n * 8 bytes, so
@@ -1332,7 +1297,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     init_decim = decim or 1, init_method = method or 0,
   })
   trace('call.init')
-  local rc = via_peek8(code_base, hx(nl.params))
+  local rc = call_native(code_base)
   trace('call.init.ret', tostring(rc))
   nl.last_rc = rc
   if rc ~= 0 then
@@ -1398,7 +1363,7 @@ function fftsa.nl.reinit(want_n, kind, beta, decim, method)
     init_decim = decim, init_method = method,
   })
   if not ok then return false end
-  local rc = via_peek8(nl.entry, hx(nl.params))
+  local rc = call_native(nl.entry)
   nl.last_rc = rc
   if rc ~= 0 then return false end
   nl.n      = want_n
@@ -1480,7 +1445,7 @@ function fftsa.nl.call_dsp(cap, out, red)
   })
   if not ok then return nil end
 
-  local r = via_peek8(nl.entry, hx(nl.params))
+  local r = call_native(nl.entry)
   nl.last_rc = r
   if type(r) ~= 'number' or r < 0 then return nil end
   return r

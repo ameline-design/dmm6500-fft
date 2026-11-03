@@ -35,7 +35,7 @@ GENERATED = os.path.join(ROOT, 'tsp', 'native_code.tsp')
 # is required to mention its own field name, so forgetting to add an entry is a failure.
 ALIAS = {
     'magic': 'MAGIC',
-    'lua_pushnumber_addr': 'fn.lua_pushnumber',
+    'status': 'STATUS_UNSET',
     'sin_addr': 'fn.sin',
     'cos_addr': 'fn.cos',
     'sqrt_addr': 'fn.sqrt',

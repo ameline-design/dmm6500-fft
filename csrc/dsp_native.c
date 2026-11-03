@@ -37,11 +37,12 @@
  * -----------------------------------------------------------
  * Field order here and in write_params must agree exactly; see DSP_NATIVE_PARAM_WORDS.
  *
- * Firmware addresses (1.7.17a -- update for other builds)
- * ------------------------------------------------------
- * LUA_TOSTRING  0x0021E868   lua_tostring(L, n) -> const char* in r3
- * HEXPARSE      0x004BFE9C   hexparse(str, &err) -> uint32 in r3
- * lua_pushnumber arrives in the params struct; FNF resolves it at startup.
+ * Firmware addresses
+ * ------------------
+ * None.  The params address is patched into dspn_params_addr at install time, the status
+ * is returned through a field of the struct rather than through lua_pushnumber, and the
+ * six math entry points arrive in the struct from FNF, which finds them at runtime.  So
+ * the image never reads the Lua stack and nothing in it is pinned to a firmware build.
  *
  * Build
  * -----
@@ -50,19 +51,21 @@
  *   cmake --build build-ppc --target dsp_native_bin
  */
 
+#include <stddef.h>
 #include <stdint.h>
 #include "dsp.h"
 
-/* lua_tostring(lua_State *L, int n) -> const char *  1.7.17a */
-#define LUA_TOSTRING_ADDR  0x0021E868u
+typedef double (*math1_fn)(double);
 
-/* hexparse(const char *str, int *err) -> uint32_t    1.7.17a */
-#define HEXPARSE_ADDR      0x004BFE9Cu
-
-typedef const char *(*lua_tostring_fn)(void *, int);
-typedef uint32_t    (*hexparse_fn)(const char *, int *);
-typedef void        (*lua_pushnumber_fn)(void *, double);
-typedef double      (*math1_fn)(double);
+/* The params struct address, written here by fftsa.nl.init once the image is relocated
+ * and before anything calls it.  A global rather than a Lua argument because reading an
+ * argument means calling lua_tostring and a hex parser, which are firmware addresses; the
+ * address is fixed for the life of an install, so there is nothing to pass per call.
+ *
+ * Volatile because nothing in this translation unit writes it and the write comes from
+ * outside the program.  The loader finds the slot by symbol: csrc/tools/emit_reloc.py
+ * emits its offset as fftsa.nl.PARAMS_SLOT. */
+volatile uint32_t dspn_params_addr;
 
 /* The address bounds and the predicates built on them.  In a header of their own so the
  * host suite tests the code that ships rather than a copy of it; see
@@ -88,6 +91,14 @@ typedef double      (*math1_fn)(double);
 #define DSPN_EMATH      (-11)
 #define DSPN_EREDUCE    (-12)
 #define DSPN_ERESULT    (-13)
+
+/* What Lua writes into p->status before the call, and no exit here ever writes.  Reading
+ * it back afterwards means the call did not return through any of them. */
+#define DSPN_STATUS_UNSET  0x7FFFFFFF
+
+/* Report and return.  Zero Lua results, because the status does not travel on the Lua
+ * stack: pushing one would mean calling lua_pushnumber, a firmware address. */
+#define RET(v)  do { *st = (uint32_t)(int32_t)(v); return 0; } while (0)
 
 #define DSP_NATIVE_MAGIC  0x44535031U   /* 'DSP1' */
 
@@ -137,7 +148,12 @@ typedef struct {
     uint32_t out_desc;     /* column descriptor base; the fields written are at the  */
                            /* offsets below, so one address is validated not three   */
 
-    uint32_t lua_pushnumber_addr;
+    /* What the call reports, read back by Lua with one ki.memread.  Lua writes
+     * DSPN_STATUS_UNSET into it before the call and every exit here overwrites it, so a
+     * status still reading unset says the call never reached an exit at all.  That is
+     * what a branch into the wrong place looks like from Lua, where a return value
+     * cannot distinguish it from a clean run. */
+    uint32_t status;
 
     /* Firmware math addresses resolved by FNF; copied into the globals below.      */
     uint32_t sin_addr;
@@ -186,8 +202,9 @@ typedef struct {
 
 #define DSPN_MODE_INIT   1U
 #define DSPN_MODE_RUN    2U
-#define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; touches no memory */
-#define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes; touches no memory */
+#define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; reads nothing but the  */
+                              /* params struct, and writes nothing but its status word  */
+#define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes, the same way       */
 
 /* Chunks the arena may span. At the largest n a single chunk can hold an array for, the
  * layout needs six, so this is generous; it bounds a stack array in dsp_native_run. */
@@ -238,18 +255,20 @@ typedef struct {
  *   [5] DSPN_HEAP_HI
  *   [6] DSPN_RES_PEAKS
  *   [7] DSPN_RES_DOUBLES
+ *   [8] offsetof(dsp_native_params, status)
  *
  * The heap bounds are here so the Lua side can sanity-check an address before passing it
  * in, without a second copy of the numbers to drift: a Lua literal and this header would
  * diverge silently the first time a firmware build moved the heap, and both sides would
  * still look self-consistent. The results-block shape is here for the same reason: Lua
  * reserves the memory and decodes what lands in it, so it needs both figures and must not
- * hold a second copy.
+ * hold a second copy. And the status offset, because the word Lua reads back after a call
+ * has to be the word this file writes, which means not counting the fields twice.
  *
  * Initialised, not tentative: without the initialiser this is a common definition that
  * lands in .bss as zeros and reports nothing.
  */
-const uint32_t dsp_native_sizes[8] = {
+const uint32_t dsp_native_sizes[9] = {
     (uint32_t)sizeof(dsp_plan),
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
@@ -257,7 +276,8 @@ const uint32_t dsp_native_sizes[8] = {
     (uint32_t)DSPN_HEAP_LO,
     (uint32_t)DSPN_HEAP_HI,
     (uint32_t)DSPN_RES_PEAKS,
-    (uint32_t)DSPN_RES_DOUBLES
+    (uint32_t)DSPN_RES_DOUBLES,
+    (uint32_t)offsetof(dsp_native_params, status)
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
@@ -477,30 +497,28 @@ static int plan_ptrs_ok(const dsp_plan *pl, const uint32_t *segs, int nsegs,
 /* -------------------------------------------------------------------------
  * Entry point.
  *
- * Arg 1 on the Lua stack: the params struct address, as a hex string.
- * Pushes one number: the bin count, or a negative DSPN_* status.
+ * Takes no Lua arguments and returns none.  The params struct is at dspn_params_addr,
+ * patched in at install time, and p->status is where the bin count or the negative
+ * DSPN_* refusal goes.
  * -------------------------------------------------------------------------*/
 int dsp_native_run(void *L)
 {
-    lua_tostring_fn lts = (lua_tostring_fn)(uintptr_t)LUA_TOSTRING_ADDR;
-    hexparse_fn     hp  = (hexparse_fn)(uintptr_t)HEXPARSE_ADDR;
-    lua_pushnumber_fn push;
     const dsp_native_params *p;
+    volatile uint32_t *st;
     const dsp_plan *plan;
     dsp_plan *plan_w;
     dsp_src cap_src;
     uint32_t paddr;
     uint32_t segs[DSPN_MAX_SEGS];
     uint32_t seg_bytes = 0U;
-    int parse_err = 0;
     /* nsegs counts the arena's chunks and ntrace the trace points dsp_reduce writes. Two
      * different things one letter apart, so neither is called nseg. */
     int n, m, nbins, k, nsegs = 0, ntrace = 0;
 
-    const char *arg1 = lts(L, 1);
-    if (arg1 == NULL) { return 0; }
-    paddr = hp(arg1, &parse_err);
-    if (parse_err) { return 0; }
+    /* The lua_State is not used: no argument is read and no result is pushed. */
+    (void)L;
+
+    paddr = dspn_params_addr;
 
     /* The params struct itself must be in the heap before it is dereferenced. */
     if (!range_ok(paddr, (uint32_t)sizeof(dsp_native_params), HEAP_LO, HEAP_HI)) {
@@ -508,38 +526,36 @@ int dsp_native_run(void *L)
     }
     p = (const dsp_native_params *)(uintptr_t)paddr;
 
-    /* Nothing can be reported without a way to push, so this is checked first and a
-     * failure is a silent return rather than a status. */
-    if (!text_ok(p->lua_pushnumber_addr)) { return 0; }
-    push = (lua_pushnumber_fn)(uintptr_t)p->lua_pushnumber_addr;
+    /* The one word written through a pointer the caller did not supply.  It is inside the
+     * struct the test above proved to be in the heap, so it needs no window of its own. */
+    st = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, status));
 
-    if (p->magic != DSP_NATIVE_MAGIC) { push(L, (double)DSPN_EMAGIC); return 1; }
+    if (p->magic != DSP_NATIVE_MAGIC) { RET(DSPN_EMAGIC); }
 
     /* Arena sizing, answered before any bound is examined because it dereferences
-     * nothing: it is how Lua learns how much storage to find in the first place, so
-     * requiring a valid arena to ask would be circular. Both are pure arithmetic. */
+     * nothing beyond the struct already proved to be in the heap: it is how Lua learns
+     * how much storage to find in the first place, so requiring a valid arena to ask
+     * would be circular. Both are pure arithmetic. */
     if (p->mode == DSPN_MODE_BYTES) {
-        push(L, (double)dsp_plan_bytes((int)p->cap_n, (int)p->init_decim,
-                                       (int)p->init_method));
-        return 1;
+        RET(dsp_plan_bytes((int)p->cap_n, (int)p->init_decim,
+                           (int)p->init_method));
     }
     if (p->mode == DSPN_MODE_SEGS) {
-        push(L, (double)dsp_plan_segs((int)p->cap_n, (int)p->init_decim,
-                                      (int)p->init_method, (size_t)p->seg_bytes));
-        return 1;
+        RET(dsp_plan_segs((int)p->cap_n, (int)p->init_decim,
+                          (int)p->init_method, (size_t)p->seg_bytes));
     }
 
     /* The declared windows have to be sane in themselves, and inside the backstop,
      * before they are trusted to validate anything else. */
     if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < HEAP_LO || p->wr_hi  > HEAP_HI ||
         p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END) {
-        push(L, (double)DSPN_EBOUNDS); return 1;
+        RET(DSPN_EBOUNDS);
     }
     /* The output window only has to be anything when a reading buffer is being written,
      * which out_desc is what says.  A caller writing the trace itself declares none. */
     if (p->out_desc != 0U &&
         (p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI)) {
-        push(L, (double)DSPN_EBOUNDS); return 1;
+        RET(DSPN_EBOUNDS);
     }
 
     /* The arena's chunks.  Copied into a local array rather than used in place: the
@@ -548,10 +564,10 @@ int dsp_native_run(void *L)
      * to depend on silently. */
     if (p->nsegs == 0U || p->nsegs > DSPN_MAX_SEGS ||
         p->seg_bytes == 0U || (p->seg_bytes & (DSP_ALIGN - 1U)) != 0U) {
-        push(L, (double)DSPN_EBOUNDS); return 1;
+        RET(DSPN_EBOUNDS);
     }
     if (!range_ok(p->segs_addr, p->nsegs * 4U, HEAP_LO, HEAP_HI)) {
-        push(L, (double)DSPN_EBOUNDS); return 1;
+        RET(DSPN_EBOUNDS);
     }
     nsegs = (int)p->nsegs;
     seg_bytes = p->seg_bytes;
@@ -564,7 +580,7 @@ int dsp_native_run(void *L)
              * every array inside it inherits. */
             if (!wr_ok(p, segs[s], seg_bytes) ||
                 (segs[s] & (DSP_ALIGN - 1U)) != 0U) {
-                push(L, (double)DSPN_EBOUNDS); return 1;
+                RET(DSPN_EBOUNDS);
             }
         }
     }
@@ -572,7 +588,7 @@ int dsp_native_run(void *L)
     /* Math addresses, before anything calls through them. */
     if (!text_ok(p->sin_addr)  || !text_ok(p->cos_addr)   || !text_ok(p->sqrt_addr) ||
         !text_ok(p->log10_addr)|| !text_ok(p->floor_addr) || !text_ok(p->ceil_addr)) {
-        push(L, (double)DSPN_EMATH); return 1;
+        RET(DSPN_EMATH);
     }
     g_sin   = (math1_fn)(uintptr_t)p->sin_addr;
     g_cos   = (math1_fn)(uintptr_t)p->cos_addr;
@@ -586,7 +602,7 @@ int dsp_native_run(void *L)
      * would overwrite a plan placed there. */
     if (!wr_ok(p, p->plan_addr, (uint32_t)sizeof(dsp_plan)) ||
         hits_arena(p->plan_addr, (uint32_t)sizeof(dsp_plan), segs, nsegs, seg_bytes)) {
-        push(L, (double)DSPN_EPLAN); return 1;
+        RET(DSPN_EPLAN);
     }
     plan   = (const dsp_plan *)(uintptr_t)p->plan_addr;
     plan_w = (dsp_plan *)(uintptr_t)p->plan_addr;
@@ -607,19 +623,18 @@ int dsp_native_run(void *L)
                                 (double)p->init_beta_milli / 1000.0,
                                 (int)p->init_decim,
                                 (int)p->init_method);
-        push(L, (double)rc);
-        return 1;
+        RET(rc);
     }
 
-    if (p->mode != DSPN_MODE_RUN) { push(L, (double)DSPN_EBOUNDS); return 1; }
+    if (p->mode != DSPN_MODE_RUN) { RET(DSPN_EBOUNDS); }
 
     m = plan->m;
     if (plan->n == 0 || plan->n != n || m <= 0 || p->cap_perchunk == 0U) {
-        push(L, (double)DSPN_EGEOM); return 1;
+        RET(DSPN_EGEOM);
     }
 
     if (!plan_ptrs_ok(plan, segs, nsegs, seg_bytes)) {
-        push(L, (double)DSPN_EARENA); return 1;
+        RET(DSPN_EARENA);
     }
 
     /* Capture storage, read in place through the chunk vector.
@@ -640,7 +655,7 @@ int dsp_native_run(void *L)
         if (p->cap_perchunk == 0U || p->cap_stride < 8U || (p->cap_stride & 7U) != 0U ||
             p->cap_stride * p->cap_perchunk > DSPN_CHUNK_BYTES ||
             p->cap_stride * (p->cap_perchunk + 1U) <= DSPN_CHUNK_BYTES) {
-            push(L, (double)DSPN_ECAPTURE); return 1;
+            RET(DSPN_ECAPTURE);
         }
         /* Blocks the record actually occupies, which is what dsp_src addresses; nch is the
          * vector's length and only has to be at least that. */
@@ -648,7 +663,7 @@ int dsp_native_run(void *L)
         if (nch == 0U || want > nch || want > (uint32_t)DSP_MAX_SRC_BLOCKS ||
             (p->cap_vec & 3U) != 0U ||
             !range_ok(p->cap_vec, nch * 4U, HEAP_LO, HEAP_HI)) {
-            push(L, (double)DSPN_ECAPTURE); return 1;
+            RET(DSPN_ECAPTURE);
         }
         for (i = 0; i < (uint32_t)DSP_MAX_SRC_BLOCKS; i++) {
             cap_src.blk[i] = NULL;
@@ -666,7 +681,7 @@ int dsp_native_run(void *L)
                 const uint32_t base = (i == 0U) ? p->cap_chunk1 : cvec[i];
                 const uint32_t take = (left < p->cap_perchunk) ? left : p->cap_perchunk;
                 if ((base & 7U) != 0U || !stride_ok_rd(p, base, take, p->cap_stride)) {
-                    push(L, (double)DSPN_ECAPTURE); return 1;
+                    RET(DSPN_ECAPTURE);
                 }
                 cap_src.blk[i] = (const unsigned char *)(uintptr_t)base;
                 left -= take;
@@ -686,7 +701,7 @@ int dsp_native_run(void *L)
     if (p->red_nseg == 0U || p->red_nseg > (uint32_t)DSP_NSEG_MAX ||
         p->red_k0 >= (uint32_t)m || p->red_k1 >= (uint32_t)m ||
         p->red_k1 < p->red_k0) {
-        push(L, (double)DSPN_EREDUCE); return 1;
+        RET(DSPN_EREDUCE);
     }
 
     /* The reduction's two output arrays and the results block.  dsp_reduce's own overlap
@@ -701,7 +716,7 @@ int dsp_native_run(void *L)
             hits_arena(p->red_hz, rbytes, segs, nsegs, seg_bytes) ||
             overlaps(p->red_db, rbytes, p->plan_addr, pbytes) ||
             overlaps(p->red_hz, rbytes, p->plan_addr, pbytes)) {
-            push(L, (double)DSPN_EREDUCE); return 1;
+            RET(DSPN_EREDUCE);
         }
         if (p->res_npk > (uint32_t)DSPN_RES_PEAKS || (p->res_addr & 7U) != 0U ||
             !wr_ok(p, p->res_addr, DSPN_RES_BYTES) ||
@@ -709,7 +724,7 @@ int dsp_native_run(void *L)
             overlaps(p->res_addr, DSPN_RES_BYTES, p->plan_addr, pbytes) ||
             overlaps(p->res_addr, DSPN_RES_BYTES, p->red_db, rbytes) ||
             overlaps(p->res_addr, DSPN_RES_BYTES, p->red_hz, rbytes)) {
-            push(L, (double)DSPN_ERESULT); return 1;
+            RET(DSPN_ERESULT);
         }
     }
 
@@ -731,7 +746,7 @@ int dsp_native_run(void *L)
         if (p->out_perchunk == 0U ||
             !stride_ok_out(p, p->out_chunk1, o_first, 32U) ||
             !stride_ok_out(p, p->out_chunk2, o_second, 32U)) {
-            push(L, (double)DSPN_EOUTPUT); return 1;
+            RET(DSPN_EOUTPUT);
         }
         /* The descriptor is a separate allocation from the chunk storage, so it is checked
          * against the heap backstop rather than the bulk window, and only its base is
@@ -741,13 +756,13 @@ int dsp_native_run(void *L)
         if (!range_ok(p->out_desc, DESC_SPAN, HEAP_LO, HEAP_HI) ||
             (p->out_desc & 3U) != 0U ||
             hits_arena(p->out_desc, DESC_SPAN, segs, nsegs, seg_bytes)) {
-            push(L, (double)DSPN_EDESC); return 1;
+            RET(DSPN_EDESC);
         }
     }
 
     /* Every address has passed.  From here on memory is touched. */
     nbins = dsp_spectrum_run_src(plan_w, &cap_src, n, NULL);
-    if (nbins <= 0) { push(L, (double)DSPN_ERUN); return 1; }
+    if (nbins <= 0) { RET(DSPN_ERUN); }
 
     /* Bins to the trace the graph reads: nseg maxima, in decibels, against the segment's
      * own frequency.  dsp_reduce rather than a loop here, because it is the reduction the
@@ -768,7 +783,7 @@ int dsp_native_run(void *L)
                        pw_double(p->red_dbmax_hi, p->red_dbmax_lo),
                        pw_double(p->red_vfloor_hi, p->red_vfloor_lo),
                        db, hz) != ntrace) {
-            push(L, (double)DSPN_EREDUCE); return 1;
+            RET(DSPN_EREDUCE);
         }
         /* The decibel value in the reading field and the frequency in the extra value,
          * which is the pair display.graph.add was given at build time. */
@@ -859,6 +874,5 @@ int dsp_native_run(void *L)
         dsc[DESC_N_3       / 4U] = nt;
     }
 
-    push(L, (double)ntrace);
-    return 1;
+    RET(ntrace);
 }

@@ -3342,34 +3342,32 @@ end)())
 
 -- The opening count depends on whether the compiled path will be there, because below 4096
 -- that path runs every count at one rate while the interpreted one scales with the count.
--- Exercised by injecting the version, since this harness's localnode carries none -- which
--- is itself the false case, and is why the rest of the suite still opens at 512.
+-- No firmware version is consulted: what the install needs is the blob, the sizes that
+-- come with it and the memory interface. Each of the three is withdrawn in turn, so a
+-- condition that stops being consulted fails this.
 check('the opening count is 2048 only where the compiled path will serve it', (function()
-  local node, fw = localnode, nil
-  if fftsa.nl ~= nil then fw = fftsa.nl.FW end
-  local sz = nil
-  if fftsa.nl ~= nil then sz = fftsa.nl.SIZEOF_REAL end
-  local no_version = fftsa.native_likely()
-  -- A known firmware with the blob present.
-  if fftsa.nl == nil then fftsa.nl = {} end
-  fftsa.nl.FW = {['9.9.9z'] = 1}
-  fftsa.nl.SIZEOF_REAL = 4
-  localnode = {model = 'DMM6500', version = '9.9.9z'}
-  local known = fftsa.native_likely()
-  -- The same firmware with no blob in the archive, which is the interpreted build.
+  local nl_keep, ki_keep = fftsa.nl, ki
+  fftsa.nl = {SIZEOF_REAL = 4, _DSP_CODE_B64 = 'AAAA', _DSP_CODE_B64_LEN = 3}
+  ki = {memwrite = function() end, poke32 = function() end}
+  local all = fftsa.native_likely()
   fftsa.nl.SIZEOF_REAL = 0
-  local no_blob = fftsa.native_likely()
-  -- A firmware the table does not know, which is the upgrade case.
+  local no_sizes = fftsa.native_likely()
   fftsa.nl.SIZEOF_REAL = 4
-  localnode = {model = 'DMM6500', version = '9.9.9-unknown'}
-  local unknown = fftsa.native_likely()
-  localnode = node
-  fftsa.nl.FW, fftsa.nl.SIZEOF_REAL = fw, sz
-  return no_version == false and known == true and no_blob == false
-         and unknown == false and fftsa.n_compiled == 2048,
-         string.format('no version=%s known=%s no blob=%s unknown=%s',
-                       tostring(no_version), tostring(known),
-                       tostring(no_blob), tostring(unknown))
+  fftsa.nl._DSP_CODE_B64 = nil
+  local no_blob = fftsa.native_likely()
+  fftsa.nl._DSP_CODE_B64 = 'AAAA'
+  ki = {}
+  local no_mem = fftsa.native_likely()
+  -- And the state this harness actually runs in, which is why the rest of the suite opens
+  -- at 512: no nl module loaded at all.
+  fftsa.nl, ki = nil, ki_keep
+  local no_module = fftsa.native_likely()
+  fftsa.nl = nl_keep
+  return all == true and no_sizes == false and no_blob == false and no_mem == false
+         and no_module == false and fftsa.n_compiled == 2048,
+         string.format('all=%s no sizes=%s no blob=%s no memwrite=%s no module=%s',
+                       tostring(all), tostring(no_sizes), tostring(no_blob),
+                       tostring(no_mem), tostring(no_module))
 end)())
 
 

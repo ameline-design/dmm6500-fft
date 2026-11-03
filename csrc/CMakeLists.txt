@@ -352,20 +352,30 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME reduce_selftest
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_reduce.py --self-test)
-    # The cache-flush routine is the one firmware address the native path cannot be handed
-    # and cannot do without, so it is found by what it does -- dcbst over the range, icbi
-    # over the same range, isync before returning. Pinning it to one build makes a firmware
-    # upgrade a branch into whatever occupies that address now, which bluescreens.
-    add_test(NAME find_flush
+    # The trampoline flushes while it is executing, so a flush whose cache lines reach it
+    # invalidates the instruction stream under the CPU. The request and the lines it
+    # covers are different ranges, and the difference is where the bluescreen lives.
+    add_test(NAME flush_range
              COMMAND ${Python3_EXECUTABLE} -I
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_findflush.py)
-    add_test(NAME find_flush_selftest
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_flush_range.py)
+    add_test(NAME flush_range_selftest
              COMMAND ${Python3_EXECUTABLE} -I
-                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_findflush.py --self-test)
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_flush_range.py --self-test)
     set_tests_properties(f64_pack b64_blob b64_blob_selftest reduce reduce_selftest
-                         find_flush find_flush_selftest
+                         flush_range flush_range_selftest
                          PROPERTIES ENVIRONMENT "LUA502=${LUA502}")
   endif()
+
+  # The operator's standing requirement: no firmware address anywhere in the native path,
+  # so the app has a chance of surviving a firmware upgrade. A wrong address is a branch
+  # into whatever occupies it now, which bluescreens, and ki.reboot cannot recover a
+  # bluescreen -- so this is a build gate and not a review item.
+  add_test(NAME no_fw_addr
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_fw_addr.py)
+  add_test(NAME no_fw_addr_selftest
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_fw_addr.py --self-test)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -453,6 +463,29 @@ if(DSP_DST_NATIVE)
       DEPENDS dsp_native_elf ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
       COMMENT "Emitting dsp_native.bin and its relocation table")
   add_custom_target(dsp_native_bin ALL DEPENDS dsp_native.bin dsp_native_reloc.lua)
+
+  # The cache-flush trampoline. Assembled, never linked: it is position-independent and
+  # carries no relocations, so the bytes in its .text are final, and emit_tramp.py refuses
+  # to emit them if that stops being true. The flags come from CMAKE_C_FLAGS so the target,
+  # the cpu and the endianness are the toolchain file's and not a second copy.
+  separate_arguments(DSPN_ASM_FLAGS NATIVE_COMMAND "${CMAKE_C_FLAGS}")
+  add_custom_command(
+      OUTPUT flush_tramp.o
+      COMMAND ${CMAKE_C_COMPILER} ${DSPN_ASM_FLAGS} -c
+              ${CMAKE_CURRENT_SOURCE_DIR}/flush_tramp.S
+              -o ${CMAKE_CURRENT_BINARY_DIR}/flush_tramp.o
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/flush_tramp.S
+      COMMENT "Assembling the cache-flush trampoline")
+  add_custom_target(flush_tramp ALL DEPENDS flush_tramp.o)
+
+  # The literal in tsp/native_link.tsp against the source it came from. The trampoline is
+  # the one piece of the native path that is hand-installed machine code, and a literal
+  # that has drifted from its source is code nobody has read.
+  add_test(NAME tramp_matches_source
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_tramp.py
+                   ${CMAKE_CURRENT_BINARY_DIR}/flush_tramp.o
+                   --check ${CMAKE_CURRENT_SOURCE_DIR}/../tsp/native_link.tsp)
 
   # The relocation applier against the linker as an independent oracle: link the same
   # objects at the load address and require the applier's output to be byte-identical.

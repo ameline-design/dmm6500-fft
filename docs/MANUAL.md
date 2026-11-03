@@ -583,6 +583,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 | Peak flat-topped at +20 dBV | Over range. |
 | Peaks update but the trace is missing | A frame failed inside the refill, leaving the trace unbound. Fixed in this build; on an older one, change the span or the sample count to force a rebind. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
+| About half the frame rate the table above gives | The compiled transform did not install, so the app is running the interpreted one. It installs once per power cycle, so a second launch without a power cycle always lands here: power cycle and launch once. A firmware upgrade is not the explanation -- the compiled path holds no address belonging to a firmware build and finds what it needs on the instrument it is running on. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | A help dialog sits over the app after pressing HELP | Expected. Press EXIT to dismiss it. The firmware offers the app no way to receive that key, so the only way to notice the dialog is to poll the glass for it, and that poll waits on the display task: it cost 44 ms of every frame, a sixth of the rate at 16384 samples. It ships off. `fftsa.help_enabled = true` turns the recogniser back on, where it runs once a second rather than once a frame. |
 | Peak width changes as you tune | Expected. See above. |

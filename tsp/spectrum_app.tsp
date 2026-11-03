@@ -118,22 +118,21 @@ fftsa.n_compiled = 2048
 fftsa.sample_counts = {512, 1024, 2048, 4096, 8192, 16384}
 fftsa.sample_labels = {"512", "1024", "2048", "4096", "8192", "16384"}
 
--- Will the compiled path install on this instrument? The blob has to be in the archive and
--- the firmware has to be one whose addresses are known, which is the same table resolve_math
--- gates the install on -- so this is a table lookup and needs no part of the install to have
--- run yet.
+-- Will the compiled path install on this instrument? What it needs is the blob in the
+-- archive, the sizes the generated module carries with it, and the memory interface the
+-- install goes through. None of that depends on the firmware build, so there is no
+-- version to consult and this costs three tests.
 --
 -- Necessary and not sufficient: the install can still fail, and a boot that has already
 -- spent one refuses a second. So this decides a default and never a correctness question,
 -- and a wrong answer costs a slower first screen rather than a wrong spectrum.
 function fftsa.native_likely()
   local nl = fftsa.nl
-  if nl == nil or nl.FW == nil then return false end
+  if nl == nil then return false end
   if nl.SIZEOF_REAL == nil or nl.SIZEOF_REAL == 0 then return false end
-  local v = nil
-  if localnode ~= nil then v = localnode.version end
-  if v == nil then return false end
-  return nl.FW[v] ~= nil
+  if nl._DSP_CODE_B64 == nil or nl._DSP_CODE_B64_LEN == 0 then return false end
+  if ki == nil or ki.memwrite == nil or ki.poke32 == nil then return false end
+  return true
 end
 
 -- Floor for the start frequency. A start of 0 would admit bin 1, which is DC and,
