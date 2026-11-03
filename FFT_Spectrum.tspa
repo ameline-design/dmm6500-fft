@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 7.4
+-- $Version: 7.5
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -960,6 +960,9 @@ if fftsa.sg_handles_inited == nil then
   -- resolves against. sg_name_buffers() says why they exist.
   FFTSA_TRACE    = nil
   FFTSA_MARK     = nil
+  -- The previous launch's pair, waiting to be released once this launch has its own.
+  FFTSA_OLDTRACE = nil
+  FFTSA_OLDMARK  = nil
   fftsa.sg_handles_inited = true
 end
 
@@ -1169,29 +1172,40 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- no-reallocation rule is stated in code rather than left implicit in the call graph.
   if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
     fftsa.sg_name_buffers()
+    fftsa.sg_free_old()
     return fftsa.sg_buf
   end
+  -- Allocated before the previous pair is released, and that order is the whole of this.
+  --
+  -- A trace buffer freed and then reallocated at the same size comes back carrying the
+  -- freed one's identity, and the display task's trace subscription for the launch that is
+  -- gone comes with it. The graph then paints a ring nothing feeds: a picture that never
+  -- changes however the buffer is rewritten, with the dB axis relabelled in volts, while
+  -- every reading in the buffer reads back correct from Lua. That was the second launch of
+  -- the app, every time.
+  --
+  -- Measured on the instrument both ways. A buffer allocated while the previous one was
+  -- still alive bound and painted first time, twice; one allocated after it had been freed
+  -- did not, and no rebind, no clear and no rewrite recovered it.
+  local newbuf = fftsa.sg_mkbuf(want)
+  -- The marker trace, one point a peak. Made here with the trace buffer and freed with it,
+  -- whether or not markers are switched on: allocating it when the option is set would be
+  -- an allocation while frames are running.
+  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
+  if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
+  local newmk = fftsa.sg_mkbuf(mkcap)
   -- Detach before deleting: the firmware refuses to delete a buffer still bound to a
   -- graph, so remaking one while attached leaves the old buffer alive and still bound,
   -- and the widget draws both -- a second trace overlaid at the old resolution.
   if fftsa.sg_graph ~= nil then
     display.graph.removeall(fftsa.sg_graph)
   end
-  if fftsa.sg_buf ~= nil then
-    fftsa.del_buf(fftsa.sg_buf)
-    fftsa.sg_buf = nil
-  end
-  fftsa.sg_buf = fftsa.sg_mkbuf(want)
-  -- The marker trace, one point a peak. Made here with the trace buffer and freed with it,
-  -- whether or not markers are switched on: allocating it when the option is set would be
-  -- an allocation while frames are running.
-  if fftsa.sg_mk ~= nil then
-    fftsa.del_buf(fftsa.sg_mk)
-    fftsa.sg_mk = nil
-  end
-  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
-  if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
-  fftsa.sg_mk = fftsa.sg_mkbuf(mkcap)
+  local oldbuf, oldmk = fftsa.sg_buf, fftsa.sg_mk
+  fftsa.sg_buf, fftsa.sg_mk = newbuf, newmk
+  fftsa.sg_name_buffers()
+  if oldbuf ~= nil then fftsa.del_buf(oldbuf) end
+  if oldmk ~= nil then fftsa.del_buf(oldmk) end
+  fftsa.sg_free_old()
   -- The marker sort's own slots, one more than the peak count because the insertion
   -- writes j+1 before n has grown.
   fftsa.sg_mk_db, fftsa.sg_mk_hz = {}, {}
@@ -1199,8 +1213,28 @@ function fftsa.sg_make_buffer(nbins, npoints)
   for j = 1, fftsa.sg_npeak + 1 do
     fftsa.sg_mk_db[j], fftsa.sg_mk_hz[j] = fftsa.sg_dbmin, 0
   end
-  fftsa.sg_name_buffers()
   return fftsa.sg_buf
+end
+
+-- The previous launch's trace buffers, released only once this launch has allocated its
+-- own. sg_make_buffer says what goes wrong when they are freed first; this is the other
+-- half of it, because the launch that ends cannot allocate the next launch's buffers and
+-- so cannot free its own in the right order.
+--
+-- Buffers are handed across a launch where display handles cannot be -- a reading buffer
+-- outlives the script that made it, and a display handle answers 1703 -- so a global is
+-- the right place for them. The cost of an exit that is never followed by another launch
+-- is 698 readings of 7,080,255 held until a power cycle.
+function fftsa.sg_free_old()
+  if FFTSA_OLDTRACE ~= nil then
+    fftsa.del_buf(FFTSA_OLDTRACE)
+    FFTSA_OLDTRACE = nil
+  end
+  if FFTSA_OLDMARK ~= nil then
+    fftsa.del_buf(FFTSA_OLDMARK)
+    FFTSA_OLDMARK = nil
+  end
+  return true
 end
 
 -- A name for each trace buffer, because a table field is not one.
@@ -1320,23 +1354,15 @@ function fftsa.sg_destroy()
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
-  -- Deleted, not just dropped: a buffer whose handle is dropped is stranded and still
-  -- counts against the instrument's capacity.
+  -- Handed to the next launch rather than deleted here, which is what sg_free_old() is
+  -- for: freeing them now would let the next launch's pair be allocated over them and
+  -- inherit this launch's trace subscription.
   --
-  -- Through the global that names it, where there is one. buffer.delete nils the variable
-  -- it is handed, so deleting through del_buf's parameter clears a local and leaves every
-  -- other reference pointing at a buffer that is gone -- and a second delete through one
-  -- of those is a double delete. Both references are cleared here either way.
-  if FFTSA_TRACE ~= nil then
-    fftsa.del_buf(FFTSA_TRACE)
-  elseif fftsa.sg_buf ~= nil then
-    fftsa.del_buf(fftsa.sg_buf)
-  end
-  if FFTSA_MARK ~= nil then
-    fftsa.del_buf(FFTSA_MARK)
-  elseif fftsa.sg_mk ~= nil then
-    fftsa.del_buf(fftsa.sg_mk)
-  end
+  -- Only when there is something to hand over. sg_destroy runs twice on a relaunch,
+  -- once from stop() and again from sg_build(), and the second pass must not overwrite
+  -- what the first one saved.
+  if fftsa.sg_buf ~= nil then FFTSA_OLDTRACE = fftsa.sg_buf end
+  if fftsa.sg_mk ~= nil then FFTSA_OLDMARK = fftsa.sg_mk end
   FFTSA_TRACE, FFTSA_MARK = nil, nil
   fftsa.sg_buf, fftsa.sg_mk = nil, nil
   collectgarbage()

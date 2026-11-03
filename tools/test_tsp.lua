@@ -5520,8 +5520,15 @@ fftsa.start()
 print('\nteardown (real code)')
 fftsa.stop()
 check('stop() deletes every display object', live() == 0, 'live=' .. live())
-check('stop() frees every buffer it made', livebufs() == base_bufs,
-      'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs)
+-- Every buffer but the two the next launch has to allocate over. They are handed on in
+-- FFTSA_OLDTRACE and FFTSA_OLDMARK, because a trace buffer freed before its replacement
+-- exists comes back carrying the freed one's trace subscription -- sg_make_buffer has the
+-- measurement. The capture buffer has no such problem and is freed here.
+check('stop() frees every buffer it made but the two it hands on',
+      livebufs() == base_bufs + 2 and FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil
+      and fftsa.cap == nil,
+      'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs
+      .. ' handed=' .. tostring(FFTSA_OLDTRACE ~= nil))
 check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optscr == nil and fftsa.opt_flo == nil and fftsa.opt_fhi == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
@@ -5645,8 +5652,76 @@ end
 -- modal dialog over a half-built app. Parking the screen set for reuse was tried on the
 -- instrument and reverted for exactly that.
 check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
-check('End App from the options screen frees every buffer', livebufs() == base_bufs,
+check('End App from the options screen hands the trace buffers to the next launch',
+      livebufs() == base_bufs + 2 and FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil,
       'buffers=' .. livebufs())
+
+-- THE ORDER THE TRACE BUFFERS ARE ALLOCATED IN, which is the fix for the second launch
+-- drawing a static picture with its dB axis relabelled in volts. A buffer freed before its
+-- replacement exists comes back carrying the freed one's identity, and the dead launch's
+-- trace subscription with it. So the new pair must exist before the old pair is deleted.
+--
+-- Nothing offline reuses a buffer's identity, so what is asserted is the ORDER rather than
+-- the consequence: at the moment each old buffer is deleted, its replacement is already
+-- allocated and already in fftsa. A mock cannot show the fault, but it can show the order
+-- that avoids it.
+check('the new trace buffers exist before the old ones are deleted', (function()
+  -- Started first, so the branch under test is reached from a known state whatever the
+  -- cases above left behind. A stopped app has no old pair to delete and the case would
+  -- pass having watched nothing.
+  fftsa.start()
+  fftsa.frame()
+  local oldbuf, oldmk = fftsa.sg_buf, fftsa.sg_mk
+  if oldbuf == nil or oldmk == nil then return false, 'no live pair to replace' end
+  local realdel, realmake = buffer.delete, buffer.make
+  local nmade, bad, seen = 0, 0, 0
+  buffer.make = function(cap, style)
+    nmade = nmade + 1
+    return realmake(cap, style)
+  end
+  buffer.delete = function(b)
+    if b == oldbuf or b == oldmk then
+      seen = seen + 1
+      -- The two things that must hold at this instant: the replacements exist, and the
+      -- live handles already point at them rather than at what is going away.
+      if nmade < 2 or fftsa.sg_buf == b or fftsa.sg_mk == b then bad = bad + 1 end
+    end
+    return realdel(b)
+  end
+  -- A capacity change is the only way to reach the allocating branch.
+  fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts - 1)
+  buffer.delete, buffer.make = realdel, realmake
+  -- Put it back and leave the app as the cases below expect it.
+  fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)
+  fftsa.sg_bind()
+  fftsa.frame_body()
+  return seen == 2 and bad == 0,
+         string.format('%d of the old pair deleted, %d of them too early, %d makes first',
+                       seen, bad, nmade)
+end)())
+
+-- And the pair handed on is released once the next launch has its own, so launches do not
+-- accumulate buffers. Two whole cycles, because one would pass with a leak of one.
+-- Stability from one launch to the next is the property, not a particular total: a count
+-- compared against the state before the first stop also counts whatever that state was
+-- missing. Three cycles, so a leak of one per launch cannot hide in the first.
+check('launches do not accumulate buffers, and the handed-on pair is released', (function()
+  fftsa.stop()
+  local parked = livebufs()
+  local handed = FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil
+  fftsa.start()
+  local a1, o1 = livebufs(), FFTSA_OLDTRACE
+  fftsa.stop()
+  fftsa.start()
+  local a2 = livebufs()
+  fftsa.stop()
+  fftsa.start()
+  local a3 = livebufs()
+  fftsa.frame()
+  return handed and a1 == a2 and a2 == a3 and o1 == nil and FFTSA_OLDTRACE == nil,
+         string.format('parked=%d then %d/%d/%d, released=%s',
+                       parked, a1, a2, a3, tostring(o1 == nil))
+end)())
 
 -- A relaunch therefore builds a fresh screen set, and the trace has to end up bound to
 -- the buffer the frames write -- which is what the buffers' own global names are for.
@@ -5716,8 +5791,9 @@ check('the halt is stated on screen', OBJ[fftsa.sg_xunit].text ~= nil
       and string.find(OBJ[fftsa.sg_xunit].text, 'HALTED') ~= nil,
       tostring(OBJ[fftsa.sg_xunit].text))
 check('a halted app still tears down cleanly',
-      (function() fftsa.stop(); return live() == 0 and livebufs() == base_bufs end)(),
-      'live=' .. live())
+      (function() fftsa.stop()
+        return live() == 0 and livebufs() == base_bufs + 2 end)(),
+      'live=' .. live() .. ' buffers=' .. livebufs())
 
 -- ---------- the transform against a direct DFT ----------
 -- The gate for replacing the transform. Every other check here looks at the
