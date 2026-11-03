@@ -4784,6 +4784,41 @@ check('making the trace buffer again at the same size keeps the one in use', (fu
                        tostring(OBJ[fftsa.sg_graph].buffer == trace))
 end)())
 
+-- Each trace buffer has a global naming it, and a build leaves both of them on the
+-- buffers in use. display.graph.add subscribes the display task to a buffer by name, and a
+-- buffer reachable only through fftsa.* does not resolve to itself: on the instrument a
+-- graph bound to a ramp held in a table field painted the app's spectrum instead, and a
+-- relaunched app came up with a blank plot and its dB axis relabelled in volts. Nothing
+-- offline can see that, so what is asserted here is the contract that avoids it.
+--
+-- Both branches of sg_make_buffer, because the reuse branch returns early: the first case
+-- covers the branch that allocates, the second the branch that keeps what it has.
+check('the trace and marker buffers are named by globals of their own', (function()
+  local named = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
+                and FFTSA_TRACE ~= nil and FFTSA_MARK ~= nil
+  FFTSA_TRACE, FFTSA_MARK = nil, nil
+  fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)   -- the reuse branch
+  local reused = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
+                 and FFTSA_TRACE ~= nil
+  -- The branch that allocates, which a different capacity is the only way to reach. Put
+  -- back at sg_maxpts and rebound afterwards, with a frame to refill it, so the cases
+  -- below find the app as they expect it -- a bind over an empty buffer binds nothing.
+  FFTSA_TRACE, FFTSA_MARK = nil, nil
+  fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts - 1)
+  local allocated = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
+                    and FFTSA_TRACE ~= nil
+                    and fftsa.sg_buf.capacity == fftsa.sg_maxpts - 1
+  fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)
+  fftsa.sg_bind()
+  fftsa.frame_body()
+  return named and reused and allocated
+         and fftsa.sg_buf.capacity == fftsa.sg_maxpts
+         and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf,
+         string.format('build %s, reuse branch %s, allocating branch %s, restored %s',
+                       tostring(named), tostring(reused), tostring(allocated),
+                       tostring(OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf))
+end)())
+
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
 -- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
 -- notice new writes -- but it derives the range from the buffer's own timestamps, and

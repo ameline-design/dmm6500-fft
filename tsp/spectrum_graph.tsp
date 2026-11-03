@@ -45,6 +45,10 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_xunit = nil     -- settings line under the peak rows
   fftsa.sg_stat  = nil
   fftsa.sg_mk    = nil
+  -- The two trace buffers' own global names, which the display task's subscription
+  -- resolves against. sg_name_buffers() says why they exist.
+  FFTSA_TRACE    = nil
+  FFTSA_MARK     = nil
   fftsa.sg_handles_inited = true
 end
 
@@ -253,6 +257,7 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- is the only caller and start() the only caller of that, so this is the one place the
   -- no-reallocation rule is stated in code rather than left implicit in the call graph.
   if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
+    fftsa.sg_name_buffers()
     return fftsa.sg_buf
   end
   -- Detach before deleting: the firmware refuses to delete a buffer still bound to a
@@ -283,7 +288,30 @@ function fftsa.sg_make_buffer(nbins, npoints)
   for j = 1, fftsa.sg_npeak + 1 do
     fftsa.sg_mk_db[j], fftsa.sg_mk_hz[j] = fftsa.sg_dbmin, 0
   end
+  fftsa.sg_name_buffers()
   return fftsa.sg_buf
+end
+
+-- A name for each trace buffer, because a table field is not one.
+--
+-- display.graph.add does not hand the display task a buffer. It subscribes that task to
+-- the buffer by name -- graph_trace_add calls bufsub_subscribe(0x407F, graph, name, slot)
+-- and the message carries two 32-byte name fields -- and a null name means defbuffer1.
+-- The axis unit comes from the subscription rather than from the add arguments, so a
+-- trace that resolved to the wrong buffer shows up as a blank plot with the dB axis
+-- relabelled in volts, while the buffer itself still reads back the right points from Lua.
+--
+-- A buffer reachable only through fftsa.* does not reliably resolve to itself. Measured
+-- on the instrument: a graph bound to a ramp held in fftsa.ZZ painted the app's own
+-- spectrum instead. So each trace buffer gets a global of its own, and these two names
+-- are part of the display contract rather than conveniences.
+--
+-- Idempotent, and called from both branches of sg_make_buffer, so the reuse branch cannot
+-- leave a buffer nameless.
+function fftsa.sg_name_buffers()
+  FFTSA_TRACE = fftsa.sg_buf
+  FFTSA_MARK  = fftsa.sg_mk
+  return true
 end
 
 -- One trace buffer: FILL_ONCE, formatted, seeded full. Capacity is sg_maxpts, so a frame
@@ -383,12 +411,22 @@ function fftsa.sg_destroy()
     fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
   -- Deleted, not just dropped: a buffer whose handle is dropped is stranded and still
   -- counts against the instrument's capacity.
-  if fftsa.sg_buf ~= nil then
+  --
+  -- Through the global that names it, where there is one. buffer.delete nils the variable
+  -- it is handed, so deleting through del_buf's parameter clears a local and leaves every
+  -- other reference pointing at a buffer that is gone -- and a second delete through one
+  -- of those is a double delete. Both references are cleared here either way.
+  if FFTSA_TRACE ~= nil then
+    fftsa.del_buf(FFTSA_TRACE)
+  elseif fftsa.sg_buf ~= nil then
     fftsa.del_buf(fftsa.sg_buf)
   end
-  if fftsa.sg_mk ~= nil then
+  if FFTSA_MARK ~= nil then
+    fftsa.del_buf(FFTSA_MARK)
+  elseif fftsa.sg_mk ~= nil then
     fftsa.del_buf(fftsa.sg_mk)
   end
+  FFTSA_TRACE, FFTSA_MARK = nil, nil
   fftsa.sg_buf, fftsa.sg_mk = nil, nil
   collectgarbage()
 end
