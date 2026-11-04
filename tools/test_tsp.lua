@@ -267,6 +267,36 @@ function display.graph.add(g, ...)
   OBJ[g].yelem, OBJ[g].xelem = arg[2], arg[4]
   OBJ[g].traces = (OBJ[g].traces or 0) + 1
 end
+-- display.graph.cursor(g, type [, pos1 [, pos2]]). One call per type places BOTH cursors
+-- of that type and the firmware SORTS the pair, so the mock sorts too or a check could
+-- assert an order the instrument does not keep. A position of 9.9e37 or more means that
+-- cursor is off. The type is a typed enum: the firmware answers 1138 for a plain number,
+-- so this raises rather than accepting one, because a mock kinder than the firmware hides
+-- exactly the mistake it exists to catch.
+display.CURSOR_VERTICAL   = 'cursor_vertical'
+display.CURSOR_HORIZONTAL = 'cursor_horizontal'
+display.CURSOR_TRIGGER    = 'cursor_trigger'
+CURSOR_OFF = 9.9e37
+function display.graph.cursor(g, ctype, p1, p2)
+  use(g, 'graph.cursor')
+  if ctype ~= display.CURSOR_VERTICAL and ctype ~= display.CURSOR_HORIZONTAL
+     and ctype ~= display.CURSOR_TRIGGER then
+    error('1138 Parameter 2, expected type disp_cursor', 0)
+  end
+  if p1 == nil then
+    -- Two arguments is the free read of the stored pair.
+    local c = OBJ[g].cursors and OBJ[g].cursors[ctype]
+    if c == nil then return nil, nil end
+    return c[1], c[2]
+  end
+  if p2 == nil then p2 = CURSOR_OFF end
+  local lo, hi = p1, p2
+  if lo > hi then lo, hi = hi, lo end
+  if OBJ[g].cursors == nil then OBJ[g].cursors = {} end
+  OBJ[g].cursors[ctype] = {lo, hi}
+  OBJ[g].cursor_sets = (OBJ[g].cursor_sets or 0) + 1
+end
+
 -- select() names a BUFFER, not a trace index, and the marker calls apply to whichever
 -- trace is selected -- so the mock records the selection and attributes each marker size
 -- to the buffer that was active when it was set.
@@ -4815,6 +4845,102 @@ check('the live trace handles are the globals, through both branches', (function
          and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf,
          string.format('build %s, reuse %s, allocate %s', tostring(built),
                        tostring(reused), tostring(allocated))
+end)())
+
+-- Cursors follow the peak table: same values, same gate, and one call per type because
+-- the firmware places both of that type at once and sorts them.
+check('cursors land on the top two peaks, in frequency and in dB', (function()
+  fftsa.sg_cursor_ok = nil
+  fftsa.sg_cursors = true
+  local g = fftsa.sg_graph
+  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
+  -- A frame, then force the gated draw so the cursors are written from real peaks.
+  fftsa.frame()
+  -- The unconditional draw, not the gated one: the gate's own move test has just been
+  -- satisfied by the frame above, so asking through it would measure the gate rather than
+  -- the cursors. "cursors follow the gate" is the case below this one.
+  local drew = fftsa.sg_show_peaks_now(nil, nil, fftsa.sg_npeak, fftsa.binhz,
+                                       dsp.pk_hz, dsp.pk_v)
+  local vert = OBJ[g].cursors and OBJ[g].cursors[display.CURSOR_VERTICAL]
+  local horz = OBJ[g].cursors and OBJ[g].cursors[display.CURSOR_HORIZONTAL]
+  if vert == nil or horz == nil then
+    return false, 'no cursors placed, drew=' .. tostring(drew)
+  end
+  -- The two strongest peaks the table is showing, in the table's own order, reduced the
+  -- same way the code reduces them: a peak that is absent or unplaceable is the off value,
+  -- not a position.
+  local function want_at(i)
+    local f = fftsa.sg_peak_at(i, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+    if f == nil or f ~= f or f < 0 then return fftsa.sg_cursor_off end
+    return f
+  end
+  local f1, f2 = want_at(1), want_at(2)
+  local lo, hi = f1, f2
+  if lo > hi then lo, hi = hi, lo end
+  -- Sorted by the firmware, so compare against the sorted pair.
+  local vok = near(vert[1], lo, 0.5) and (near(vert[2], hi, 0.5)
+              or (hi >= fftsa.sg_cursor_off and vert[2] >= fftsa.sg_cursor_off))
+  -- Both horizontal positions inside the plotted dB window, and the stronger peak's level
+  -- is the higher of the pair.
+  local hok = horz[1] >= fftsa.sg_dbmin and horz[2] >= horz[1]
+              and (horz[2] <= fftsa.sg_dbmax or horz[2] >= fftsa.sg_cursor_off)
+  return drew == true and vok and hok and OBJ[g].cursor_sets == 2,
+         string.format('vert %.1f/%.1f want %.1f/%.1f, horz %.1f/%.1f, sets=%s',
+                       vert[1], vert[2], lo, hi, horz[1], horz[2],
+                       tostring(OBJ[g].cursor_sets))
+end)())
+
+-- A missing second peak is a cursor switched OFF rather than one parked at zero, which
+-- would read as a real cursor sitting on dc.
+check('a peak that is not there leaves its cursor off', (function()
+  local g = fftsa.sg_graph
+  OBJ[g].cursors = nil
+  fftsa.sg_cursor_ok = true
+  -- count 1: the second peak is not being reported at all.
+  fftsa.sg_cursors_set(1, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local vert = OBJ[g].cursors[display.CURSOR_VERTICAL]
+  return vert[2] >= fftsa.sg_cursor_off,
+         string.format('pair %.3g/%.3g', vert[1], vert[2])
+end)())
+
+-- A refusal stops the asking. The call is synchronous, so a refused cursor every second is
+-- a round trip every second for nothing, and the model that lacks the call must cost the
+-- app one attempt rather than one per update.
+check('a refused cursor switches cursors off for the session', (function()
+  local real = display.graph.cursor
+  local calls = 0
+  display.graph.cursor = function() calls = calls + 1 error('1138 no such call', 0) end
+  fftsa.sg_cursor_ok = true
+  local first = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local after = fftsa.sg_cursor_ok
+  local second = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  display.graph.cursor = real
+  fftsa.sg_cursor_ok, fftsa.lasterr = nil, nil
+  return first == false and after == false and second == false and calls == 1,
+         string.format('first=%s ok=%s second=%s calls=%d', tostring(first),
+                       tostring(after), tostring(second), calls)
+end)())
+
+-- And the knob, because a graph the operator wants bare has to be reachable from the
+-- socket without a reinstall.
+check('sg_cursors false places none', (function()
+  local g = fftsa.sg_graph
+  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
+  fftsa.sg_cursors, fftsa.sg_cursor_ok = false, true
+  local r = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  fftsa.sg_cursors = true
+  return r == false and OBJ[g].cursors == nil and OBJ[g].cursor_sets == 0,
+         tostring(r) .. ' sets=' .. tostring(OBJ[g].cursor_sets)
+end)())
+
+-- The type is a typed enum on this firmware, so a plain number answers 1138. Asserted
+-- because the mock is the only place that can see it and the three values look like
+-- numbers in the notes.
+check('the cursor type must be the typed enum, not a number', (function()
+  local ok = pcall(function()
+    display.graph.cursor(fftsa.sg_graph, 1, 1000.0, 2000.0)
+  end)
+  return ok == false
 end)())
 
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.

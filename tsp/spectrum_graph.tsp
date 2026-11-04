@@ -1337,7 +1337,84 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       settext(fftsa.sg_pk_d[p], "")
     end
   end
+  -- Cursors move with the numbers, from the same values, under the same gate.
+  fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
   return true
+end
+
+-- ---------- cursors on the peaks ----------
+
+-- Two vertical cursors on the top two peaks' frequencies and two horizontal ones across
+-- the strongest peak and the weakest reported, so the pair brackets what the table lists.
+--
+-- Driven from fftsa.sg_show_peaks_now(), so they move when the peak numbers move and under
+-- the same tolerance gate: a dithering last digit redraws neither. A cursor set is
+-- SYNCHRONOUS -- a round trip to the display task, in the class of the 60 ms axis writes --
+-- which is affordable once a second and would not be affordable once a frame.
+--
+-- The firmware takes one call per cursor type and sorts the pair itself, so each call
+-- places both of that type. A position of 9.9e37 or more switches a cursor off, which is
+-- how a missing second peak leaves one cursor rather than a stray at zero.
+fftsa.sg_cursors = true         -- live knob: set false from the socket to drop them
+fftsa.sg_cursor_off = 9.9e37    -- the firmware's own "this cursor is off" value
+fftsa.sg_cursor_ok = nil        -- nil until probed; false where the model lacks the call
+
+-- Resolved once rather than per update, the same way the HELP recogniser resolves its
+-- names: display.graph.cursor is recorded as absent on this model in one place and present
+-- in another, and the three enum values are typed rather than plain numbers, so passing 1
+-- where CURSOR_VERTICAL is wanted answers 1138.
+function fftsa.sg_cursor_probe()
+  fftsa.sg_cursor_ok = false
+  if display.graph == nil or display.graph.cursor == nil then return false end
+  if display.CURSOR_VERTICAL == nil or display.CURSOR_HORIZONTAL == nil then return false end
+  fftsa.sg_cursor_ok = true
+  return true
+end
+
+function fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
+  if not fftsa.sg_cursors then return false end
+  if fftsa.sg_cursor_ok == nil then fftsa.sg_cursor_probe() end
+  if not fftsa.sg_cursor_ok then return false end
+  if fftsa.sg_graph == nil then return false end
+  local off = fftsa.sg_cursor_off
+  -- The two strongest peaks the table is reporting, in its own order.
+  local f1, v1 = fftsa.sg_peak_at(1, bi, bv, binhz, pk_hz, pk_v)
+  local f2, v2 = nil, nil
+  if count >= 2 then f2, v2 = fftsa.sg_peak_at(2, bi, bv, binhz, pk_hz, pk_v) end
+  -- A NaN frequency is a peak the search could not place; it is not a position.
+  if f1 == nil or f1 ~= f1 or f1 < 0 then f1 = off end
+  if f2 == nil or f2 ~= f2 or f2 < 0 then f2 = off end
+  -- Bailing on the first refusal rather than collecting both: the call is synchronous, so
+  -- a model without it must cost one round trip and not two.
+  if not pcall(function()
+       display.graph.cursor(fftsa.sg_graph, display.CURSOR_VERTICAL, f1, f2)
+     end) then
+    return fftsa.sg_cursors_failed()
+  end
+  -- The horizontal pair in dB, floored at the axis like the table's own column: a bin at
+  -- 1e-26 is -260 dBV, which is not a position on a plot that stops at sg_dbmin.
+  local d1, d2 = off, off
+  if v1 ~= nil and v1 == v1 and v1 > 0 then
+    d1 = 20 * math.log10(v1)
+    if not (d1 > fftsa.sg_dbmin) then d1 = fftsa.sg_dbmin end
+  end
+  if v2 ~= nil and v2 == v2 and v2 > 0 then
+    d2 = 20 * math.log10(v2)
+    if not (d2 > fftsa.sg_dbmin) then d2 = fftsa.sg_dbmin end
+  end
+  if not pcall(function()
+       display.graph.cursor(fftsa.sg_graph, display.CURSOR_HORIZONTAL, d1, d2)
+     end) then
+    return fftsa.sg_cursors_failed()
+  end
+  return true
+end
+
+-- One refusal is enough to stop asking for the rest of the session.
+function fftsa.sg_cursors_failed()
+  fftsa.sg_cursor_ok = false
+  fftsa.lasterr = "graph cursors refused; switched off"
+  return false
 end
 
 function fftsa.sg_status(txt)
