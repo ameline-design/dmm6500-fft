@@ -1390,8 +1390,11 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       settext(fftsa.sg_pk_d[p], "")
     end
   end
-  -- Cursors move with the numbers, from the same values, under the same gate.
+  -- Cursors and the peak ticks move with the numbers, from the same values, under the same
+  -- gate. The ticks are here rather than in the frame because their buffer is cleared and
+  -- rewritten whole, and a repaint inside that window shows as flicker.
   fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
+  fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
   return true
 end
 

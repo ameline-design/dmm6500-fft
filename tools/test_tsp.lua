@@ -1443,12 +1443,18 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
                              hz[1], hz[2], hz[3], db[1], fftsa.sg_mk_db[1],
                              fftsa.sg_mk_db[2], fftsa.sg_mk_db[3])
 end)())
--- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought and
--- is the part that still has to hold. The markers cannot be filled first any more: the peaks
--- come out of the same dsp.spectrum() call that writes the trace. So the order is no longer
--- the invariant and the yield's position is -- and the window in which one of the two is
--- incomplete is now the 18 marker points rather than the 255 trace points.
-check('both buffers are complete before the frame yields for the paint', (function()
+-- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought
+-- and is the part that still has to hold. The markers cannot be filled first any more: the
+-- peaks come out of the same dsp.spectrum() call that writes the trace. So the order is no
+-- longer the invariant and the yield's position is.
+--
+-- And the ticks are only written on the frames where the peak table updates, about one a
+-- second: their buffer is cleared and rewritten whole, so a repaint inside that window
+-- draws a partial trace, and eighteen points vanishing is visible flicker where the
+-- spectrum's 255 points of noise are not. Measured on the glass three times -- feet on the
+-- floor flickered along the bottom, feet at the top flickered along the top, and the
+-- cursor, which is widget state rather than buffer state, never flickered at all.
+check('the trace completes before the yield and the ticks never straddle one', (function()
   local order = {}
   local realwr = buffer.write.reading
   local realdelay = delay
@@ -1462,6 +1468,10 @@ check('both buffers are complete before the frame yields for the paint', (functi
     return realwr(b, unpack(arg))
   end
   delay = function(s) mark('yield') return realdelay(s) end
+  -- The peak ticks are filled on the peak table's once-a-second path, not every frame, so
+  -- the gate has to be opened or there is no marker write in this frame to order. Both the
+  -- period and the move test: sg_pk_last for the first, the remembered peaks for the second.
+  fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   fftsa.frame()
   buffer.write.reading = realwr
   delay = realdelay
@@ -1471,8 +1481,26 @@ check('both buffers are complete before the frame yields for the paint', (functi
     if order[i] == 'trace' then trace_at = i end
     if order[i] == 'marker' then marker_at = i end
   end
-  return n >= 3 and order[n] == 'yield' and trace_at ~= nil and marker_at ~= nil
-         and trace_at < n and marker_at < n,
+  -- The trace completes before the yield, which is the paint. The ticks are written after
+  -- it, and must not STRADDLE one: the display task runs only while Lua is blocked, so a
+  -- rewrite with no yield inside it cannot be repainted half-done. That is what makes the
+  -- ticks stable, where filling them in the frame before the yield flickered.
+  local straddles = false
+  local seen_mk, j = false, nil
+  for j = 1, n do
+    if order[j] == 'marker' then
+      if seen_mk == 'after_yield' then straddles = true end
+      seen_mk = true
+    elseif order[j] == 'yield' and seen_mk == true then
+      seen_mk = 'after_yield'
+    end
+  end
+  local first_yield = nil
+  for j = 1, n do
+    if order[j] == 'yield' and first_yield == nil then first_yield = j end
+  end
+  return trace_at ~= nil and marker_at ~= nil and first_yield ~= nil
+         and trace_at < first_yield and not straddles,
          table.concat(order, ' then ')
 end)())
 check('switching markers off again leaves one trace and a line', (function()
