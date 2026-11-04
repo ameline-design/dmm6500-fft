@@ -1236,8 +1236,10 @@ check('frame, preview and the three dismiss timers are live', live('timer') == 5
 check('exactly six screens are live', live('screen') == 6,
       'screens=' .. live('screen')
       .. ' (cover + spectrum + options + about + main help + options help)')
-check('the graph has exactly one trace bound', (function()
-  return OBJ[fftsa.sg_graph].traces == 1
+-- Two: the spectrum and the marker needles. Markers are on by default because the two
+-- vertical cursors are a firmware pair and cannot mark more than two peaks.
+check('the graph has the spectrum and the marker trace bound', (function()
+  return OBJ[fftsa.sg_graph].traces == 2 and fftsa.sg_markers == true
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
 
 -- a second start() must not orphan the first build
@@ -1253,11 +1255,15 @@ check('still exactly six screens after rebuild', live('screen') == 6,
       'screens=' .. live('screen'))
 
 print('\npeak markers (real code)')
--- NOT OFFERED IN THE FORM YET, so these drive fftsa.sg_markers directly: the field is
--- withheld until the second trace can be pinned, and setvalue on its nil handle raises.
--- The machinery stays tested so it does not rot while it waits.
-check('the form offers no peak markers field', fftsa.opt_mk == nil
-      and fftsa.sg_markers == false,
+-- NOT OFFERED IN THE FORM, so these drive fftsa.sg_markers directly: setvalue on a nil
+-- handle raises, and the knob is reachable from the socket without a field.
+--
+-- Markers are now ON by default, which the comment here used to say they were not. The
+-- reason they were withheld stands as the thing to watch: the second trace has to be
+-- pinned with scaletrace(TRACE_ALL) or it auto-scales on its own and its points stretch
+-- across the whole plot, and that call was measured at 126.6 ms and unpinning both axes.
+-- Nothing offline can see either, so the axes staying put is an instrument check.
+check('the form offers no peak markers field', fftsa.opt_mk == nil,
       'opt_mk=' .. tostring(fftsa.opt_mk) .. ' markers=' .. tostring(fftsa.sg_markers))
 -- Off means ONE trace drawn as a line: the marker buffer exists but is not bound, so
 -- drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
@@ -4958,6 +4964,56 @@ check('the cursor type must be the typed enum, not a number', (function()
   return ok == false
 end)())
 
+-- Headroom, not an absolute level, decides a needle and the cursor: a peak has to stand
+-- sg_mk_snr / sg_cursor_snr above the MEASURED noise floor. Driven by moving the cached
+-- figure rather than the signal, because that is the input the code reads and the one a
+-- caller can get wrong.
+check('a peak without headroom over the noise floor gets no needle and no cursor',
+      (function()
+  fftsa.sg_markers, fftsa.sg_cursor_ok = true, true
+  fftsa.frame()
+  local keep = fftsa.sg_noise_db
+  local g = fftsa.sg_graph
+  -- The tallest peak in this harness sits near 0 dBV, so a floor just under it leaves far
+  -- less than 25 dB of headroom.
+  fftsa.sg_noise_db = -5
+  local lean = fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz,
+                                       dsp.pk_hz, dsp.pk_v)
+  OBJ[g].cursors = nil
+  fftsa.sg_cursors_set(fftsa.sg_npeak, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local cur_off = OBJ[g].cursors[display.CURSOR_VERTICAL][1] >= fftsa.sg_cursor_off
+  -- And with a floor far below it, the needle and the cursor both appear.
+  fftsa.sg_noise_db = -100
+  local rich = fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz,
+                                       dsp.pk_hz, dsp.pk_v)
+  OBJ[g].cursors = nil
+  fftsa.sg_cursors_set(fftsa.sg_npeak, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local cur_on = OBJ[g].cursors[display.CURSOR_VERTICAL][1] < fftsa.sg_cursor_off
+  fftsa.sg_noise_db = keep
+  return lean == 0 and rich > 0 and cur_off and cur_on,
+         string.format('lean=%d rich=%d cursor off=%s on=%s', lean, rich,
+                       tostring(cur_off), tostring(cur_on))
+end)())
+
+-- The needle fill runs PER FRAME and the noise figure is a pass over every plotted bin, so
+-- it has to come from the cache the THD line fills once a second. A marker path that
+-- recomputed it would cost that pass every frame and nothing else would notice.
+check('the needle fill reads the cached noise figure, it does not recompute it',
+      (function()
+  local real, calls = fftsa.distortion, 0
+  fftsa.distortion = function() calls = calls + 1 return real() end
+  fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local inmark = calls
+  -- The once-a-second line is where it belongs, and it fills the cache.
+  fftsa.sg_thd_last, fftsa.sg_noise_db = nil, nil
+  fftsa.sg_show_thd()
+  local inline = calls - inmark
+  fftsa.distortion = real
+  return inmark == 0 and inline == 1 and fftsa.sg_noise_db ~= nil,
+         string.format('marker path %d calls, thd line %d, cached=%s', inmark, inline,
+                       tostring(fftsa.sg_noise_db))
+end)())
+
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
 -- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
 -- notice new writes -- but it derives the range from the buffer's own timestamps, and
@@ -6003,9 +6059,12 @@ check('a run of failed frames rebinds the trace once, not once a frame', (functi
   local failed = fftsa.errrun
   fftsa.errcount, fftsa.errrun, fftsa.halted = 0, 0, false
   fftsa.frame()
-  return adds == 1 and failed == 5 and fftsa.sg_buf.n > 0,
-         string.format('adds=%d over %d failures, recovered n=%s', adds, failed,
-                       tostring(fftsa.sg_buf.n))
+  -- One bind, counted in adds: two with the marker trace on, one without.
+  local perbind = 1
+  if fftsa.sg_markers then perbind = 2 end
+  return adds == perbind and failed == 5 and fftsa.sg_buf.n > 0,
+         string.format('adds=%d over %d failures, wanted %d, recovered n=%s', adds, failed,
+                       perbind, tostring(fftsa.sg_buf.n))
 end)())
 fftsa.stop()
 
