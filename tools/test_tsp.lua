@@ -457,6 +457,11 @@ function buffer.delete(b)
     REFUSED_BUF_DELETES = REFUSED_BUF_DELETES + 1
     return
   end
+  -- The default buffers cannot be deleted: "only user-defined buffers can be deleted".
+  if b == defbuffer1 or b == defbuffer2 then
+    REFUSED_BUF_DELETES = REFUSED_BUF_DELETES + 1
+    return
+  end
   for _, o in pairs(OBJ) do
     if o.alive and o.buffer == b then
       REFUSED_BUF_DELETES = REFUSED_BUF_DELETES + 1
@@ -568,12 +573,69 @@ end
 
 -- Signal source for the mocked digitizer: a 12.5 kHz tone on a 2.5 V pedestal.
 local SIG = {f = 12500, amp = 1.0, dc = 2.5, short = false, over = false}
+
+-- BOTH DEFAULT BUFFERS EXIST HERE, and neither did before. The app's teardown reads one
+-- sample into defbuffer1 to make it the panel's current buffer again, and with that nil the
+-- gate checking it compared `b == defbuffer1` with nil on both sides -- it passed for the
+-- wrong reason and could not have told the read from no read at all. Capacity is the
+-- instrument's default for each, and buffer.delete refuses them the way the firmware does.
+defbuffer1, defbuffer2 = newbuf(100000), newbuf(100000)
+
 -- The terminal selection is a front-panel button, so the mock carries it as state the
 -- tests can move under the app, which is what the panel does.
-dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', digitize = {},
+dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', FUNC_DC_VOLTAGE = 'dcv', FUNC_NONE = 'none',
        TERMINALS_FRONT = 'front', TERMINALS_REAR = 'rear'}
 dmm.terminals = dmm.TERMINALS_FRONT
+
+-- MEASURE AND DIGITIZE ARE MUTUALLY EXCLUSIVE, and the firmware POSTS rather than raising
+-- when that is ignored. Setting the function of one side sets the other's to None, the idle
+-- side reads FUNC_NONE, and then:
+--
+--   2800  The <attr> attribute is not available for the <func> function
+--   2801  DMM cannot measure when <side> function is set to None
+--
+-- Modelled because a pcall is no defence against a posted event, so a mock that raised would
+-- have the suite testing a failure the instrument does not have. This table previously had no
+-- function state at all, which is how 8.5 shipped a teardown that posted BOTH of these on the
+-- operator's panel with all 482 cases green. DMM_EVENTS is what a gate asserts on.
+DMM_EVENTS = {}
+local DIG, MEAS = {}, {}
+
+local function dmm_post(code, text)
+  DMM_EVENTS[table.getn(DMM_EVENTS) + 1] = {code = code, text = text}
+end
+
+local function dmm_side(own, other)
+  return setmetatable({}, {
+    __index = function(_, k) return own[k] end,
+    __newindex = function(_, k, v)
+      if k == 'func' then
+        own.func = v
+        if v ~= dmm.FUNC_NONE then other.func = dmm.FUNC_NONE end
+        return
+      end
+      -- read is the mock's own hook point and the tests replace it; every other key is an
+      -- instrument attribute, and writing one needs this side's function live.
+      if k ~= 'read' and own.func == dmm.FUNC_NONE then
+        dmm_post(2800, 'The ' .. tostring(k) .. ' attribute is not available for the '
+                       .. tostring(other.func) .. ' function')
+        return
+      end
+      own[k] = v
+    end})
+end
+
+dmm.digitize, dmm.measure = dmm_side(DIG, MEAS), dmm_side(MEAS, DIG)
+-- A CONFIGURED instrument, which is what nearly every case is about. The cold state a power
+-- cycle leaves is measure DC voltage with the digitizer idle; the cases that care set that
+-- through dmm.measure.func and put this back.
+DIG.func, MEAS.func = dmm.FUNC_DIGITIZE_VOLTAGE, dmm.FUNC_NONE
+
 function dmm.digitize.read(b)
+  if DIG.func == dmm.FUNC_NONE then
+    dmm_post(2801, 'DMM cannot measure when digitize function is set to None')
+    return nil
+  end
   local count = dmm.digitize.count or 512
   local fs    = dmm.digitize.samplerate or 100000
   if SIG.short then count = math.floor(count / 2) end     -- simulate a partial read
@@ -592,6 +654,20 @@ function dmm.digitize.read(b)
     local k
     for k = 1, 5 do b.readings[k * 3] = 9.9e37 end
   end
+  return b.readings[1]
+end
+
+-- One reading, which is all the measure side is ever asked for here: the teardown's fallback
+-- branch, for an exit after the panel has been moved off the digitizer.
+function dmm.measure.read(b)
+  if MEAS.func == dmm.FUNC_NONE then
+    dmm_post(2801, 'DMM cannot measure when measure function is set to None')
+    return nil
+  end
+  b.clear()
+  b.n = 1
+  b.readings[1] = SIG.dc
+  b.relativetimestamps[1] = 0
   return b.readings[1]
 end
 
@@ -4837,6 +4913,7 @@ check('an exit makes defbuffer1 current before dropping the trace buffers', (fun
     if b == tr or b == mk then order[table.getn(order) + 1] = 'drop' end
     return realdel(b)
   end
+  local df0 = defbuffer1.n
   fftsa.stop()
   dmm.digitize.read, buffer.delete = realread, realdel
   local n = table.getn(order)
@@ -4845,9 +4922,17 @@ check('an exit makes defbuffer1 current before dropping the trace buffers', (fun
   for i = 1, n do
     if order[i] == 'drop' then drops = drops + 1 end
   end
-  return order[1] == 'defbuffer1' and drops == 2
-         and FFTSA_TRACE == nil and FFTSA_MARK == nil,
-         table.concat(order, ' then ') .. ', globals=' .. tostring(FFTSA_TRACE)
+  local ok = order[1] == 'defbuffer1' and drops == 2
+             and FFTSA_TRACE == nil and FFTSA_MARK == nil
+             and fftsa.sg_defbuf_ok == true and defbuffer1.n == 1 and defbuffer1.alive
+  local why = table.concat(order, ' then ') .. ', globals=' .. tostring(FFTSA_TRACE)
+              .. ', defbuffer1.n ' .. tostring(df0) .. ' -> ' .. tostring(defbuffer1.n)
+  -- Leave the app up: a torn-down app is what the next case finds, and a case that indexes
+  -- OBJ[fftsa.sg_graph] then dies on a nil with no summary printed. That is how 8.5's suite
+  -- stopped after 409 of its cases while reporting no failure.
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
 end)())
 
 -- And a failing start must keep the reason it failed. The teardown runs inside
@@ -4861,9 +4946,12 @@ check('the exit teardown does not overwrite the reason a start failed', (functio
   dmm.digitize.read = function() error('no digitizer', 0) end
   fftsa.stop()
   dmm.digitize.read = real
-  return fftsa.lasterr == nil and fftsa.sg_defbuf_ok == false,
-         string.format('lasterr=%s defbuf_ok=%s', tostring(fftsa.lasterr),
-                       tostring(fftsa.sg_defbuf_ok))
+  local ok = fftsa.lasterr == nil and fftsa.sg_defbuf_ok == false
+  local why = string.format('lasterr=%s defbuf_ok=%s', tostring(fftsa.lasterr),
+                            tostring(fftsa.sg_defbuf_ok))
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
 end)())
 
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
@@ -5773,77 +5861,126 @@ check('launches do not accumulate buffers, and the handed-on pair is released', 
                        parked, a1, a2, a3, tostring(o1 == nil))
 end)())
 
--- sg_retrace() is the sequence measured to restore a second launch's trace: allocate a new
--- pair, point the app at them, rebind, and only THEN release the old pair. The order is the
--- finding, so it is what is asserted -- at each delete of the old pair the new trace must
--- already be bound.
-check('sg_retrace rebinds onto a new pair before releasing the old one', (function()
+-- NO SECOND ALLOCATION INSIDE ONE LAUNCH. sg_retrace() used to replace the trace buffers on
+-- a live graph about two seconds into a relaunch, and it is gone: on four consecutive
+-- launches the operator saw the trace draw correctly from the first frame and freeze at
+-- exactly the frame that fired. The naming in sg_mk_trace() is the half that works.
+--
+-- What this asserts is the absence -- no retrace entry point, and a launch that runs frames
+-- without ever allocating a trace buffer after the first one. An absence is worth a case
+-- here because the removed code was reachable only from the frame path, where nothing else
+-- would notice it coming back.
+check('a launch allocates its trace buffers once and never again', (function()
+  if fftsa.sg_retrace ~= nil then return false, 'sg_retrace is back' end
+  if fftsa.fix_arm ~= nil or fftsa.fix_step ~= nil then
+    return false, 'the staged recovery is back'
+  end
+  fftsa.start()
+  local realmake, makes = buffer.make, 0
+  buffer.make = function(cap, style)
+    makes = makes + 1
+    return realmake(cap, style)
+  end
+  local trace, mk, graph = fftsa.sg_buf, fftsa.sg_mk, fftsa.sg_graph
+  local i
+  for i = 1, 40 do fftsa.frame() end
+  buffer.make = realmake
+  return makes == 0 and fftsa.sg_buf == trace and fftsa.sg_mk == mk
+         and fftsa.sg_graph == graph and OBJ[graph].buffer == trace
+         and FFTSA_TRACE == trace and trace.n > 0 and fftsa.errrun == 0,
+         string.format('makes=%d over 40 frames, same=%s bound=%s n=%s errrun=%s',
+                       makes, tostring(fftsa.sg_buf == trace),
+                       tostring(OBJ[graph].buffer == trace), tostring(trace.n),
+                       tostring(fftsa.errrun))
+end)())
+
+-- A COLD INSTRUMENT POSTS NOTHING. fftsa.start() opens with fftsa.stop(), so the exit
+-- teardown runs on the way INTO the first launch of a power cycle -- before hw_config has
+-- set a digitize function, with the instrument sitting on measure DC voltage where it was
+-- left by the power cycle. 8.5 wrote dmm.digitize.count and read the digitizer there, which
+-- posted 2800 and then 2801 as modal dialogs over the operator's panel.
+--
+-- pcall is no defence, so this cannot be asserted by catching anything: the mock posts into
+-- DMM_EVENTS the way the panel collects events, and the case reads that.
+check('a first launch on a cold instrument posts no events from the teardown', (function()
+  fftsa.stop()
+  -- A power cycle: no buffers of ours anywhere, and the panel on a measure function.
+  FFTSA_TRACE, FFTSA_MARK, FFTSA_OLDTRACE, FFTSA_OLDMARK = nil, nil, nil, nil
+  fftsa.cap, fftsa.cap_cap = nil, nil
+  dmm.measure.func = dmm.FUNC_DC_VOLTAGE
+  local idle = dmm.digitize.func
+  DMM_EVENTS = {}
+  fftsa.stop()
+  local posted, skipped = table.getn(DMM_EVENTS), fftsa.sg_defbuf_ok
+  local codes = {}
+  local i
+  for i = 1, posted do codes[i] = tostring(DMM_EVENTS[i].code) end
+  -- And the launch that follows configures the digitizer and comes up clean.
+  local started = fftsa.start()
+  fftsa.frame()
+  local after = table.getn(DMM_EVENTS)
+  return posted == 0 and skipped == nil and idle == dmm.FUNC_NONE
+         and started == true and after == 0 and fftsa.errrun == 0,
+         string.format('teardown posted %d [%s], defbuf_ok=%s, idle=%s, start=%s, then %d',
+                       posted, table.concat(codes, ','), tostring(skipped),
+                       tostring(idle), tostring(started), after)
+end)())
+
+-- And the exit the operator actually asked for still works where the digitizer IS live:
+-- defbuffer1 ends up holding a reading, so it is the panel's current buffer, and no event
+-- is posted getting there.
+check('an exit with the digitizer live makes defbuffer1 current and posts nothing',
+      (function()
   fftsa.start()
   fftsa.frame()
-  local oldbuf, oldmk, graph = fftsa.sg_buf, fftsa.sg_mk, fftsa.sg_graph
-  local adds0 = OBJ[graph].adds
-  local realdel, seen, early = buffer.delete, 0, 0
-  buffer.delete = function(b)
-    if b == oldbuf or b == oldmk then
-      seen = seen + 1
-      -- Bound to the new buffer already, and the new buffer is not the one going away.
-      if OBJ[graph].buffer ~= fftsa.sg_buf or fftsa.sg_buf == b then early = early + 1 end
-    end
-    return realdel(b)
-  end
-  local ok = fftsa.sg_retrace()
-  buffer.delete = realdel
+  defbuffer1.clear()
+  DMM_EVENTS = {}
+  local func0 = dmm.digitize.func
+  fftsa.stop()
+  local posted = table.getn(DMM_EVENTS)
+  local ok = posted == 0 and fftsa.sg_defbuf_ok == true and defbuffer1.n == 1
+             and defbuffer1.alive and FFTSA_TRACE == nil and FFTSA_MARK == nil
+             and func0 == dmm.FUNC_DIGITIZE_VOLTAGE
+  local why = string.format('posted=%d defbuf_ok=%s defbuffer1.n=%s func=%s',
+                            posted, tostring(fftsa.sg_defbuf_ok),
+                            tostring(defbuffer1.n), tostring(func0))
+  fftsa.start()
   fftsa.frame()
-  return ok == true and seen == 2 and early == 0
-         and fftsa.sg_buf ~= oldbuf and fftsa.sg_mk ~= oldmk
-         and fftsa.sg_graph == graph
-         and OBJ[graph].buffer == fftsa.sg_buf
-         and OBJ[graph].adds > adds0
-         and FFTSA_TRACE == fftsa.sg_buf
-         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0,
-         string.format('ok=%s replaced=%s deletes=%d early=%d bound=%s n=%s',
-                       tostring(ok), tostring(fftsa.sg_buf ~= oldbuf), seen, early,
-                       tostring(OBJ[graph].buffer == fftsa.sg_buf),
-                       tostring(fftsa.sg_buf.n))
+  return ok, why
 end)())
 
--- The staged recovery runs only on a relaunch, which NLBOOT is the only state that
--- answers, and it must walk all four steps and then put the settings line back. A first
--- launch of a power cycle must arm nothing at all.
-check('the staged recovery arms on a relaunch and on nothing else', (function()
-  local keep = NLBOOT
-  NLBOOT = nil
-  fftsa.fix_stage = nil
-  local first = fftsa.fix_arm()
-  local armed_first = fftsa.fix_stage
-  NLBOOT = 12345
-  local again = fftsa.fix_arm()
-  local armed_again = fftsa.fix_stage
-  NLBOOT = keep
-  return first == false and armed_first == nil and again == true and armed_again == 1,
-         string.format('first=%s/%s relaunch=%s/%s', tostring(first), tostring(armed_first),
-                       tostring(again), tostring(armed_again))
-end)())
-
-check('the relaunch recovery takes its one step and then stands down', (function()
-  local keep = NLBOOT
-  NLBOOT = 12345
-  fftsa.fix_arm()
-  local armed = fftsa.fix_stage
-  local frames, guard = 0, 0
-  while fftsa.fix_stage ~= nil and guard < 200 do
-    guard = guard + 1
-    fftsa.fix_step()
-  end
-  NLBOOT = keep
+-- The OTHER branch, which the panel can reach: the operator moves the instrument to a
+-- measure function while the app is up, then ends the app. The digitize side then reads
+-- FUNC_NONE, so the teardown has to read the measure side -- writing dmm.digitize.count
+-- here is the 2800 over again. Exercised because an unexercised branch in a teardown is one
+-- nobody sees until it is on the glass.
+check('an exit after the panel moved to a measure function uses the measure side',
+      (function()
+  fftsa.start()
   fftsa.frame()
-  return armed == 1 and guard == fftsa.fix_every and FFTSA_FIX == 'retrace'
-         and fftsa.fix_stage == nil and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
-         and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf
-         and string.find(OBJ[fftsa.sg_xunit].text, 'pts', 1, true) ~= nil,
-         string.format('armed=%s after %d frames, FFTSA_FIX=%s, bound=%s',
-                       tostring(armed), guard, tostring(FFTSA_FIX),
-                       tostring(OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf))
+  defbuffer1.clear()
+  DMM_EVENTS = {}
+  dmm.measure.func = dmm.FUNC_DC_VOLTAGE      -- which sets the digitize side to None
+  local digidle = dmm.digitize.func
+  local reads = 0
+  local realm = dmm.measure.read
+  dmm.measure.read = function(b)
+    if b == defbuffer1 then reads = reads + 1 end
+    return realm(b)
+  end
+  fftsa.stop()
+  dmm.measure.read = realm
+  local posted = table.getn(DMM_EVENTS)
+  local ok = digidle == dmm.FUNC_NONE and posted == 0 and reads == 1
+             and fftsa.sg_defbuf_ok == true and defbuffer1.n == 1
+             and FFTSA_TRACE == nil and FFTSA_MARK == nil
+  local why = string.format('digitize=%s posted=%d measure reads=%d defbuf_ok=%s n=%s',
+                            tostring(digidle), posted, reads,
+                            tostring(fftsa.sg_defbuf_ok), tostring(defbuffer1.n))
+  dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
 end)())
 
 -- The trace buffers are created into their globals. What this can assert is that they are

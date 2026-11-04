@@ -305,33 +305,21 @@ function fftsa.sg_make_buffer(nbins, npoints)
   return fftsa.sg_buf
 end
 
--- Replace the trace buffers on a graph that is already live, and rebind.
+-- A SECOND ALLOCATION INSIDE ONE LAUNCH BREAKS THE TRACE, so there is no sg_retrace() here
+-- any more. It replaced the trace buffers on a live graph -- allocate a new pair, rebind,
+-- then release the old pair -- and that sequence did restore a blank trace by hand over the
+-- socket, twice, which is why it shipped as a staged recovery about two seconds into a
+-- relaunch.
 --
--- This is the sequence measured to restore the trace on a second launch, twice, applied by
--- hand over the socket: with the graph up and frames running, allocate a new pair, point
--- the app at them, rebind, and only then release the old pair. A plain rebind over the same
--- buffer was tried the same way and did not work, so the new allocation is the part that
--- matters and the old pair being alive at bind time is the rest of it.
+-- What the operator then measured on four consecutive launches: the trace drew correctly
+-- from the first frame and froze a couple of seconds in, at exactly the frame the recovery
+-- fired. So the naming in sg_mk_trace() below is the half of the fix that works, the retrace
+-- is the half that undid it, and an Apply from the panel -- which allocates and rebinds
+-- through sg_make_buffer() -- is already the repair if one is ever needed.
 --
--- Costs one allocation of sg_maxpts points and one rebind, which repaints the axes. Run
--- once per launch, not per frame.
-function fftsa.sg_retrace()
-  if fftsa.sg_graph == nil then return false end
-  local newbuf = fftsa.sg_mk_trace(fftsa.sg_maxpts)
-  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
-  if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
-  local newmk = fftsa.sg_mk_mark(mkcap)
-  if newbuf == nil or newmk == nil then return false end
-  local oldbuf, oldmk = fftsa.sg_buf, fftsa.sg_mk
-  fftsa.sg_buf, fftsa.sg_mk = newbuf, newmk
-  fftsa.sg_name_buffers()
-  fftsa.sg_bind()
-  -- After the bind, which is the order that worked: the old pair is still allocated while
-  -- the new trace is being created.
-  if oldbuf ~= nil then fftsa.del_buf(oldbuf) end
-  if oldmk ~= nil then fftsa.del_buf(oldmk) end
-  return true
-end
+-- The mechanism is NOT established. The suspicion is that the pair released at the previous
+-- exit leaves holes a second allocation lands in, inheriting the dead launch's subscription,
+-- which would make this specific to releasing them at exit rather than handing them on.
 
 -- The previous launch's trace buffers, released only once this launch has allocated its
 -- own. sg_make_buffer says what goes wrong when they are freed first; this is the other
@@ -384,13 +372,14 @@ end
 -- is 0% filled" events are the only thing the firmware says about it.
 --
 -- What is measured: every buffer that bound and painted on this instrument was assigned to
--- a bare global, and buffers held only in fftsa.sg_buf did not. What is NOT established is
--- that this is the reason. Creating into the global and aliasing it afterwards are the same
--- operation in Lua, 7.2 shipped the late alias and fixed nothing, and every successful
--- hand-run also had a freshly allocated buffer with the previous one still alive and bound
--- -- so three factors move together and only the instrument can separate them. These two
--- functions are the only places the trace buffers may be created, the globals are the
--- authority, and fftsa.sg_buf and fftsa.sg_mk are copies for the frame path to read.
+-- a bare global, and buffers held only in fftsa.sg_buf did not. Creating into the global and
+-- aliasing it afterwards are the same operation in Lua and 7.2 shipped the late alias and
+-- fixed nothing, so the two cannot be separated offline -- but the retrace that used to sit
+-- beside this has been, and it was the harmful half. Four launches drew correctly from the
+-- first frame, which is this code with no recovery having run yet. That makes the naming the
+-- fix, and it is why creating a trace buffer anywhere else is a defect rather than a style
+-- slip. These two functions are the only places the trace buffers may be created, the
+-- globals are the authority, and fftsa.sg_buf and fftsa.sg_mk are copies for the frame path.
 --
 -- Two functions with a literal global each rather than one taking a name, because
 -- assigning through _G may not be the same thing to the firmware and has not been measured.
@@ -533,11 +522,40 @@ end
 -- One sample, because the count the app was running at could be 16,384 and this is a
 -- teardown. Guarded, and its failure is not allowed to stop the deletes below it: a panel
 -- left on the wrong buffer is untidy, a buffer left allocated is a leak.
+--
+-- BOTH GUARDS BELOW ARE EVENTS SEEN ON THE GLASS, not caution. Measure and digitize are
+-- mutually exclusive -- setting the function of one sets the other's to None, and the idle
+-- one reads FUNC_NONE -- and the firmware POSTS rather than raising when that is ignored, so
+-- a pcall catches neither:
+--
+--   2800  the count attribute is not available for the DC voltage function
+--   2801  DMM cannot measure when digitize function is set to None
+--
+-- Both appeared, in that order, on the first launch of a power cycle: fftsa.start() opens
+-- with fftsa.stop(), which lands here before hw_config has set a digitize function, and a
+-- cold instrument is sitting on measure DC voltage. The second launch was clean because the
+-- first one left the digitize function set. notes/HANDOFF-session64.md records 2800 against
+-- this same write in the other app.
 function fftsa.sg_restore_defbuffer()
-  local ok = pcall(function()
-    dmm.digitize.count = 1
-    dmm.digitize.read(defbuffer1)
-  end)
+  -- Nothing of ours can be current if nothing of ours was ever made, which is the cold
+  -- start above. Skipping leaves the digitizer alone, which is the whole point: a teardown
+  -- on the way into a launch must not be the thing that configures the instrument.
+  if FFTSA_TRACE == nil and FFTSA_MARK == nil and FFTSA_OLDTRACE == nil
+     and FFTSA_OLDMARK == nil and fftsa.cap == nil then
+    fftsa.sg_defbuf_ok = nil
+    return false
+  end
+  -- Whichever side is live. The app's own exit is the digitize branch; the measure branch is
+  -- for an exit after the panel has been moved to a measure function under the app.
+  local ok = false
+  if dmm.digitize.func ~= dmm.FUNC_NONE then
+    ok = pcall(function()
+      dmm.digitize.count = 1
+      dmm.digitize.read(defbuffer1)
+    end)
+  elseif dmm.measure.func ~= dmm.FUNC_NONE then
+    ok = pcall(function() dmm.measure.read(defbuffer1) end)
+  end
   -- NOT into fftsa.lasterr. A teardown runs inside fftsa.start_failed(), which has just
   -- put the reason the start failed there, and the panel shows it: a note about the current
   -- buffer would replace the one thing the operator needs to read. Its own field, so a

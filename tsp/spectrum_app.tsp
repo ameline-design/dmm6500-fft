@@ -1122,56 +1122,12 @@ function fftsa.frame()
       fftsa.sg_pin_x()
     end
   end
-  -- The staged recovery, between frames for the same reason as the retune above.
-  if fftsa.fix_stage ~= nil and not fftsa.stop_pending and not fftsa.halted then
-    pcall(function() fftsa.fix_step() end)
-  end
   fftsa.busy = false
   -- A teardown that arrived mid-frame waits here, where nothing is in flight.
   if fftsa.stop_pending then
     fftsa.stop_pending = false
     fftsa.stop()
   end
-end
-
--- ---------------------------------------------------------------------------
--- One recovery step on a relaunch, and why it is still here.
---
--- The fault was that the trace buffer had no name the display task could resolve, so the
--- subscription fell back to defbuffer1: volts on the value axis, kilovolts on an axis that
--- should read kilohertz, and nothing recognisable drawn. fftsa.sg_mk_trace() fixes that at
--- the source by creating each trace buffer into its own bare global.
---
--- This runs fftsa.sg_retrace() once anyway, about two seconds in, because that sequence is
--- measured to restore the trace by itself and the cost is one allocation and one rebind
--- per relaunch. It also makes the next run say which fix did the work: a trace that is
--- right from the first frame is the naming, and one that is wrong for two seconds and then
--- comes good is this.
---
--- Armed only where the fault is, which is a launch that is not the first of a power cycle.
--- NLBOOT is the only state that answers that: nl.init claims it on the first install and
--- nothing but a power cycle clears it, so a start() that finds it already set is a
--- relaunch. A first launch runs none of this. FFTSA_FIX records what happened where a
--- socket can read it afterwards.
--- ---------------------------------------------------------------------------
-fftsa.fix_every = 20          -- frames before the step, about two seconds at 2048 samples
-
-function fftsa.fix_arm()
-  if NLBOOT == nil then return false end
-  fftsa.fix_stage, fftsa.fix_wait = 1, 0
-  FFTSA_FIX = 'armed'
-  return true
-end
-
-function fftsa.fix_step()
-  if fftsa.fix_stage == nil then return false end
-  fftsa.fix_wait = (fftsa.fix_wait or 0) + 1
-  if fftsa.fix_wait < fftsa.fix_every then return false end
-  fftsa.fix_stage, fftsa.fix_wait = nil, 0
-  FFTSA_FIX = 'retrace'
-  fftsa.sg_retrace()
-  fftsa.sg_write_xunit()
-  return true
 end
 
 -- The firmware frees the fields with their screen; the Lua handles still need clearing.
@@ -2283,10 +2239,6 @@ function fftsa.start()
   -- HELP recogniser needs out of the undocumented ki namespace.
   fftsa.help_probe()
 
-  -- Armed before nl.init below claims NLBOOT, which is what tells a relaunch from the
-  -- first launch of a power cycle. fftsa.fix_step() says what it does and why.
-  fftsa.fix_arm()
-
   local hooked = fftsa.install_cleanup()
   -- The boundary that remains, and what it is for: apply() is arithmetic over tables
   -- fft_init builds, so a defect in OUR code raises here. A raise escaping a timer or
@@ -2394,8 +2346,6 @@ function fftsa.stop()
   -- off the next one's first frame, fftsa.start() opening with a stop().
   fftsa.busy, fftsa.halted, fftsa.errrun = false, false, 0
   fftsa.retune_pending, fftsa.armed_n = false, nil
-  -- A staged recovery left armed would run against the next launch's screen set.
-  fftsa.fix_stage, fftsa.fix_wait = nil, 0
   return true
 end
 
