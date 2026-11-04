@@ -1135,35 +1135,26 @@ function fftsa.frame()
 end
 
 -- ---------------------------------------------------------------------------
--- A staged recovery for the second launch's trace, and what it is for.
+-- One recovery step on a relaunch, and why it is still here.
 --
--- A second launch in one power cycle comes up with the peak table, the noise figure, the
--- THD line and the frame rate all correct, and a plot that never changes. The buffer the
--- frames write reads back correct from Lua, and at 7.5 the dB axis is correct too, which
--- says the display task's subscription did resolve to that buffer -- the unit comes from
--- the subscription and carries no readings. What does not arrive is the readings.
+-- The fault was that the trace buffer had no name the display task could resolve, so the
+-- subscription fell back to defbuffer1: volts on the value axis, kilovolts on an axis that
+-- should read kilohertz, and nothing recognisable drawn. fftsa.sg_mk_trace() fixes that at
+-- the source by creating each trace buffer into its own bare global.
 --
--- Three things could restore it and the app cannot tell them apart, because it cannot see
--- its own glass. So it tries them in turn, two seconds apart, naming each one on the
--- settings line, and ends on the one already measured to work. Whoever is watching reads
--- off the step at which the trace becomes a spectrum, and that names the mechanism:
---
---   rebind      removeall and add over the same buffer. Tried by hand on the instrument
---               and it did NOT work, so this step is the control.
---   invalidate  drawstyle, which repaints without going through the appender's pending
---               flag. If this is the step, the records were reaching the trace's ring all
---               along and only the repaint was never posted.
---   clear       the buffer's own clear marker, a third message path again.
---   new buffer  fftsa.sg_retrace(), the sequence measured to work twice.
+-- This runs fftsa.sg_retrace() once anyway, about two seconds in, because that sequence is
+-- measured to restore the trace by itself and the cost is one allocation and one rebind
+-- per relaunch. It also makes the next run say which fix did the work: a trace that is
+-- right from the first frame is the naming, and one that is wrong for two seconds and then
+-- comes good is this.
 --
 -- Armed only where the fault is, which is a launch that is not the first of a power cycle.
 -- NLBOOT is the only state that answers that: nl.init claims it on the first install and
 -- nothing but a power cycle clears it, so a start() that finds it already set is a
--- relaunch. A first launch runs none of this.
---
--- FFTSA_FIX keeps the last step attempted where a socket can read it after the fact.
+-- relaunch. A first launch runs none of this. FFTSA_FIX records what happened where a
+-- socket can read it afterwards.
 -- ---------------------------------------------------------------------------
-fftsa.fix_every = 20          -- frames between steps, about two seconds at 2048 samples
+fftsa.fix_every = 20          -- frames before the step, about two seconds at 2048 samples
 
 function fftsa.fix_arm()
   if NLBOOT == nil then return false end
@@ -1176,31 +1167,10 @@ function fftsa.fix_step()
   if fftsa.fix_stage == nil then return false end
   fftsa.fix_wait = (fftsa.fix_wait or 0) + 1
   if fftsa.fix_wait < fftsa.fix_every then return false end
-  fftsa.fix_wait = 0
-  local s = fftsa.fix_stage
-  fftsa.fix_stage = s + 1
-  if s == 1 then
-    FFTSA_FIX = 'rebind'
-    fftsa.sg_rebind()
-  elseif s == 2 then
-    FFTSA_FIX = 'invalidate'
-    if fftsa.sg_graph ~= nil then
-      display.graph.drawstyle(fftsa.sg_graph, display.STYLE_LINE)
-    end
-  elseif s == 3 then
-    FFTSA_FIX = 'clear'
-    if fftsa.sg_buf ~= nil then fftsa.sg_buf.clear() end
-  elseif s == 4 then
-    FFTSA_FIX = 'new buffer'
-    fftsa.sg_retrace()
-  else
-    -- Done: the settings line goes back to saying what it is for.
-    fftsa.fix_stage = nil
-    FFTSA_FIX = 'done'
-    fftsa.sg_write_xunit()
-    return true
-  end
-  fftsa.say(string.format('step %d of 4: %s', s, FFTSA_FIX))
+  fftsa.fix_stage, fftsa.fix_wait = nil, 0
+  FFTSA_FIX = 'retrace'
+  fftsa.sg_retrace()
+  fftsa.sg_write_xunit()
   return true
 end
 

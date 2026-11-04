@@ -4793,30 +4793,28 @@ end)())
 --
 -- Both branches of sg_make_buffer, because the reuse branch returns early: the first case
 -- covers the branch that allocates, the second the branch that keeps what it has.
-check('the trace and marker buffers are named by globals of their own', (function()
-  local named = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
-                and FFTSA_TRACE ~= nil and FFTSA_MARK ~= nil
-  FFTSA_TRACE, FFTSA_MARK = nil, nil
+check('the live trace handles are the globals, through both branches', (function()
+  -- The globals are set when the buffers are created and fftsa.sg_buf is a copy, so what
+  -- matters is that the two never diverge. sg_name_buffers() reports agreement rather than
+  -- restoring it: a bare global pointed at an already-created buffer was measured not to
+  -- give the display task a name, so there is nothing to restore it to.
+  local built = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
+                and FFTSA_TRACE ~= nil and fftsa.sg_name_buffers() == true
   fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)   -- the reuse branch
   local reused = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
-                 and FFTSA_TRACE ~= nil
-  -- The branch that allocates, which a different capacity is the only way to reach. Put
-  -- back at sg_maxpts and rebound afterwards, with a frame to refill it, so the cases
-  -- below find the app as they expect it -- a bind over an empty buffer binds nothing.
-  FFTSA_TRACE, FFTSA_MARK = nil, nil
+  -- And the branch that allocates, which a different capacity is the only way to reach.
   fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts - 1)
   local allocated = FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
-                    and FFTSA_TRACE ~= nil
                     and fftsa.sg_buf.capacity == fftsa.sg_maxpts - 1
+  -- Put it back and leave the app as the cases below expect it.
   fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)
   fftsa.sg_bind()
   fftsa.frame_body()
-  return named and reused and allocated
+  return built and reused and allocated
          and fftsa.sg_buf.capacity == fftsa.sg_maxpts
          and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf,
-         string.format('build %s, reuse branch %s, allocating branch %s, restored %s',
-                       tostring(named), tostring(reused), tostring(allocated),
-                       tostring(OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf))
+         string.format('build %s, reuse %s, allocate %s', tostring(built),
+                       tostring(reused), tostring(allocated))
 end)())
 
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
@@ -5775,31 +5773,44 @@ check('the staged recovery arms on a relaunch and on nothing else', (function()
                        tostring(again), tostring(armed_again))
 end)())
 
-check('the staged recovery walks its four steps and then stands down', (function()
+check('the relaunch recovery takes its one step and then stands down', (function()
   local keep = NLBOOT
   NLBOOT = 12345
   fftsa.fix_arm()
-  local labels, guard = {}, 0
-  -- fix_every frames between steps, so the step count is paced rather than per frame.
-  while fftsa.fix_stage ~= nil and guard < 500 do
+  local armed = fftsa.fix_stage
+  local frames, guard = 0, 0
+  while fftsa.fix_stage ~= nil and guard < 200 do
     guard = guard + 1
-    local before = FFTSA_FIX
     fftsa.fix_step()
-    if FFTSA_FIX ~= before then table.insert(labels, FFTSA_FIX) end
   end
   NLBOOT = keep
-  local want = {'rebind', 'invalidate', 'clear', 'new buffer', 'done'}
-  local ok = table.getn(labels) == table.getn(want)
-  local i
-  for i = 1, table.getn(want) do
-    if labels[i] ~= want[i] then ok = false end
-  end
   fftsa.frame()
-  return ok and guard == table.getn(want) * fftsa.fix_every
-         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
+  return armed == 1 and guard == fftsa.fix_every and FFTSA_FIX == 'retrace'
+         and fftsa.fix_stage == nil and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
+         and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf
          and string.find(OBJ[fftsa.sg_xunit].text, 'pts', 1, true) ~= nil,
-         string.format('%d steps over %d frames: %s | line=%s', table.getn(labels), guard,
-                       table.concat(labels, ','), tostring(OBJ[fftsa.sg_xunit].text))
+         string.format('armed=%s after %d frames, FFTSA_FIX=%s, bound=%s',
+                       tostring(armed), guard, tostring(FFTSA_FIX),
+                       tostring(OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf))
+end)())
+
+-- The trace buffers are created into their globals. What this can assert is that they are
+-- there; it CANNOT assert that creating into the global differs from aliasing it
+-- afterwards, because in Lua those are the same operation and the difference, if there is
+-- one, is the firmware's. The mutation that aliases late passes this case. Whether a name
+-- is what the display task needs is an instrument question, and it is still open.
+check('each trace buffer is created into its own global', (function()
+  local before_t, before_m = FFTSA_TRACE, FFTSA_MARK
+  local b = fftsa.sg_mk_trace(64)
+  local ok_t = b == FFTSA_TRACE and FFTSA_TRACE ~= before_t and b.n == 64
+  local m = fftsa.sg_mk_mark(32)
+  local ok_m = m == FFTSA_MARK and FFTSA_MARK ~= before_m and m.n == 32
+  fftsa.del_buf(b)
+  fftsa.del_buf(m)
+  FFTSA_TRACE, FFTSA_MARK = before_t, before_m
+  fftsa.sg_buf, fftsa.sg_mk = before_t, before_m
+  return ok_t and ok_m,
+         string.format('trace=%s mark=%s', tostring(ok_t), tostring(ok_m))
 end)())
 
 -- A relaunch therefore builds a fresh screen set, and the trace has to end up bound to

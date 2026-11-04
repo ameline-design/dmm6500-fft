@@ -276,13 +276,13 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- Measured on the instrument both ways. A buffer allocated while the previous one was
   -- still alive bound and painted first time, twice; one allocated after it had been freed
   -- did not, and no rebind, no clear and no rewrite recovered it.
-  local newbuf = fftsa.sg_mkbuf(want)
+  local newbuf = fftsa.sg_mk_trace(want)
   -- The marker trace, one point a peak. Made here with the trace buffer and freed with it,
   -- whether or not markers are switched on: allocating it when the option is set would be
   -- an allocation while frames are running.
   local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
-  local newmk = fftsa.sg_mkbuf(mkcap)
+  local newmk = fftsa.sg_mk_mark(mkcap)
   -- Detach before deleting: the firmware refuses to delete a buffer still bound to a
   -- graph, so remaking one while attached leaves the old buffer alive and still bound,
   -- and the widget draws both -- a second trace overlaid at the old resolution.
@@ -317,10 +317,10 @@ end
 -- once per launch, not per frame.
 function fftsa.sg_retrace()
   if fftsa.sg_graph == nil then return false end
-  local newbuf = fftsa.sg_mkbuf(fftsa.sg_maxpts)
+  local newbuf = fftsa.sg_mk_trace(fftsa.sg_maxpts)
   local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
-  local newmk = fftsa.sg_mkbuf(mkcap)
+  local newmk = fftsa.sg_mk_mark(mkcap)
   if newbuf == nil or newmk == nil then return false end
   local oldbuf, oldmk = fftsa.sg_buf, fftsa.sg_mk
   fftsa.sg_buf, fftsa.sg_mk = newbuf, newmk
@@ -371,17 +371,46 @@ end
 -- Idempotent, and called from both branches of sg_make_buffer, so the reuse branch cannot
 -- leave a buffer nameless.
 function fftsa.sg_name_buffers()
-  FFTSA_TRACE = fftsa.sg_buf
-  FFTSA_MARK  = fftsa.sg_mk
-  return true
+  return FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
 end
 
--- One trace buffer: FILL_ONCE, formatted, seeded full. Capacity is sg_maxpts, so a frame
--- writing sg_ncol points always fits, and fftsa.dsp_live() clamps a raised sg_ncol to it
--- -- one write past capacity is event 4915. Seeded because an empty buffer binds no trace at
--- all, and sg_build() binds this before the first frame has run.
-function fftsa.sg_mkbuf(want)
-  local b = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
+-- A trace buffer is created INTO ITS OWN BARE GLOBAL, and that is not a style choice.
+--
+-- display.graph.add subscribes the display task to the buffer by name, and a buffer the
+-- task cannot name is subscribed as defbuffer1 instead -- the documented null-name default.
+-- The graph then draws defbuffer1's contents on defbuffer1's units: volts on the value axis
+-- and kilovolts on an axis that should read kilohertz, with nothing recognisable plotted,
+-- while the app's own buffer reads back perfectly from Lua. Two "Reading buffer defbuffer1
+-- is 0% filled" events are the only thing the firmware says about it.
+--
+-- What is measured: every buffer that bound and painted on this instrument was assigned to
+-- a bare global, and buffers held only in fftsa.sg_buf did not. What is NOT established is
+-- that this is the reason. Creating into the global and aliasing it afterwards are the same
+-- operation in Lua, 7.2 shipped the late alias and fixed nothing, and every successful
+-- hand-run also had a freshly allocated buffer with the previous one still alive and bound
+-- -- so three factors move together and only the instrument can separate them. These two
+-- functions are the only places the trace buffers may be created, the globals are the
+-- authority, and fftsa.sg_buf and fftsa.sg_mk are copies for the frame path to read.
+--
+-- Two functions with a literal global each rather than one taking a name, because
+-- assigning through _G may not be the same thing to the firmware and has not been measured.
+function fftsa.sg_mk_trace(want)
+  FFTSA_TRACE = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
+  return fftsa.sg_fmt_seed(FFTSA_TRACE, want)
+end
+
+function fftsa.sg_mk_mark(want)
+  FFTSA_MARK = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
+  return fftsa.sg_fmt_seed(FFTSA_MARK, want)
+end
+
+-- The format and the seed, shared by the two above. FILL_ONCE, formatted, seeded full:
+-- capacity is sg_maxpts, so a frame writing sg_ncol points always fits, and
+-- fftsa.dsp_live() clamps a raised sg_ncol to it -- one write past capacity is event 4915.
+-- Seeded because an empty buffer binds no trace at all, and sg_build() binds this before
+-- the first frame has run.
+function fftsa.sg_fmt_seed(b, want)
+  if b == nil then return nil end
   -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the
   -- newest point to the oldest.
   --
