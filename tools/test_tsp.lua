@@ -4849,8 +4849,9 @@ end)())
 
 -- Cursors follow the peak table: same values, same gate, and one call per type because
 -- the firmware places both of that type at once and sorts them.
-check('cursors land on the top two peaks, in frequency and in dB', (function()
+check('vertical cursors land on the top two peaks, horizontal switched off', (function()
   fftsa.sg_cursor_ok = nil
+  fftsa.sg_cursors_h, fftsa.sg_cursor_h_done = false, false
   fftsa.sg_cursors = true
   local g = fftsa.sg_graph
   OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
@@ -4880,14 +4881,28 @@ check('cursors land on the top two peaks, in frequency and in dB', (function()
   -- Sorted by the firmware, so compare against the sorted pair.
   local vok = near(vert[1], lo, 0.5) and (near(vert[2], hi, 0.5)
               or (hi >= fftsa.sg_cursor_off and vert[2] >= fftsa.sg_cursor_off))
-  -- Both horizontal positions inside the plotted dB window, and the stronger peak's level
-  -- is the higher of the pair.
-  local hok = horz[1] >= fftsa.sg_dbmin and horz[2] >= horz[1]
-              and (horz[2] <= fftsa.sg_dbmax or horz[2] >= fftsa.sg_cursor_off)
+  -- Vertical only: the horizontal pair is switched off, both positions at the firmware's
+  -- own off value, and it is written once per graph rather than every second.
+  local hok = horz[1] >= fftsa.sg_cursor_off and horz[2] >= fftsa.sg_cursor_off
   return drew == true and vok and hok and OBJ[g].cursor_sets == 2,
          string.format('vert %.1f/%.1f want %.1f/%.1f, horz %.1f/%.1f, sets=%s',
                        vert[1], vert[2], lo, hi, horz[1], horz[2],
                        tostring(OBJ[g].cursor_sets))
+end)())
+
+-- The horizontal off is a ONE-SHOT. The call is synchronous, so re-sending a pair that is
+-- already off would be a round trip a second for nothing; the vertical pair still moves.
+check('the horizontal off is written once per graph, the vertical every update', (function()
+  local g = fftsa.sg_graph
+  fftsa.sg_cursor_ok, fftsa.sg_cursors_h = true, false
+  fftsa.sg_cursor_h_done = false
+  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
+  fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local first = OBJ[g].cursor_sets                    -- vertical and the horizontal off
+  fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
+  local second = OBJ[g].cursor_sets - first           -- vertical only
+  return first == 2 and second == 1,
+         string.format('first update %d calls, second %d', first, second)
 end)())
 
 -- A missing second peak is a cursor switched OFF rather than one parked at zero, which

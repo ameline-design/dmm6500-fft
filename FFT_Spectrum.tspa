@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 7.8
+-- $Version: 7.9
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -1373,6 +1373,9 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.loading_front()
 
   fftsa.sg_graph = create(fftsa.sg_scr, display.OBJ_GRAPH, fftsa.sg_gx, fftsa.sg_gy, fftsa.sg_gw, fftsa.sg_gh)
+  -- A new graph carries no cursors, so the one-shot that switches the horizontal pair off
+  -- is owed again: per graph, not per boot.
+  fftsa.sg_cursor_h_done = false
   -- X is ELEMENT_EXTRA (the bin's frequency in Hz); Y is ELEMENT_DATA (dB).
   fftsa.sg_bind()
 
@@ -2255,8 +2258,10 @@ end
 
 -- ---------- cursors on the peaks ----------
 
--- Two vertical cursors on the top two peaks' frequencies and two horizontal ones across
--- the strongest peak and the weakest reported, so the pair brackets what the table lists.
+-- Two vertical cursors on the top two peaks' frequencies. Vertical only: a horizontal pair
+-- across the levels was tried and is not wanted, so it is switched OFF rather than left
+-- alone -- a graph that has carried horizontal cursors keeps them until something says
+-- otherwise, and that something has to be us.
 --
 -- Driven from fftsa.sg_show_peaks_now(), so they move when the peak numbers move and under
 -- the same tolerance gate: a dithering last digit redraws neither. A cursor set is
@@ -2267,6 +2272,10 @@ end
 -- places both of that type. A position of 9.9e37 or more switches a cursor off, which is
 -- how a missing second peak leaves one cursor rather than a stray at zero.
 fftsa.sg_cursors = true         -- live knob: set false from the socket to drop them
+-- The horizontal pair, off. Kept as a knob rather than deleted because the call that
+-- places it is the same one, and the levels are already to hand.
+fftsa.sg_cursors_h = false
+fftsa.sg_cursor_h_done = false  -- the one-shot that switches the pair off
 fftsa.sg_cursor_off = 9.9e37    -- the firmware's own "this cursor is off" value
 fftsa.sg_cursor_ok = nil        -- nil until probed; false where the model lacks the call
 
@@ -2302,22 +2311,29 @@ function fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
      end) then
     return fftsa.sg_cursors_failed()
   end
-  -- The horizontal pair in dB, floored at the axis like the table's own column: a bin at
-  -- 1e-26 is -260 dBV, which is not a position on a plot that stops at sg_dbmin.
+  -- The horizontal pair. Off by default, and switched off once rather than every second:
+  -- the call is synchronous, so a pair that is already off costs nothing to leave alone.
   local d1, d2 = off, off
-  if v1 ~= nil and v1 == v1 and v1 > 0 then
-    d1 = 20 * math.log10(v1)
-    if not (d1 > fftsa.sg_dbmin) then d1 = fftsa.sg_dbmin end
-  end
-  if v2 ~= nil and v2 == v2 and v2 > 0 then
-    d2 = 20 * math.log10(v2)
-    if not (d2 > fftsa.sg_dbmin) then d2 = fftsa.sg_dbmin end
+  if fftsa.sg_cursors_h then
+    -- In dB, floored at the axis like the table's own column: a bin at 1e-26 is -260 dBV,
+    -- which is not a position on a plot that stops at sg_dbmin.
+    if v1 ~= nil and v1 == v1 and v1 > 0 then
+      d1 = 20 * math.log10(v1)
+      if not (d1 > fftsa.sg_dbmin) then d1 = fftsa.sg_dbmin end
+    end
+    if v2 ~= nil and v2 == v2 and v2 > 0 then
+      d2 = 20 * math.log10(v2)
+      if not (d2 > fftsa.sg_dbmin) then d2 = fftsa.sg_dbmin end
+    end
+  elseif fftsa.sg_cursor_h_done then
+    return true
   end
   if not pcall(function()
        display.graph.cursor(fftsa.sg_graph, display.CURSOR_HORIZONTAL, d1, d2)
      end) then
     return fftsa.sg_cursors_failed()
   end
+  fftsa.sg_cursor_h_done = true
   return true
 end
 
