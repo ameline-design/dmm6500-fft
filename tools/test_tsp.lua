@@ -1236,9 +1236,9 @@ check('frame, preview and the three dismiss timers are live', live('timer') == 5
 check('exactly six screens are live', live('screen') == 6,
       'screens=' .. live('screen')
       .. ' (cover + spectrum + options + about + main help + options help)')
--- Two: the spectrum and the marker needles. Markers are on by default because the two
--- vertical cursors are a firmware pair and cannot mark more than two peaks.
-check('the graph has the spectrum and the marker trace bound', (function()
+-- One: the spectrum. The marker needles were tried on the glass and judged not useful, so
+-- they are off and the second trace is not bound -- see fftsa.sg_markers.
+check('the graph has the spectrum and the peak-tick trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 2 and fftsa.sg_markers == true
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
 
@@ -1355,7 +1355,7 @@ check('every bound trace is pinned to the same dB range and span', (function()
   return true, string.format('both traces at %g..%g dB and 0..%g Hz',
                              fftsa.sg_dbmin, fftsa.sg_dbmax, fftsa.sg_fhi_hz)
 end)())
-check('each peak gets a needle: floor, peak, floor, in frequency order', (function()
+check('each peak gets a tick hung from the top edge, in frequency order', (function()
   fftsa.frame()
   local mk = fftsa.sg_mk
   local found, i = 0, nil
@@ -1368,14 +1368,17 @@ check('each peak gets a needle: floor, peak, floor, in frequency order', (functi
     return false, string.format('%d points for %d peaks at %d a needle', mk.n, found,
                                 fftsa.sg_mk_per)
   end
-  -- Each triple is floor, above the floor, floor again, and x never goes backwards.
+  -- Each triple is the top edge, a tick below it, the top edge again, and x never goes
+  -- backwards. Hung from the top so the run joining the ticks is above the spectrum.
   for i = 1, found do
     local b = (i - 1) * 3
-    if mk.readings[b + 1] ~= fftsa.sg_dbmin or mk.readings[b + 3] ~= fftsa.sg_dbmin then
-      return false, string.format('needle %d does not start and end at the floor', i)
+    if mk.readings[b + 1] ~= fftsa.sg_dbmax or mk.readings[b + 3] ~= fftsa.sg_dbmax then
+      return false, string.format('tick %d does not start and end at the top edge', i)
     end
-    if not (mk.readings[b + 2] > fftsa.sg_dbmin) then
-      return false, string.format('needle %d has no height', i)
+    -- Depth, not height: the tick hangs below the top edge and must clear it, or there is
+    -- nothing to see.
+    if not (mk.readings[b + 2] < fftsa.sg_dbmax) then
+      return false, string.format('tick %d has no depth', i)
     end
   end
   for i = 2, mk.n do
@@ -1383,7 +1386,7 @@ check('each peak gets a needle: floor, peak, floor, in frequency order', (functi
       return false, string.format('x goes backwards at point %d', i)
     end
   end
-  return true, string.format('%d needles, %d points', found, mk.n)
+  return true, string.format('%d ticks, %d points', found, mk.n)
 end)())
 
 -- The sort, driven directly. The end-to-end check above cannot reach it: the mock's
@@ -1411,23 +1414,34 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
   for i = 1, 3 do
     hz[i], db[i] = mk.extravalues[(i - 1) * 3 + 2], mk.readings[(i - 1) * 3 + 2]
   end
-  -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. Each has to carry its OWN amplitude
-  -- through the sort, which here means dB rising with frequency.
-  local want = {{400, 20 * math.log10(0.005)},
-                {1900, 20 * math.log10(0.020)},
-                {3900, 20 * math.log10(0.040)}}
+  -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. The apex of every needle is the top of
+  -- the plot, so the buffer no longer carries the peak's own level -- a needle that stopped
+  -- at the level was invisible under the spectrum's own spike. The pairing the sort has to
+  -- keep is therefore asserted where it still exists, on the app's own arrays, which is
+  -- also where a pairing bug would start.
+  local want = {400, 1900, 3900}
   for i = 1, 3 do
-    if math.abs(hz[i] - want[i][1]) > 1 then
-      return false, string.format('point %d at %.0f Hz, wanted %.0f',
-                                  i, hz[i], want[i][1])
+    if math.abs(hz[i] - want[i]) > 1 then
+      return false, string.format('point %d at %.0f Hz, wanted %.0f', i, hz[i], want[i])
     end
-    if math.abs(db[i] - want[i][2]) > 0.01 then
-      return false, string.format('point %d at %.0f Hz carries %.2f dB, wanted %.2f',
-                                  i, hz[i], db[i], want[i][2])
+    if math.abs(db[i] - (fftsa.sg_dbmax - fftsa.sg_mk_depth)) > 0.01 then
+      return false, string.format('tick %d reaches %.2f dB, wanted %.2f below the top',
+                                  i, db[i], fftsa.sg_dbmax - fftsa.sg_mk_depth)
     end
   end
-  return true, string.format('%.0f Hz %.1f dB, %.0f Hz %.1f dB, %.0f Hz %.1f dB',
-                             hz[1], db[1], hz[2], db[2], hz[3], db[3])
+  -- The levels, still sorted with their frequencies: dB rising with frequency here,
+  -- because the stub makes the amplitude a function of the bin.
+  local lv = {20 * math.log10(0.005), 20 * math.log10(0.020), 20 * math.log10(0.040)}
+  for i = 1, 3 do
+    if math.abs(fftsa.sg_mk_hz[i] - want[i]) > 1
+       or math.abs(fftsa.sg_mk_db[i] - lv[i]) > 0.01 then
+      return false, string.format('slot %d pairs %.0f Hz with %.2f dB, wanted %.0f/%.2f',
+                                  i, fftsa.sg_mk_hz[i], fftsa.sg_mk_db[i], want[i], lv[i])
+    end
+  end
+  return true, string.format('%.0f/%.0f/%.0f Hz, apexes at %.0f dB, levels %.1f/%.1f/%.1f',
+                             hz[1], hz[2], hz[3], db[1], fftsa.sg_mk_db[1],
+                             fftsa.sg_mk_db[2], fftsa.sg_mk_db[3])
 end)())
 -- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought and
 -- is the part that still has to hold. The markers cannot be filled first any more: the peaks
@@ -4989,10 +5003,26 @@ check('a peak without headroom over the noise floor gets no needle and no cursor
   OBJ[g].cursors = nil
   fftsa.sg_cursors_set(fftsa.sg_npeak, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
   local cur_on = OBJ[g].cursors[display.CURSOR_VERTICAL][1] < fftsa.sg_cursor_off
+  -- Hung from the top: every point is at the top edge or sg_mk_depth below it, and nothing
+  -- the trace draws is anywhere near the spectrum. Both ends are checked, because a tick
+  -- with its feet at the floor is the form that flickered on the trace.
+  local mk = fftsa.sg_mk
+  local lo, hi = nil, nil
+  local i
+  for i = 1, mk.n do
+    local v = mk.readings[i]
+    if lo == nil or v < lo then lo = v end
+    if hi == nil or v > hi then hi = v end
+  end
+  local apex = lo
   fftsa.sg_noise_db = keep
-  return lean == 0 and rich > 0 and cur_off and cur_on,
-         string.format('lean=%d rich=%d cursor off=%s on=%s', lean, rich,
-                       tostring(cur_off), tostring(cur_on))
+  fftsa.sg_markers = true             -- the shipped default, restored for the cases below
+  return lean == 0 and rich > 0 and cur_off and cur_on
+         and hi ~= nil and near(hi, fftsa.sg_dbmax, 0.01)
+         and near(lo, fftsa.sg_dbmax - fftsa.sg_mk_depth, 0.01),
+         string.format('lean=%d rich=%d cursor off=%s on=%s apex=%s want %s', lean, rich,
+                       tostring(cur_off), tostring(cur_on), tostring(apex),
+                       tostring(fftsa.sg_dbmax))
 end)())
 
 -- The needle fill runs PER FRAME and the noise figure is a pass over every plotted bin, so

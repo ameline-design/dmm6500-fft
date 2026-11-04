@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.0
+-- $Version: 8.2
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -932,14 +932,18 @@ fftsa.sg_ncol    = 255
 -- interpolated frequency and amplitude the peak table reports -- so a marker sits where
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
--- On, because the vertical cursors are a firmware PAIR and cannot be grown -- graph notes
--- section 4.5, positions at +0x58/+0x60 with enable bits in graph+0x604 -- so a needle a
--- peak is the only way to mark more than one. Binding the second trace needs
--- scaletrace(TRACE_ALL), which was measured at 126.6 ms and unpinning both axes; sg_bind()
--- calls it before sg_pin_y and sg_pin_x, so the pins are re-asserted after it, and once per
--- bind rather than per frame.
+-- Off. Needles on the peaks were tried on the glass and judged not useful: at the top of
+-- the plot they are vertical lines that say no more than the cursor does, and at the peak's
+-- own level they sit under the spectrum's spike and show as flickering pixels on it and
+-- along the floor. The machinery stays, switchable from the socket, because it is the only
+-- way to mark more than one peak -- the vertical cursors are a firmware PAIR and cannot be
+-- grown (graph notes 4.5, positions at +0x58/+0x60, enable bits in graph+0x604).
+--
+-- Switching it on binds a second trace, which needs scaletrace(TRACE_ALL): measured at
+-- 126.6 ms and unpinning both axes. sg_bind() calls it before sg_pin_y and sg_pin_x, so the
+-- pins are re-asserted after it, once per bind rather than per frame.
 fftsa.sg_markers = true
--- A needle only for a peak with this much headroom over the measured noise floor, in dB.
+-- A tick only for a peak with this much headroom over the measured noise floor, in dB.
 -- The peak search reports the strongest sg_npeak whatever their level, so without it the
 -- weakest few are needles on the noise, which says nothing.
 fftsa.sg_mk_snr = 25
@@ -949,7 +953,14 @@ fftsa.sg_mk_floor = -60
 -- Needles, not dots: drawstyle is per graph, so markers on the peak trace would put one
 -- on all 255 spectrum points too. Three points a peak -- floor, peak, floor, a pixel
 -- either side -- draws a vertical needle with the run between them along the bottom rule.
-fftsa.sg_mk_per  = 3       -- points a needle: floor, peak, floor
+fftsa.sg_mk_per  = 3       -- points a tick: top, down, top
+-- How far a tick hangs below the top of the plot, in dB. The trace is drawn as a LINE, so
+-- consecutive ticks are joined and that run has to go somewhere: along the top edge, where
+-- there is no spectrum. Hung from the top rather than standing on the floor because both of
+-- those were tried on the glass -- at the peak's own level a needle is hidden under the
+-- spectrum's spike and shows only as flickering pixels on it, and at full height it says no
+-- more than the cursor does, with its feet flickering along the bottom rule.
+fftsa.sg_mk_depth = 12
 -- Firmware floor on a reading buffer, event 4920. Ask for less and buffer.make returns
 -- nil rather than refusing, so every later call on the handle is a 1138.
 fftsa.sg_bufmin  = 10
@@ -2179,14 +2190,20 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
     end
   end
   if n == 0 then return 0 end
-  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a
-  -- pixel above. The x values have to stay increasing or the line doubles back, so each
-  -- foot is held at or above the previous needle's -- two peaks within two pixels then
-  -- read as one slightly wider needle, which is what they look like anyway.
+  -- A tick a peak, hung from the top: the top edge a pixel below the peak frequency, the
+  -- bottom of the tick at it, the top edge a pixel above. The run between ticks is
+  -- therefore along the top of the plot, which is empty on a -120 to +20 axis, so nothing
+  -- the marker trace draws can land on the spectrum.
+  --
+  -- The x values have to stay increasing or the line doubles back, so each foot is held at
+  -- or above the previous tick's -- two peaks within two pixels then read as one slightly
+  -- wider tick, which is what they look like anyway.
   local span = fftsa.sg_fhi_hz - fftsa.sg_flo_hz
   local dx = span / fftsa.sg_plotpx
   if not (dx > 0) then dx = binhz end
-  local floordb = fftsa.sg_dbmin
+  -- The top edge is where the line runs; the tick hangs sg_mk_depth below it.
+  local topdb = fftsa.sg_dbmax
+  local tickdb = topdb - fftsa.sg_mk_depth
   local wr = buffer.write.reading
   local cap = mk.capacity
   local i, slot, prev = nil, 0, nil
@@ -2198,9 +2215,9 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
     if f < l then f = l end
     if r < f then r = f end
     if slot + fftsa.sg_mk_per <= cap then
-      slot = slot + 1; wr(mk, floordb, l, slot, 0)
-      slot = slot + 1; wr(mk, db[i],   f, slot, 0)
-      slot = slot + 1; wr(mk, floordb, r, slot, 0)
+      slot = slot + 1; wr(mk, topdb,  l, slot, 0)
+      slot = slot + 1; wr(mk, tickdb, f, slot, 0)
+      slot = slot + 1; wr(mk, topdb,  r, slot, 0)
       prev = r
     end
   end
