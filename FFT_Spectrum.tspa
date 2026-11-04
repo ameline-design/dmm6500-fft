@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.3
+-- $Version: 8.4
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -932,35 +932,11 @@ fftsa.sg_ncol    = 255
 -- interpolated frequency and amplitude the peak table reports -- so a marker sits where
 -- the peak really is, which is up to half a bin off the column the trace draws there.
 -- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
--- Off. Needles on the peaks were tried on the glass and judged not useful: at the top of
--- the plot they are vertical lines that say no more than the cursor does, and at the peak's
--- own level they sit under the spectrum's spike and show as flickering pixels on it and
--- along the floor. The machinery stays, switchable from the socket, because it is the only
--- way to mark more than one peak -- the vertical cursors are a firmware PAIR and cannot be
--- grown (graph notes 4.5, positions at +0x58/+0x60, enable bits in graph+0x604).
---
--- Switching it on binds a second trace, which needs scaletrace(TRACE_ALL): measured at
--- 126.6 ms and unpinning both axes. sg_bind() calls it before sg_pin_y and sg_pin_x, so the
--- pins are re-asserted after it, once per bind rather than per frame.
-fftsa.sg_markers = true
--- A tick only for a peak with this much headroom over the measured noise floor, in dB.
--- The peak search reports the strongest sg_npeak whatever their level, so without it the
--- weakest few are needles on the noise, which says nothing.
-fftsa.sg_mk_snr = 25
--- And an absolute backstop in dBV, for a floor figure that is missing or absurd.
-fftsa.sg_mk_floor = -60
-fftsa.sg_mk_floor = -60
+fftsa.sg_markers = false
 -- Needles, not dots: drawstyle is per graph, so markers on the peak trace would put one
 -- on all 255 spectrum points too. Three points a peak -- floor, peak, floor, a pixel
 -- either side -- draws a vertical needle with the run between them along the bottom rule.
-fftsa.sg_mk_per  = 3       -- points a tick: top, down, top
--- How far a tick hangs below the top of the plot, in dB. The trace is drawn as a LINE, so
--- consecutive ticks are joined and that run has to go somewhere: along the top edge, where
--- there is no spectrum. Hung from the top rather than standing on the floor because both of
--- those were tried on the glass -- at the peak's own level a needle is hidden under the
--- spectrum's spike and shows only as flickering pixels on it, and at full height it says no
--- more than the cursor does, with its feet flickering along the bottom rule.
-fftsa.sg_mk_depth = 12
+fftsa.sg_mk_per  = 3       -- points a needle: floor, peak, floor
 -- Firmware floor on a reading buffer, event 4920. Ask for less and buffer.make returns
 -- nil rather than refusing, so every later call on the handle is a 1138.
 fftsa.sg_bufmin  = 10
@@ -1397,9 +1373,6 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.loading_front()
 
   fftsa.sg_graph = create(fftsa.sg_scr, display.OBJ_GRAPH, fftsa.sg_gx, fftsa.sg_gy, fftsa.sg_gw, fftsa.sg_gh)
-  -- A new graph carries no cursors, so the one-shot that switches the horizontal pair off
-  -- is owed again: per graph, not per boot.
-  fftsa.sg_cursor_h_done = false
   -- X is ELEMENT_EXTRA (the bin's frequency in Hz); Y is ELEMENT_DATA (dB).
   fftsa.sg_bind()
 
@@ -1568,11 +1541,6 @@ end
 function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
   local thd, snr, ndb = fftsa.distortion()
-  -- Kept for the cursor and the marker needles, which both gate on headroom over the noise
-  -- floor and run per frame: distortion() is a pass over every plotted bin and belongs
-  -- here, once a second. Reading the cache also means the line and the marks cannot
-  -- disagree about where the floor is.
-  fftsa.sg_noise_db = ndb
   if thd ~= nil then thd = thd * 100 end
   local t = fftsa.sg_thd_text(thd, snr, ndb, fftsa.plan_n(), fftsa.overrange)
   if t == fftsa.sg_thd_last then return false end
@@ -2160,22 +2128,7 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
   local p
   for p = 1, count do
     local f, iv = fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
-    -- Positive tests throughout, so a NaN amplitude or a missing noise figure falls out
-    -- here rather than becoming a needle at the clamp. Headroom over the measured floor is
-    -- the rule; the absolute floor is the backstop for a noise figure that is missing.
-    local draw = false
-    if f ~= nil and iv ~= nil and iv > 0 then
-      local d = 20 * log10(iv)
-      if d >= fftsa.sg_mk_floor then
-        local ndb = fftsa.sg_noise_db
-        if ndb == nil or ndb ~= ndb then
-          draw = true                      -- no floor measured yet: the absolute stands
-        else
-          draw = (d - ndb) >= fftsa.sg_mk_snr
-        end
-      end
-    end
-    if draw then
+    if f ~= nil then
       local d = 20 * log10(iv)
       if not (d > fftsa.sg_dbmin) then d = fftsa.sg_dbmin end
       if not (d < fftsa.sg_dbmax) then d = fftsa.sg_dbmax end
@@ -2190,20 +2143,14 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
     end
   end
   if n == 0 then return 0 end
-  -- A tick a peak, hung from the top: the top edge a pixel below the peak frequency, the
-  -- bottom of the tick at it, the top edge a pixel above. The run between ticks is
-  -- therefore along the top of the plot, which is empty on a -120 to +20 axis, so nothing
-  -- the marker trace draws can land on the spectrum.
-  --
-  -- The x values have to stay increasing or the line doubles back, so each foot is held at
-  -- or above the previous tick's -- two peaks within two pixels then read as one slightly
-  -- wider tick, which is what they look like anyway.
+  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a
+  -- pixel above. The x values have to stay increasing or the line doubles back, so each
+  -- foot is held at or above the previous needle's -- two peaks within two pixels then
+  -- read as one slightly wider needle, which is what they look like anyway.
   local span = fftsa.sg_fhi_hz - fftsa.sg_flo_hz
   local dx = span / fftsa.sg_plotpx
   if not (dx > 0) then dx = binhz end
-  -- The top edge is where the line runs; the tick hangs sg_mk_depth below it.
-  local topdb = fftsa.sg_dbmax
-  local tickdb = topdb - fftsa.sg_mk_depth
+  local floordb = fftsa.sg_dbmin
   local wr = buffer.write.reading
   local cap = mk.capacity
   local i, slot, prev = nil, 0, nil
@@ -2215,9 +2162,9 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
     if f < l then f = l end
     if r < f then r = f end
     if slot + fftsa.sg_mk_per <= cap then
-      slot = slot + 1; wr(mk, topdb,  l, slot, 0)
-      slot = slot + 1; wr(mk, tickdb, f, slot, 0)
-      slot = slot + 1; wr(mk, topdb,  r, slot, 0)
+      slot = slot + 1; wr(mk, floordb, l, slot, 0)
+      slot = slot + 1; wr(mk, db[i],   f, slot, 0)
+      slot = slot + 1; wr(mk, floordb, r, slot, 0)
       prev = r
     end
   end
@@ -2301,115 +2248,7 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       settext(fftsa.sg_pk_d[p], "")
     end
   end
-  -- Cursors and the peak ticks move with the numbers, from the same values, under the same
-  -- gate. The ticks are here rather than in the frame because their buffer is cleared and
-  -- rewritten whole, and a repaint inside that window shows as flicker.
-  fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
-  fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
   return true
-end
-
--- ---------- cursors on the peaks ----------
-
--- One vertical cursor, on the tallest peak, and only when that peak stands at least
--- sg_cursor_snr above the measured noise floor. Below that it is switched off rather than
--- parked, because a cursor on the largest ripple of a noise floor points at nothing and
--- reads as though it meant something.
---
--- One and not two: the cursors are a firmware PAIR per type, so two is the ceiling and the
--- second of the pair is held off. Vertical only, and the horizontal pair is switched OFF
--- rather than left alone -- a graph that has carried horizontal cursors keeps them until
--- something says otherwise, and that something has to be us.
---
--- Driven from fftsa.sg_show_peaks_now(), so they move when the peak numbers move and under
--- the same tolerance gate: a dithering last digit redraws neither. A cursor set is
--- SYNCHRONOUS -- a round trip to the display task, in the class of the 60 ms axis writes --
--- which is affordable once a second and would not be affordable once a frame.
---
--- The firmware takes one call per cursor type and sorts the pair itself, so each call
--- places both of that type. A position of 9.9e37 or more switches a cursor off, which is
--- how a missing second peak leaves one cursor rather than a stray at zero.
-fftsa.sg_cursors = true         -- live knob: set false from the socket to drop them
--- dB the tallest peak has to stand above the noise floor before it earns a cursor.
-fftsa.sg_cursor_snr = 25
--- The horizontal pair, off. Kept as a knob rather than deleted because the call that
--- places it is the same one, and the levels are already to hand.
-fftsa.sg_cursors_h = false
-fftsa.sg_cursor_h_done = false  -- the one-shot that switches the pair off
-fftsa.sg_cursor_off = 9.9e37    -- the firmware's own "this cursor is off" value
-fftsa.sg_cursor_ok = nil        -- nil until probed; false where the model lacks the call
-
--- Resolved once rather than per update, the same way the HELP recogniser resolves its
--- names: display.graph.cursor is recorded as absent on this model in one place and present
--- in another, and the three enum values are typed rather than plain numbers, so passing 1
--- where CURSOR_VERTICAL is wanted answers 1138.
-function fftsa.sg_cursor_probe()
-  fftsa.sg_cursor_ok = false
-  if display.graph == nil or display.graph.cursor == nil then return false end
-  if display.CURSOR_VERTICAL == nil or display.CURSOR_HORIZONTAL == nil then return false end
-  fftsa.sg_cursor_ok = true
-  return true
-end
-
-function fftsa.sg_cursors_set(count, bi, bv, binhz, pk_hz, pk_v)
-  if not fftsa.sg_cursors then return false end
-  if fftsa.sg_cursor_ok == nil then fftsa.sg_cursor_probe() end
-  if not fftsa.sg_cursor_ok then return false end
-  if fftsa.sg_graph == nil then return false end
-  local off = fftsa.sg_cursor_off
-  -- The tallest peak, which is peak 1: the search reports strongest first.
-  local f1, v1 = fftsa.sg_peak_at(1, bi, bv, binhz, pk_hz, pk_v)
-  local f2, v2 = off, nil
-  -- A NaN frequency is a peak the search could not place; it is not a position.
-  if f1 == nil or f1 ~= f1 or f1 < 0 then f1 = off end
-  -- The headroom test, against the same noise figure the THD line reports so the cursor
-  -- and that line cannot disagree. No figure yet, or not enough headroom, and the cursor
-  -- goes off: every comparison with a NaN is false, so this is written as a positive test.
-  if f1 < off then
-    local ok_snr = false
-    if v1 ~= nil and v1 == v1 and v1 > 0 then
-      local ndb = fftsa.sg_noise_db
-      if ndb ~= nil and ndb == ndb then
-        ok_snr = (20 * math.log10(v1) - ndb) >= fftsa.sg_cursor_snr
-      end
-    end
-    if not ok_snr then f1 = off end
-  end
-  -- Bailing on the first refusal rather than collecting both: the call is synchronous, so
-  -- a model without it must cost one round trip and not two.
-  if not pcall(function()
-       display.graph.cursor(fftsa.sg_graph, display.CURSOR_VERTICAL, f1, f2)
-     end) then
-    return fftsa.sg_cursors_failed()
-  end
-  -- The horizontal pair. Off by default, and switched off once rather than every second:
-  -- the call is synchronous, so a pair that is already off costs nothing to leave alone.
-  local d1, d2 = off, off
-  if fftsa.sg_cursors_h then
-    -- In dB, floored at the axis like the table's own column: a bin at 1e-26 is -260 dBV,
-    -- which is not a position on a plot that stops at sg_dbmin. Only the tallest peak has
-    -- a level here, so the second of the pair stays off.
-    if f1 < off and v1 ~= nil and v1 == v1 and v1 > 0 then
-      d1 = 20 * math.log10(v1)
-      if not (d1 > fftsa.sg_dbmin) then d1 = fftsa.sg_dbmin end
-    end
-  elseif fftsa.sg_cursor_h_done then
-    return true
-  end
-  if not pcall(function()
-       display.graph.cursor(fftsa.sg_graph, display.CURSOR_HORIZONTAL, d1, d2)
-     end) then
-    return fftsa.sg_cursors_failed()
-  end
-  fftsa.sg_cursor_h_done = true
-  return true
-end
-
--- One refusal is enough to stop asking for the rest of the session.
-function fftsa.sg_cursors_failed()
-  fftsa.sg_cursor_ok = false
-  fftsa.lasterr = "graph cursors refused; switched off"
-  return false
 end
 
 function fftsa.sg_status(txt)
@@ -5624,15 +5463,12 @@ function fftsa.frame_body()
   fftsa.sg_nwrote = nseg
   local t_c = os.clock()
   local pk_hz, pk_v = fftsa.dsp_peaks(npk)
-  -- The peak ticks are NOT refilled here. Their buffer is cleared and rewritten in one
-  -- go, so a repaint landing inside that window draws a partial trace -- and a trace of
-  -- eighteen points disappearing and coming back is visible as flicker where the
-  -- spectrum's 255 points of noise are not. Measured on the glass twice: feet on the floor
-  -- flickered along the bottom rule, feet at the top edge flickered along the top.
-  --
-  -- The peaks themselves only move at fftsa.sg_pk_period, so the fill belongs with the
-  -- peak table: fftsa.sg_show_peaks_now() does it, under the same gate, and most frames
-  -- leave that buffer alone entirely.
+  -- After the trace rather than before it: the peaks come out of the same call that writes
+  -- the trace, so the markers cannot be filled first. What the ordering was for still holds
+  -- -- the yield below is the first paint after BOTH buffers are complete -- and the window
+  -- in which one of them is incomplete is now the 18 marker points rather than 255 trace
+  -- points.
+  fftsa.sg_update_markers(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
   local t_d = os.clock()
   -- Display work the primitive does not do: outside any write window, then the paint.
   -- Whether the one-a-second block ran is recorded, because the timer period follows the

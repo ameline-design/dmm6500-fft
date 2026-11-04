@@ -267,36 +267,6 @@ function display.graph.add(g, ...)
   OBJ[g].yelem, OBJ[g].xelem = arg[2], arg[4]
   OBJ[g].traces = (OBJ[g].traces or 0) + 1
 end
--- display.graph.cursor(g, type [, pos1 [, pos2]]). One call per type places BOTH cursors
--- of that type and the firmware SORTS the pair, so the mock sorts too or a check could
--- assert an order the instrument does not keep. A position of 9.9e37 or more means that
--- cursor is off. The type is a typed enum: the firmware answers 1138 for a plain number,
--- so this raises rather than accepting one, because a mock kinder than the firmware hides
--- exactly the mistake it exists to catch.
-display.CURSOR_VERTICAL   = 'cursor_vertical'
-display.CURSOR_HORIZONTAL = 'cursor_horizontal'
-display.CURSOR_TRIGGER    = 'cursor_trigger'
-CURSOR_OFF = 9.9e37
-function display.graph.cursor(g, ctype, p1, p2)
-  use(g, 'graph.cursor')
-  if ctype ~= display.CURSOR_VERTICAL and ctype ~= display.CURSOR_HORIZONTAL
-     and ctype ~= display.CURSOR_TRIGGER then
-    error('1138 Parameter 2, expected type disp_cursor', 0)
-  end
-  if p1 == nil then
-    -- Two arguments is the free read of the stored pair.
-    local c = OBJ[g].cursors and OBJ[g].cursors[ctype]
-    if c == nil then return nil, nil end
-    return c[1], c[2]
-  end
-  if p2 == nil then p2 = CURSOR_OFF end
-  local lo, hi = p1, p2
-  if lo > hi then lo, hi = hi, lo end
-  if OBJ[g].cursors == nil then OBJ[g].cursors = {} end
-  OBJ[g].cursors[ctype] = {lo, hi}
-  OBJ[g].cursor_sets = (OBJ[g].cursor_sets or 0) + 1
-end
-
 -- select() names a BUFFER, not a trace index, and the marker calls apply to whichever
 -- trace is selected -- so the mock records the selection and attributes each marker size
 -- to the buffer that was active when it was set.
@@ -1236,10 +1206,8 @@ check('frame, preview and the three dismiss timers are live', live('timer') == 5
 check('exactly six screens are live', live('screen') == 6,
       'screens=' .. live('screen')
       .. ' (cover + spectrum + options + about + main help + options help)')
--- One: the spectrum. The marker needles were tried on the glass and judged not useful, so
--- they are off and the second trace is not bound -- see fftsa.sg_markers.
-check('the graph has the spectrum and the peak-tick trace bound', (function()
-  return OBJ[fftsa.sg_graph].traces == 2 and fftsa.sg_markers == true
+check('the graph has exactly one trace bound', (function()
+  return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
 
 -- a second start() must not orphan the first build
@@ -1255,15 +1223,11 @@ check('still exactly six screens after rebuild', live('screen') == 6,
       'screens=' .. live('screen'))
 
 print('\npeak markers (real code)')
--- NOT OFFERED IN THE FORM, so these drive fftsa.sg_markers directly: setvalue on a nil
--- handle raises, and the knob is reachable from the socket without a field.
---
--- Markers are now ON by default, which the comment here used to say they were not. The
--- reason they were withheld stands as the thing to watch: the second trace has to be
--- pinned with scaletrace(TRACE_ALL) or it auto-scales on its own and its points stretch
--- across the whole plot, and that call was measured at 126.6 ms and unpinning both axes.
--- Nothing offline can see either, so the axes staying put is an instrument check.
-check('the form offers no peak markers field', fftsa.opt_mk == nil,
+-- NOT OFFERED IN THE FORM YET, so these drive fftsa.sg_markers directly: the field is
+-- withheld until the second trace can be pinned, and setvalue on its nil handle raises.
+-- The machinery stays tested so it does not rot while it waits.
+check('the form offers no peak markers field', fftsa.opt_mk == nil
+      and fftsa.sg_markers == false,
       'opt_mk=' .. tostring(fftsa.opt_mk) .. ' markers=' .. tostring(fftsa.sg_markers))
 -- Off means ONE trace drawn as a line: the marker buffer exists but is not bound, so
 -- drawstyle must not be STYLE_BOTH or the spectrum gets a dot per point.
@@ -1355,7 +1319,7 @@ check('every bound trace is pinned to the same dB range and span', (function()
   return true, string.format('both traces at %g..%g dB and 0..%g Hz',
                              fftsa.sg_dbmin, fftsa.sg_dbmax, fftsa.sg_fhi_hz)
 end)())
-check('each peak gets a tick hung from the top edge, in frequency order', (function()
+check('each peak gets a needle: floor, peak, floor, in frequency order', (function()
   fftsa.frame()
   local mk = fftsa.sg_mk
   local found, i = 0, nil
@@ -1368,17 +1332,14 @@ check('each peak gets a tick hung from the top edge, in frequency order', (funct
     return false, string.format('%d points for %d peaks at %d a needle', mk.n, found,
                                 fftsa.sg_mk_per)
   end
-  -- Each triple is the top edge, a tick below it, the top edge again, and x never goes
-  -- backwards. Hung from the top so the run joining the ticks is above the spectrum.
+  -- Each triple is floor, above the floor, floor again, and x never goes backwards.
   for i = 1, found do
     local b = (i - 1) * 3
-    if mk.readings[b + 1] ~= fftsa.sg_dbmax or mk.readings[b + 3] ~= fftsa.sg_dbmax then
-      return false, string.format('tick %d does not start and end at the top edge', i)
+    if mk.readings[b + 1] ~= fftsa.sg_dbmin or mk.readings[b + 3] ~= fftsa.sg_dbmin then
+      return false, string.format('needle %d does not start and end at the floor', i)
     end
-    -- Depth, not height: the tick hangs below the top edge and must clear it, or there is
-    -- nothing to see.
-    if not (mk.readings[b + 2] < fftsa.sg_dbmax) then
-      return false, string.format('tick %d has no depth', i)
+    if not (mk.readings[b + 2] > fftsa.sg_dbmin) then
+      return false, string.format('needle %d has no height', i)
     end
   end
   for i = 2, mk.n do
@@ -1386,7 +1347,7 @@ check('each peak gets a tick hung from the top edge, in frequency order', (funct
       return false, string.format('x goes backwards at point %d', i)
     end
   end
-  return true, string.format('%d ticks, %d points', found, mk.n)
+  return true, string.format('%d needles, %d points', found, mk.n)
 end)())
 
 -- The sort, driven directly. The end-to-end check above cannot reach it: the mock's
@@ -1414,47 +1375,30 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
   for i = 1, 3 do
     hz[i], db[i] = mk.extravalues[(i - 1) * 3 + 2], mk.readings[(i - 1) * 3 + 2]
   end
-  -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. The apex of every needle is the top of
-  -- the plot, so the buffer no longer carries the peak's own level -- a needle that stopped
-  -- at the level was invisible under the spectrum's own spike. The pairing the sort has to
-  -- keep is therefore asserted where it still exists, on the app's own arrays, which is
-  -- also where a pairing bug would start.
-  local want = {400, 1900, 3900}
+  -- Bins 5, 20 and 40 at 100 Hz: 400, 1900, 3900. Each has to carry its OWN amplitude
+  -- through the sort, which here means dB rising with frequency.
+  local want = {{400, 20 * math.log10(0.005)},
+                {1900, 20 * math.log10(0.020)},
+                {3900, 20 * math.log10(0.040)}}
   for i = 1, 3 do
-    if math.abs(hz[i] - want[i]) > 1 then
-      return false, string.format('point %d at %.0f Hz, wanted %.0f', i, hz[i], want[i])
+    if math.abs(hz[i] - want[i][1]) > 1 then
+      return false, string.format('point %d at %.0f Hz, wanted %.0f',
+                                  i, hz[i], want[i][1])
     end
-    if math.abs(db[i] - (fftsa.sg_dbmax - fftsa.sg_mk_depth)) > 0.01 then
-      return false, string.format('tick %d reaches %.2f dB, wanted %.2f below the top',
-                                  i, db[i], fftsa.sg_dbmax - fftsa.sg_mk_depth)
+    if math.abs(db[i] - want[i][2]) > 0.01 then
+      return false, string.format('point %d at %.0f Hz carries %.2f dB, wanted %.2f',
+                                  i, hz[i], db[i], want[i][2])
     end
   end
-  -- The levels, still sorted with their frequencies: dB rising with frequency here,
-  -- because the stub makes the amplitude a function of the bin.
-  local lv = {20 * math.log10(0.005), 20 * math.log10(0.020), 20 * math.log10(0.040)}
-  for i = 1, 3 do
-    if math.abs(fftsa.sg_mk_hz[i] - want[i]) > 1
-       or math.abs(fftsa.sg_mk_db[i] - lv[i]) > 0.01 then
-      return false, string.format('slot %d pairs %.0f Hz with %.2f dB, wanted %.0f/%.2f',
-                                  i, fftsa.sg_mk_hz[i], fftsa.sg_mk_db[i], want[i], lv[i])
-    end
-  end
-  return true, string.format('%.0f/%.0f/%.0f Hz, apexes at %.0f dB, levels %.1f/%.1f/%.1f',
-                             hz[1], hz[2], hz[3], db[1], fftsa.sg_mk_db[1],
-                             fftsa.sg_mk_db[2], fftsa.sg_mk_db[3])
+  return true, string.format('%.0f Hz %.1f dB, %.0f Hz %.1f dB, %.0f Hz %.1f dB',
+                             hz[1], db[1], hz[2], db[2], hz[3], db[3])
 end)())
--- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought
--- and is the part that still has to hold. The markers cannot be filled first any more: the
--- peaks come out of the same dsp.spectrum() call that writes the trace. So the order is no
--- longer the invariant and the yield's position is.
---
--- And the ticks are only written on the frames where the peak table updates, about one a
--- second: their buffer is cleared and rewritten whole, so a repaint inside that window
--- draws a partial trace, and eighteen points vanishing is visible flicker where the
--- spectrum's 255 points of noise are not. Measured on the glass three times -- feet on the
--- floor flickered along the bottom, feet at the top flickered along the top, and the
--- cursor, which is widget state rather than buffer state, never flickered at all.
-check('the trace completes before the yield and the ticks never straddle one', (function()
+-- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought and
+-- is the part that still has to hold. The markers cannot be filled first any more: the peaks
+-- come out of the same dsp.spectrum() call that writes the trace. So the order is no longer
+-- the invariant and the yield's position is -- and the window in which one of the two is
+-- incomplete is now the 18 marker points rather than the 255 trace points.
+check('both buffers are complete before the frame yields for the paint', (function()
   local order = {}
   local realwr = buffer.write.reading
   local realdelay = delay
@@ -1468,10 +1412,6 @@ check('the trace completes before the yield and the ticks never straddle one', (
     return realwr(b, unpack(arg))
   end
   delay = function(s) mark('yield') return realdelay(s) end
-  -- The peak ticks are filled on the peak table's once-a-second path, not every frame, so
-  -- the gate has to be opened or there is no marker write in this frame to order. Both the
-  -- period and the move test: sg_pk_last for the first, the remembered peaks for the second.
-  fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
   fftsa.frame()
   buffer.write.reading = realwr
   delay = realdelay
@@ -1481,26 +1421,8 @@ check('the trace completes before the yield and the ticks never straddle one', (
     if order[i] == 'trace' then trace_at = i end
     if order[i] == 'marker' then marker_at = i end
   end
-  -- The trace completes before the yield, which is the paint. The ticks are written after
-  -- it, and must not STRADDLE one: the display task runs only while Lua is blocked, so a
-  -- rewrite with no yield inside it cannot be repainted half-done. That is what makes the
-  -- ticks stable, where filling them in the frame before the yield flickered.
-  local straddles = false
-  local seen_mk, j = false, nil
-  for j = 1, n do
-    if order[j] == 'marker' then
-      if seen_mk == 'after_yield' then straddles = true end
-      seen_mk = true
-    elseif order[j] == 'yield' and seen_mk == true then
-      seen_mk = 'after_yield'
-    end
-  end
-  local first_yield = nil
-  for j = 1, n do
-    if order[j] == 'yield' and first_yield == nil then first_yield = j end
-  end
-  return trace_at ~= nil and marker_at ~= nil and first_yield ~= nil
-         and trace_at < first_yield and not straddles,
+  return n >= 3 and order[n] == 'yield' and trace_at ~= nil and marker_at ~= nil
+         and trace_at < n and marker_at < n,
          table.concat(order, ' then ')
 end)())
 check('switching markers off again leaves one trace and a line', (function()
@@ -4895,183 +4817,6 @@ check('the live trace handles are the globals, through both branches', (function
                        tostring(reused), tostring(allocated))
 end)())
 
--- Cursors follow the peak table: same values, same gate, and one call per type because
--- the firmware places both of that type at once and sorts them.
-check('vertical cursors land on the top two peaks, horizontal switched off', (function()
-  fftsa.sg_cursor_ok = nil
-  fftsa.sg_cursors_h, fftsa.sg_cursor_h_done = false, false
-  fftsa.sg_cursors = true
-  local g = fftsa.sg_graph
-  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
-  -- A frame, then force the gated draw so the cursors are written from real peaks.
-  fftsa.frame()
-  -- The unconditional draw, not the gated one: the gate's own move test has just been
-  -- satisfied by the frame above, so asking through it would measure the gate rather than
-  -- the cursors. "cursors follow the gate" is the case below this one.
-  local drew = fftsa.sg_show_peaks_now(nil, nil, fftsa.sg_npeak, fftsa.binhz,
-                                       dsp.pk_hz, dsp.pk_v)
-  local vert = OBJ[g].cursors and OBJ[g].cursors[display.CURSOR_VERTICAL]
-  local horz = OBJ[g].cursors and OBJ[g].cursors[display.CURSOR_HORIZONTAL]
-  if vert == nil or horz == nil then
-    return false, 'no cursors placed, drew=' .. tostring(drew)
-  end
-  -- The two strongest peaks the table is showing, in the table's own order, reduced the
-  -- same way the code reduces them: a peak that is absent or unplaceable is the off value,
-  -- not a position.
-  local function want_at(i)
-    local f = fftsa.sg_peak_at(i, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-    if f == nil or f ~= f or f < 0 then return fftsa.sg_cursor_off end
-    return f
-  end
-  local f1, f2 = want_at(1), want_at(2)
-  local lo, hi = f1, f2
-  if lo > hi then lo, hi = hi, lo end
-  -- Sorted by the firmware, so compare against the sorted pair.
-  local vok = near(vert[1], lo, 0.5) and (near(vert[2], hi, 0.5)
-              or (hi >= fftsa.sg_cursor_off and vert[2] >= fftsa.sg_cursor_off))
-  -- Vertical only: the horizontal pair is switched off, both positions at the firmware's
-  -- own off value, and it is written once per graph rather than every second.
-  local hok = horz[1] >= fftsa.sg_cursor_off and horz[2] >= fftsa.sg_cursor_off
-  return drew == true and vok and hok and OBJ[g].cursor_sets == 2,
-         string.format('vert %.1f/%.1f want %.1f/%.1f, horz %.1f/%.1f, sets=%s',
-                       vert[1], vert[2], lo, hi, horz[1], horz[2],
-                       tostring(OBJ[g].cursor_sets))
-end)())
-
--- The horizontal off is a ONE-SHOT. The call is synchronous, so re-sending a pair that is
--- already off would be a round trip a second for nothing; the vertical pair still moves.
-check('the horizontal off is written once per graph, the vertical every update', (function()
-  local g = fftsa.sg_graph
-  fftsa.sg_cursor_ok, fftsa.sg_cursors_h = true, false
-  fftsa.sg_cursor_h_done = false
-  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
-  fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local first = OBJ[g].cursor_sets                    -- vertical and the horizontal off
-  fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local second = OBJ[g].cursor_sets - first           -- vertical only
-  return first == 2 and second == 1,
-         string.format('first update %d calls, second %d', first, second)
-end)())
-
--- A missing second peak is a cursor switched OFF rather than one parked at zero, which
--- would read as a real cursor sitting on dc.
-check('a peak that is not there leaves its cursor off', (function()
-  local g = fftsa.sg_graph
-  OBJ[g].cursors = nil
-  fftsa.sg_cursor_ok = true
-  -- count 1: the second peak is not being reported at all.
-  fftsa.sg_cursors_set(1, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local vert = OBJ[g].cursors[display.CURSOR_VERTICAL]
-  return vert[2] >= fftsa.sg_cursor_off,
-         string.format('pair %.3g/%.3g', vert[1], vert[2])
-end)())
-
--- A refusal stops the asking. The call is synchronous, so a refused cursor every second is
--- a round trip every second for nothing, and the model that lacks the call must cost the
--- app one attempt rather than one per update.
-check('a refused cursor switches cursors off for the session', (function()
-  local real = display.graph.cursor
-  local calls = 0
-  display.graph.cursor = function() calls = calls + 1 error('1138 no such call', 0) end
-  fftsa.sg_cursor_ok = true
-  local first = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local after = fftsa.sg_cursor_ok
-  local second = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  display.graph.cursor = real
-  fftsa.sg_cursor_ok, fftsa.lasterr = nil, nil
-  return first == false and after == false and second == false and calls == 1,
-         string.format('first=%s ok=%s second=%s calls=%d', tostring(first),
-                       tostring(after), tostring(second), calls)
-end)())
-
--- And the knob, because a graph the operator wants bare has to be reachable from the
--- socket without a reinstall.
-check('sg_cursors false places none', (function()
-  local g = fftsa.sg_graph
-  OBJ[g].cursors, OBJ[g].cursor_sets = nil, 0
-  fftsa.sg_cursors, fftsa.sg_cursor_ok = false, true
-  local r = fftsa.sg_cursors_set(2, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  fftsa.sg_cursors = true
-  return r == false and OBJ[g].cursors == nil and OBJ[g].cursor_sets == 0,
-         tostring(r) .. ' sets=' .. tostring(OBJ[g].cursor_sets)
-end)())
-
--- The type is a typed enum on this firmware, so a plain number answers 1138. Asserted
--- because the mock is the only place that can see it and the three values look like
--- numbers in the notes.
-check('the cursor type must be the typed enum, not a number', (function()
-  local ok = pcall(function()
-    display.graph.cursor(fftsa.sg_graph, 1, 1000.0, 2000.0)
-  end)
-  return ok == false
-end)())
-
--- Headroom, not an absolute level, decides a needle and the cursor: a peak has to stand
--- sg_mk_snr / sg_cursor_snr above the MEASURED noise floor. Driven by moving the cached
--- figure rather than the signal, because that is the input the code reads and the one a
--- caller can get wrong.
-check('a peak without headroom over the noise floor gets no needle and no cursor',
-      (function()
-  fftsa.sg_markers, fftsa.sg_cursor_ok = true, true
-  fftsa.frame()
-  local keep = fftsa.sg_noise_db
-  local g = fftsa.sg_graph
-  -- The tallest peak in this harness sits near 0 dBV, so a floor just under it leaves far
-  -- less than 25 dB of headroom.
-  fftsa.sg_noise_db = -5
-  local lean = fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz,
-                                       dsp.pk_hz, dsp.pk_v)
-  OBJ[g].cursors = nil
-  fftsa.sg_cursors_set(fftsa.sg_npeak, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local cur_off = OBJ[g].cursors[display.CURSOR_VERTICAL][1] >= fftsa.sg_cursor_off
-  -- And with a floor far below it, the needle and the cursor both appear.
-  fftsa.sg_noise_db = -100
-  local rich = fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz,
-                                       dsp.pk_hz, dsp.pk_v)
-  OBJ[g].cursors = nil
-  fftsa.sg_cursors_set(fftsa.sg_npeak, nil, nil, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local cur_on = OBJ[g].cursors[display.CURSOR_VERTICAL][1] < fftsa.sg_cursor_off
-  -- Hung from the top: every point is at the top edge or sg_mk_depth below it, and nothing
-  -- the trace draws is anywhere near the spectrum. Both ends are checked, because a tick
-  -- with its feet at the floor is the form that flickered on the trace.
-  local mk = fftsa.sg_mk
-  local lo, hi = nil, nil
-  local i
-  for i = 1, mk.n do
-    local v = mk.readings[i]
-    if lo == nil or v < lo then lo = v end
-    if hi == nil or v > hi then hi = v end
-  end
-  local apex = lo
-  fftsa.sg_noise_db = keep
-  fftsa.sg_markers = true             -- the shipped default, restored for the cases below
-  return lean == 0 and rich > 0 and cur_off and cur_on
-         and hi ~= nil and near(hi, fftsa.sg_dbmax, 0.01)
-         and near(lo, fftsa.sg_dbmax - fftsa.sg_mk_depth, 0.01),
-         string.format('lean=%d rich=%d cursor off=%s on=%s apex=%s want %s', lean, rich,
-                       tostring(cur_off), tostring(cur_on), tostring(apex),
-                       tostring(fftsa.sg_dbmax))
-end)())
-
--- The needle fill runs PER FRAME and the noise figure is a pass over every plotted bin, so
--- it has to come from the cache the THD line fills once a second. A marker path that
--- recomputed it would cost that pass every frame and nothing else would notice.
-check('the needle fill reads the cached noise figure, it does not recompute it',
-      (function()
-  local real, calls = fftsa.distortion, 0
-  fftsa.distortion = function() calls = calls + 1 return real() end
-  fftsa.sg_update_markers(nil, nil, fftsa.sg_npeak, fftsa.binhz, dsp.pk_hz, dsp.pk_v)
-  local inmark = calls
-  -- The once-a-second line is where it belongs, and it fills the cache.
-  fftsa.sg_thd_last, fftsa.sg_noise_db = nil, nil
-  fftsa.sg_show_thd()
-  local inline = calls - inmark
-  fftsa.distortion = real
-  return inmark == 0 and inline == 1 and fftsa.sg_noise_db ~= nil,
-         string.format('marker path %d calls, thd line %d, cached=%s', inmark, inline,
-                       tostring(fftsa.sg_noise_db))
-end)())
-
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
 -- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
 -- notice new writes -- but it derives the range from the buffer's own timestamps, and
@@ -6117,12 +5862,9 @@ check('a run of failed frames rebinds the trace once, not once a frame', (functi
   local failed = fftsa.errrun
   fftsa.errcount, fftsa.errrun, fftsa.halted = 0, 0, false
   fftsa.frame()
-  -- One bind, counted in adds: two with the marker trace on, one without.
-  local perbind = 1
-  if fftsa.sg_markers then perbind = 2 end
-  return adds == perbind and failed == 5 and fftsa.sg_buf.n > 0,
-         string.format('adds=%d over %d failures, wanted %d, recovered n=%s', adds, failed,
-                       perbind, tostring(fftsa.sg_buf.n))
+  return adds == 1 and failed == 5 and fftsa.sg_buf.n > 0,
+         string.format('adds=%d over %d failures, recovered n=%s', adds, failed,
+                       tostring(fftsa.sg_buf.n))
 end)())
 fftsa.stop()
 

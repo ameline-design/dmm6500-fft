@@ -847,15 +847,12 @@ function fftsa.frame_body()
   fftsa.sg_nwrote = nseg
   local t_c = os.clock()
   local pk_hz, pk_v = fftsa.dsp_peaks(npk)
-  -- The peak ticks are NOT refilled here. Their buffer is cleared and rewritten in one
-  -- go, so a repaint landing inside that window draws a partial trace -- and a trace of
-  -- eighteen points disappearing and coming back is visible as flicker where the
-  -- spectrum's 255 points of noise are not. Measured on the glass twice: feet on the floor
-  -- flickered along the bottom rule, feet at the top edge flickered along the top.
-  --
-  -- The peaks themselves only move at fftsa.sg_pk_period, so the fill belongs with the
-  -- peak table: fftsa.sg_show_peaks_now() does it, under the same gate, and most frames
-  -- leave that buffer alone entirely.
+  -- After the trace rather than before it: the peaks come out of the same call that writes
+  -- the trace, so the markers cannot be filled first. What the ordering was for still holds
+  -- -- the yield below is the first paint after BOTH buffers are complete -- and the window
+  -- in which one of them is incomplete is now the 18 marker points rather than 255 trace
+  -- points.
+  fftsa.sg_update_markers(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
   local t_d = os.clock()
   -- Display work the primitive does not do: outside any write window, then the paint.
   -- Whether the one-a-second block ran is recorded, because the timer period follows the
