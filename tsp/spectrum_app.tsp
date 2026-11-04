@@ -2372,7 +2372,9 @@ function fftsa.stop()
   -- The cost is that the next launch rebuilds the tables, 0.163 ms a sample. It is paid
   -- behind the loading cover, start() running apply() before it switches away.
   pcall(function() dsp.release() end)
-  pcall(function() fftsa.sg_destroy() end)    -- screen, graph, texts, spectrum buffer
+  -- release: the trace buffers are deleted and defbuffer1 made current again, rather than
+  -- handed to a next launch. sg_destroy() says why the two callers differ.
+  pcall(function() fftsa.sg_destroy(true) end)   -- screen, graph, texts, trace buffers
   fftsa.destroy_options()
   fftsa.destroy_about()
   fftsa.destroy_help()

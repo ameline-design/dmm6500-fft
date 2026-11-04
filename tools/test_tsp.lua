@@ -4817,6 +4817,55 @@ check('the live trace handles are the globals, through both branches', (function
                        tostring(reused), tostring(allocated))
 end)())
 
+-- An exit makes defbuffer1 current BEFORE deleting the trace buffers, and that order is the
+-- requirement: the front panel adopts a user buffer as its current one, and deleting the one
+-- it is pointing at is the case to avoid. Asserted by order of calls, because the harness's
+-- digitizer refuses a read into defbuffer1 and the app swallows that -- what can be checked
+-- offline is that the attempt comes first and that both buffers then go.
+check('an exit makes defbuffer1 current before dropping the trace buffers', (function()
+  fftsa.start()
+  fftsa.frame()
+  local tr, mk = FFTSA_TRACE, FFTSA_MARK
+  if tr == nil or mk == nil then return false, 'no trace buffers to drop' end
+  local order = {}
+  local realread, realdel = dmm.digitize.read, buffer.delete
+  dmm.digitize.read = function(b)
+    if b == defbuffer1 then order[table.getn(order) + 1] = 'defbuffer1' end
+    return realread(b)
+  end
+  buffer.delete = function(b)
+    if b == tr or b == mk then order[table.getn(order) + 1] = 'drop' end
+    return realdel(b)
+  end
+  fftsa.stop()
+  dmm.digitize.read, buffer.delete = realread, realdel
+  local n = table.getn(order)
+  local drops = 0
+  local i
+  for i = 1, n do
+    if order[i] == 'drop' then drops = drops + 1 end
+  end
+  return order[1] == 'defbuffer1' and drops == 2
+         and FFTSA_TRACE == nil and FFTSA_MARK == nil,
+         table.concat(order, ' then ') .. ', globals=' .. tostring(FFTSA_TRACE)
+end)())
+
+-- And a failing start must keep the reason it failed. The teardown runs inside
+-- start_failed(), which has just put that reason where the panel reads it, so a note about
+-- the current buffer must not replace it -- which is exactly what the first version of this
+-- did, and the pool-exhaustion case caught it.
+check('the exit teardown does not overwrite the reason a start failed', (function()
+  fftsa.start()
+  fftsa.lasterr = nil
+  local real = dmm.digitize.read
+  dmm.digitize.read = function() error('no digitizer', 0) end
+  fftsa.stop()
+  dmm.digitize.read = real
+  return fftsa.lasterr == nil and fftsa.sg_defbuf_ok == false,
+         string.format('lasterr=%s defbuf_ok=%s', tostring(fftsa.lasterr),
+                       tostring(fftsa.sg_defbuf_ok))
+end)())
+
 -- The X axis is PINNED, and an auto method is a regression rather than an improvement.
 -- XSCALE_ALL does make the trace redraw -- it reads the whole buffer, so it has to
 -- notice new writes -- but it derives the range from the buffer's own timestamps, and
@@ -5518,15 +5567,16 @@ fftsa.start()
 print('\nteardown (real code)')
 fftsa.stop()
 check('stop() deletes every display object', live() == 0, 'live=' .. live())
--- Every buffer but the two the next launch has to allocate over. They are handed on in
--- FFTSA_OLDTRACE and FFTSA_OLDMARK, because a trace buffer freed before its replacement
--- exists comes back carrying the freed one's trace subscription -- sg_make_buffer has the
--- measurement. The capture buffer has no such problem and is freed here.
-check('stop() frees every buffer it made but the two it hands on',
-      livebufs() == base_bufs + 2 and FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil
-      and fftsa.cap == nil,
+-- An exit RELEASES: every buffer the app made is deleted and every global naming one is
+-- cleared, because a trace buffer left alive is adopted by the front panel as its current
+-- buffer -- the home screen then shows a spectrum level in dB as though it were a
+-- measurement. The handover to a next launch belongs to the rebuild path only.
+check('stop() frees every buffer it made and clears every global naming one',
+      livebufs() == base_bufs and fftsa.cap == nil
+      and FFTSA_TRACE == nil and FFTSA_MARK == nil
+      and FFTSA_OLDTRACE == nil and FFTSA_OLDMARK == nil,
       'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs
-      .. ' handed=' .. tostring(FFTSA_OLDTRACE ~= nil))
+      .. ' globals=' .. tostring(FFTSA_TRACE) .. '/' .. tostring(FFTSA_OLDTRACE))
 check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optscr == nil and fftsa.opt_flo == nil and fftsa.opt_fhi == nil
       and fftsa.opt_rng == nil and fftsa.opt_info == nil and fftsa.optbtn == nil
@@ -5650,8 +5700,8 @@ end
 -- modal dialog over a half-built app. Parking the screen set for reuse was tried on the
 -- instrument and reverted for exactly that.
 check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
-check('End App from the options screen hands the trace buffers to the next launch',
-      livebufs() == base_bufs + 2 and FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil,
+check('End App from the options screen frees every buffer',
+      livebufs() == base_bufs and FFTSA_TRACE == nil and FFTSA_MARK == nil,
       'buffers=' .. livebufs())
 
 -- THE ORDER THE TRACE BUFFERS ARE ALLOCATED IN, which is the fix for the second launch
@@ -5706,7 +5756,9 @@ end)())
 check('launches do not accumulate buffers, and the handed-on pair is released', (function()
   fftsa.stop()
   local parked = livebufs()
-  local handed = FFTSA_OLDTRACE ~= nil and FFTSA_OLDMARK ~= nil
+  -- An exit releases, so nothing is parked: the handover is the rebuild path's, and
+  -- "the new pair exists before the old is deleted" covers it.
+  local handed = FFTSA_OLDTRACE == nil and FFTSA_OLDMARK == nil
   fftsa.start()
   local a1, o1 = livebufs(), FFTSA_OLDTRACE
   fftsa.stop()
@@ -5882,7 +5934,7 @@ check('the halt is stated on screen', OBJ[fftsa.sg_xunit].text ~= nil
       tostring(OBJ[fftsa.sg_xunit].text))
 check('a halted app still tears down cleanly',
       (function() fftsa.stop()
-        return live() == 0 and livebufs() == base_bufs + 2 end)(),
+        return live() == 0 and livebufs() == base_bufs end)(),
       'live=' .. live() .. ' buffers=' .. livebufs())
 
 -- ---------- the transform against a direct DFT ----------

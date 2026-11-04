@@ -490,7 +490,7 @@ end
 
 -- Tear down in dependency order: detach the trace, drop the screen and its
 -- children, then free the buffer the trace referenced. Nils every handle.
-function fftsa.sg_destroy()
+function fftsa.sg_destroy(release)
   if fftsa.sg_graph ~= nil then
     display.graph.removeall(fftsa.sg_graph)
   end
@@ -500,18 +500,65 @@ function fftsa.sg_destroy()
   end
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
-  -- Handed to the next launch rather than deleted here, which is what sg_free_old() is
-  -- for: freeing them now would let the next launch's pair be allocated over them and
-  -- inherit this launch's trace subscription.
+  -- Two callers want opposite things here, so release says which.
   --
-  -- Only when there is something to hand over. sg_destroy runs twice on a relaunch,
-  -- once from stop() and again from sg_build(), and the second pass must not overwrite
-  -- what the first one saved.
-  if fftsa.sg_buf ~= nil then FFTSA_OLDTRACE = fftsa.sg_buf end
-  if fftsa.sg_mk ~= nil then FFTSA_OLDMARK = fftsa.sg_mk end
-  FFTSA_TRACE, FFTSA_MARK = nil, nil
+  -- Releasing, which is what an exit does: the buffers go, and defbuffer1 is made current
+  -- FIRST. The front panel adopts a user buffer as its current one, so an app that exits
+  -- leaving FFTSA_MARK alive leaves the home screen showing a spectrum level in dB as
+  -- though it were a measurement -- seen on the glass. Restoring before deleting also
+  -- means nothing is deleted while the panel is pointing at it.
+  --
+  -- Not releasing, which is what sg_build() does on a relaunch: the pair is handed on in
+  -- FFTSA_OLDTRACE and FFTSA_OLDMARK for sg_free_old() to take once the new pair exists,
+  -- because freeing them first lets the new pair be allocated over them and inherit this
+  -- launch's trace subscription.
+  --
+  -- Only hand over when there is something to hand over: sg_destroy runs twice on a
+  -- relaunch and the second pass must not overwrite what the first one saved.
+  if release then
+    fftsa.sg_restore_defbuffer()
+    fftsa.sg_drop_buffers()
+  else
+    if fftsa.sg_buf ~= nil then FFTSA_OLDTRACE = fftsa.sg_buf end
+    if fftsa.sg_mk ~= nil then FFTSA_OLDMARK = fftsa.sg_mk end
+    FFTSA_TRACE, FFTSA_MARK = nil, nil
+  end
   fftsa.sg_buf, fftsa.sg_mk = nil, nil
   collectgarbage()
+end
+
+-- Make defbuffer1 the instrument's current buffer again. One reading into it is what names
+-- it: the panel follows the buffer last used, and nothing else in the API points it.
+--
+-- One sample, because the count the app was running at could be 16,384 and this is a
+-- teardown. Guarded, and its failure is not allowed to stop the deletes below it: a panel
+-- left on the wrong buffer is untidy, a buffer left allocated is a leak.
+function fftsa.sg_restore_defbuffer()
+  local ok = pcall(function()
+    dmm.digitize.count = 1
+    dmm.digitize.read(defbuffer1)
+  end)
+  -- NOT into fftsa.lasterr. A teardown runs inside fftsa.start_failed(), which has just
+  -- put the reason the start failed there, and the panel shows it: a note about the current
+  -- buffer would replace the one thing the operator needs to read. Its own field, so a
+  -- socket can still ask.
+  fftsa.sg_defbuf_ok = ok
+  return ok
+end
+
+-- Delete both trace buffers and every global naming them, in the order that leaves nothing
+-- dangling. THROUGH THE GLOBALS, because buffer.delete nils the variable it is handed:
+-- deleting through a local or a table field clears that one reference and leaves all the
+-- others pointing at a buffer that is gone, and a second delete through one of those is a
+-- double delete.
+function fftsa.sg_drop_buffers()
+  if FFTSA_MARK ~= nil then pcall(function() buffer.delete(FFTSA_MARK) end) end
+  if FFTSA_TRACE ~= nil then pcall(function() buffer.delete(FFTSA_TRACE) end) end
+  if FFTSA_OLDMARK ~= nil then pcall(function() buffer.delete(FFTSA_OLDMARK) end) end
+  if FFTSA_OLDTRACE ~= nil then pcall(function() buffer.delete(FFTSA_OLDTRACE) end) end
+  FFTSA_TRACE, FFTSA_MARK = nil, nil
+  FFTSA_OLDTRACE, FFTSA_OLDMARK = nil, nil
+  return true
 end
 
 
