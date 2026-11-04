@@ -5723,6 +5723,85 @@ check('launches do not accumulate buffers, and the handed-on pair is released', 
                        parked, a1, a2, a3, tostring(o1 == nil))
 end)())
 
+-- sg_retrace() is the sequence measured to restore a second launch's trace: allocate a new
+-- pair, point the app at them, rebind, and only THEN release the old pair. The order is the
+-- finding, so it is what is asserted -- at each delete of the old pair the new trace must
+-- already be bound.
+check('sg_retrace rebinds onto a new pair before releasing the old one', (function()
+  fftsa.start()
+  fftsa.frame()
+  local oldbuf, oldmk, graph = fftsa.sg_buf, fftsa.sg_mk, fftsa.sg_graph
+  local adds0 = OBJ[graph].adds
+  local realdel, seen, early = buffer.delete, 0, 0
+  buffer.delete = function(b)
+    if b == oldbuf or b == oldmk then
+      seen = seen + 1
+      -- Bound to the new buffer already, and the new buffer is not the one going away.
+      if OBJ[graph].buffer ~= fftsa.sg_buf or fftsa.sg_buf == b then early = early + 1 end
+    end
+    return realdel(b)
+  end
+  local ok = fftsa.sg_retrace()
+  buffer.delete = realdel
+  fftsa.frame()
+  return ok == true and seen == 2 and early == 0
+         and fftsa.sg_buf ~= oldbuf and fftsa.sg_mk ~= oldmk
+         and fftsa.sg_graph == graph
+         and OBJ[graph].buffer == fftsa.sg_buf
+         and OBJ[graph].adds > adds0
+         and FFTSA_TRACE == fftsa.sg_buf
+         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0,
+         string.format('ok=%s replaced=%s deletes=%d early=%d bound=%s n=%s',
+                       tostring(ok), tostring(fftsa.sg_buf ~= oldbuf), seen, early,
+                       tostring(OBJ[graph].buffer == fftsa.sg_buf),
+                       tostring(fftsa.sg_buf.n))
+end)())
+
+-- The staged recovery runs only on a relaunch, which NLBOOT is the only state that
+-- answers, and it must walk all four steps and then put the settings line back. A first
+-- launch of a power cycle must arm nothing at all.
+check('the staged recovery arms on a relaunch and on nothing else', (function()
+  local keep = NLBOOT
+  NLBOOT = nil
+  fftsa.fix_stage = nil
+  local first = fftsa.fix_arm()
+  local armed_first = fftsa.fix_stage
+  NLBOOT = 12345
+  local again = fftsa.fix_arm()
+  local armed_again = fftsa.fix_stage
+  NLBOOT = keep
+  return first == false and armed_first == nil and again == true and armed_again == 1,
+         string.format('first=%s/%s relaunch=%s/%s', tostring(first), tostring(armed_first),
+                       tostring(again), tostring(armed_again))
+end)())
+
+check('the staged recovery walks its four steps and then stands down', (function()
+  local keep = NLBOOT
+  NLBOOT = 12345
+  fftsa.fix_arm()
+  local labels, guard = {}, 0
+  -- fix_every frames between steps, so the step count is paced rather than per frame.
+  while fftsa.fix_stage ~= nil and guard < 500 do
+    guard = guard + 1
+    local before = FFTSA_FIX
+    fftsa.fix_step()
+    if FFTSA_FIX ~= before then table.insert(labels, FFTSA_FIX) end
+  end
+  NLBOOT = keep
+  local want = {'rebind', 'invalidate', 'clear', 'new buffer', 'done'}
+  local ok = table.getn(labels) == table.getn(want)
+  local i
+  for i = 1, table.getn(want) do
+    if labels[i] ~= want[i] then ok = false end
+  end
+  fftsa.frame()
+  return ok and guard == table.getn(want) * fftsa.fix_every
+         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
+         and string.find(OBJ[fftsa.sg_xunit].text, 'pts', 1, true) ~= nil,
+         string.format('%d steps over %d frames: %s | line=%s', table.getn(labels), guard,
+                       table.concat(labels, ','), tostring(OBJ[fftsa.sg_xunit].text))
+end)())
+
 -- A relaunch therefore builds a fresh screen set, and the trace has to end up bound to
 -- the buffer the frames write -- which is what the buffers' own global names are for.
 fftsa.start()

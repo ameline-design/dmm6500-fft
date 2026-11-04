@@ -305,6 +305,34 @@ function fftsa.sg_make_buffer(nbins, npoints)
   return fftsa.sg_buf
 end
 
+-- Replace the trace buffers on a graph that is already live, and rebind.
+--
+-- This is the sequence measured to restore the trace on a second launch, twice, applied by
+-- hand over the socket: with the graph up and frames running, allocate a new pair, point
+-- the app at them, rebind, and only then release the old pair. A plain rebind over the same
+-- buffer was tried the same way and did not work, so the new allocation is the part that
+-- matters and the old pair being alive at bind time is the rest of it.
+--
+-- Costs one allocation of sg_maxpts points and one rebind, which repaints the axes. Run
+-- once per launch, not per frame.
+function fftsa.sg_retrace()
+  if fftsa.sg_graph == nil then return false end
+  local newbuf = fftsa.sg_mkbuf(fftsa.sg_maxpts)
+  local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
+  if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
+  local newmk = fftsa.sg_mkbuf(mkcap)
+  if newbuf == nil or newmk == nil then return false end
+  local oldbuf, oldmk = fftsa.sg_buf, fftsa.sg_mk
+  fftsa.sg_buf, fftsa.sg_mk = newbuf, newmk
+  fftsa.sg_name_buffers()
+  fftsa.sg_bind()
+  -- After the bind, which is the order that worked: the old pair is still allocated while
+  -- the new trace is being created.
+  if oldbuf ~= nil then fftsa.del_buf(oldbuf) end
+  if oldmk ~= nil then fftsa.del_buf(oldmk) end
+  return true
+end
+
 -- The previous launch's trace buffers, released only once this launch has allocated its
 -- own. sg_make_buffer says what goes wrong when they are freed first; this is the other
 -- half of it, because the launch that ends cannot allocate the next launch's buffers and
