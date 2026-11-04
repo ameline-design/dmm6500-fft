@@ -671,6 +671,19 @@ function dmm.measure.read(b)
   return b.readings[1]
 end
 
+-- An autoexec can leave a trigger model running, and a running model owns the digitizer, so
+-- the app aborts before it configures. Measured on 1.7.17a: abort on an empty model posts
+-- nothing, so the app calls it unconditionally and the mock counts it rather than refusing.
+TRIG_ABORTS = 0
+trigger = {STATE_EMPTY = 'empty', STATE_RUNNING = 'running', STATE_IDLE = 'idle',
+           model = {}}
+trigger.model.st = trigger.STATE_EMPTY
+function trigger.model.abort()
+  TRIG_ABORTS = TRIG_ABORTS + 1
+  trigger.model.st = trigger.STATE_EMPTY
+end
+function trigger.model.state() return trigger.model.st end
+
 function collectgarbage() end   -- no-op; the real one is fine, this keeps it quiet
 
 -- ---------- load the REAL modules ----------
@@ -5981,6 +5994,95 @@ check('an exit after the panel moved to a measure function uses the measure side
   fftsa.start()
   fftsa.frame()
   return ok, why
+end)())
+
+-- ---------------------------------------------------------------------------
+-- THE APP MUST COME UP FROM ANY INSTRUMENT STATE. An autoexec script runs before the app
+-- does and can leave the DMM on any function, with a trigger model running, and with a user
+-- buffer current -- so no path in start() or stop() may assume a state. This is the case
+-- that says so: a matrix of hostile openings, each one driven all the way through a launch
+-- and an exit, asserting the same three things every time.
+--
+--   nothing posted, start() returned true, and the exit left defbuffer1 holding a reading
+--
+-- A matrix rather than one case per state, because the defect this replaces -- 8.5 posting
+-- 2800 and 2801 -- was invisible precisely because only ONE opening state produced it and
+-- every case ran from the state the previous case happened to leave.
+-- ---------------------------------------------------------------------------
+check('the app launches and exits cleanly from any opening instrument state', (function()
+  local OPENINGS = {
+    {name = 'power cycle: measure DC voltage, digitizer idle',
+     set = function() dmm.measure.func = dmm.FUNC_DC_VOLTAGE end},
+    {name = 'autoexec left the digitizer live at a long count',
+     set = function()
+       dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE
+       dmm.digitize.count = 16384
+     end},
+    {name = 'autoexec left a measure function that is not DC voltage',
+     set = function() dmm.measure.func = 'acv' end},
+    {name = 'both sides idle',
+     set = function()
+       dmm.measure.func = dmm.FUNC_DC_VOLTAGE
+       dmm.measure.func = dmm.FUNC_NONE
+     end},
+    {name = 'autoexec left a trigger model running',
+     set = function()
+       dmm.measure.func = dmm.FUNC_DC_VOLTAGE
+       trigger.model.st = trigger.STATE_RUNNING
+     end},
+    {name = 'a previous launch died and left its buffers in the globals',
+     set = function()
+       dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE
+       FFTSA_OLDTRACE = buffer.make(680, buffer.STYLE_WRITABLE_FULL)
+       FFTSA_OLDMARK = buffer.make(680, buffer.STYLE_WRITABLE_FULL)
+     end},
+    -- THE EXIT HAS AN OPENING STATE OF ITS OWN, and the panel can change it under a running
+    -- app: a function key moves the instrument to a measure function, which sets the
+    -- digitize side to None, and the teardown then has to read the other side. Without this
+    -- the matrix only ever exits with the digitizer live, because apply() set it -- so a
+    -- teardown hardcoded to the digitize branch passed the matrix and only the dedicated
+    -- measure-side case caught it.
+    {name = 'the panel moved to a measure function while the app ran',
+     set = function() dmm.measure.func = dmm.FUNC_DC_VOLTAGE end,
+     mid = function() dmm.measure.func = dmm.FUNC_DC_VOLTAGE end},
+  }
+  local bad, notes, i = 0, {}, nil
+  for i = 1, table.getn(OPENINGS) do
+    local o = OPENINGS[i]
+    -- Get to a clean slate without asserting on it, then set the opening under test.
+    fftsa.stop()
+    FFTSA_TRACE, FFTSA_MARK, FFTSA_OLDTRACE, FFTSA_OLDMARK = nil, nil, nil, nil
+    o.set()
+    defbuffer1.clear()
+    DMM_EVENTS = {}
+    local aborts0 = TRIG_ABORTS
+    local started = fftsa.start()
+    fftsa.frame()
+    local posted_up = table.getn(DMM_EVENTS)
+    local drew = fftsa.sg_buf ~= nil and fftsa.sg_buf.n > 0
+                 and OBJ[fftsa.sg_graph].buffer == fftsa.sg_buf
+    if o.mid ~= nil then o.mid() end
+    fftsa.stop()
+    local posted = table.getn(DMM_EVENTS)
+    -- A running model must have been aborted; the app takes the instrument, never adjusts it.
+    local tookit = TRIG_ABORTS > aborts0 and trigger.model.state() == trigger.STATE_EMPTY
+    local ok = started == true and posted == 0 and drew and tookit
+               and defbuffer1.n == 1 and FFTSA_TRACE == nil and FFTSA_MARK == nil
+    if not ok then
+      bad = bad + 1
+      notes[table.getn(notes) + 1] = string.format(
+        '%s -> start=%s posted=%d/%d drew=%s abort=%s defbuffer1.n=%s',
+        o.name, tostring(started), posted_up, posted, tostring(drew),
+        tostring(tookit), tostring(defbuffer1.n))
+    end
+  end
+  dmm.digitize.func = dmm.FUNC_DIGITIZE_VOLTAGE
+  fftsa.start()
+  fftsa.frame()
+  return bad == 0, string.format('%d of %d openings failed%s%s',
+                                 bad, table.getn(OPENINGS),
+                                 bad > 0 and ': ' or '',
+                                 table.concat(notes, ' | '))
 end)())
 
 -- The trace buffers are created into their globals. What this can assert is that they are

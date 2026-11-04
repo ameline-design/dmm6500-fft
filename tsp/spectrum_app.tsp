@@ -567,6 +567,19 @@ function fftsa.apply()
   -- Before the sg_set_xrange() below, which reads it: the settings line counts the bins
   -- inside the span, and that count is computed from sg_nbins.
   fftsa.sg_nbins = fftsa.n / 2
+  -- NOTHING ABOUT THE INSTRUMENT'S STATE MAY BE ASSUMED HERE. An autoexec script runs before
+  -- any of this and can leave the DMM on any function, with a trigger model running, and with
+  -- a user buffer current. So the app takes the instrument rather than adjusting it:
+  --
+  --   abort first, because a model left running owns the digitizer, and
+  --   the FUNCTION FIRST, because measure and digitize are mutually exclusive and every
+  --   digitize attribute below is refused with event 2800 while a measure function is live.
+  --
+  -- Measured on 1.7.17a from the state a power cycle leaves (measure DC voltage, digitize
+  -- idle): abort on an empty model is quiet, and so is this switch, which flips
+  -- dmm.measure.func to FUNC_NONE. Both post nothing, so neither needs a state test first --
+  -- and a state test is the wrong shape anyway, since the point is not to depend on the state.
+  trigger.model.abort()
   dmm.digitize.func       = dmm.FUNC_DIGITIZE_VOLTAGE
   dmm.digitize.range      = fftsa.range
   dmm.digitize.samplerate = fftsa.fs_acq
