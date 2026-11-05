@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.9
+-- $Version: 8.10
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -5768,17 +5768,26 @@ function fftsa.frame()
       -- work_peak remains the basis until a plain frame has been seen, which is the state
       -- in the first window after a size change.
       local want = fftsa.tick_period(fftsa.plain_peak or fftsa.work_peak)
-      -- CLOSED ON WHAT WAS DELIVERED, not only on what was computed. plain_peak is a
-      -- decaying window maximum, so it under-reports the worst frame and the period is armed
-      -- below what the instrument can turn around: measured at 4096, it armed 0.110 while
-      -- frames were arriving 0.153 apart, and at 8192 it armed 0.160 against 0.207. A period
-      -- shorter than the real turnaround does not raise the rate -- the tick is missed and
-      -- the whole period is lost -- so the delivered gap is a floor under the asking price.
-      if fftsa.gap_peak ~= nil then
-        local held = fftsa.tick_period(fftsa.gap_peak - fftsa.tick_idle)
-        if held > want then want = held end
-      end
-      if want ~= fftsa.period then
+      -- THE DELIVERED GAP IS MEASURED AND DELIBERATELY NOT ACTED ON.
+      --
+      -- 8.9 used it as a floor under the period, because plain_peak is a decaying window
+      -- maximum that under-reports the worst frame -- it armed 0.110 against a measured
+      -- 0.153 at 4096. IT RATCHETED, and on the glass 2048 fell from 10.7 fps to 3. The loop
+      -- closes on itself: fftsa.arm() deletes and recreates a display timer, that re-arm
+      -- delays the next frame, the delayed frame sets gap_peak above the period just armed,
+      -- and the next window raises it again. Nothing ever lowers it, because the gap is
+      -- re-earned against the period it just set.
+      --
+      -- To use the gap at all, the frame that follows a re-arm has to be excluded from it.
+      -- Measuring it costs nothing and the census is what diagnosed the quantizer, so it
+      -- stays; acting on it needs that exclusion first.
+      --
+      -- A DEADBAND, because the grid is 10 ms rather than 50 and every step it offers is a
+      -- timer delete and create against a 463-object display pool. A converged period has to
+      -- stop re-arming whatever the grid, and the old 50 ms grid gave that for free.
+      local move = want - (fftsa.period or 0)
+      if move < 0 then move = -move end
+      if fftsa.period == nil or move >= fftsa.tick_rearm then
         fftsa.period = want
         fftsa.arm(want)
       end
@@ -6880,6 +6889,11 @@ fftsa.tick_idle = 0.020
 -- costs nothing and gives the loop below somewhere to land.
 fftsa.tick_grid = 0.010
 fftsa.tick_min  = 0.050
+-- How far the period must move before it is worth re-arming. Every re-arm is a display timer
+-- deleted and created against a 463-object pool, and the 50 ms grid used to supply this
+-- deadband as a side effect of being coarse. On a 10 ms grid it has to be explicit, or a
+-- period that dithers by one step re-arms for the life of the app.
+fftsa.tick_rearm = 0.020
 
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return fftsa.tick_min end

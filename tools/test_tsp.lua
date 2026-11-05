@@ -5059,36 +5059,46 @@ end)())
 -- period must leave at least fftsa.tick_idle free at every frame length, less the slack it
 -- is allowed to spend on rate. A fifth-of-the-frame rule held back 85 ms at the long counts
 -- and under a tenth of this floor at the short ones, which is the wrong way round.
--- THE PERIOD IS FLOORED BY WHAT WAS DELIVERED, not only by what was computed. plain_peak is
--- a decaying window maximum, so it under-reports the worst frame: measured on 1.7.17a at
--- 4096 the app armed 0.110 while frames arrived 0.153 apart, and at 8192 it armed 0.160
--- against 0.207. Arming under the real turnaround does not raise the rate -- the tick is
--- missed and a whole period is lost -- which is what made 16384 wander between 3.0 and 3.8
--- fps. The gap is therefore a floor under the asking price.
---
--- Driven through the real frame path, with os.clock advanced by a stub so the gap is a known
--- quantity rather than whatever the host happened to take.
-check('a delivered gap longer than the armed period raises the period', (function()
+-- THE DELIVERED GAP MUST NOT DRIVE THE PERIOD. 8.9 made it a floor, because plain_peak
+-- under-reports the worst frame -- 0.110 armed against a measured 0.153 at 4096 -- and it
+-- RATCHETED: fftsa.arm() deletes and recreates a display timer, that re-arm delays the next
+-- frame, the delayed frame sets gap_peak above the period just armed, and nothing lowers it
+-- again. On the glass 2048 went from 10.7 fps to 3. This pins the absence, and the deadband
+-- that keeps a converged period from re-arming at all.
+check('a long delivered gap does not ratchet the period, and converged periods settle',
+      (function()
   fftsa.start()
-  local realclock = os.clock
-  local t, step = 0, 0.30          -- 300 ms between frame entries, far over any armed period
+  local realclock, realarm = os.clock, fftsa.arm
+  local arms = 0
+  fftsa.arm = function(p) arms = arms + 1 return realarm(p) end
+  local t = 0
   os.clock = function()
     t = t + 0.001
     return t
   end
-  -- Nine frames: one more than the eight-frame re-arm window, each entered a step apart.
-  local i
-  for i = 1, 9 do
-    t = t + step
+  -- Forty frames, each entered 300 ms apart: far longer than any period the work justifies,
+  -- which is exactly the input that ratcheted. The period must not climb, and once it has
+  -- settled the re-arms must stop.
+  local i, seen = nil, {}
+  for i = 1, 40 do
+    t = t + 0.300
+    fftsa.frame()
+    seen[i] = fftsa.period
+  end
+  local armed_early = arms
+  for i = 1, 40 do
+    t = t + 0.300
     fftsa.frame()
   end
-  local armed, gap = fftsa.period, fftsa.gap_peak
-  os.clock = realclock
-  -- The period must have been pulled up towards the delivered gap rather than sitting at the
-  -- work figure, which under a stubbed clock is a few milliseconds.
-  local ok = armed ~= nil and armed >= 0.25
-  local why = string.format('armed=%s after 9 frames %.0f ms apart, gap_peak=%s',
-                            tostring(armed), 1000 * step, tostring(gap))
+  local armed_late = arms - armed_early
+  os.clock, fftsa.arm = realclock, realarm
+  -- A stubbed clock makes the real work a few milliseconds, so the period belongs at the
+  -- floor. The ratchet drove it past 0.3; anything near the floor is the fix holding.
+  local ok = fftsa.period ~= nil and fftsa.period <= 0.10 and armed_late == 0
+  local why = string.format('period=%s after 80 frames 300 ms apart,'
+                            .. ' re-arms %d then %d, first=%s',
+                            tostring(fftsa.period), armed_early, armed_late,
+                            tostring(seen[1]))
   fftsa.start()
   fftsa.frame()
   return ok, why
