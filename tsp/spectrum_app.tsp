@@ -747,6 +747,10 @@ function fftsa.frame_body()
      or fftsa.sg_pk_f == nil then
     return
   end
+  -- Diagnostic: FFTSA_FREEZE, set before launch, runs one frame then stops touching the
+  -- trace buffer, so dropouts that continue are the widget's and not ours. A bare global
+  -- because a socket command aborts a running app.
+  if FFTSA_FREEZE and fftsa.froze then return end
   local t_a = os.clock()
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
@@ -758,11 +762,10 @@ function fftsa.frame_body()
   -- window, are pushed by spectrum_interp at the point of use, so a compiled frame writes
   -- none of them.
   local npk = fftsa.dsp_live()
-  -- Native path: the compiled DSP writes the trace into sg_buf's chunk storage in place
-  -- and rewinds the descriptor, so no buffer.clear() happens and the graph never paints a
-  -- half-filled trace. Falls back to Keithley's dsp.spectrum whenever the install is not
-  -- usable for the plan in force -- no binary in the archive, a boot that already spent
-  -- its install, or a sample count above what the arena was sized for.
+  -- Native path: the compiled DSP computes, Lua writes the trace, because the display task
+  -- feeds from buffer.write.reading only. The clear and refill below is the window the trace
+  -- drops out in -- measured on the glass, and gone when FFTSA_FREEZE stops the writes.
+  -- Falls back to dsp.spectrum when the install cannot serve the plan in force.
   --
   -- Both flags are cleared first and set only on success, so everything that reads them --
   -- the peak table, the THD line, plan_n -- is reading this frame or nothing.
@@ -802,6 +805,8 @@ function fftsa.frame_body()
     -- The bin width THIS capture delivered, off its own timestamps: the samplerate
     -- read-back does not match what arrives, so it is never the source. Two table reads.
     local binhz = fftsa.measure_fs(fftsa.cap) / fftsa.n
+    -- nil for the output: the primitive reduces and touches no reading buffer. Having it
+    -- write the trace itself was tried and is below.
     nseg = fftsa.nl.call_dsp(fftsa.nl_cap, nil, fftsa.nl_reduction(binhz))
     if nseg == nil then
       -- Demoted for the rest of the session rather than raising once a frame. last_rc
@@ -826,6 +831,20 @@ function fftsa.frame_body()
         fftsa.binhz = binhz
         fftsa.nl_frame = true
         fftsa.nl_res = fftsa.nl.results()
+        -- Cleared and refilled. The window between the clear and the last append is where
+        -- the trace drops out for a frame, and TWO WAYS OUT OF IT WERE TRIED ON THE GLASS
+        -- and both were worse:
+        --
+        --   hiding the graph across the refill changed nothing, because setstate posts
+        --   without waiting and so cannot bracket this against the GUI's own paint timer;
+        --
+        --   having the primitive write the elements in place and re-subscribing to rebuild
+        --   the GUI's ring repaints the WHOLE widget, axes included, once a frame -- far
+        --   worse flicker, and no faster, since a rebind re-pins the axes.
+        --
+        -- What is left is clearing less often: the buffer holds 680 and a frame writes 255,
+        -- so every second frame could skip the clear. Untried, and it would draw the last
+        -- two spectra overlaid.
         local wr = buffer.write.reading
         local tb, db, hz = fftsa.sg_buf, rd.db, rd.hz
         local i
@@ -920,6 +939,10 @@ function fftsa.frame_body()
   for k, v in pairs(ph) do
     if pk[k] == nil or v > pk[k] then pk[k] = v end
   end
+  -- One full frame has now drawn a trace, so the freeze diagnostic above can stand everything
+  -- down. Set unconditionally: it costs one store and it means the flag can be raised from a
+  -- socket between launches without the app having to be rebuilt for it.
+  fftsa.froze = true
 end
 
 -- The per-phase costs as one line, for a probe. Milliseconds, last frame then the worst.
@@ -1087,23 +1110,12 @@ function fftsa.frame()
       -- work_peak remains the basis until a plain frame has been seen, which is the state
       -- in the first window after a size change.
       local want = fftsa.tick_period(fftsa.plain_peak or fftsa.work_peak)
-      -- THE DELIVERED GAP IS MEASURED AND DELIBERATELY NOT ACTED ON.
+      -- The delivered gap is measured and NOT acted on. 8.9 floored the period at it and it
+      -- ratcheted -- arm() delays the frame it then measures, so the period only climbed and
+      -- 2048 fell from 10.7 fps to 3. Using it needs the frame after a re-arm excluded.
       --
-      -- 8.9 used it as a floor under the period, because plain_peak is a decaying window
-      -- maximum that under-reports the worst frame -- it armed 0.110 against a measured
-      -- 0.153 at 4096. IT RATCHETED, and on the glass 2048 fell from 10.7 fps to 3. The loop
-      -- closes on itself: fftsa.arm() deletes and recreates a display timer, that re-arm
-      -- delays the next frame, the delayed frame sets gap_peak above the period just armed,
-      -- and the next window raises it again. Nothing ever lowers it, because the gap is
-      -- re-earned against the period it just set.
-      --
-      -- To use the gap at all, the frame that follows a re-arm has to be excluded from it.
-      -- Measuring it costs nothing and the census is what diagnosed the quantizer, so it
-      -- stays; acting on it needs that exclusion first.
-      --
-      -- A DEADBAND, because the grid is 10 ms rather than 50 and every step it offers is a
-      -- timer delete and create against a 463-object display pool. A converged period has to
-      -- stop re-arming whatever the grid, and the old 50 ms grid gave that for free.
+      -- The deadband: on a 10 ms grid every step is a timer delete and create, so a
+      -- converged period must stop re-arming. The old 50 ms grid gave that for free.
       local move = want - (fftsa.period or 0)
       if move < 0 then move = -move end
       if fftsa.period == nil or move >= fftsa.tick_rearm then
@@ -2293,6 +2305,10 @@ end
 function fftsa.start()
   fftsa.stop()
   fftsa.halted, fftsa.errrun, fftsa.stop_pending = false, 0, false
+  -- Cleared per launch, because fftsa survives one: left set, the freeze diagnostic would
+  -- bail out of the FIRST frame of the next launch and the trace would never be drawn at all,
+  -- which reads as permanent flicker rather than as the frozen trace it is meant to give.
+  fftsa.froze = false
 
   -- The refusal the capability gate promised, taken before anything is built. Without it
   -- the first dsp.* write is inside apply(), so the whole screen set is created and then
