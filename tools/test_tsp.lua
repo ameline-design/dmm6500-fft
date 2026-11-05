@@ -687,7 +687,10 @@ function trigger.model.state() return trigger.model.st end
 function collectgarbage() end   -- no-op; the real one is fine, this keeps it quiet
 
 -- ---------- load the REAL modules ----------
-for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
+-- fft_interp.tsp is NOT in the archive: package_tspa.py leaves it out, because the compiled
+-- image is the only implementation that ships. Loaded here so the frame gates drive a real
+-- spectrum rather than a stub -- it is the reference implementation and the oracle.
+for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/fft_interp.tsp', 'tsp/spectrum_ui.tsp',
                    'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp',
                    'tsp/spectrum_app.tsp'}) do
   local chunk, err = loadfile(m)
@@ -1267,7 +1270,12 @@ check('acquisition is short at every rate, so the panel keeps its slice', (funct
     local a = fftsa.n / fftsa.rates[i]
     if a > worst then worst = a end
   end
-  return worst < 0.010, string.format('%.1f ms worst', worst * 1000)
+  -- Derived, not pinned: the worst case is the smallest count the options offer at the
+  -- floor rate, which doubled to 10.24 ms when 512 left the list. Both halves asserted --
+  -- that the floor rate is the worst, and that it is still a small slice of a frame.
+  local bound = fftsa.n / fftsa.fs_min
+  return worst <= bound + 1e-12 and bound < 0.015,
+         string.format('%.1f ms worst, bound %.1f ms', worst * 1000, bound * 1000)
 end)())
 check('the finest bin width is the floor rate, and it is the default span', (function()
   return fftsa.pick_fs(fftsa.fhi) == fftsa.fs_min
@@ -2771,14 +2779,14 @@ end)())
 check('an Apply writes the frequency axis once and quotes the measured rate', (function()
   local realm = fftsa.measure_fs
   local p = (OBJ[gh].pins or 0)
-  fftsa.measure_fs = function() return 80000 end         -- 156.25 Hz bins, not 195.31
+  fftsa.measure_fs = function() return 80000 end         -- 78.12 Hz bins, not 97.66
   local ok, err = pcall(fftsa.apply)
   -- Both readings taken before the restoring apply below, which writes an axis of its own.
   local pins, t = (OBJ[gh].pins or 0), tostring(OBJ[fftsa.sg_xunit].text)
   fftsa.measure_fs = realm
   fftsa.apply()                                          -- back to the real rate
   if not ok then return false, 'raised: ' .. tostring(err) end
-  return pins == p + 1 and string.find(t, '156.25', 1, true) ~= nil,
+  return pins == p + 1 and string.find(t, '78.12', 1, true) ~= nil,
          string.format('pins %d/%d after the forced apply, legend [%s]', pins, p, t)
 end)())
 -- A re-planning gesture leaves the pin to apply(), so between them they write ONE axis. The
@@ -4635,7 +4643,7 @@ check('the preview uses the timestamp-measured rate for the active rate', (funct
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_preview()
   local text = obj_at(fftsa.opt_info).text
-  local expected = fftsa.opt_info_text(fftsa.fs_acq, 512)
+  local expected = fftsa.opt_info_text(fftsa.fs_acq, fftsa.sample_counts[1])
   fftsa.fs_acq = acq
   return text == expected, tostring(text) .. ' | wanted ' .. tostring(expected)
 end)())
@@ -4684,6 +4692,113 @@ end)())
 -- One buffer, bound for the life of the app, so its identity IS the invariant: it must
 -- be the same object, still alive, still the one the graph holds, at the same capacity,
 -- with adds and removes unmoved and no object or buffer created along the way.
+-- THE LIST AND THE ARENA MUST AGREE, and nothing else checks it. nl.init sizes the arena for
+-- fftsa.nl_nmax and nl.reinit re-plans inside it for any count at or below; a count ABOVE it
+-- has no arena, so nl_usable() refuses and that size runs interpreted -- seconds a frame, with
+-- nothing on the panel to say why. So the largest count offered may never exceed nl_nmax.
+--
+-- The ceiling is not arbitrary. dsp_plan_segs(n, 1, FOURSTEP, 32736) computed on the host:
+-- 16384 needs 13 segments, 32768 needs 26, and DSPN_MAX_SEGS is 32 -- so 32768 is the largest
+-- the arena can ever serve, and 65536 does not lay out at all. Raising this list needs that
+-- arithmetic redone, not a guess.
+check('every offered sample count is one the native arena can serve', (function()
+  local counts = fftsa.sample_counts
+  local nc = table.getn(counts)
+  local biggest, i = 0, nil
+  for i = 1, nc do
+    if counts[i] > biggest then biggest = counts[i] end
+  end
+  -- The labels are a parallel list and the option field enumerates six of them by hand, so
+  -- both the count and the pairing are asserted.
+  local paired = true
+  for i = 1, nc do
+    if counts[i] ~= tonumber(fftsa.sample_labels[i]) then paired = false end
+  end
+  -- Ascending, because opt_index and the preview both take the list's order on trust.
+  local ordered = true
+  for i = 2, nc do
+    if counts[i] <= counts[i - 1] then ordered = false end
+  end
+  return nc == 6 and table.getn(fftsa.sample_labels) == 6 and paired and ordered
+         and biggest <= fftsa.nl_nmax and biggest == 32768
+         and fftsa.cap_floor_n == fftsa.nl_nmax,
+         string.format('%d counts, largest %d, nl_nmax %s, cap_floor %s, paired=%s'
+                       .. ' ordered=%s', nc, biggest, tostring(fftsa.nl_nmax),
+                       tostring(fftsa.cap_floor_n), tostring(paired), tostring(ordered))
+end)())
+
+-- THE SHIPPED CONFIGURATION, which no other case covers. tsp/fft_interp.tsp is loaded by this
+-- harness and is NOT in the archive, so every case above drives an implementation the
+-- instrument does not have. These assert what the shipped modules do when it is absent:
+-- commit still settles the plan the caller needs before it acquires, spectrum REFUSES by
+-- posting rather than indexing a nil, and both cost models go to zero instead of describing a
+-- transform that cannot run.
+check('without the interpreted transform, dsp commits and refuses to run', (function()
+  local keep = fftsa.fft_init
+  fftsa.fft_init = nil
+  local rc_commit = dsp.commit()
+  local src = dsp.fft.srclength
+  -- committime has to be read with the tables DIRTY, or the guard being tested is bypassed:
+  -- after a clean commit the cost is zero whether or not the transform exists. A write in the
+  -- 'tables' class dirties it and recomputes the estimate -- and it has to be a DIFFERENT
+  -- value, because the setter returns early on a write of what is already there.
+  local n0 = dsp.fft.samples
+  dsp.fft.samples = fftsa.sample_counts[2]
+  if dsp.fft.samples == n0 then dsp.fft.samples = fftsa.sample_counts[3] end
+  local ctime, stime = dsp.fft.committime, dsp.fft.spectrumtime
+  dsp.fft.samples = n0
+  local rc_spec = dsp.spectrum(fftsa.cap, fftsa.sg_buf, nil)
+  -- lastevent() returns ONE value, the {code, why} record post() stored.
+  local ev = dsp.lastevent()
+  local why = ev and ev.why
+  fftsa.fft_init = keep
+  dsp.commit()
+  return rc_commit == dsp.OK and src == fftsa.n
+         and ctime == 0 and stime == 0
+         and rc_spec == dsp.EUNSUPPORTED
+         and string.find(tostring(why), 'no interpreted transform', 1, true) ~= nil,
+         string.format('commit=%s srclength=%s committime=%s spectrumtime=%s spectrum=%s (%s)',
+                       tostring(rc_commit), tostring(src), tostring(ctime), tostring(stime),
+                       tostring(rc_spec), tostring(why))
+end)())
+
+-- And start() refuses outright rather than running frames that cannot compute: with no
+-- compiled path and no interpreted one there is nothing to draw, and twenty posted events a
+-- second behind a working-looking panel is the failure this avoids.
+check('without either implementation, start refuses and says so', (function()
+  local keepi, keepnl = fftsa.fft_init, fftsa.nl
+  fftsa.fft_init, fftsa.nl = nil, nil
+  local ok = fftsa.start()
+  local why = tostring(fftsa.lasterr)
+  fftsa.fft_init, fftsa.nl = keepi, keepnl
+  fftsa.start()
+  fftsa.frame()
+  return ok == false and string.find(why, 'no interpreted fallback', 1, true) ~= nil,
+         'start=' .. tostring(ok) .. ' lasterr=' .. why
+end)())
+
+-- A DEMOTION MID-SESSION has nowhere to go in the shipped archive, and must halt rather than
+-- spin. Without the guard the frame posts EUNSUPPORTED and then "no spectrum yet" once per
+-- peak per frame -- six events a frame behind a panel that still looks alive.
+check('a demotion with no interpreted transform halts instead of spinning', (function()
+  local keep = fftsa.fft_init
+  fftsa.fft_init = nil
+  fftsa.halted = false
+  dsp.nevents = 0
+  local rc = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
+  local halted, why, posted = fftsa.halted, tostring(fftsa.lasterr), dsp.nevents
+  local banner = tostring(obj_at(fftsa.sg_xunit).text)
+  fftsa.fft_init = keep
+  fftsa.halted = false
+  fftsa.start()
+  fftsa.frame()
+  return rc == nil and halted and posted == 0
+         and string.find(why, 'no interpreted fallback', 1, true) ~= nil
+         and string.find(banner, 'HALTED', 1, true) ~= nil,
+         string.format('rc=%s halted=%s posted=%d banner=[%s]',
+                       tostring(rc), tostring(halted), posted, banner)
+end)())
+
 check('all size transitions keep the original trace bound and plot without leaks',
       (function()
   display.setvalue(fftsa.opt_flo, 10)
@@ -4709,8 +4824,12 @@ check('all size transitions keep the original trace bound and plot without leaks
     capmax = wantcap
     display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])
     if not fftsa.options_apply() then
+      local why = tostring(fftsa.lasterr)
       display.setvalue(fftsa.opt_n, 1); fftsa.options_apply()
-      return false, fftsa.lasterr
+      -- Which size, always: lasterr is nil for a refusal that posted rather than raised, and
+      -- this case then failed with no message at all.
+      return false, string.format('apply refused at N=%d (lasterr %s)',
+                                  fftsa.sample_counts[i], why)
     end
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
        or dmm.digitize.count ~= n or fftsa.cap.cap ~= wantcap
@@ -4760,11 +4879,17 @@ check('all size transitions keep the original trace bound and plot without leaks
   display.setvalue(fftsa.opt_n, 1)
   local ok = fftsa.options_apply()
   fftsa.frame()
-  return ok and fftsa.n == 512 and fftsa.sg_nbins == 256
-         and OBJ[graph0].buffer == fftsa.sg_buf and OBJ[graph0].traces == 1
-         and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
-         and fftsa.sg_graph == graph0 and fftsa.sg_scr == screen0
-         and live() == objects0 and livebufs() == buffers0
+  -- The list's first count, not a literal: this returned WITHOUT A MESSAGE and so failed
+  -- silently when 512 left the list.
+  local want_n = fftsa.sample_counts[1]
+  return (ok and fftsa.n == want_n and fftsa.sg_nbins == want_n / 2
+          and OBJ[graph0].buffer == fftsa.sg_buf and OBJ[graph0].traces == 1
+          and fftsa.sg_buf.n > 0 and fftsa.errrun == 0
+          and fftsa.sg_graph == graph0 and fftsa.sg_scr == screen0
+          and live() == objects0 and livebufs() == buffers0),
+         string.format('back to N=%s/%s nbins=%s, objs %d/%d bufs %d/%d, errrun %s',
+                       tostring(fftsa.n), tostring(want_n), tostring(fftsa.sg_nbins),
+                       live(), objects0, livebufs(), buffers0, tostring(fftsa.errrun))
 end)())
 check('unchanged sample counts reuse acquisition and graph buffers', (function()
   local cap, graphbuf = fftsa.cap, fftsa.sg_buf
@@ -4786,9 +4911,13 @@ check('a buffer allocation failure halts frames and allows recovery', (function(
   display.setvalue(fftsa.opt_n, 1)
   local recovered = fftsa.options_apply()
   fftsa.frame()
-  return not ok and halted and string.find(message, 'resize-boom', 1, true) ~= nil
-         and recovered and not fftsa.halted and fftsa.errrun == 0
-         and fftsa.n == 512 and fftsa.sg_nbins == 256
+  local want_n = fftsa.sample_counts[1]
+  return (not ok and halted and string.find(message, 'resize-boom', 1, true) ~= nil
+          and recovered and not fftsa.halted and fftsa.errrun == 0
+          and fftsa.n == want_n and fftsa.sg_nbins == want_n / 2),
+         string.format('refused=%s halted=%s recovered=%s back to N=%s/%s',
+                       tostring(not ok), tostring(halted), tostring(recovered),
+                       tostring(fftsa.n), tostring(want_n))
 end)())
 -- The buffer object itself must survive a sample change, still bound to the graph: the
 -- capacity is the ceiling at every size, so a resize has nothing to reallocate.
@@ -5194,8 +5323,10 @@ check('the timer period follows measured work, not the model', (function()
   for i = 1, 10 do fftsa.frame() end
   local measured = fftsa.period
   fftsa.options_apply()
-  return near(modelled, 0.10, 1e-9) and near(measured, 0.05, 1e-9)
-         and measured < modelled,
+  -- The model's own value is not pinned: it follows dsp.fft.spectrumtime and the sample
+  -- count, and pinning it tests the mock. What matters is that it over-predicts and that
+  -- measurement pulls the period down to the floor.
+  return modelled > measured and near(measured, 0.05, 1e-9),
          string.format('model armed %.2f, measurement armed %.2f', modelled, measured)
 end)())
 
@@ -5306,7 +5437,7 @@ check('an off-list sample count leaves Options and Apply working', (function()
   fftsa.n = keep
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
-  return opened and onscr and applied and landed == 512,
+  return opened and onscr and applied and landed == fftsa.sample_counts[1],
          string.format('opened=%s applied=%s n=%s', tostring(opened),
                        tostring(applied), tostring(landed))
 end)())
@@ -5381,22 +5512,31 @@ end)())
 -- one size and not at the other. The match is on the warning's own words: the settings
 -- line always carries a bin WIDTH, so a bare 'bin' matches either way.
 check('the legend bin count follows a resize in the same Apply', (function()
+  -- Narrow enough that the SMALLEST count the list offers still holds only a bin or two:
+  -- at 1024 a 501 Hz window already holds five and the message does not fire, so the span
+  -- has to follow the list down rather than stay where 512 put it.
   display.setvalue(fftsa.opt_flo, 1999)
-  display.setvalue(fftsa.opt_fhi, 2500)
+  display.setvalue(fftsa.opt_fhi, 2100)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
-  local at512 = fftsa.sg_xunit_text()
-  display.setvalue(fftsa.opt_n, 6)           -- 16384
+  local atsmall = fftsa.sg_xunit_text()
+  local nsmall = fftsa.sg_nbins
+  display.setvalue(fftsa.opt_n, 6)           -- the largest the list offers
   fftsa.options_apply()
-  local at16k = fftsa.sg_xunit_text()
+  local atbig = fftsa.sg_xunit_text()
   local nb = fftsa.sg_nbins
   display.setvalue(fftsa.opt_n, 1)
   display.setvalue(fftsa.opt_flo, 1000)
   display.setvalue(fftsa.opt_fhi, 50000)
   fftsa.options_apply()
-  return nb == 8192 and string.find(at512, 'only 2 bins in the span', 1, true) ~= nil
-         and string.find(at16k, 'in the span', 1, true) == nil,
-         '512: ' .. tostring(at512) .. ' | 16384: ' .. tostring(at16k)
+  -- The bin count in the message is not pinned -- it follows the count and the span, and a
+  -- literal here would have to move every time the list does. What is asserted is that the
+  -- narrow span reports a bin count at the smallest size and stops reporting one at the
+  -- largest, and that the largest really is half the sample count.
+  return nb == fftsa.sample_counts[6] / 2 and nb > nsmall
+         and string.find(atsmall, 'in the span', 1, true) ~= nil
+         and string.find(atbig, 'in the span', 1, true) == nil,
+         'small: ' .. tostring(atsmall) .. ' | big: ' .. tostring(atbig)
 end)())
 
 -- F13. Three constants that have to agree and nothing said so.
@@ -5426,12 +5566,14 @@ check('the trace never exceeds the column cap at any sample count', (function()
                              fftsa.sg_maxpts)
 end)())
 
--- The default must be untouched: fewer bins in the span than columns, so every bin
--- is still its own point and the shipped appearance does not change.
--- At the default the span holds fewer bins than there are columns, so no bin can be
--- skipped: every one lands in at least one column. That is the resolution guarantee at
--- the default, and it is weaker at every larger size.
-check('the default skips no bin in the span', (function()
+-- EVERY BIN IS COVERED BY SOME COLUMN'S RUN, which is the real guarantee and holds at every
+-- size. This used to assert one bin per column at the default, true only while 512 was the
+-- smallest count -- at 1024 the span holds 501 bins over 255 columns. Nothing is lost by
+-- that: dsp_reduce takes the MAXIMUM over each column's run of bins, so a column covering
+-- two bins reports the taller, and each column spans the same ~195 Hz it did at 512. The
+-- partition is what matters, so the partition is what is checked, against the same
+-- quotient-and-remainder walk the C uses.
+check('the column runs partition the span, so no bin escapes the maximum', (function()
   display.setvalue(fftsa.opt_rng, 3)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
@@ -5440,20 +5582,33 @@ check('the default skips no bin in the span', (function()
   local kmin, kmax = fftsa.sg_window_bins(nb, fftsa.binhz)
   local npts = kmax - kmin + 1
   local ncol = fftsa.sg_ncol
-  local seen = {}
-  local c
+  -- dsp_reduce's walk: qstep/rstep carried as integers, segment c covering offsets
+  -- [q0, q1-1]. Every offset must land in exactly one run.
+  local hits = {}
+  local qstep, rstep = math.floor(npts / ncol), math.mod(npts, ncol)
+  local q0, q1, r1 = 0, qstep, rstep
+  local c, overlap = nil, 0
   for c = 0, ncol - 1 do
-    local a = kmin + math.floor(c * npts / ncol)
-    seen[a] = true
+    local oa, ob = q0, q1 - 1
+    if ob < oa then ob = oa end
+    if ob > npts - 1 then ob = npts - 1 end
+    local o
+    for o = oa, ob do
+      if hits[o] ~= nil then overlap = overlap + 1 end
+      hits[o] = true
+    end
+    q0 = q1
+    q1 = q1 + qstep
+    r1 = r1 + rstep
+    if r1 >= ncol then q1 = q1 + 1; r1 = r1 - ncol end
   end
-  local missing = 0
-  local k
-  for k = kmin, kmax do
-    if seen[k] == nil then missing = missing + 1 end
+  local missing, o = 0, nil
+  for o = 0, npts - 1 do
+    if hits[o] == nil then missing = missing + 1 end
   end
-  return npts <= ncol and missing == 0 and fftsa.sg_buf.n == ncol,
-         string.format('%d bins over %d columns, %d skipped, %d written',
-                       npts, ncol, missing, fftsa.sg_buf.n)
+  return missing == 0 and overlap == 0 and fftsa.sg_buf.n == ncol,
+         string.format('%d bins over %d columns, %d uncovered, %d doubled, %d written',
+                       npts, ncol, missing, overlap, fftsa.sg_buf.n)
 end)())
 
 -- The point of max-per-column: a tone in any bin reaches the trace. Stride sampling
@@ -5768,7 +5923,7 @@ local live_one, bufs_one = live(), livebufs()
 check('first launch is live', live_one > 0 and live('timer') == 5,
       'live=' .. live_one .. ' timers=' .. live('timer'))
 -- Leave by HOME / another App: EVENT_ENDAPP never fires, nothing is torn down.
-for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
+for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/fft_interp.tsp', 'tsp/spectrum_ui.tsp',
                     'tsp/spectrum_graph.tsp', 'tsp/dsp_lua.tsp',
                     'tsp/spectrum_app.tsp'}) do
   loadfile(m)()

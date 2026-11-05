@@ -155,6 +155,9 @@ function fftsa.dsp_install()
   -- presses -- so a caller can tell a commit it has to cover the screen for from one it
   -- does not.
   local function commit_cost(n)
+    -- Nothing to build when tsp/fft_interp.tsp is not in the archive, which is the shipped
+    -- case: the tables this cost is for are the interpreted transform's.
+    if fftsa.fft_init == nil then return 0 end
     if dsp.dirty_tables or not dsp.built then return 0.163e-3 * (n or 0) end
     return 0
   end
@@ -168,6 +171,10 @@ function fftsa.dsp_install()
   -- figure without measuring. Switch day re-derives it against the native path, which is
   -- what docs/PERFORMANCE.md's phase table is for.
   local function spectrum_cost(n)
+    -- The model is of the INTERPRETED frame, so it describes nothing when that module is not
+    -- in the archive. Zero, and frame_estimate falls through to its own floor: the modelled
+    -- period was 0.407 s at 4096 against a real compiled frame of 0.037.
+    if fftsa.fft_init == nil then return 0 end
     if n == nil or n < 2 then n = 512 end
     local log2n = math.log(n) / 0.69314718055995
     return n * 46.6e-6 + 3.593e-6 * n * log2n + 0.04
@@ -260,7 +267,10 @@ function fftsa.dsp_install()
     -- EXPENSIVE, and only when something it is built from moved. fft_init has its own cache
     -- on (n, win_i, kbeta_i), so a commit whose only change was the decimation costs the
     -- taps alone even though decimate is in the expensive class for the arena's sake.
-    if dsp.dirty_tables or not dsp.built then
+    -- Guarded, because tsp/fft_interp.tsp is not in the archive: a commit still has to
+    -- settle srclength and the bin width for the caller that is about to acquire, whether or
+    -- not anything here can transform the record.
+    if (dsp.dirty_tables or not dsp.built) and fftsa.fft_init ~= nil then
       fftsa.fft_init(n)
       dsp.builds = dsp.builds + 1
     end
@@ -313,6 +323,13 @@ function fftsa.dsp_install()
   -- YIELDS: the yields inside fft_load_rd and fft_run are what let the display task dispatch
   -- a touch, and at 16,384 samples those two are 0.5 s and 0.8 s of arithmetic.
   function dsp.spectrum(cap, trace, marks)
+    -- THE ARCHIVE SHIPS NO INTERPRETED TRANSFORM. tsp/fft_interp.tsp is left out by
+    -- package_tspa.py, so on an instrument this refuses and the compiled path is the only
+    -- one. Posted rather than raised, like every other refusal here, so the frame path
+    -- counts it and the panel says why instead of the app dying in a timer callback.
+    if fftsa.fft_init == nil then
+      return post(dsp.EUNSUPPORTED, 'no interpreted transform in this archive')
+    end
     if dsp.dirty then return post(dsp.EDIRTY, 'an attribute moved since commit()') end
     if cap == nil or trace == nil then return post(dsp.EARG, 'nil buffer') end
     if not span_ok() then return post(dsp.EARG, 'out.lowfreq is not below out.highfreq') end

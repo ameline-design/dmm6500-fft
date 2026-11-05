@@ -56,11 +56,28 @@ OUT = os.path.join(ROOT, 'FFT_Spectrum.tspa')
 # implementation of the same work, not a replacement for the names.
 #
 # It costs 24 KB of source, against the 83 KB that moving the image to base64 saved.
+#
+# tsp/fft_interp.tsp IS DELIBERATELY ABSENT, and that is the one module which is. It holds the
+# interpreted transform -- the window build, the interpolation tables, the butterflies, the
+# power pass and the peak interpolation -- and at 32768 samples that implementation is seconds
+# a frame with a table build of about 5.3 s in front of it, so it is not a fallback anyone
+# could use. dsp_lua.tsp tests for fftsa.fft_init before touching any of it: commit still
+# settles srclength for the caller about to acquire, dsp.spectrum posts EUNSUPPORTED, and both
+# cost models report zero rather than describing a transform that cannot run. start() refuses
+# outright when neither implementation is there, rather than running frames that post an event
+# each.
+#
+# tools/test_tsp.lua DOES load it, which is the point: the offline gates drive the real
+# reference implementation instead of a stub, so no coverage is traded for the saving.
 MODULES = ['tsp/fft_core.tsp', 'tsp/spectrum_ui.tsp',
            'tsp/spectrum_graph.tsp', 'tsp/native_link.tsp',
            'tsp/native_code.tsp', 'tsp/dsp_lua.tsp', 'tsp/spectrum_app.tsp']
 MODULES = [m for m in MODULES
            if m != 'tsp/native_code.tsp' or os.path.exists(os.path.join(ROOT, m))]
+# Asserted rather than left to the list above reading right: adding it back would ship an
+# implementation that cannot serve the sizes the app offers.
+assert 'tsp/fft_interp.tsp' not in MODULES, \
+    'tsp/fft_interp.tsp must not be packaged -- see the note above'
 
 # Panel icons: assets/<name>.png, embedded as their own loadimage block. The names are
 # NOT listed here -- script_images() reads them out of the modules' `fftsa.img_* = "name"`
@@ -91,7 +108,7 @@ MANIFEST = [
     # Identifies which tree is installed in MENU > Manage Apps, so it has to move with the
     # tree or an install cannot be told from the one it replaced. One decimal digit only,
     # because the field may be compared as a STRING, where "3.10" sorts below "3.9".
-    ('Version', '8.17'),
+    ('Version', '8.19'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was

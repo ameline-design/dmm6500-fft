@@ -107,16 +107,20 @@ end
 
 -- Every table, window and twiddle is sized from the selected power-of-two count.
 --
--- Two defaults, chosen between in start(). On the compiled path 512, 1024 and 2048 all run
--- at the same measured frame rate, because what sets it below 4096 is per-frame work that
--- does not depend on the count at all -- so 2048 is four times the frequency resolution for
--- nothing, 48.8 Hz bins against 195.3 at the 100 kS/s floor. The interpreted primitive does
--- scale with the count, and at 2048 it costs about four times what it does at 512, so that
--- is the count to open at when the compiled path will not be there.
-fftsa.n          = 512
+-- Two defaults, chosen between in start(). On the compiled path everything below 4096 runs
+-- at the same measured frame rate, because what sets it there is per-frame work independent
+-- of the count -- so 2048 is four times the resolution for nothing, 48.8 Hz bins against
+-- 195.3 at the 100 kS/s floor. The interpreted primitive does scale with the count, so 1024
+-- is what to open at when the compiled path will not be there.
+--
+-- 512 IS GONE and 32768 replaces it. 512 bought no frame rate over 1024 on the compiled
+-- path, which is the whole list below 4096. 32768 is the largest the arena can serve:
+-- dsp_plan_segs(32768, 1, FOURSTEP, 32736) is 26 segments against the 32 of DSPN_MAX_SEGS,
+-- and 65536 does not lay out at all. Six entries either way, which the option field needs.
+fftsa.n          = 1024
 fftsa.n_compiled = 2048
-fftsa.sample_counts = {512, 1024, 2048, 4096, 8192, 16384}
-fftsa.sample_labels = {"512", "1024", "2048", "4096", "8192", "16384"}
+fftsa.sample_counts = {1024, 2048, 4096, 8192, 16384, 32768}
+fftsa.sample_labels = {"1024", "2048", "4096", "8192", "16384", "32768"}
 
 -- Will the compiled path install on this instrument? What it needs is the blob in the
 -- archive, the sizes the generated module carries with it, and the memory interface the
@@ -372,6 +376,18 @@ end
 -- The only route to the interpreted primitive, so the attributes it reads cannot be left
 -- behind by a caller that forgot them. Every fallback in the frame goes through here.
 function fftsa.spectrum_interp(cap, buf)
+  -- THERE IS NOTHING TO FALL BACK TO. The archive ships no interpreted transform, so a
+  -- demotion from the compiled path is the end of the line: halt and say so once. Without
+  -- this the frame carries on, dsp.spectrum posts EUNSUPPORTED and then dsp.peak posts
+  -- "no spectrum yet" once per peak per frame, behind a panel that looks alive.
+  if fftsa.fft_init == nil then
+    if not fftsa.halted then
+      fftsa.halted = true
+      fftsa.lasterr = 'the compiled DSP stopped and this archive has no interpreted fallback'
+      fftsa.say('HALTED: ' .. fftsa.lasterr)
+    end
+    return nil
+  end
   fftsa.dsp_live_push()
   fftsa.dsp_window()
   return dsp.spectrum(cap, buf, nil)
@@ -405,14 +421,14 @@ end
 -- This is what nl.init is given, NOT fftsa.n: the arena is sized once per boot and
 -- nl.reinit re-plans inside it for every count at or below, which is what makes a sample
 -- count press cost one call instead of an install.
-fftsa.nl_nmax = 16384
+fftsa.nl_nmax = 32768
 
 -- The count the acquisition buffer's capacity is floored at. At nl_nmax one allocation
 -- serves every count, so the buffer's object identity never changes and the content scan
 -- that finds its storage -- a sweep of the whole heap window, seconds of ki.memread -- runs
--- once per boot rather than once per step up to a longer record. The price is 65,536
--- readings held for the life of the app, 1.6 MB of a 200 MB window, and it buys an Apply
--- that sweeps nothing at any count.
+-- once per boot rather than once per step up to a longer record. At nl_nmax of 32768 the
+-- price is 131,072 readings held for the life of the app, about 3.2 MB of a 200 MB window,
+-- and it buys an Apply that sweeps nothing at any count.
 fftsa.cap_floor_n = fftsa.nl_nmax
 
 -- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
@@ -2423,6 +2439,17 @@ function fftsa.start()
                   fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP,
                   fftsa.sg_maxpts)
     fftsa.nl_replan()
+  end
+  -- NO IMPLEMENTATION AT ALL is a refusal, not twenty error frames a second. The archive
+  -- ships no interpreted transform -- tsp/fft_interp.tsp is left out -- so if the compiled
+  -- path did not come up there is nothing to compute a spectrum with, and every frame would
+  -- post EUNSUPPORTED behind a panel that looks like it is working. nl_lasterr carries why
+  -- the install refused.
+  if fftsa.fft_init == nil
+     and (fftsa.nl == nil or not fftsa.nl.ready or not fftsa.nl_usable()) then
+    return fftsa.start_failed("the compiled DSP did not start and this archive has no "
+                              .. "interpreted fallback -- " .. tostring(fftsa.nl_lasterr)
+                              .. " -- power cycle the instrument and try again")
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
