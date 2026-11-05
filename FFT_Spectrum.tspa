@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.7
+-- $Version: 8.9
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -5692,6 +5692,16 @@ function fftsa.frame()
   -- timer period rounds up to a 50 ms tick, so a 60 ms frame and a 99 ms frame both display
   -- at 10 a second. Counted over a window and not per frame, because a rate from one
   -- interval dithers by a tick.
+  -- The DELIVERED interval between frames, which is the figure that says where the rate
+  -- actually goes. It is NOT frame_work: the firmware's timer and the display task both live
+  -- in the gap between frames, and the display task runs only while Lua is blocked. Measured
+  -- at 4096: the app armed 0.15 s and delivered 0.20 s with frame_work at 0.125, so 50 ms a
+  -- frame was being spent where frame_work cannot see it.
+  if fftsa.last_entry ~= nil then
+    local gap = entry - fftsa.last_entry
+    if fftsa.gap_peak == nil or gap > fftsa.gap_peak then fftsa.gap_peak = gap end
+  end
+  fftsa.last_entry = entry
   fftsa.fps_n = (fftsa.fps_n or 0) + 1
   if fftsa.fps_t0 == nil then fftsa.fps_t0 = entry end
   local span = os.clock() - fftsa.fps_t0
@@ -5699,6 +5709,19 @@ function fftsa.frame()
     fftsa.fps = fftsa.fps_n / span
     fftsa.fps_n, fftsa.fps_t0 = 0, os.clock()
     fftsa.fps_show = true
+    -- A CENSUS PER SAMPLE COUNT, kept in a bare global, because a socket command aborts the
+    -- running app: one statement returns a frozen snapshot of the last frame and the app is
+    -- dead after it, so a size sweep can neither be driven nor read from outside. The app
+    -- records its own instead -- change size on the panel, and one read afterwards gives the
+    -- whole curve. A formatted string so that read is a single print.
+    if FFTSA_CENSUS == nil then FFTSA_CENSUS = {} end
+    local ph = fftsa.ph
+    FFTSA_CENSUS[fftsa.n] = string.format(
+      'per=%.3f fps=%.2f gap=%.1f wp=%.1f wt=%.1f acq=%.1f spec=%.1f yld=%.1f nl=%s',
+      fftsa.period or 0, fftsa.fps or 0, 1000 * (fftsa.gap_peak or 0),
+      1000 * (fftsa.work_plain or 0), 1000 * (fftsa.work_tick or 0),
+      1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.yld or 0),
+      tostring(fftsa.nl_frame))
   end
   -- Re-arm from measured work: frame_estimate() is a model, and divided by the occupancy
   -- target an error of a few ms lands either side of a tick boundary, which is a 50 %
@@ -5745,6 +5768,16 @@ function fftsa.frame()
       -- work_peak remains the basis until a plain frame has been seen, which is the state
       -- in the first window after a size change.
       local want = fftsa.tick_period(fftsa.plain_peak or fftsa.work_peak)
+      -- CLOSED ON WHAT WAS DELIVERED, not only on what was computed. plain_peak is a
+      -- decaying window maximum, so it under-reports the worst frame and the period is armed
+      -- below what the instrument can turn around: measured at 4096, it armed 0.110 while
+      -- frames were arriving 0.153 apart, and at 8192 it armed 0.160 against 0.207. A period
+      -- shorter than the real turnaround does not raise the rate -- the tick is missed and
+      -- the whole period is lost -- so the delivered gap is a floor under the asking price.
+      if fftsa.gap_peak ~= nil then
+        local held = fftsa.tick_period(fftsa.gap_peak - fftsa.tick_idle)
+        if held > want then want = held end
+      end
       if want ~= fftsa.period then
         fftsa.period = want
         fftsa.arm(want)
@@ -5755,6 +5788,11 @@ function fftsa.frame()
       fftsa.work_peak = fftsa.frame_work
       fftsa.plain_peak = nil
       if not fftsa.ph_tick then fftsa.plain_peak = fftsa.frame_work end
+      -- The delivered gap decays with the work peaks and for the same reason: a size change
+      -- downwards has to be noticed, and a gap earned at the old count would hold the period
+      -- up for the life of the setting. Cleared HERE and not in the census above, which runs
+      -- once a second and would wipe it before this window closed.
+      fftsa.gap_peak = nil
       fftsa.work_seen = 0
     end
   end
@@ -6836,11 +6874,21 @@ end
 -- The 2.5 ms of slack prefers rate over idle. A tick is 50 ms, so holding the target to
 -- the last millisecond buys a fiftieth of a tick of idle and costs a whole tick of rate.
 fftsa.tick_idle = 0.020
+-- The period granularity, and the timer's own floor. The grid was 0.05 for both, which is
+-- what the firmware's minimum is, not what its resolution is -- so the period could only
+-- ever be a multiple of 50 ms and a frame needing 205 ms was armed at 250. A finer grid
+-- costs nothing and gives the loop below somewhere to land.
+fftsa.tick_grid = 0.010
+fftsa.tick_min  = 0.050
+
 function fftsa.tick_period(busy)
-  if busy == nil or busy <= 0 then return 0.05 end
-  local ticks = math.ceil((busy + fftsa.tick_idle) / 0.05 - 0.05)
+  if busy == nil or busy <= 0 then return fftsa.tick_min end
+  local g = fftsa.tick_grid
+  local ticks = math.ceil((busy + fftsa.tick_idle) / g - 0.05)
   if ticks < 1 then ticks = 1 end
-  return ticks * 0.05
+  local p = ticks * g
+  if p < fftsa.tick_min then p = fftsa.tick_min end
+  return p
 end
 
 -- The FIRST arm, before any frame has been timed. From here on frame() re-arms from the

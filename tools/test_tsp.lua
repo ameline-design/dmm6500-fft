@@ -5022,29 +5022,36 @@ check('a zoom well above the first bin keeps its own low limit', (function()
   return kept, string.format('pinned %g..%g, wanted 8000..16000', lo, hi)
 end)())
 
--- The 0.05 s tick is a cliff: the idle floor turns an 80.4 ms frame into 100.4 ms, and a
--- tick either side of that is 0.10 s and 10 fps against 0.15 and 6.7. Pinned at the
--- boundary in both directions so the rounding cannot drift unnoticed.
-check('tick_period rounds up to the 0.05 s tick, and the boundary is exact', (function()
-  -- near(), not equality: ticks * 0.05 is 0.15000000000000002 where the literal 0.15 is
-  -- 0.1499999999999999944, so == fails on values that are the same tick count.
+-- THE GRID IS 10 ms AND THE FLOOR IS 50 ms, and those are two different numbers. They used
+-- to be the same one: the period could only be a multiple of 0.05, so a frame needing 205 ms
+-- was armed at 250 and lost a fifth of its rate to rounding alone. 0.05 is the timer's
+-- minimum, which is not its resolution. Pinned either side of a boundary so the rounding
+-- cannot drift unnoticed, and at the floor so a short frame cannot ask for less than the
+-- timer will take.
+check('tick_period rounds up to the 10 ms grid and never below the 50 ms floor', (function()
+  -- near(), not equality: ticks * grid does not reproduce the literal exactly.
   --
-  -- 80.1 ms is the measured worst frame at 512 samples and must still give two ticks --
-  -- that is the whole point of the slack. 85 ms is past it and must give three, which is
-  -- what stops the slack from quietly becoming a rule that always rounds down.
+  -- The slack is 0.5 ms on this grid -- a twentieth of a 10 ms step, where it was a
+  -- twentieth of a 50 ms one -- so 80.1 ms still fits the 0.10 period it would have had
+  -- without the idle floor, and 81 ms does not. Both are pinned: that pair is what stops the
+  -- slack from quietly becoming a rule that always rounds down.
   --
-  -- 40 ms gives two ticks, not one: one tick would leave it 10 ms of idle, under the 12 ms
-  -- measured as too little to dispatch a press. The fifth-of-the-frame rule gave one.
+  -- Everything at or under 30 ms of work lands on the floor, because 30 + 20 of idle is
+  -- exactly it.
   return near(fftsa.tick_period(0.080), 0.10, 1e-9)
          and near(fftsa.tick_period(0.0801), 0.10, 1e-9)
-         and near(fftsa.tick_period(0.085), 0.15, 1e-9)
-         and near(fftsa.tick_period(0.040), 0.10, 1e-9)
+         and near(fftsa.tick_period(0.081), 0.11, 1e-9)
+         and near(fftsa.tick_period(0.085), 0.11, 1e-9)
+         and near(fftsa.tick_period(0.040), 0.06, 1e-9)
          and near(fftsa.tick_period(0.029), 0.05, 1e-9)
-         and near(fftsa.tick_period(0), 0.05, 1e-9),
-         string.format('80 ms -> %.2f, 80.1 -> %.2f, 85 -> %.2f, 40 -> %.2f, 29 -> %.2f',
+         and near(fftsa.tick_period(0.005), 0.05, 1e-9)
+         and near(fftsa.tick_period(0), 0.05, 1e-9)
+         and near(fftsa.tick_period(0.185), 0.21, 1e-9),
+         string.format('80 ms -> %.2f, 80.1 -> %.2f, 85 -> %.2f, 40 -> %.2f, 29 -> %.2f,'
+                       .. ' 185 -> %.2f',
                        fftsa.tick_period(0.080), fftsa.tick_period(0.0801),
                        fftsa.tick_period(0.085), fftsa.tick_period(0.040),
-                       fftsa.tick_period(0.029))
+                       fftsa.tick_period(0.029), fftsa.tick_period(0.185))
 end)())
 
 -- Why the rule is an amount and not a fraction. What the idle is for -- dispatching a press
@@ -5052,6 +5059,41 @@ end)())
 -- period must leave at least fftsa.tick_idle free at every frame length, less the slack it
 -- is allowed to spend on rate. A fifth-of-the-frame rule held back 85 ms at the long counts
 -- and under a tenth of this floor at the short ones, which is the wrong way round.
+-- THE PERIOD IS FLOORED BY WHAT WAS DELIVERED, not only by what was computed. plain_peak is
+-- a decaying window maximum, so it under-reports the worst frame: measured on 1.7.17a at
+-- 4096 the app armed 0.110 while frames arrived 0.153 apart, and at 8192 it armed 0.160
+-- against 0.207. Arming under the real turnaround does not raise the rate -- the tick is
+-- missed and a whole period is lost -- which is what made 16384 wander between 3.0 and 3.8
+-- fps. The gap is therefore a floor under the asking price.
+--
+-- Driven through the real frame path, with os.clock advanced by a stub so the gap is a known
+-- quantity rather than whatever the host happened to take.
+check('a delivered gap longer than the armed period raises the period', (function()
+  fftsa.start()
+  local realclock = os.clock
+  local t, step = 0, 0.30          -- 300 ms between frame entries, far over any armed period
+  os.clock = function()
+    t = t + 0.001
+    return t
+  end
+  -- Nine frames: one more than the eight-frame re-arm window, each entered a step apart.
+  local i
+  for i = 1, 9 do
+    t = t + step
+    fftsa.frame()
+  end
+  local armed, gap = fftsa.period, fftsa.gap_peak
+  os.clock = realclock
+  -- The period must have been pulled up towards the delivered gap rather than sitting at the
+  -- work figure, which under a stubbed clock is a few milliseconds.
+  local ok = armed ~= nil and armed >= 0.25
+  local why = string.format('armed=%s after 9 frames %.0f ms apart, gap_peak=%s',
+                            tostring(armed), 1000 * step, tostring(gap))
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
+end)())
+
 check('every frame length keeps the idle floor, and the long ones do not overpay',
       (function()
   local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}
