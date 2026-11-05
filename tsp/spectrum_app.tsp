@@ -930,6 +930,30 @@ function fftsa.frame_body()
   -- frame of tens of milliseconds; fftsa.phases() formats them.
   local ph, pk = fftsa.ph, fftsa.ph_peak
   ph.acq  = t_b - t_a
+  -- acq split by whether the PREVIOUS frame carried the one-a-second display block. The
+  -- display task runs only while Lua is blocked and digitize.read is the longest block in the
+  -- frame, so if painting is being absorbed by acq it shows up here. The previous frame, not
+  -- this one: the display block runs after acq within a frame.
+  -- Per sample count, or the means mix the sizes and say nothing. Reset when n moves.
+  if fftsa.acq_for ~= fftsa.n then
+    fftsa.acq_for = fftsa.n
+    fftsa.acq_after_tick, fftsa.acq_after_plain = nil, nil
+    fftsa.acq_tick_n, fftsa.acq_tick_s = 0, 0
+    fftsa.acq_plain_n, fftsa.acq_plain_s = 0, 0
+  end
+  if fftsa.prev_tick then
+    if fftsa.acq_after_tick == nil or ph.acq > fftsa.acq_after_tick then
+      fftsa.acq_after_tick = ph.acq
+    end
+    fftsa.acq_tick_n = (fftsa.acq_tick_n or 0) + 1
+    fftsa.acq_tick_s = (fftsa.acq_tick_s or 0) + ph.acq
+  else
+    if fftsa.acq_after_plain == nil or ph.acq > fftsa.acq_after_plain then
+      fftsa.acq_after_plain = ph.acq
+    end
+    fftsa.acq_plain_n = (fftsa.acq_plain_n or 0) + 1
+    fftsa.acq_plain_s = (fftsa.acq_plain_s or 0) + ph.acq
+  end
   ph.spec = t_c - t_b
   ph.mark = t_d - t_c
   ph.tick = t_e - t_d
@@ -943,6 +967,7 @@ function fftsa.frame_body()
   -- down. Set unconditionally: it costs one store and it means the flag can be raised from a
   -- socket between launches without the app having to be rebuilt for it.
   fftsa.froze = true
+  fftsa.prev_tick = fftsa.ph_tick
 end
 
 -- The per-phase costs as one line, for a probe. Milliseconds, last frame then the worst.
@@ -1064,6 +1089,15 @@ function fftsa.frame()
       1000 * (fftsa.work_plain or 0), 1000 * (fftsa.work_tick or 0),
       1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.yld or 0),
       tostring(fftsa.nl_frame))
+    -- The acq split, where a paint absorbed by the capture would show.
+    local pn, tn = fftsa.acq_plain_n or 0, fftsa.acq_tick_n or 0
+    FFTSA_ACQ = string.format(
+      'n=%d after-plain mean=%.1f peak=%.1f (%d) | after-tick mean=%.1f peak=%.1f (%d)',
+      fftsa.n,
+      1000 * (pn > 0 and (fftsa.acq_plain_s / pn) or 0),
+      1000 * (fftsa.acq_after_plain or 0), pn,
+      1000 * (tn > 0 and (fftsa.acq_tick_s / tn) or 0),
+      1000 * (fftsa.acq_after_tick or 0), tn)
   end
   -- Re-arm from measured work: frame_estimate() is a model, and divided by the occupancy
   -- target an error of a few ms lands either side of a tick boundary, which is a 50 %
