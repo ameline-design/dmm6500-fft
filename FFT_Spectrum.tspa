@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.14
+-- $Version: 8.15
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -5523,9 +5523,9 @@ function fftsa.frame_body()
         --   the GUI's ring repaints the WHOLE widget, axes included, once a frame -- far
         --   worse flicker, and no faster, since a rebind re-pins the axes.
         --
-        -- What is left is clearing less often: the buffer holds 680 and a frame writes 255,
-        -- so every second frame could skip the clear. Untried, and it would draw the last
-        -- two spectra overlaid.
+        -- Clearing less often was the third option -- the buffer holds 680 and a frame
+        -- writes 255 -- and it is REFUSED: it halves the dropouts by drawing the last two
+        -- spectra overlaid, and a doubled trace is not wanted. So the dropout stays.
         local wr = buffer.write.reading
         local tb, db, hz = fftsa.sg_buf, rd.db, rd.hz
         local i
@@ -5797,9 +5797,18 @@ function fftsa.frame()
       --
       -- The deadband: on a 10 ms grid every step is a timer delete and create, so a
       -- converged period must stop re-arming. The old 50 ms grid gave that for free.
+      -- ASYMMETRIC, biased towards rate. Arming a step short costs an occasional missed
+      -- tick; arming a step long costs every frame. At 4096 the work straddles the 0.12/0.15
+      -- boundary -- acq alone varies 42 to 74 ms -- so a symmetric deadband chased the jitter
+      -- and the rate swung between 8.2 and 6.7 fps. Dropping takes one grid step, raising
+      -- takes tick_rise, so it settles at the fast end and still follows a size change, which
+      -- moves the period far more than tick_rise.
       local move = want - (fftsa.period or 0)
-      if move < 0 then move = -move end
-      if fftsa.period == nil or move >= fftsa.tick_rearm then
+      local need = fftsa.tick_rise
+      if move < 0 then
+        move, need = -move, fftsa.tick_grid
+      end
+      if fftsa.period == nil or move >= need then
         fftsa.period = want
         fftsa.arm(want)
       end
@@ -6906,6 +6915,9 @@ fftsa.tick_min  = 0.050
 -- deadband as a side effect of being coarse. On a 10 ms grid it has to be explicit, or a
 -- period that dithers by one step re-arms for the life of the app.
 fftsa.tick_rearm = 0.020
+-- How far the period must RISE before it is re-armed, against one grid step to fall. Wider
+-- than the jitter it is meant to ignore and narrower than a size change.
+fftsa.tick_rise = 0.050
 
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return fftsa.tick_min end
