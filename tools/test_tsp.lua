@@ -1223,21 +1223,49 @@ check('idx_to_range tolerates 1-based', fftsa.idx_to_range(1) == 0.1)
 check('idx_to_range tolerates the label string', fftsa.idx_to_range('10 V') == 10)
 check('idx_to_range tolerates 0-based', fftsa.idx_to_range(0) == 0.1)
 check('idx_to_range clamps out-of-range', fftsa.idx_to_range(99) == 10)
--- THE RATE RULE IS DIRECTIONAL, and that is an anti-aliasing requirement rather
--- than a convenience. There is no anti-alias filter, so a rate whose Nyquist falls
--- below what is on the wire folds it into the display. Measured on hardware: a pure
--- 21.1 kHz sine over a 0-7 kHz span at 20 kS/s drew one 4.51 V peak at 1.100 kHz,
--- which is 21100 reduced mod 20000, with nothing on screen to say so. Raising the
--- rate can only remove aliases; lowering it is what creates them.
-check('zooming in never lowers the sample rate below the floor', (function()
+-- A narrow span lowers the rate to narrow the bin, so aliasing is reachable from the
+-- panel and the declared ceilings are the whole defence. What they defend against,
+-- measured on hardware: a pure 21.1 kHz sine over a 0-7 kHz span at 20 kS/s drew one
+-- 4.51 V peak at 1.100 kHz, which is 21100 reduced mod 20000, with nothing on screen
+-- to say so.
+check('a narrow span lowers the rate to the floor and no further', (function()
   local worst, at = 1e12, 0
-  for _, f in ipairs({2000, 3000, 5000, 10000, 20000, 25000, 40000, 50000}) do
+  for _, f in ipairs({2000, 3000, 5000, 10000, 12000, 20000, 25000, 40000, 50000}) do
     local fs = fftsa.pick_fs(f)
     if fs < worst then worst, at = fs, f end
   end
-  return worst >= fftsa.fs_min,
+  return worst == fftsa.fs_min and fftsa.pick_fs(fftsa.fhi_min) == fftsa.fs_min,
          string.format('lowest %g S/s at a %g Hz stop, floor %g', worst, at,
                        fftsa.fs_min)
+end)())
+-- Two parallel tables, so the gate is that they cannot drift apart. A ceiling above its
+-- own Nyquist would alias by construction, whatever span asked for it.
+check('every rate ceiling is at or under that rate Nyquist', (function()
+  local r, c = fftsa.rates, fftsa.rate_fhi
+  local n = table.getn(r)
+  if table.getn(c) ~= n then
+    return false, string.format('%d rates, %d ceilings', n, table.getn(c))
+  end
+  for i = 1, n do
+    if c[i] * 2 > r[i] then
+      return false, string.format('%g S/s claims a %g Hz stop', r[i], c[i])
+    end
+    if i > 1 and (r[i] <= r[i - 1] or c[i] <= c[i - 1]) then
+      return false, 'entry ' .. i .. ' does not ascend'
+    end
+  end
+  return true, n .. ' rates, every ceiling at or under Nyquist'
+end)())
+check('the rate steps at the declared stops, which are inclusive', (function()
+  local want = {{12000, 25000}, {12001, 50000}, {25000, 50000}, {25001, 100000}}
+  for _, p in ipairs(want) do
+    local got = fftsa.pick_fs(p[1])
+    if got ~= p[2] then
+      return false, string.format('a %g Hz stop picked %g S/s, wanted %g',
+                                  p[1], got, p[2])
+    end
+  end
+  return true, '12 kHz takes 25 kS/s and 25 kHz takes 50 kS/s, both inclusive'
 end)())
 check('the rate never decreases as the span widens', (function()
   local prev, ok = 0, true
@@ -1248,40 +1276,71 @@ check('the rate never decreases as the span widens', (function()
   end
   return ok
 end)())
-check('widening past the floor Nyquist does raise the rate',
-      fftsa.pick_fs(50000) == fftsa.fs_min
-      and fftsa.pick_fs(200000) > fftsa.fs_min,
-      string.format('%g at 50 kHz, %g at 200 kHz', fftsa.pick_fs(50000),
-                    fftsa.pick_fs(200000)))
 check('every settable span is covered by its own Nyquist', (function()
-  local bad = 0
-  for f = fftsa.fhi_min, fftsa.fhi_max, 1000 do
-    if fftsa.pick_fs(f) / 2 < f then bad = bad + 1 end
+  local bad, first = 0, nil
+  -- 1 Hz steps where the slow rates live, so the two new thresholds are visited rather
+  -- than stepped over; the stride above only has to cross the three fast ceilings.
+  for f = fftsa.fhi_min, 30000 do
+    if fftsa.pick_fs(f) / 2 < f then bad, first = bad + 1, first or f end
   end
-  return bad == 0, bad .. ' span(s) past Nyquist'
+  for f = 30000, fftsa.fhi_max, 1000 do
+    if fftsa.pick_fs(f) / 2 < f then bad, first = bad + 1, first or f end
+  end
+  return bad == 0, bad .. ' span(s) past Nyquist, first at ' .. tostring(first)
 end)())
 check('the widest span is the fastest rate Nyquist, so no bandwidth is thrown away',
       fftsa.fhi_max * 2 == fftsa.rates[table.getn(fftsa.rates)],
       string.format('fhi_max %g, fastest %g', fftsa.fhi_max,
                     fftsa.rates[table.getn(fftsa.rates)]))
-check('acquisition is short at every rate, so the panel keeps its slice', (function()
-  local worst = 0
-  for i = 1, table.getn(fftsa.rates) do
-    local a = fftsa.n / fftsa.rates[i]
-    if a > worst then worst = a end
+-- The capture is no longer a small slice of a frame: 32768 samples at 25 kS/s is 1.31 s,
+-- which on its own outruns the 2 s floor under the busy guard. So the property asserted is
+-- that the estimate busy_max is built from carries the capture at every count and rate.
+check('the frame estimate carries the capture, so the busy guard clears a real frame',
+(function()
+  local worst, at = 0, ''
+  for i = 1, table.getn(fftsa.sample_counts) do
+    local n = fftsa.sample_counts[i]
+    for j = 1, table.getn(fftsa.rates) do
+      local fs = fftsa.rates[j]
+      local acq = n / fs
+      local est = fftsa.frame_estimate(n, fs)
+      if est < acq - 1e-12 then
+        return false, string.format('N=%d at %g S/s: a %.3f s estimate under a %.3f s '
+                                    .. 'capture', n, fs, est, acq)
+      end
+      -- The expression apply() arms, so a change to either half is caught here.
+      local guard = math.max(2.0, 3.0 * est)
+      if guard <= acq then
+        return false, string.format('N=%d at %g S/s: a %.2f s guard under a %.3f s '
+                                    .. 'capture', n, fs, guard, acq)
+      end
+      if acq > worst then worst, at = acq, string.format('N=%d at %g S/s', n, fs) end
+    end
   end
-  -- Derived, not pinned: the worst case is the smallest count the options offer at the
-  -- floor rate, which doubled to 10.24 ms when 512 left the list. Both halves asserted --
-  -- that the floor rate is the worst, and that it is still a small slice of a frame.
-  local bound = fftsa.n / fftsa.fs_min
-  return worst <= bound + 1e-12 and bound < 0.015,
-         string.format('%.1f ms worst, bound %.1f ms', worst * 1000, bound * 1000)
+  return true, string.format('worst capture %.2f s, %s', worst, at)
 end)())
-check('the finest bin width is the floor rate, and it is the default span', (function()
-  return fftsa.pick_fs(fftsa.fhi) == fftsa.fs_min
-         and fftsa.fs_min / fftsa.n < 200,
-         string.format('%.2f Hz bins at the default %g Hz stop',
-                       fftsa.pick_fs(fftsa.fhi) / fftsa.n, fftsa.fhi)
+check('the floor rate quarters the bin width the default span gives', (function()
+  local slow, fast = fftsa.pick_fs(fftsa.fhi_min), fftsa.pick_fs(fftsa.fhi)
+  return slow * 4 == fast and slow / fftsa.n < 200,
+         string.format('%.2f Hz bins at a %g Hz stop against %.2f at the default %g',
+                       slow / fftsa.n, fftsa.fhi_min, fast / fftsa.n, fftsa.fhi)
+end)())
+-- Without this the feature is inert: a zoom that does not report a changed plan takes the
+-- axis-only path, and the digitizer keeps the rate it had.
+check('crossing a rate ceiling forces a re-plan, and a zoom inside one does not',
+(function()
+  local keep = fftsa.fhi
+  for _, p in ipairs({{50000, 20000}, {20000, 8000}, {8000, 50000}}) do
+    fftsa.fhi = p[1]
+    if not fftsa.plan_changed(p[2]) then
+      fftsa.fhi = keep
+      return false, string.format('%g to %g Hz reported no re-plan', p[1], p[2])
+    end
+  end
+  fftsa.fhi = 50000
+  local inert = fftsa.plan_changed(30000)
+  fftsa.fhi = keep
+  return not inert, 'a 50 kHz to 30 kHz zoom stays inside 100 kS/s'
 end)())
 
 -- ---------- lifecycle: the object-lifetime invariant ----------
@@ -2576,17 +2635,19 @@ check('and asks for no re-plan, the rate in force already covering it',
       'pending=' .. tostring(fftsa.retune_pending) .. ' rate='
       .. tostring(dmm.digitize.samplerate) .. '/' .. tostring(RATE0))
 -- The rate ladder is the whole of it: a stop the rate in force already covers changes which
--- bins are plotted and nothing else. Asked of plan_changed directly, which is pure, where
--- provoking it through a frame would pay for a capture to assert an arithmetic answer.
+-- bins are plotted and nothing else, while one needing a different rate -- in either
+-- direction -- needs the digitizer re-planned. Asked of plan_changed directly, which is
+-- pure, where provoking it through a frame would pay for a capture to assert an arithmetic
+-- answer.
 check('a re-plan is asked for only when the stop crosses the rate ladder', (function()
   local lo0, hi0 = fftsa.flo, fftsa.fhi
   fftsa.flo, fftsa.fhi = 10, 50000
   local samerate = fftsa.plan_changed(49000)     -- inside 100 kS/s
-  local steps = fftsa.plan_changed(120000)       -- needs 500 kS/s
-  local down = fftsa.plan_changed(4000)          -- still 100 kS/s, the floor
+  local up = fftsa.plan_changed(120000)          -- needs 500 kS/s
+  local down = fftsa.plan_changed(4000)          -- drops to 25 kS/s for the finer bin
   fftsa.flo, fftsa.fhi = lo0, hi0
-  return samerate == false and steps == true and down == false,
-         string.format('49k=%s 120k=%s 4k=%s', tostring(samerate), tostring(steps),
+  return samerate == false and up == true and down == true,
+         string.format('49k=%s 120k=%s 4k=%s', tostring(samerate), tostring(up),
                        tostring(down))
 end)())
 -- The form is the other half of "the range of the FFT". A gesture the Options fields never
@@ -4602,6 +4663,8 @@ fftsa.show_main()      -- field left at a default the hardware was never given
 print('\nFFT sample selection and preview (real code)')
 check('sample-rate labels use SI prefixes', (function()
   return fftsa.sample_rate_text(512) == '512 S/s'
+         and fftsa.sample_rate_text(25000) == '25 kS/s'
+         and fftsa.sample_rate_text(50000) == '50 kS/s'
          and fftsa.sample_rate_text(100000) == '100 kS/s'
          and fftsa.sample_rate_text(200000) == '200 kS/s'
          and fftsa.sample_rate_text(500000) == '500 kS/s'
@@ -4615,7 +4678,9 @@ check('all count/rate combinations preview bin spacing and record duration', (fu
     display.setvalue(fftsa.opt_n, i)
     for j = 1, table.getn(fftsa.rates) do
       local fs = fftsa.rates[j]
-      display.setvalue(fftsa.opt_fhi, fs / 2)
+      -- The stop that rate declares, not its Nyquist: 25 kS/s stops at 12 kHz, so a
+      -- Nyquist stop here would preview the rate above it.
+      display.setvalue(fftsa.opt_fhi, fftsa.rate_fhi[j])
       fftsa.options_preview()
       local text = obj_at(fftsa.opt_info).text
       if string.find(text, 'fs ' .. fftsa.sample_rate_text(fs), 1, true) == nil
@@ -4653,8 +4718,14 @@ check('preview and Apply share stop-frequency clamping', (function()
   local low = obj_at(fftsa.opt_info).text
   display.setvalue(fftsa.opt_fhi, fftsa.fhi_max * 2)
   fftsa.options_preview()
-  return string.find(low, 'fs 100 kS/s', 1, true) ~= nil
-         and string.find(obj_at(fftsa.opt_info).text, 'fs 1 MS/s', 1, true) ~= nil
+  local high = obj_at(fftsa.opt_info).text
+  -- Derived: each end clamps to its own field's limit and then takes whatever rate the
+  -- ladder gives it, which a literal would pin to one ladder.
+  local lowfs = fftsa.sample_rate_text(fftsa.pick_fs(fftsa.fhi_min))
+  local highfs = fftsa.sample_rate_text(fftsa.pick_fs(fftsa.fhi_max))
+  return string.find(low, 'fs ' .. lowfs, 1, true) ~= nil
+         and string.find(high, 'fs ' .. highfs, 1, true) ~= nil,
+         string.format('[%s] wanted %s | [%s] wanted %s', low, lowfs, high, highfs)
 end)())
 check('Cancel discards a pending sample-count edit', (function()
   local n = fftsa.n
@@ -5512,11 +5583,13 @@ end)())
 -- one size and not at the other. The match is on the warning's own words: the settings
 -- line always carries a bin WIDTH, so a bare 'bin' matches either way.
 check('the legend bin count follows a resize in the same Apply', (function()
-  -- Narrow enough that the SMALLEST count the list offers still holds only a bin or two:
-  -- at 1024 a 501 Hz window already holds five and the message does not fire, so the span
-  -- has to follow the list down rather than stay where 512 put it.
+  -- Narrow enough that the smallest count the list offers still holds only a bin or two,
+  -- derived because the bin width follows both the list and the rate: a stop near 2 kHz
+  -- takes the floor rate, where the smallest count gives 24.41 Hz bins and a window wide
+  -- enough to hold five would not fire the message at either size.
+  local w = 1.5 * fftsa.fs_min / fftsa.sample_counts[1]
   display.setvalue(fftsa.opt_flo, 1999)
-  display.setvalue(fftsa.opt_fhi, 2100)
+  display.setvalue(fftsa.opt_fhi, 1999 + w)
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
   local atsmall = fftsa.sg_xunit_text()

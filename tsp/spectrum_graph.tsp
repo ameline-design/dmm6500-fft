@@ -217,7 +217,7 @@ function fftsa.sg_xunit_text()
   local t = string.format("%d pts   %s   %s", fftsa.n or 0,
                           tostring(fftsa.opt_info_text(fftsa.fs, fftsa.n)),
                           tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]))
-  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at 195.3 Hz bins: the
+  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at any bin width: the
   -- trace is a dot, five peak rows read ---, and this count is the only thing that says
   -- why. The width is already in the line, so the count alone is enough.
   local b = fftsa.binhz

@@ -170,22 +170,32 @@ drag that has not yet been adopted snaps back instead. Pressing it open settles 
 span already in force stays in force until something is dragged.
 
 **What a retune costs depends on whether the sample rate has to change.** The digitizer runs at the
-lowest of 100 k, 200 k, 500 k and 1 MS/s whose Nyquist covers the stop frequency, so:
+slowest rate whose declared stop frequency covers the span:
+
+| stop frequency | rate | bin at 2048 samples | capture at 2048 |
+|---|---|---|---|
+| up to 12 kHz | 25 kS/s | 12.2 Hz | 82 ms |
+| up to 25 kHz | 50 kS/s | 24.4 Hz | 41 ms |
+| up to 50 kHz | 100 kS/s | 48.8 Hz | 20 ms |
+| up to 100 kHz | 200 kS/s | 97.7 Hz | 10 ms |
+| up to 250 kHz | 500 kS/s | 244.1 Hz | 4 ms |
+| up to 500 kHz | 1 MS/s | 488.3 Hz | 2 ms |
+
+The two slow rates are there for resolution: a 12 kHz stop at 25 kS/s gives a bin width that a
+100 kS/s span would need four times the samples to reach. What it costs is the capture column, and
+aliasing — see *Aliasing* below, which matters most at these two rates.
 
 - A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
-  bins are captured already. Note that zooming in gives more plot columns per bin, not finer
-  resolution: the bin width is the rate over the sample count, and neither has changed. (With the
-  **band-pass on** it can buy resolution, by decimating harder — see *Band-Pass*.)
-- Taking the stop past 50 kHz, 100 kHz or 250 kHz crosses a rate step, and the app re-plans between
-  frames. The settings line reads `retuning to ... Hz` while it reconfigures the digitizer and takes
+  bins are captured already, and zooming in there gives more plot columns per bin rather than
+  finer resolution.
+- Crossing a ceiling in the table re-plans the digitizer, in either direction, between frames. The
+  settings line reads `retuning to ... Hz` while it reconfigures the digitizer and takes
   one capture. The window and interpolation tables are **not** rebuilt: they depend only on the sample
-  count and the window, and a drag changes neither — so the pause is one capture (5 ms at 512 samples,
-  164 ms at 16,384) and one axis write, rather than that plus the table rebuild — 0.163 ms a sample,
-  which is 83 ms at 512 samples and 2.7 s at 16,384. With the **band-pass on** a change re-plans
-  whenever a filter is actually in the path, its cutoff being derived from the stop frequency; at a
-  span too wide to decimate there is no filter, and the rate alone decides.
+  count and the window, and a drag changes neither — so the pause is one capture (20 ms at 2048
+  samples and 100 kS/s, 1.31 s at 32,768 and 25 kS/s) and one axis write, rather than that plus the
+  table rebuild — 0.163 ms a sample, which is 167 ms at 1024 samples and 5.3 s at 32,768.
 
-Note that the **default stop of 50 kHz sits exactly on the first rate step**, so the first drag to
+Note that the **default stop of 50 kHz sits exactly on a rate step**, so the first drag to
 the right from a fresh start re-plans: 55 kHz needs 200 kS/s, which doubles the bin width at the same
 sample count. The settings line reports the new rate and bin spacing when it comes back. Dragging
 back and forth across a step re-plans each way; staying on one side of it does not.
@@ -228,7 +238,7 @@ works either way.
 | Field | |
 |---|---|
 | Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. The peak table has its own floor two or three bins up — see *The lowest frequency the table reports*. |
-| Stop Freq | Top of the display, 2 kHz to 500 kHz. Zooming in does not change the sample rate; widening past 50 kHz raises it. |
+| Stop Freq | Top of the display, 2 kHz to 500 kHz. It sets the sample rate, and so the bin width: at or below 12 kHz the digitizer runs at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
@@ -347,22 +357,24 @@ which is usually the worse trade.
 There is no anti-alias filter in front of the digitizer. Anything above half the sample rate folds
 back into the display, at full amplitude, looking exactly like a tone that is there.
 
-Measured: a pure 21.1 kHz sine, with the sample rate chosen from a 0 to 7 kHz span, drew one 4.5135 V
-peak at **1.100 kHz** — 21100 reduced mod 20000. The amplitude was right to four digits. Nothing on
-the screen said the frequency was not.
+Measured on this instrument: a pure 21.1 kHz sine digitized at 20 kS/s drew one 4.5135 V peak at
+**1.100 kHz** — 21100 reduced mod 20000. The amplitude was right to four digits. Nothing on the
+screen said the frequency was not.
 
-That is why zooming in no longer lowers the sample rate. The span selects which bins are drawn and
-leaves acquisition alone, so a tone outside the view is excluded rather than folded into it.
+**A narrow span is the exposed case**, because a narrow span is what lowers the sample rate. A stop
+at or below 25 kHz runs the digitizer at 50 kS/s and a stop at or below 12 kHz runs it at 25 kS/s —
+that is what buys the finer bins, and it is also what brings the folding frequency down into the
+range of ordinary signals. The same 21.1 kHz tone viewed over a 10 kHz span, at 25 kS/s, lands at
+3.9 kHz.
 
-**Band-Pass is the one thing that reaches this**, and only partly: it filters digitally, so it can
-remove what the digitizer has sampled honestly but not what the ADC already folded. See the next
-section.
+**Nothing in the instrument can filter it out first.** The digitize aperture is the only analog
+averaging available, it clamps at 10 µs, and a 10 µs boxcar first nulls at 100 kHz — so it
+attenuates nothing near a 12.5 kHz folding frequency. A longer aperture would not help either: at
+the whole sample interval it costs 23 % of the amplitude in band, measured.
 
-**Folding above 50 kHz remains** with Band-Pass off, because it is the missing filter rather than the
-rate. At the
-default span a 63 kHz tone appears at 37 kHz and an 84 kHz tone at 16 kHz. Two ways to tell an alias
-from a tone: widen the span, and a real tone stays put while an alias moves; or change the signal and
-watch which peak follows.
+Two ways to tell an alias from a tone: widen the span, and a real tone stays put while an alias
+moves; or change the signal and watch which peak follows. At the default 50 kHz span a 63 kHz tone
+appears at 37 kHz and an 84 kHz tone at 16 kHz.
 
 ## Band-Pass
 
@@ -536,13 +548,14 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 
 ## Limits
 
-- **Bin width is the sample rate divided by the selected sample count**, and the sample rate is
-  100 kS/s for any span up to 50 kHz. At 512 samples bins are 195.3 Hz; at the default 2048 they are
-  48.8 Hz; at 16384 they are
-  6.10 Hz. **Zooming in alone does not make them finer**; increase FFT Samples instead.
-- **A span wider than 50 kHz raises the rate** and coarsens the bins with it. At 512 samples:
-  200 kS/s to 100 kHz (390.6 Hz bins), 500 kS/s to 250 kHz (976.6 Hz), 1 MS/s to 500 kHz (1953 Hz).
-  Divide all three by 32 at 16384 samples. 500 kHz is the highest tone the instrument can show.
+- **Bin width is the sample rate divided by the selected sample count**, so either knob moves it.
+  At 2048 samples and 100 kS/s bins are 48.8 Hz; at 32768 and 25 kS/s they are **0.76 Hz**, which is
+  the finest the app reaches.
+- **The span sets the rate**, so zooming in below 25 kHz or 12 kHz does make the bins finer — see the
+  rate table under *Gestures*. It costs capture time in proportion, and it brings the folding
+  frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
+- **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
+  tone the instrument can show.
 - **10 frames a second up to 2048 samples, and 4 at 16384.** The firmware's shortest timer period is
   0.05 s and a tick arriving mid-frame is dropped, so the rate can only be `1 / (0.05 * k)` -- a
   ladder of 20, 10, 6.67, 5 fps and on down. The app times its own frames and picks the smallest

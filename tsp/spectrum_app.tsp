@@ -109,14 +109,13 @@ end
 --
 -- Two defaults, chosen between in start(). On the compiled path everything below 4096 runs
 -- at the same measured frame rate, because what sets it there is per-frame work independent
--- of the count -- so 2048 is four times the resolution for nothing, 48.8 Hz bins against
--- 195.3 at the 100 kS/s floor. The interpreted primitive does scale with the count, so 1024
--- is what to open at when the compiled path will not be there.
+-- of the count -- so 2048 is twice the resolution of 1024 for nothing, 48.8 Hz bins against
+-- 97.7 at 100 kS/s. The interpreted primitive does scale with the count, so 1024 is what to
+-- open at when the compiled path will not be there.
 --
--- 512 IS GONE and 32768 replaces it. 512 bought no frame rate over 1024 on the compiled
--- path, which is the whole list below 4096. 32768 is the largest the arena can serve:
--- dsp_plan_segs(32768, 1, FOURSTEP, 32736) is 26 segments against the 32 of DSPN_MAX_SEGS,
--- and 65536 does not lay out at all. Six entries either way, which the option field needs.
+-- 32768 is the largest the arena can serve: dsp_plan_segs(32768, 1, FOURSTEP, 32736) is 26
+-- segments against the 32 of DSPN_MAX_SEGS, and 65536 does not lay out at all. Six entries
+-- either way, which the option field needs.
 fftsa.n          = 1024
 fftsa.n_compiled = 2048
 fftsa.sample_counts = {1024, 2048, 4096, 8192, 16384, 32768}
@@ -145,9 +144,9 @@ fftsa.flomin  = 10          -- floor for the start frequency (Hz)
 fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
 -- Nyquist at the fastest rate, so this is the widest view the hardware can give.
--- The low end is not a hardware limit: zooming in does not change the bin width, so
--- 2 kHz is already down to about ten bins across the plot and narrower is a handful
--- of points.
+-- The low end is where the rate ladder runs out: 2 kHz already takes the slowest rate,
+-- so a narrower stop would buy no further bin width, only a narrower view of the same
+-- bins -- 82 of them across the plot at the smallest count.
 fftsa.fhi_max = 500000
 fftsa.fhi_min = 2000
 -- Ceiling for the start, a kilohertz under the stop's so the form cannot be set to a span
@@ -223,26 +222,31 @@ if fftsa.handles_inited == nil then
   fftsa.handles_inited = true
 end
 
--- The span may raise the sample rate, never lower it below the floor.
+-- The span picks the rate, and a narrow span picks a slow one: bin width is fs/n, so the
+-- rate is the only way to narrow a bin without changing the transform.
 --
--- There is no anti-alias filter in front of the digitizer, so a rate whose Nyquist falls
--- below what is on the wire folds that content in as peaks that are not there, at full
--- amplitude and with nothing on the glass to say so. Raising the rate can only remove
--- aliases; lowering it creates them. So zooming in never drops the rate -- the span only
--- selects which bins are drawn -- while widening past the floor's Nyquist does raise it.
+-- The cost is aliasing, and the aperture cannot mitigate it -- it clamps at 10 us, whose
+-- boxcar first nulls at 100 kHz, so it attenuates nothing near a 12.5 kHz folding
+-- frequency. Content above the chosen Nyquist folds in at full amplitude with nothing on
+-- the glass to say so, and a narrow span is now the view most exposed to it.
 --
--- The floor is 100 kS/s, 195.3 Hz bins at the default 512 samples. A higher rate coarsens
--- the bins in proportion, which is the price of the wider view.
-fftsa.fs_min = 100000
--- Exact, achievable rates only; the hardware cannot produce 102400 S/s.
-fftsa.rates  = {100000, 200000, 500000, 1000000}
+-- Each rate declares the highest stop frequency it may serve, and pick_fs takes the
+-- slowest that covers the span. The ceilings are Nyquist everywhere but 25 kS/s, which
+-- stops at 12 kHz rather than 12.5.
+--
+-- Exact rates only: the delivered rate is 66e6/ceil(66e6/request), so a divisor of 66e6 is
+-- exact -- 2640 for 25000, 1320 for 50000 -- while 102400 becomes 102325.5.
+fftsa.rates    = {25000, 50000, 100000, 200000, 500000, 1000000}
+fftsa.rate_fhi = {12000, 25000,  50000, 100000, 250000,  500000}
+fftsa.fs_min   = fftsa.rates[1]
 
--- Smallest rate whose Nyquist covers the stop frequency, never below the floor.
+-- Slowest rate whose ceiling covers the stop frequency. A NaN stop compares false against
+-- every ceiling and lands on the fastest rate, which is the one that cannot alias.
 function fftsa.pick_fs(fhi)
   local r = fftsa.rates
   local n = table.getn(r)
   for i = 1, n do
-    if r[i] >= fftsa.fs_min and r[i] / 2 >= fhi then return r[i] end
+    if fftsa.rate_fhi[i] >= fhi then return r[i] end
   end
   return r[n]
 end
@@ -1009,27 +1013,28 @@ fftsa.busy_since = nil
 fftsa.busy_max   = 2.0      -- seconds a guard may be held before it is judged stuck
 
 
--- Seconds one frame costs at a given sample count, from per-phase costs in
--- docs/PERFORMANCE.md. Predicts 0.080 s at 512 against 0.079 measured, 1.63 s at 16384
--- against 1.686.
+-- Seconds one frame costs at a given count and rate. The transform term is stated by the
+-- primitive rather than modelled here -- dsp.fft.spectrumtime, filled by commit() for the
+-- plan in force, so its coefficients belong to whichever implementation is bound -- and it
+-- reads zero when the archive carries no interpreted transform.
 --
--- busy_max breaks a guard a host abort left set, and the app looks dead until it expires,
--- so it has to clear a legitimate frame and not much more. Three times the model does
--- that at every count; a multiple of the sample count does not.
--- STATED BY THE PRIMITIVE, not modelled here: dsp.fft.spectrumtime is filled by commit() for
--- the plan in force, and every coefficient belongs to whichever implementation is bound.
---
--- Both callers ask about the count just committed: busy_max at the end of apply(), and the
--- first timer arm immediately after it. So the floor below is reached only by a question
--- about a plan that does not exist, and it answers one tick rather than a second copy of a
--- model free to drift from the primitive's.
-function fftsa.frame_estimate(n)
+-- busy_max breaks a guard a host abort left set, and the app looks dead until it expires, so
+-- it has to clear a legitimate frame and not much more. Three times this does that at every
+-- count and rate; a multiple of the sample count does not.
+function fftsa.frame_estimate(n, fs)
   if n == nil or n < 2 then n = 512 end
+  local est = 0.05
   if dsp.fft.samples == n then
     local t = dsp.fft.spectrumtime
-    if type(t) == "number" and t > 0 then return t end
+    if type(t) == "number" and t > 0 then est = t end
   end
-  return 0.05
+  -- The capture is a floor on any estimate, and the only term known exactly rather than
+  -- modelled. It dominates at the slow rates: 32768 samples at 25 kS/s is 1.31 s, which on
+  -- its own outruns the 2 s busy guard this feeds.
+  if type(fs) ~= "number" or fs <= 0 then fs = fftsa.fs_acq or fftsa.fs or fftsa.fs_min end
+  local acq = n / fs
+  if est < acq then est = acq end
+  return est
 end
 fftsa.busy_stuck = 0        -- how many times the guard had to be broken
 
