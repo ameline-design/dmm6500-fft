@@ -4953,6 +4953,11 @@ function fftsa.apply()
   local want = need
   if want < fftsa.cap_floor_n then want = fftsa.cap_floor_n end
   want = want * fftsa.cap_cap_mult
+  -- Unreachable after the first allocation while the floor is a constant, since want does not
+  -- move with the count. Anyone who lowers the floor or the multiplier makes it live again,
+  -- and it is then the one delete in the app that does not follow fftsa.del_scr's rule: this
+  -- buffer may be the panel's current one, so it would need defbuffer1 restored and a yield
+  -- before the delete, not just the delete.
   if fftsa.cap ~= nil and (fftsa.cap_cap == nil or fftsa.cap_cap < want) then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
