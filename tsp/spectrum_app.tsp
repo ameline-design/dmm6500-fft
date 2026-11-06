@@ -2310,13 +2310,23 @@ end
 -- already buy. It is 1.7 times the 12 ms that failed, not a wide margin, and it is a live
 -- knob: raise fftsa.tick_idle from the socket if a press gets swallowed, no reinstall.
 --
--- The 2.5 ms of slack prefers rate over idle. A tick is 50 ms, so holding the target to
--- the last millisecond buys a fiftieth of a tick of idle and costs a whole tick of rate.
+-- The slack in tick_period prefers rate over idle: holding the target to the last
+-- millisecond buys a fraction of a tick of idle and can cost a whole tick of rate. It is
+-- expressed in TICKS, so what it forgives scales with the grid below -- 0.5 ms on the 10 ms
+-- grid, not the 2.5 ms it forgave when the grid was 50 ms.
 fftsa.tick_idle = 0.020
 -- The period granularity, and the timer's own floor. The grid was 0.05 for both, which is
 -- what the firmware's minimum is, not what its resolution is -- so the period could only
 -- ever be a multiple of 50 ms and a frame needing 205 ms was armed at 250. A finer grid
 -- costs nothing and gives the loop below somewhere to land.
+--
+-- A PERIOD OFF THE 50 ms GRID POSTS EVENT 1727 AND IS STILL HONOURED. Measured both ways:
+-- 1727 fires exactly when the period is not a multiple of 0.05 -- ten periods, the seven
+-- non-multiples warned and 0.05/0.10/0.25 did not -- and at 1024 an armed 0.07 delivered
+-- 13 to 15 fps, which is 0.07 and neither 0.05 nor 0.10. So the event says the resolution
+-- cannot be RELIED on below 50 ms, not that the value was refused. Do not quantise this to
+-- 0.05 to silence the log: it would arm 1024 at 0.10 and cost about a third of the frame
+-- rate. The floor is a different matter and is real -- arm(0.045) is refused with 1131.
 fftsa.tick_grid = 0.010
 fftsa.tick_min  = 0.050
 -- How far the period must move before it is worth re-arming. Every re-arm is a display timer
