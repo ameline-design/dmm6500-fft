@@ -1272,11 +1272,10 @@ end
 
 -- The firmware frees the fields with their screen; the Lua handles still need clearing.
 function fftsa.destroy_options()
-  if fftsa.optscr ~= nil then
-    -- Never delete the screen currently on show: leave it first.
-    fftsa.show_main()
-    fftsa.del_obj(fftsa.optscr)
-  end
+  -- Never delete the screen on show, and the switch away needs a yield to land: see
+  -- fftsa.del_scr. Nil for the target when there is no spectrum screen, which del_scr
+  -- reads as the home screen -- what show_main() did here.
+  fftsa.del_scr(fftsa.optscr, fftsa.sg_scr)
   fftsa.optscr, fftsa.opt_flo, fftsa.opt_fhi, fftsa.opt_rng, fftsa.opt_info =
     nil, nil, nil, nil, nil
   fftsa.opt_win, fftsa.opt_beta, fftsa.opt_n = nil, nil, nil
@@ -1463,11 +1462,7 @@ fftsa.about_text = {
 }
 
 function fftsa.destroy_about()
-  if fftsa.aboutscr ~= nil then
-    -- Never delete the screen currently on show: leave it first.
-    fftsa.show_main()
-    fftsa.del_obj(fftsa.aboutscr)
-  end
+  fftsa.del_scr(fftsa.aboutscr, fftsa.sg_scr)
   fftsa.aboutscr, fftsa.about_name, fftsa.about_lines = nil, nil, nil
   fftsa.about_pageno, fftsa.about_page = nil, 1
 end
@@ -1665,8 +1660,11 @@ function fftsa.destroy_help()
   if fftsa.help_screens ~= nil then
     local k, h
     -- Never delete the screen currently on show, and switch away once rather than per
-    -- screen: deleting the visible one can wedge the panel until a power cycle.
+    -- screen: deleting the visible one bluescreens the instrument. One switch and one
+    -- yield for the whole set rather than fftsa.del_scr per screen, which would pay the
+    -- yield four times for one switch -- see fftsa.del_scr for why the yield is needed.
     fftsa.show_main()
+    delay(fftsa.sg_scr_yield)
     for k, h in pairs(fftsa.help_screens) do
       if h.scr ~= nil then fftsa.del_obj(h.scr) end
     end
@@ -2517,10 +2515,8 @@ function fftsa.stop()
   fftsa.destroy_about()
   fftsa.destroy_help()
   fftsa.loading_destroy(display.SCREEN_HOME)
-  if fftsa.errscr ~= nil then
-    fftsa.del_obj(fftsa.errscr)
-    fftsa.errscr = nil
-  end
+  fftsa.del_scr(fftsa.errscr)
+  fftsa.errscr = nil
   if fftsa.cap ~= nil then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap, fftsa.cap_cap = nil, nil

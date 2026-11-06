@@ -175,6 +175,25 @@ function fftsa.del_buf(b)
   return true
 end
 
+-- Delete a SCREEN: switch away, let the switch land, then delete. The single owner of that
+-- rule, because every part of it is necessary.
+--
+-- display.delete on the screen that is on show bluescreens the instrument at pc=00318FC0 --
+-- measured from a probe that deleted a visible screen, where it took the whole box down: no
+-- ping, no port 80, no port 5025, and a manual power cycle. Switching away first is not
+-- sufficient on its own: changescreen does not wait, so the delete can still reach a screen
+-- the panel is showing. The glass shows the home screen for an instant and then the same PC.
+--
+-- The yield is what makes the switch real, and it is the only part the app controls.
+function fftsa.del_scr(h, showscr)
+  if h == nil then return true end
+  if showscr == nil then showscr = display.SCREEN_HOME end
+  display.changescreen(showscr)
+  delay(fftsa.sg_scr_yield)
+  display.delete(h)
+  return true
+end
+
 -- The X limits the axis should hold, nil for a span that is not plottable. Shared by
 -- sg_pin_x and sg_restore so the moved-or-not test cannot disagree with the pin. Start
 -- moves to DC where that is under one pixel, because the firmware steps ticks from the
@@ -413,9 +432,25 @@ function fftsa.sg_fmt_seed(b, want)
   buffer.unit(buffer.UNIT_CUSTOM1, "dB")
   buffer.write.format(b, buffer.UNIT_CUSTOM1, buffer.DIGITS_4_5,
                          buffer.UNIT_HERTZ,   buffer.DIGITS_6_5)
-  local k
+  -- The seed has to sit inside the axes the graph is pinned to, because it is the geometry
+  -- the widget draws at the first paint of every launch.
+  --
+  -- X across the plotted span, not 0..want-1. The X axis is bound to the frequency in the
+  -- extra field and pinned to flo..fhi, so a counter put all 255 points in the leftmost
+  -- half-percent of the plot with the first ten of them below the axis minimum.
+  --
+  -- Y a small ramp, not one repeated value: every point at sg_dbmin gives the trace a
+  -- bounding box of zero height. sg_seed_spread is 2 dB, about three pixels on an axis
+  -- 140 dB tall, so it is invisible and the box still has a height.
+  local k, span = nil, want - 1
+  if span < 1 then span = 1 end
+  local flo = fftsa.sg_flo_hz or fftsa.flo or fftsa.flomin
+  local fhi = fftsa.sg_fhi_hz or fftsa.fhi or fftsa.fhi_min
+  if not (fhi > flo) then flo, fhi = fftsa.flomin, fftsa.fhi_min end
   for k = 1, want do
-    fftsa.sg_write_point(b, fftsa.sg_dbmin, (k - 1) * 1.0, k)
+    local t = (k - 1) / span
+    fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t, flo + (fhi - flo) * t,
+                         k)
   end
   return b
 end
@@ -486,10 +521,7 @@ function fftsa.sg_destroy(release)
   if fftsa.sg_graph ~= nil then
     display.graph.removeall(fftsa.sg_graph)
   end
-  if fftsa.sg_scr ~= nil then
-    display.changescreen(display.SCREEN_HOME)
-    fftsa.del_obj(fftsa.sg_scr)
-  end
+  fftsa.del_scr(fftsa.sg_scr)
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
     fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
@@ -497,8 +529,14 @@ function fftsa.sg_destroy(release)
   -- Releasing, which is what an exit does: the buffers go, and defbuffer1 is made current
   -- FIRST. The front panel adopts a user buffer as its current one, so an app that exits
   -- leaving FFTSA_MARK alive leaves the home screen showing a spectrum level in dB as
-  -- though it were a measurement -- seen on the glass. Restoring before deleting also
-  -- means nothing is deleted while the panel is pointing at it.
+  -- though it were a measurement.
+  --
+  -- THE RESTORE NEEDS A YIELD BEFORE THE DELETE, for the same reason fftsa.del_scr does:
+  -- the panel picks up the new current buffer on its own schedule, not on the return of
+  -- dmm.digitize.read. Caught on video: the home screen rendering -118.00 dB with
+  -- FFTSA_MARK named in the status bar and the spectrium screen's title still showing
+  -- through it, for about 50 ms, and then pc=00318FC0. So the panel was reading a buffer
+  -- this went on to delete.
   --
   -- Not releasing, which is what sg_build() does on a relaunch: the pair is handed on in
   -- FFTSA_OLDTRACE and FFTSA_OLDMARK for sg_free_old() to take once the new pair exists,
@@ -509,6 +547,7 @@ function fftsa.sg_destroy(release)
   -- relaunch and the second pass must not overwrite what the first one saved.
   if release then
     fftsa.sg_restore_defbuffer()
+    delay(fftsa.sg_scr_yield)
     fftsa.sg_drop_buffers()
   else
     if fftsa.sg_buf ~= nil then FFTSA_OLDTRACE = fftsa.sg_buf end
@@ -1248,6 +1287,11 @@ fftsa.sg_yield = 0.010
 -- Given to the widget's first draw of a freshly bound trace, before any frame can clear the
 -- buffer under it. Paid once a launch, behind a load that already takes seconds.
 fftsa.sg_first_paint = 0.25
+-- Height, in dB, of the seeded trace: see fftsa.sg_fmt_seed for why it may not be flat.
+fftsa.sg_seed_spread = 2
+-- Given to the panel between switching away from a screen and deleting it: see
+-- fftsa.del_scr for what deleting a screen still on show costs.
+fftsa.sg_scr_yield = 0.15
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
 fftsa.sg_pk_ftol   = 0.002      -- fractional frequency move worth a redraw

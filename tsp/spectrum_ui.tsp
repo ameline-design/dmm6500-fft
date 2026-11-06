@@ -41,10 +41,13 @@ end
 -- second: deleting the screen on show leaves the panel black.
 function fftsa.loading_destroy(showscr)
   if showscr == nil then showscr = display.SCREEN_HOME end
-  display.changescreen(showscr)
-  if fftsa.loadscr == nil then return false end
+  if fftsa.loadscr == nil then
+    display.changescreen(showscr)
+    return false
+  end
+  -- The text is a child and not a screen, so it takes no yield of its own; the cover does.
   fftsa.del_obj(fftsa.loadtxt)
-  fftsa.del_obj(fftsa.loadscr)
+  fftsa.del_scr(fftsa.loadscr, showscr)
   fftsa.loadtxt, fftsa.loadscr = nil, nil
   return true
 end

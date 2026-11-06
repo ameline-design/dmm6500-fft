@@ -1394,6 +1394,43 @@ check('exactly six screens are live', live('screen') == 6,
 check('the graph has exactly one trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
+-- The seeded trace may not be flat. Every point at one value gives the trace a bounding box
+-- of zero height, and that is the geometry at the first paint of every launch. Nothing
+-- asserted the seed's shape before, only that it was full.
+check('the seeded trace has a height, so its bounding box is not degenerate', (function()
+  -- Its own buffer, seeded by the real function: sg_mk_trace() would reassign FFTSA_TRACE
+  -- and orphan the live trace, which four later cases count buffers against.
+  local b = buffer.make(300, buffer.STYLE_WRITABLE_FULL)
+  fftsa.sg_fmt_seed(b, 255)
+  if b == nil then return false, 'no trace buffer' end
+  local n = b.n
+  local lo, hi, i = b.readings[1], b.readings[1], nil
+  for i = 1, n do
+    local v = b.readings[i]
+    if v < lo then lo = v end
+    if v > hi then hi = v end
+  end
+  -- Invisible is the other half of it: a spread big enough to see would be a tilted
+  -- baseline on the glass. Two dB against the axis the app actually pins.
+  local axis = fftsa.sg_dbmax - fftsa.sg_dbmin
+  -- And X inside the pinned frequency axis. A counter here put every point in the leftmost
+  -- half-percent of the plot with the lowest ten below the axis minimum, which is the
+  -- geometry the widget drew at the first paint of every launch.
+  local xlo, xhi, flo, fhi = nil, nil, fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  xlo, xhi = b.extravalues[1], b.extravalues[1]
+  for i = 1, n do
+    local x = b.extravalues[i]
+    if x < xlo then xlo = x end
+    if x > xhi then xhi = x end
+  end
+  local ok = n > 1 and hi > lo and lo == fftsa.sg_dbmin and (hi - lo) < axis / 50
+             and xlo >= flo and xhi <= fhi and (xhi - xlo) > (fhi - flo) * 0.9
+  local msg = string.format('%d points, %.2f dB of height from %.1f on a %g dB axis; '
+                            .. 'x %g..%g inside %g..%g', n, hi - lo, lo, axis, xlo, xhi,
+                            flo, fhi)
+  buffer.delete(b)
+  return ok, msg
+end)())
 -- The frame timer is created after the spectrum screen is the one on show, so no frame can
 -- clear the trace buffer during the widget's first draw of it. The mock's born_on records
 -- which screen was showing at create time, which is the only way to see the ordering
