@@ -502,13 +502,21 @@ end
 -- capture is STYLE_STANDARD.
 function fftsa.nl_bind()
   local nl = fftsa.nl
+  -- Each failure says which term, because a silent one here reads as "the compiled DSP did
+  -- not start" with no reason at all wherever nl_lasterr is reported.
   if nl == nil or not nl.ready or fftsa.cap == nil or fftsa.sg_buf == nil then
     fftsa.nl_cap = nil
+    fftsa.nl_lasterr = 'bind: ready=' .. tostring(nl ~= nil and nl.ready)
+                       .. ' cap=' .. tostring(fftsa.cap ~= nil)
+                       .. ' trace=' .. tostring(fftsa.sg_buf ~= nil)
     return false
   end
   fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
   local c = nl.describe(fftsa.cap, false)
-  if c == nil then return false end
+  if c == nil then
+    fftsa.nl_lasterr = 'bind: describe found no descriptor for the capture buffer'
+    return false
+  end
   fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
   return true
 end
@@ -2448,15 +2456,31 @@ function fftsa.start()
                   fftsa.sg_maxpts)
     fftsa.nl_replan()
   end
-  -- NO IMPLEMENTATION AT ALL is a refusal, not twenty error frames a second. The archive
+  -- No implementation at all is a refusal, not twenty error frames a second. The archive
   -- ships no interpreted transform -- tsp/fft_interp.tsp is left out -- so if the compiled
   -- path did not come up there is nothing to compute a spectrum with, and every frame would
-  -- post EUNSUPPORTED behind a panel that looks like it is working. nl_lasterr carries why
-  -- the install refused.
+  -- post EUNSUPPORTED behind a panel that looks like it is working.
+  --
+  -- What counts as "did not come up" is an installed and planned image: nl.ready and a
+  -- resolved entry point. NOT fftsa.nl_usable(), which is the per-frame test and includes
+  -- fftsa.nl_cap, the cached capture descriptor. That descriptor is rebuilt by nl_bind() on
+  -- every Apply, so a cold one is recoverable and refusing the launch over it threw away a
+  -- working install: measured on the instrument with nl.ready true, nl.n matching
+  -- fftsa.n, nl.entry resolved and last_rc 0, refused because nl_cap was nil.
+  --
+  -- Every term is in the message. nl_lasterr alone read "nil" on exactly the failure it was
+  -- there to explain.
   if fftsa.fft_init == nil
-     and (fftsa.nl == nil or not fftsa.nl.ready or not fftsa.nl_usable()) then
+     and (fftsa.nl == nil or not fftsa.nl.ready
+          or fftsa.nl.entry == nil or fftsa.nl.entry == 0) then
+    local nl = fftsa.nl
+    local why = "nl absent"
+    if nl ~= nil then
+      why = "ready=" .. tostring(nl.ready) .. " entry=" .. tostring(nl.entry)
+            .. " rc=" .. tostring(nl.last_rc) .. " " .. tostring(fftsa.nl_lasterr)
+    end
     return fftsa.start_failed("the compiled DSP did not start and this archive has no "
-                              .. "interpreted fallback -- " .. tostring(fftsa.nl_lasterr)
+                              .. "interpreted fallback -- " .. why
                               .. " -- power cycle the instrument and try again")
   end
   if not hooked then

@@ -5062,6 +5062,32 @@ check('without either implementation, start refuses and says so', (function()
   return ok == false and string.find(why, 'no interpreted fallback', 1, true) ~= nil,
          'start=' .. tostring(ok) .. ' lasterr=' .. why
 end)())
+-- The other side of that refusal, and the one it got wrong. An installed, planned compiled
+-- path must start even when the per-frame descriptor cache is cold: nl_bind() rebuilds
+-- fftsa.nl_cap on every Apply, so a nil one is recoverable and not an absent implementation.
+-- Gating the launch on fftsa.nl_usable() refused a working install on the instrument, with
+-- nl.ready true, nl.n matching and nl.entry resolved.
+check('a cold capture descriptor does not stop a compiled launch', (function()
+  local keepi, keepcap, keepnl = fftsa.fft_init, fftsa.nl_cap, fftsa.nl
+  -- There is no native link offline, so the installed state has to be stood up: ready,
+  -- planned, entry resolved. No init or reinit member, so start() skips the install block
+  -- and nl_replan() returns early -- this case is about the guard and nothing else.
+  fftsa.fft_init, fftsa.nl_cap = nil, nil
+  fftsa.nl = {ready = true, entry = 999, last_rc = 0, n = fftsa.n,
+              nmax = fftsa.nl_nmax}
+  local usable = fftsa.nl_usable()
+  local ok = fftsa.start()
+  local why = tostring(fftsa.lasterr)
+  fftsa.fft_init, fftsa.nl = keepi, keepnl
+  if fftsa.nl_cap == nil then fftsa.nl_cap = keepcap end
+  fftsa.start()
+  fftsa.frame()
+  -- usable must be false or the case is vacuous: it has to be the cold-cache state that
+  -- start() is being asked to tolerate.
+  return usable == false and ok == true,
+         string.format('nl_usable=%s start=%s lasterr=%s', tostring(usable), tostring(ok),
+                       why)
+end)())
 
 -- A DEMOTION MID-SESSION has nowhere to go in the shipped archive, and must halt rather than
 -- spin. Without the guard the frame posts EUNSUPPORTED and then "no spectrum yet" once per
