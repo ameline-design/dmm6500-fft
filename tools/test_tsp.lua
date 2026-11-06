@@ -1394,6 +1394,18 @@ check('exactly six screens are live', live('screen') == 6,
 check('the graph has exactly one trace bound', (function()
   return OBJ[fftsa.sg_graph].traces == 1
 end)(), 'traces=' .. tostring(OBJ[fftsa.sg_graph].traces))
+-- The frame timer is created after the spectrum screen is the one on show, so no frame can
+-- clear the trace buffer during the widget's first draw of it. The mock's born_on records
+-- which screen was showing at create time, which is the only way to see the ordering
+-- offline -- there is no paint here to race against.
+check('the frame timer is created after the spectrum screen is on show', (function()
+  local t = fftsa.timer
+  if t == nil then return false, 'no frame timer' end
+  local o = OBJ[t]
+  return o.parent == fftsa.sg_scr and o.born_on == fftsa.sg_scr,
+         string.format('parent=%s born_on=%s, spectrum screen=%s', tostring(o.parent),
+                       tostring(o.born_on), tostring(fftsa.sg_scr))
+end)())
 
 -- a second start() must not orphan the first build
 local ok2 = pcall(function() fftsa.start() end)
@@ -4421,6 +4433,49 @@ check('short captures are rejected, not transformed', fftsa.shortreads == before
 check('a rejected short capture is not an error frame', fftsa.errcount == 0,
       'errcount=' .. fftsa.errcount)
 SIG.short = false
+
+-- A shorted input is a spectrum with no tone in it: every bin at the floor, no peak over the
+-- threshold, the whole trace clamped to the axis minimum. Nothing else here drives that --
+-- SIG.amp has never been zero in this file -- and it is the condition the instrument
+-- bluescreens under, at pc=00318FC0 inside the graph widget's trace code. These cases say
+-- whether the Lua path survives it, which is the half that can be answered offline.
+local sf0, sa0, sd0 = SIG.f, SIG.amp, SIG.dc
+SIG.f, SIG.amp, SIG.dc = 1000, 0, 0
+local flat_ec, flat_er = fftsa.errcount, fftsa.errrun
+local flat_raised, flat_why = false, nil
+for _ = 1, 3 do
+  local ok, err = pcall(function() fftsa.frame() end)
+  if not ok then flat_raised, flat_why = true, err end
+end
+check('a capture with no tone in it draws frames without raising',
+      not flat_raised and fftsa.errcount == flat_ec and fftsa.errrun == flat_er,
+      string.format('raised=%s (%s), errcount %d->%d, errrun %d->%d',
+                    tostring(flat_raised), tostring(flat_why), flat_ec, fftsa.errcount,
+                    flat_er, fftsa.errrun))
+-- The trace still has to be a full one at the floor. An empty or part-filled trace buffer is
+-- the state the widget would be drawing when it died, so this is the case worth pinning.
+check('and the trace is full, every point at the axis floor', (function()
+  local tb = fftsa.sg_buf
+  if tb == nil then return false, 'no trace buffer' end
+  local n, i, off = tb.n, nil, 0
+  for i = 1, n do
+    if tb.readings[i] ~= fftsa.sg_dbmin then off = off + 1 end
+  end
+  return n == fftsa.sg_ncol and off == 0,
+         string.format('%d of %d points written, %d not at the %g dB floor', n,
+                       fftsa.sg_ncol, off, fftsa.sg_dbmin)
+end)())
+-- Six rows of a noise peak would be six arbitrary picks from a spectrum whose bins are equal.
+check('and the peak table reports nothing rather than noise', (function()
+  local shown, p = 0, nil
+  for p = 1, fftsa.sg_npeak do
+    local t = obj_at(fftsa.sg_pk_v[p]).text
+    if t ~= nil and t ~= '' and t ~= '---' then shown = shown + 1 end
+  end
+  return shown == 0, shown .. ' of ' .. fftsa.sg_npeak .. ' rows carry a voltage'
+end)())
+SIG.f, SIG.amp, SIG.dc = sf0, sa0, sd0
+fftsa.frame()
 
 -- Nothing may be assembled where the operator can watch it happen. The cover is
 -- what prevents it, and the mock's born_on is the only thing that can see it.

@@ -1245,6 +1245,9 @@ end
 -- not a figure to shave: the saving is nothing, the loss is a stale trace, and the settings
 -- line would go on reporting the rate Lua achieved.
 fftsa.sg_yield = 0.010
+-- Given to the widget's first draw of a freshly bound trace, before any frame can clear the
+-- buffer under it. Paid once a launch, behind a load that already takes seconds.
+fftsa.sg_first_paint = 0.25
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
 fftsa.sg_pk_ftol   = 0.002      -- fractional frequency move worth a redraw

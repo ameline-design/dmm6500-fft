@@ -2413,10 +2413,11 @@ function fftsa.start()
     fftsa.n = fftsa.n_compiled
     fftsa.defaults.n = fftsa.n_compiled
   end
+  -- The period is settled here and the timer created at the end of start(), after the
+  -- screen is on show: see the arm there for why the two are separated.
   local ok, err = pcall(function()
     fftsa.apply()
     fftsa.period = fftsa.frame_period(fftsa.n)
-    fftsa.arm(fftsa.period)
   end)
   if not ok then return fftsa.start_failed(tostring(err)) end
 
@@ -2470,6 +2471,18 @@ function fftsa.start()
   -- while the screen it is parented to is the one on show. The cover itself stays
   -- allocated until fftsa.stop(), since Apply raises it again.
   fftsa.show_main()
+  -- The widget's first draw of this trace gets a window of its own before any frame can
+  -- clear the buffer under it. The switch above is that first draw, of a trace object built
+  -- moments earlier, and a frame opens with tb.clear(), which takes the buffer's n to zero;
+  -- a timer armed before the switch can fire inside the draw. Creating the timer after the
+  -- yield, rather than only yielding, keeps the ordering independent of whether delay()
+  -- dispatches timer callbacks.
+  --
+  -- Under pcall because display.create answers nil on an exhausted pool and the setevent
+  -- that follows would raise, which here would escape start().
+  delay(fftsa.sg_first_paint)
+  local aok, aerr = pcall(function() fftsa.arm(fftsa.period) end)
+  if not aok then return fftsa.start_failed(tostring(aerr)) end
   return true
 end
 

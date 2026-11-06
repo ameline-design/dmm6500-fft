@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.25
+-- $Version: 8.26
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -1681,6 +1681,9 @@ end
 -- not a figure to shave: the saving is nothing, the loss is a stale trace, and the settings
 -- line would go on reporting the rate Lua achieved.
 fftsa.sg_yield = 0.010
+-- Given to the widget's first draw of a freshly bound trace, before any frame can clear the
+-- buffer under it. Paid once a launch, behind a load that already takes seconds.
+fftsa.sg_first_paint = 0.25
 
 fftsa.sg_pk_period = 1.0        -- seconds between refreshes
 fftsa.sg_pk_ftol   = 0.002      -- fractional frequency move worth a redraw
@@ -6661,10 +6664,11 @@ function fftsa.start()
     fftsa.n = fftsa.n_compiled
     fftsa.defaults.n = fftsa.n_compiled
   end
+  -- The period is settled here and the timer created at the end of start(), after the
+  -- screen is on show: see the arm there for why the two are separated.
   local ok, err = pcall(function()
     fftsa.apply()
     fftsa.period = fftsa.frame_period(fftsa.n)
-    fftsa.arm(fftsa.period)
   end)
   if not ok then return fftsa.start_failed(tostring(err)) end
 
@@ -6718,6 +6722,18 @@ function fftsa.start()
   -- while the screen it is parented to is the one on show. The cover itself stays
   -- allocated until fftsa.stop(), since Apply raises it again.
   fftsa.show_main()
+  -- The widget's first draw of this trace gets a window of its own before any frame can
+  -- clear the buffer under it. The switch above is that first draw, of a trace object built
+  -- moments earlier, and a frame opens with tb.clear(), which takes the buffer's n to zero;
+  -- a timer armed before the switch can fire inside the draw. Creating the timer after the
+  -- yield, rather than only yielding, keeps the ordering independent of whether delay()
+  -- dispatches timer callbacks.
+  --
+  -- Under pcall because display.create answers nil on an exhausted pool and the setevent
+  -- that follows would raise, which here would escape start().
+  delay(fftsa.sg_first_paint)
+  local aok, aerr = pcall(function() fftsa.arm(fftsa.period) end)
+  if not aok then return fftsa.start_failed(tostring(aerr)) end
   return true
 end
 
