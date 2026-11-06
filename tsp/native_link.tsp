@@ -1347,6 +1347,17 @@ end
 -- Scalars, the two buffer handles, and fn, which holds the resolved firmware math
 -- addresses. Functions are deliberately not copied: they must come from the module being
 -- loaded, or a relaunch would run the previous build's Lua.
+--
+-- _stor_of goes too, and it is the CAPTURE buffer's handle rather than one of ours, because
+-- it is describe()'s cache key. The address that cache holds, _stor_elem0, is a number and
+-- so already survived -- but without the key the `_stor_of == buf` test failed on every
+-- relaunch, describe() discarded a still-valid address and swept the heap, and that sweep
+-- comes back empty. Measured on the instrument: _stor_of nil with the capture buffer alive
+-- at 65,536 readings and reattached true, which halted the app on every second launch.
+--
+-- Safe because apply() keeps that buffer for the power cycle, so its storage cannot have
+-- moved; and a handle for a buffer that did go compares unequal to the live one, so a stale
+-- key falls back to the sweep rather than being believed.
 function fftsa.nl.stash()
   local nl, out = fftsa.nl, {}
   local k, v
@@ -1360,7 +1371,7 @@ function fftsa.nl.stash()
         if type(v2) == 'number' then fn[k2] = v2 end
       end
       out[k] = fn
-    elseif k == 'code_buf' or k == 'plan_buf' then
+    elseif k == 'code_buf' or k == 'plan_buf' or k == '_stor_of' then
       out[k] = v
     end
   end

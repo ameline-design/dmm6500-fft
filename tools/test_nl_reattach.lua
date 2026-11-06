@@ -200,6 +200,25 @@ check('carries the addresses, the buffers and the resolved math table',
       and NLSTASH.plan_buf == fftsa.nl.plan_buf
       and NLSTASH.fn ~= nil and NLSTASH.fn.sin == 4651068
       and NLSTASH.fn ~= fftsa.nl.fn)
+-- describe()'s cache survives a relaunch only if its KEY does. The address it caches is a
+-- number and rides along as a scalar; the key is the capture buffer's handle, and without it
+-- the `_stor_of == buf` test fails, describe() discards a still-valid address and sweeps --
+-- a sweep that came back empty on the instrument and halted every second launch. Asserted on
+-- identity, because a copy of the handle would not compare equal to the live buffer.
+check('carries describe()\'s capture-buffer cache, key included', (function()
+  local cap = live_buffer()
+  fftsa.nl._stor_of, fftsa.nl._stor_x = cap, false
+  fftsa.nl._stor_elem0, fftsa.nl._stor_stride = 60176864, 24
+  fftsa.nl._desc_of, fftsa.nl._desc_at = 60176864, 60242432
+  fftsa.nl.stash()
+  return NLSTASH._stor_of == cap and NLSTASH._stor_x == false
+         and NLSTASH._stor_elem0 == 60176864 and NLSTASH._stor_stride == 24
+         and NLSTASH._desc_of == 60176864 and NLSTASH._desc_at == 60242432,
+         string.format('key=%s elem0=%s stride=%s desc=%s/%s x=%s',
+                       tostring(NLSTASH._stor_of == cap), tostring(NLSTASH._stor_elem0),
+                       tostring(NLSTASH._stor_stride), tostring(NLSTASH._desc_of),
+                       tostring(NLSTASH._desc_at), tostring(NLSTASH._stor_x))
+end)())
 check('carries no functions',
       (function()
         local k, v
