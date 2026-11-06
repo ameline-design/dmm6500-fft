@@ -1372,19 +1372,21 @@ function fftsa.sg_show_peaks(bi, bv, count, binhz, pk_hz, pk_v)
   return fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
 end
 
--- The microvolt format the peak table's volt column uses, by range. A one-microvolt step
--- throws away real information on the quiet ranges, where the instrument's own floor is
--- well under a microvolt. The widest result is "999.99 uV", nine characters, which is what
--- "%.2f mV" and "%.4f V" already produce in the same field -- so the column is unchanged
--- and the 82 px to the dB field still holds it.
-fftsa.sg_uv_fmt_std = "%0.0f uV"
-fftsa.sg_uv_fmt_by_range = {[0.1] = "%0.2f uV", [1] = "%0.1f uV"}
+-- The microvolt format the peak table's volt column uses. One decimal on the 1 V and 0.1 V
+-- ranges, where a whole-microvolt step throws away resolution, and whole microvolts on
+-- 10 V.
+--
+-- One decimal and not two: the digitizer is 4.5 digits, an LSB of about 2 uV on 0.1 V and
+-- 20 uV on 1 V, and the measured per-bin noise floor is 2.95 uV, so a second decimal states
+-- precision the measurement does not have. The widest result is "999.9 uV", inside what
+-- "%.2f mV" and "%.4f V" already print in the same field and its 82 px to the dB column.
+fftsa.sg_uv_fmt_std  = "%0.0f uV"
+fftsa.sg_uv_fmt_fine = "%0.1f uV"
+fftsa.sg_uv_fine_vmax = 1        -- the largest range that gets the decimal
 
 function fftsa.sg_uv_fmt(range)
-  if range == nil then return fftsa.sg_uv_fmt_std end
-  local f = fftsa.sg_uv_fmt_by_range[range]
-  if f == nil then return fftsa.sg_uv_fmt_std end
-  return f
+  if range ~= nil and range <= fftsa.sg_uv_fine_vmax then return fftsa.sg_uv_fmt_fine end
+  return fftsa.sg_uv_fmt_std
 end
 
 -- The unconditional draw; the gate above is the only thing deciding when it runs.

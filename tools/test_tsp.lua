@@ -3258,19 +3258,23 @@ check('the volt column cannot print a 45-character field', (function()
          string.format('volt [%s] %d chars, dB [%s]', tostring(vtxt),
                        string.len(tostring(vtxt)), tostring(dtxt))
 end)())
--- The quiet ranges get more microvolt digits, and the width is the reason the column can
--- take them: driven through the frame's own path into the formatter, and asserted against
--- the widest string the field already prints rather than a pinned character count.
-check('the microvolt column gains digits on the quiet ranges, within the width it had',
+-- The quiet ranges get one microvolt decimal, and the width is the reason the column can
+-- take it: driven through the frame's own path into the formatter, and asserted against the
+-- widest string the field already prints rather than a pinned character count.
+--
+-- One decimal and not two, which is a judgement the gate records rather than enforces: the
+-- digitizer is 4.5 digits and the measured per-bin floor 2.95 uV, so the second decimal
+-- would be below the measurement's own uncertainty.
+check('the microvolt column gains one decimal on the quiet ranges, within its width',
       (function()
   local r0 = fftsa.range
   local widest = string.len(string.format('%.2f mV', 999.99))
-  local want = {{0.1, '999.94 uV'}, {1, '999.9 uV'}, {10, '1000 uV'}}
+  local want = {{0.1, '999.9 uV'}, {1, '999.9 uV'}, {10, '1000 uV'}}
   local i
   for i = 1, table.getn(want) do
     fftsa.range = want[i][1]
     -- 999.94 uV reads differently at every precision, so a formatter that ignored the
-    -- range would print one of these three strings for all three ranges.
+    -- range cannot print the expected string for more than one of these three.
     fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, {12500}, {999.94e-6})
     local got = obj_at(fftsa.sg_pk_v[1]).text
     fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
@@ -3288,9 +3292,10 @@ check('the microvolt column gains digits on the quiet ranges, within the width i
   fftsa.range = nil
   local none = fftsa.sg_uv_fmt(fftsa.range)
   fftsa.range = r0
-  return off == fftsa.sg_uv_fmt_std and none == fftsa.sg_uv_fmt_std,
-         string.format('0.1 V and 1 V gain digits within %d chars; 100 V [%s], nil [%s]',
-                       widest, off, none)
+  return off == fftsa.sg_uv_fmt_std and none == fftsa.sg_uv_fmt_std
+         and fftsa.sg_uv_fmt_fine == '%0.1f uV',
+         string.format('0.1 V and 1 V take %s within %d chars; 100 V [%s], nil [%s]',
+                       fftsa.sg_uv_fmt_fine, widest, off, none)
 end)())
 -- End to end, through a real frame: the capture is clipped the way the instrument clips it,
 -- and the banner, its colour, the dashed table and the dashed distortion line all follow.
