@@ -417,6 +417,97 @@ fftsa.nl._find_storage = REAL_FS
 check('a buffer with extras still goes through the content scan',
       probed == 1, string.format('content scans=%d', probed))
 
+-- AND THE OTHER HALF OF THE SAME QUESTION: the signature route must not depend on the flat
+-- record it was written for. A live capture's readings all differ, which is the case the
+-- content scan already handled, so the two routes have to agree there -- otherwise fixing
+-- the shorted input would have broken the working one.
+--
+-- FINDS is modelled on the needle's meaning rather than returning a fixed list: it answers
+-- a signature pattern with every descriptor whose capacity and n pack to it. That is what
+-- lets a decoy buffer be placed and proved unreachable.
+local function u32be(v)
+  return string.char(math.floor(v / 16777216), math.mod(math.floor(v / 65536), 256),
+                     math.mod(math.floor(v / 256), 256), math.mod(v, 256))
+end
+local function sigof(cap, n) return u32be(cap) .. u32be(n) end
+
+local DESCS, READHIT = {}, nil
+fftsa.nl.FINDS = function(lo, hi, pat)
+  local out, m, i = {}, 0, nil
+  for i = 1, table.getn(DESCS) do
+    local dd = DESCS[i]
+    if pat == sigof(dd.cap, dd.n) then m = m + 1; out[m] = dd.base + 116 end
+  end
+  if m > 0 then return out end
+  if READHIT ~= nil then return {READHIT} end
+  return {}
+end
+
+local function place_record(elem0, stride, vals)
+  local i, v
+  for i, v in pairs(vals) do
+    local hi, lo = fftsa.nl._f64_words(v)
+    WORDS[elem0 + (i - 1) * stride] = hi
+    WORDS[elem0 + (i - 1) * stride + 4] = lo
+  end
+end
+
+reset_heap()
+DESCS = {{base = DESC, cap = 65536, n = 2048}}
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+local live = readings(0.125, 0.1875)
+place_record(TRUE_E0, 24, live)
+READHIT = TRUE_E0
+local LIVEBUF = {n = 2048, capacity = 65536, readings = live}
+
+fftsa.nl._stor_of = nil
+local dl = fftsa.nl.describe(LIVEBUF, false)
+local ce0, cst = fftsa.nl._find_storage(LIVEBUF, false)
+check('signature and content routes agree on a live record',
+      dl ~= nil and dl.chunk1 == TRUE_E0 and ce0 == TRUE_E0 and cst == 24,
+      string.format('sig=%s content=%s stride=%s',
+                    dl and string.format('%X', dl.chunk1) or 'nil',
+                    ce0 and string.format('%X', ce0) or 'nil', tostring(cst)))
+
+-- A second buffer of the same capacity and a different count must not be reachable: n is
+-- half the needle, so the wrong descriptor is never a hit rather than merely losing.
+reset_heap()
+local DECOY, DECOY_E0 = 57000000, 57500000
+DESCS = {{base = DECOY, cap = 65536, n = 4096}, {base = DESC, cap = 65536, n = 2048}}
+place_desc(DECOY, DECOY_E0, 24, 1365, 49, 65536, 4096)
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+place_record(TRUE_E0, 24, live)
+READHIT = TRUE_E0
+fftsa.nl._stor_of = nil
+local dd2 = fftsa.nl.describe(LIVEBUF, false)
+check('a same-capacity buffer at a different count is not a candidate',
+      dd2 ~= nil and dd2.chunk1 == TRUE_E0,
+      string.format('chunk1=%s decoy=%X',
+                    dd2 and string.format('%X', dd2.chunk1) or 'nil', DECOY_E0))
+
+-- And the count the app actually offers, not just the one measured. Each FFT size gives a
+-- different n, so each is a different needle, and the route has to hold for all of them.
+local counts = {512, 2048, 4096, 16384, 32768}
+local allok, firstbad = true, nil
+local ci
+for ci = 1, table.getn(counts) do
+  local cn = counts[ci]
+  reset_heap()
+  DESCS = {{base = DESC, cap = 65536, n = cn}}
+  place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, cn)
+  place_record(TRUE_E0, 24, live)
+  READHIT = nil
+  fftsa.nl._stor_of = nil
+  local dc = fftsa.nl.describe({n = cn, capacity = 65536, readings = live}, false)
+  if dc == nil or dc.chunk1 ~= TRUE_E0 then
+    allok = false
+    if firstbad == nil then firstbad = cn end
+  end
+end
+check('resolves at every count the app offers, with no content scan available',
+      allok, string.format('counts=%d firstbad=%s',
+                           table.getn(counts), tostring(firstbad)))
+
 fftsa.nl.FINDS = FINDS_REAL
 
 print()
