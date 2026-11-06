@@ -291,11 +291,12 @@ skips the rebuild — which is what keeps a Kaiser window from costing 0.3 s on 
 touch it. The graph buffer is one fixed size for every sample count and stays attached throughout,
 because the trace is capped at the graph's width (see **How many points the trace carries** below).
 
-**Apply costs roughly 0.2 ms per sample**, measured on 2026-10-24 and linear in the count:
+**Apply costs roughly 0.2 ms per sample**, measured on 2026-10-24 and linear in the count. The
+32768 figure follows that law rather than a measurement of its own:
 
-| FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+| FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |---|---|---|---|---|---|---|
-| Apply | 0.11 s | 0.22 s | 0.38 s | 0.74 s | 1.46 s | **2.89 s** |
+| Apply | 0.22 s | 0.38 s | 0.74 s | 1.46 s | **2.89 s** | ~5.8 s |
 
 Most of it is the gain table and the window: both are rebuilt for the new size, and both are
 proportional to it. The loading screen is up for all of it.
@@ -343,9 +344,10 @@ on a bin centre therefore puts all its neighbours in those zeros: three bins car
 rest carry nothing. Move the tone half a bin and the neighbours land on the sidelobe envelope
 instead, which is far from zero, and the skirts appear.
 
-With Hann the second bin from the peak swings **49.8 dB** between the two cases. At 100 kS/s and
-N=512 the bins are 195.3 Hz apart, so 25.000 kHz is bin 128 exactly and draws the spike; 24.9 kHz is
-not and draws the skirts.
+With Hann the second bin from the peak swings **49.8 dB** between the two cases, and the zeros being
+at whole-bin offsets makes that independent of the count. At 100 kS/s and N=1024 the bins are
+97.66 Hz apart, so 25.000 kHz is bin 256 exactly and draws the spike; 24.95 kHz is half a bin out
+and draws the skirts.
 
 **The narrow peak is the truthful one.** The skirts are leakage, not signal. The amplitude in the
 peak table is right in both cases.
@@ -393,7 +395,8 @@ around a quarter of a second for nothing an operator can see. At 4096 samples an
 leaves no room for it at any span. **There is no longer any way to turn it on from the app**: the
 filter lives in `csrc/` behind `DSP_BANDPASS` and the shipped build compiles it out, with no
 remaining switch in `tsp/`. The rest of this section describes what it does, and is kept because the
-measurements behind the decision not to offer it are worth having.
+measurements behind the decision not to offer it are worth having. **Those figures were taken at 512
+samples**, a count the form no longer offers, and on the interpreted path.
 
 On, the capture is low-pass filtered and then decimated to the span, so the transform
 sees only the band on screen. Two things come of that, and which one you get depends on the span.
@@ -459,10 +462,13 @@ Three consequences, and the first is the point of it:
   smallest, 1024, puts about 511 bins in a 10 Hz to 50 kHz span against 255 columns, so every
   trace is now reduced.
 
-| FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+| FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |---|---|---|---|---|---|---|
-| bins in a 50 kHz span | 255 | 511 | 1023 | 2047 | 4095 | 8191 |
-| points drawn | 255 | 380 | 441 | 475 | 496 | 502 |
+| bins in a 50 kHz span | 511 | 1023 | 2047 | 4095 | 8191 | 16383 |
+| points drawn | 380 | 441 | 475 | 496 | 502 | |
+
+Points drawn rises towards 510 rather than towards 255, because a column contributes its minimum as
+well as its maximum wherever the two differ. 32768 is unmeasured.
 
 ![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 12.0 dBV, its second
 and third harmonics resolved as separate spikes at 25.002 and 37.501 kHz, and the noise floor drawn
@@ -567,27 +573,35 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
   tone the instrument can show.
-- **10 frames a second up to 2048 samples, and 4 at 16384.** The firmware's shortest timer period is
-  0.05 s and a tick arriving mid-frame is dropped, so the rate can only be `1 / (0.05 * k)` -- a
-  ladder of 20, 10, 6.67, 5 fps and on down. The app times its own frames and picks the smallest
-  period that still leaves 20 ms free, so the rate below is what it settles on rather than wherever
-  the rounding fell:
+- **13 to 15 frames a second at 1024 samples, falling as the count rises.** The firmware's shortest
+  timer period is 0.05 s and a tick arriving mid-frame is dropped. The period itself is **not
+  restricted to multiples of 0.05**: asking for one off that grid posts event 1727 in the log and the
+  period is honoured anyway, measured as an armed 0.07 s delivering 13 to 15 fps, which is neither
+  0.05 (20 fps) nor 0.10 (10 fps). So the rate is `1 / period` on a 10 ms grid, with 0.05 s a hard
+  floor -- `0.045` is refused outright. The app times its own frames and picks the smallest period
+  that still leaves 20 ms free:
 
-  | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+  | FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
   |---|---|---|---|---|---|---|
-  | period | 0.10 s | 0.10 s | 0.10 s | 0.20 s | 0.25 s | 0.25 s |
-  | displayed | 10 fps | 10 fps | 10 fps | 5 fps | 4 fps | **4 fps** |
+  | period | **0.07 s** | | | | | |
+  | displayed | **13-15 fps** | | | | | |
 
-  The three smallest counts share a rate because below 4096 the frame is dominated by work that does
-  not depend on the sample count, which is why 2048 is the default: it is four times the frequency
-  resolution of 512 for nothing. The figure on the settings line reads about 5 % low, because its
-  window closes on the first frame past one second.
+  Only 1024 has been measured on the compiled path, and it is faster than the whole of the earlier
+  interpreted table it replaces -- which read 0.10 s and 10 fps here. The remaining counts are blank
+  rather than carried over, because a figure from the interpreted path is not a figure for this one.
+
+  At the small counts the frame is dominated by work that does not depend on the sample count, which
+  is why 2048 is the default: it is twice the frequency resolution of 1024 for little. From 8192 up
+  acquisition dominates instead -- the record alone is 81.92 ms at 8192 and 327.68 ms at 32768 at
+  100 kS/s -- so the period cannot fall below that however fast the transform gets. The figure on the
+  settings line reads about 5 % low, because its window closes on the first frame past one second.
 
   That reserved idle is what keeps the **padlock** and **cog** answering: `delay()` lets the display task
   paint, but dispatching a press needs the Lua interpreter, and during a frame the interpreter is
-  busy. It costs 4096 and 8192 about a tick each against leaving the period at the floor, and in
-  exchange every size stays operable -- at 16384 the trace repaints about every two seconds and the
-  button still answers. **16384 is usable rather than comfortable**, and 32768 is not offered.
+  busy. It costs the middle counts about a tick each against leaving the period at the floor, and in
+  exchange every size stays operable -- at the largest counts the trace repaints slowly and the
+  button still answers. **The two largest counts are usable rather than comfortable**: 32768 is
+  offered, and its record alone is a third of a second.
 
 - **The trace flickers slightly.** The firmware requires a writable buffer to be cleared before it
   can be rewritten, so the trace buffer is empty for the 20 ms it takes to write 255 points, and a
