@@ -174,6 +174,7 @@ slowest rate whose declared stop frequency covers the span:
 
 | stop frequency | rate | bin at 2048 samples | capture at 2048 |
 |---|---|---|---|
+| up to 5 kHz | 12.5 kS/s | 6.1 Hz | 164 ms |
 | up to 12 kHz | 25 kS/s | 12.2 Hz | 82 ms |
 | up to 25 kHz | 50 kS/s | 24.4 Hz | 41 ms |
 | up to 50 kHz | 100 kS/s | 48.8 Hz | 20 ms |
@@ -181,9 +182,15 @@ slowest rate whose declared stop frequency covers the span:
 | up to 250 kHz | 500 kS/s | 244.1 Hz | 4 ms |
 | up to 500 kHz | 1 MS/s | 488.3 Hz | 2 ms |
 
-The two slow rates are there for resolution: a 12 kHz stop at 25 kS/s gives a bin width that a
-100 kS/s span would need four times the samples to reach. What it costs is the capture column, and
-aliasing — see *Aliasing* below, which matters most at these two rates.
+The three slow rates are there for resolution: a 5 kHz stop at 12.5 kS/s gives a bin width that a
+100 kS/s span would need eight times the samples to reach, and at 32,768 samples it is **0.38 Hz**.
+What it costs is the capture column — 2.6 s a frame at that corner — and aliasing, which is worst
+at these three rates. See *Aliasing* below.
+
+Every rate in the table is one the hardware delivers exactly. The digitizer divides a 66 MHz
+clock, so only a divisor of 66 MHz arrives as asked, and `dmm.digitize.samplerate` reads back the
+request either way: 102,400 S/s is accepted, reported verbatim and delivered as 102,325.5, which
+puts every bin 0.073 % out.
 
 - A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
   bins are captured already, and zooming in there gives more plot columns per bin rather than
@@ -238,7 +245,7 @@ works either way.
 | Field | |
 |---|---|
 | Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. The peak table has its own floor two or three bins up — see *The lowest frequency the table reports*. |
-| Stop Freq | Top of the display, 500 Hz to 500 kHz. It sets the sample rate, and so the bin width: at or below 12 kHz the digitizer runs at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. Below 12 kHz the rate is already at its floor, so a lower stop narrows the view and not the bin. |
+| Stop Freq | Top of the display, 500 Hz to 500 kHz. It sets the sample rate, and so the bin width: at or below 5 kHz the digitizer runs at 12.5 kS/s, at or below 12 kHz at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. Below 5 kHz the rate is already at its floor, so a lower stop narrows the view and not the bin. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
@@ -362,14 +369,14 @@ Measured on this instrument: a pure 21.1 kHz sine digitized at 20 kS/s drew one 
 screen said the frequency was not.
 
 **A narrow span is the exposed case**, because a narrow span is what lowers the sample rate. A stop
-at or below 25 kHz runs the digitizer at 50 kS/s and a stop at or below 12 kHz runs it at 25 kS/s —
-that is what buys the finer bins, and it is also what brings the folding frequency down into the
-range of ordinary signals. The same 21.1 kHz tone viewed over a 10 kHz span, at 25 kS/s, lands at
-3.9 kHz.
+at or below 25 kHz runs the digitizer at 50 kS/s, at or below 12 kHz at 25 kS/s, and at or below
+5 kHz at 12.5 kS/s — that is what buys the finer bins, and it is also what brings the folding
+frequency down into the range of ordinary signals. The same 21.1 kHz tone viewed over a 10 kHz span,
+at 25 kS/s, lands at 3.9 kHz — and at 12.5 kS/s an ordinary 10 kHz tone lands at 2.5 kHz.
 
 **Nothing in the instrument can filter it out first.** The digitize aperture is the only analog
 averaging available, it clamps at 10 µs, and a 10 µs boxcar first nulls at 100 kHz — so it
-attenuates nothing near a 12.5 kHz folding frequency. A longer aperture would not help either: at
+attenuates nothing near a 6.25 kHz folding frequency. A longer aperture would not help either: at
 the whole sample interval it costs 23 % of the amplitude in band, measured.
 
 Two ways to tell an alias from a tone: widen the span, and a real tone stays put while an alias
@@ -549,10 +556,10 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 ## Limits
 
 - **Bin width is the sample rate divided by the selected sample count**, so either knob moves it.
-  At 2048 samples and 100 kS/s bins are 48.8 Hz; at 32768 and 25 kS/s they are **0.76 Hz**, which is
-  the finest the app reaches.
-- **The span sets the rate**, so zooming in below 25 kHz or 12 kHz does make the bins finer — see the
-  rate table under *Gestures*. It costs capture time in proportion, and it brings the folding
+  At 2048 samples and 100 kS/s bins are 48.8 Hz; at 32768 and 12.5 kS/s they are **0.38 Hz**, which
+  is the finest the app reaches.
+- **The span sets the rate**, so zooming in below 25 kHz, 12 kHz or 5 kHz does make the bins finer —
+  see the rate table under *Gestures*. It costs capture time in proportion, and it brings the folding
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
   tone the instrument can show.

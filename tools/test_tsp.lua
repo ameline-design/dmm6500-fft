@@ -1256,8 +1256,29 @@ check('every rate ceiling is at or under that rate Nyquist', (function()
   end
   return true, n .. ' rates, every ceiling at or under Nyquist'
 end)())
+-- Structural, not a one-off check on the rate last added: the delivered rate is
+-- 66e6/ceil(66e6/request), so only a divisor of 66e6 arrives as asked, and the attribute
+-- reads back the request either way so nothing downstream can notice.
+check('every rate in the ladder is one the hardware delivers exactly', (function()
+  local clk, i = 66e6, nil
+  for i = 1, table.getn(fftsa.rates) do
+    local r = fftsa.rates[i]
+    local div = clk / r
+    if div ~= math.floor(div) then
+      return false, string.format('%g S/s needs a divider of %.4f, so it arrives as %.1f',
+                                  r, div, clk / math.ceil(div))
+    end
+  end
+  -- Teeth: the same arithmetic has to reject the rate measured as substituted, 102400 ->
+  -- 102325.5, or this passes by testing nothing.
+  local bad = clk / 102400
+  return bad ~= math.floor(bad),
+         string.format('%d rates, every divider an integer; 102400 would need %.4f',
+                       table.getn(fftsa.rates), bad)
+end)())
 check('the rate steps at the declared stops, which are inclusive', (function()
-  local want = {{12000, 25000}, {12001, 50000}, {25000, 50000}, {25001, 100000}}
+  local want = {{5000, 12500}, {5001, 25000}, {12000, 25000}, {12001, 50000},
+                {25000, 50000}, {25001, 100000}}
   for _, p in ipairs(want) do
     local got = fftsa.pick_fs(p[1])
     if got ~= p[2] then
@@ -1265,7 +1286,8 @@ check('the rate steps at the declared stops, which are inclusive', (function()
                                   p[1], got, p[2])
     end
   end
-  return true, '12 kHz takes 25 kS/s and 25 kHz takes 50 kS/s, both inclusive'
+  return true, string.format('%d declared stops, each inclusive and each one rung above '
+                             .. 'the next hertz', table.getn(want) / 2)
 end)())
 check('the rate never decreases as the span widens', (function()
   local prev, ok = 0, true
@@ -1319,11 +1341,18 @@ check('the frame estimate carries the capture, so the busy guard clears a real f
   end
   return true, string.format('worst capture %.2f s, %s', worst, at)
 end)())
-check('the floor rate quarters the bin width the default span gives', (function()
+-- The capability both ladders exist to give, stated as what it reaches rather than as a
+-- ratio: a fixed multiple here would have to move every time either list changes, and the
+-- sub-hertz claim is the one worth holding.
+check('the narrowest span on the largest count reaches a sub-hertz bin', (function()
+  local counts = fftsa.sample_counts
+  local biggest = counts[table.getn(counts)]
   local slow, fast = fftsa.pick_fs(fftsa.fhi_min), fftsa.pick_fs(fftsa.fhi)
-  return slow * 4 == fast and slow / fftsa.n < 200,
-         string.format('%.2f Hz bins at a %g Hz stop against %.2f at the default %g',
-                       slow / fftsa.n, fftsa.fhi_min, fast / fftsa.n, fftsa.fhi)
+  local fine, coarse = slow / biggest, fast / fftsa.n
+  return slow == fftsa.fs_min and fine < 1 and fine < coarse,
+         string.format('%.3f Hz bins at a %g Hz stop on %d samples, against %.2f at the '
+                       .. 'default %g Hz stop on %d', fine, fftsa.fhi_min, biggest, coarse,
+                       fftsa.fhi, fftsa.n)
 end)())
 -- Without this the feature is inert: a zoom that does not report a changed plan takes the
 -- axis-only path, and the digitizer keeps the rate it had.

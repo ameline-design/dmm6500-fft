@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.24
+-- $Version: 8.25
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -4393,8 +4393,8 @@ fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
 -- Nyquist at the fastest rate, so this is the widest view the hardware can give.
 -- The low end is well under the slowest rate, so a stop down here narrows the view
--- rather than the bin: 500 Hz holds 20 bins at the smallest count and 642 at the
--- largest, drawn into 255 columns either way.
+-- rather than the bin: 500 Hz holds 40 bins at the smallest count and about 1280 at
+-- the largest, drawn into 255 columns either way.
 fftsa.fhi_max = 500000
 fftsa.fhi_min = 500
 -- Ceiling for the start, a kilohertz under the stop's so the form cannot be set to a span
@@ -4474,18 +4474,22 @@ end
 -- rate is the only way to narrow a bin without changing the transform.
 --
 -- The cost is aliasing, and the aperture cannot mitigate it -- it clamps at 10 us, whose
--- boxcar first nulls at 100 kHz, so it attenuates nothing near a 12.5 kHz folding
--- frequency. Content above the chosen Nyquist folds in at full amplitude with nothing on
--- the glass to say so, and a narrow span is now the view most exposed to it.
+-- boxcar first nulls at 100 kHz, so it attenuates nothing near the 6.25 kHz folding
+-- frequency of the slowest rung. Content above the chosen Nyquist folds in at full
+-- amplitude with nothing on the glass to say so, and a narrow span is the view most
+-- exposed to it.
 --
 -- Each rate declares the highest stop frequency it may serve, and pick_fs takes the
--- slowest that covers the span. The ceilings are Nyquist everywhere but 25 kS/s, which
--- stops at 12 kHz rather than 12.5.
+-- slowest that covers the span. The ceilings are Nyquist on the four fast rungs and under
+-- it on the three slow ones, which is where folding reaches ordinary signals: 5 kHz against
+-- a 6.25 kHz Nyquist, 12 kHz against 12.5, 25 kHz against 25.
 --
--- Exact rates only: the delivered rate is 66e6/ceil(66e6/request), so a divisor of 66e6 is
--- exact -- 2640 for 25000, 1320 for 50000 -- while 102400 becomes 102325.5.
-fftsa.rates    = {25000, 50000, 100000, 200000, 500000, 1000000}
-fftsa.rate_fhi = {12000, 25000,  50000, 100000, 250000,  500000}
+-- Exact rates only: the delivered rate is 66e6/ceil(66e6/request), so only a divisor of
+-- 66e6 arrives as asked -- 5280 for 12500, 2640 for 25000, 1320 for 50000 -- while 102400
+-- is read back verbatim and delivered as 102325.5, putting every bin 0.073 % out. A gate
+-- holds the whole ladder to that division.
+fftsa.rates    = {12500, 25000, 50000, 100000, 200000, 500000, 1000000}
+fftsa.rate_fhi = { 5000, 12000, 25000,  50000, 100000, 250000,  500000}
 fftsa.fs_min   = fftsa.rates[1]
 
 -- Slowest rate whose ceiling covers the stop frequency. A NaN stop compares false against
