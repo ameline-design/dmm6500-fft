@@ -7003,6 +7003,31 @@ check('start() opens at the compiled count before its only Apply', (function()
                        tostring(ok), tostring(n), tostring(dn), tostring(committed))
 end)())
 
+-- The re-stash in nl_bind(). nl.init takes its stash as its last act, before the capture
+-- buffer has ever been described, so without this call a relaunch restores a key for the
+-- plan buffer and describe() sweeps the heap for storage it already found. What the stash
+-- then carries is tools/test_nl_reattach.lua's business; this is the call site.
+--
+-- Both paths are driven. A stash on the failure path would carry a descriptor the app has
+-- just rejected, which is the opposite defect and passes an assertion that counts only up.
+check('a successful bind re-stashes, a failed one does not', (function()
+  local keepnl, keepcap, keepof = fftsa.nl, fftsa.nl_cap, fftsa.nl_cap_of
+  local stashed, desc = 0, nil
+  fftsa.nl = {ready = true, entry = 999,
+              describe = function() return desc end,
+              stash = function() stashed = stashed + 1; return true end}
+  desc = {chunk1 = 1, nchunks = 4}
+  local okgood = fftsa.nl_bind()
+  local ngood = stashed
+  desc = nil
+  local okbad = fftsa.nl_bind()
+  fftsa.nl, fftsa.nl_cap, fftsa.nl_cap_of = keepnl, keepcap, keepof
+  return okgood == true and ngood == 1 and okbad == false and stashed == 1,
+         string.format('good=%s/%d bad=%s/%d cap=%s trace=%s',
+                       tostring(okgood), ngood, tostring(okbad), stashed,
+                       tostring(fftsa.cap ~= nil), tostring(fftsa.sg_buf ~= nil))
+end)())
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

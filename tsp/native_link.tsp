@@ -565,8 +565,14 @@ local FAR_INDEX = { 64, 256 }
 -- does not raise, so the call succeeds and returns nil while the operator gets a dialog.
 -- Every caller created the buffer it is asking about and knows the style it asked for.
 function fftsa.nl._find_storage(buf, has_extras)
+  -- Which term failed, for whoever reports the refusal: a sweep that answers only nil
+  -- leaves the caller saying "no descriptor" with nothing to act on.
   local n = buf.n
-  if n == nil or n < READ_CONFIRM then return nil end
+  fftsa.nl._stor_why = nil
+  if n == nil or n < READ_CONFIRM then
+    fftsa.nl._stor_why = 'short record n=' .. tostring(n)
+    return nil
+  end
   local rd, ex = {}, nil
   local i
   for i = 1, READ_CONFIRM do
@@ -603,8 +609,10 @@ function fftsa.nl._find_storage(buf, has_extras)
     { 17825792, 150994944 },    -- 0x01100000 - 0x09000000, both inside .heap
   }
   local wi
+  local nhits = 0
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    nhits = nhits + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
@@ -615,18 +623,22 @@ function fftsa.nl._find_storage(buf, has_extras)
       -- reach it. This rejects nothing real and costs nothing; the discrimination is the
       -- extras and the far readings below.
       if math.mod(h, 8) == 0 then
-        -- CANDIDATE STRIDES, 32 FIRST AND PREFERRED. 32 is what a WRITABLE_FULL element
-        -- measures, the extra value at +20 only exists in an element that long, and
-        -- assuming it was necessary: measuring the stride from the spacing of the
-        -- readings instead found a 16-byte record holding the same six values. So 32 is
-        -- tried first and the measured offsets are the fallback, for a STYLE_STANDARD
-        -- buffer whose element really is smaller. Each candidate gets the FULL
-        -- confirmation before it is accepted.
-        local cands, cn = { 32 }, 1
+        -- CANDIDATE STRIDES: 32 AND 24, BOTH UNCONDITIONALLY. They are the two element
+        -- sizes this firmware uses -- WRITABLE_FULL and STANDARD -- and both are measured,
+        -- 32 being the only one that can hold the extra value at +20. The discovered
+        -- offsets after them cover an element neither size matches, and they can only be
+        -- measured where readings 1 and 2 differ: with every reading equal each offset
+        -- matches and the list fills with noise. A quiet capture is exactly that case, its
+        -- first two readings often identical at 4.5 digits, which left 24 untried and no
+        -- stride able to confirm. Each candidate still gets the FULL confirmation, and
+        -- describe() then checks the winner against the descriptor's own element size.
+        local cands, cn = { 32, 24 }, 2
         if rd[2] ~= rd[1] then
           local off
           for off = 8, 64, 4 do
-            if off ~= 32 and eq64(h + off, rd[2]) then cn = cn + 1; cands[cn] = off end
+            if off ~= 32 and off ~= 24 and eq64(h + off, rd[2]) then
+              cn = cn + 1; cands[cn] = off
+            end
           end
         end
         local ci
@@ -657,6 +669,9 @@ function fftsa.nl._find_storage(buf, has_extras)
       end
     end
   end
+  fftsa.nl._stor_why = 'no stride confirmed n=' .. tostring(n) .. ' hits=' .. tostring(nhits)
+                       .. ' eq12=' .. tostring(rd[2] == rd[1])
+                       .. ' x=' .. tostring(has_extras)
   return nil
 end
 

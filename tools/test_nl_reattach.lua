@@ -202,23 +202,39 @@ check('carries the addresses, the buffers and the resolved math table',
       and NLSTASH.fn ~= fftsa.nl.fn)
 -- describe()'s cache survives a relaunch only if its KEY does. The address it caches is a
 -- number and rides along as a scalar; the key is the capture buffer's handle, and without it
--- the `_stor_of == buf` test fails, describe() discards a still-valid address and sweeps --
--- a sweep that came back empty on the instrument and halted every second launch. Asserted on
--- identity, because a copy of the handle would not compare equal to the live buffer.
-check('carries describe()\'s capture-buffer cache, key included', (function()
-  local cap = live_buffer()
-  fftsa.nl._stor_of, fftsa.nl._stor_x = cap, false
-  fftsa.nl._stor_elem0, fftsa.nl._stor_stride = 60176864, 24
-  fftsa.nl._desc_of, fftsa.nl._desc_at = 60176864, 60242432
-  fftsa.nl.stash()
-  return NLSTASH._stor_of == cap and NLSTASH._stor_x == false
-         and NLSTASH._stor_elem0 == 60176864 and NLSTASH._stor_stride == 24
-         and NLSTASH._desc_of == 60176864 and NLSTASH._desc_at == 60242432,
-         string.format('key=%s elem0=%s stride=%s desc=%s/%s x=%s',
-                       tostring(NLSTASH._stor_of == cap), tostring(NLSTASH._stor_elem0),
-                       tostring(NLSTASH._stor_stride), tostring(NLSTASH._desc_of),
-                       tostring(NLSTASH._desc_at), tostring(NLSTASH._stor_x))
-end)())
+-- the `_stor_of == buf` test fails and describe() discards a still-valid address and sweeps.
+--
+-- The slot is a SINGLE shared one, so which buffer's key a stash carries is decided by when
+-- the stash is taken and not by the handle list. Both orders are driven, because asserting
+-- only the second one passes while the app -- which stashes in the first order -- fails.
+local CAP, PLAN = live_buffer(65536), live_buffer(28672)
+local CAP_E0, PLAN_E0 = 60831232, 60176864
+local function describe_slot(buf, elem0, stride)
+  fftsa.nl._stor_of, fftsa.nl._stor_x = buf, false
+  fftsa.nl._stor_elem0, fftsa.nl._stor_stride = elem0, stride
+  fftsa.nl._desc_of, fftsa.nl._desc_at = elem0, elem0 + 65568
+end
+
+-- nl.init's order: the plan buffer is the last thing it describes, and the stash is its last
+-- act. So a stash taken there carries the plan buffer however long the handle list grows.
+describe_slot(PLAN, PLAN_E0, 32)
+fftsa.nl.stash()
+check('a stash taken before the capture is described carries the other buffer',
+      NLSTASH._stor_of == PLAN and NLSTASH._stor_elem0 == PLAN_E0,
+      string.format('capacity=%s elem0=%s',
+                    tostring(NLSTASH._stor_of.capacity), tostring(NLSTASH._stor_elem0)))
+
+-- fftsa.nl_bind's order: re-taken once the capture buffer is the described one.
+describe_slot(CAP, CAP_E0, 24)
+fftsa.nl.stash()
+check('carries describe()\'s capture-buffer cache, key included',
+      NLSTASH._stor_of == CAP and NLSTASH._stor_x == false
+      and NLSTASH._stor_elem0 == CAP_E0 and NLSTASH._stor_stride == 24
+      and NLSTASH._desc_of == CAP_E0 and NLSTASH._desc_at == CAP_E0 + 65568,
+      string.format('key=%s elem0=%s stride=%s desc=%s/%s x=%s',
+                    tostring(NLSTASH._stor_of == CAP), tostring(NLSTASH._stor_elem0),
+                    tostring(NLSTASH._stor_stride), tostring(NLSTASH._desc_of),
+                    tostring(NLSTASH._desc_at), tostring(NLSTASH._stor_x)))
 check('carries no functions',
       (function()
         local k, v
@@ -231,6 +247,103 @@ check('carries the constants the next launch compares against, whatever reloads 
       NLSTASH._TRAMP == fftsa.nl._TRAMP
       and NLSTASH.TRAMP_RANGE == fftsa.nl.TRAMP_RANGE
       and NLSTASH.PARAMS_SLOT == fftsa.nl.PARAMS_SLOT)
+
+-- And the far end of the same path: carrying the cache is only worth anything if a relaunch
+-- puts it back on a module table that reloaded without it. _stor_x is asserted against false
+-- rather than merely being present, because describe() compares it to has_extras and a nil
+-- there misses the cache for a STYLE_STANDARD buffer exactly as a wrong key would.
+print('\nnl.reattach restores the cache')
+
+reset_heap()
+NLSTASH = fresh_stash()
+NLSTASH._stor_of, NLSTASH._stor_x = CAP, false
+NLSTASH._stor_elem0, NLSTASH._stor_stride = CAP_E0, 24
+NLSTASH._desc_of, NLSTASH._desc_at = CAP_E0, CAP_E0 + 65568
+fftsa.nl._stor_of, fftsa.nl._stor_x = nil, nil
+fftsa.nl._stor_elem0, fftsa.nl._stor_stride = nil, nil
+fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil
+nl.ready, nl.reattached = false, nil
+arm_reinit(true)
+local rok = nl.reattach(2048, 1, 0, 1, 1)
+check('puts all six cache fields back on a cold module table',
+      rok == true and nl._stor_of == CAP and nl._stor_x == false
+      and nl._stor_elem0 == CAP_E0 and nl._stor_stride == 24
+      and nl._desc_of == CAP_E0 and nl._desc_at == CAP_E0 + 65568,
+      string.format('ok=%s key=%s elem0=%s stride=%s x=%s',
+                    tostring(rok), tostring(nl._stor_of == CAP), tostring(nl._stor_elem0),
+                    tostring(nl._stor_stride), tostring(nl._stor_x)))
+
+-- A refusal must not leave a key behind: the addresses it names were validated by the same
+-- checks that just failed, and describe() would hit the cache rather than sweep.
+fftsa.nl._stor_of, fftsa.nl._stor_elem0 = nil, nil
+ok, ready, n = try(function(s)
+  s.code_buf = dead_buffer()
+  s._stor_of, s._stor_x, s._stor_elem0, s._stor_stride = CAP, false, CAP_E0, 24
+end)
+check('a refused reattach installs no cache key',
+      ok == false and nl._stor_of == nil and nl._stor_elem0 == nil,
+      string.format('ok=%s key=%s elem0=%s',
+                    tostring(ok), tostring(nl._stor_of), tostring(nl._stor_elem0)))
+
+print('\nnl._find_storage')
+
+-- A STYLE_STANDARD element is 24 bytes, and a quiet capture's first two readings are often
+-- identical at 4.5 digits. The discovered-offset loop is skipped in that case -- with every
+-- reading equal, every offset would match and the list would fill with noise -- so 24 has to
+-- be a standing candidate or the capture buffer cannot be found at all.
+--
+-- 32 is left failing against the mock exactly as it fails against a real 24-byte element, so
+-- these drive the stride selection rather than merely reaching a hit. FINDS is stubbed: the
+-- defect is in the candidate list, and sweeping 32 MB of mock heap would prove nothing more.
+local FINDS_REAL = fftsa.nl.FINDS
+local SELEM0 = 60831232
+local function place(stride, vals)
+  reset_heap()
+  local i, v
+  for i, v in pairs(vals) do
+    local hi, lo = fftsa.nl._f64_words(v)
+    WORDS[SELEM0 + (i - 1) * stride] = hi
+    WORDS[SELEM0 + (i - 1) * stride + 4] = lo
+  end
+  fftsa.nl.FINDS = function() return {SELEM0} end
+end
+local function readings(r1, r2)
+  local v = {r1, r2, 0.25, 0.375, 0.5, 0.625}
+  v[64], v[256] = 1.5, 2.5
+  return v
+end
+
+local QUIET = readings(0.125, 0.125)
+place(24, QUIET)
+local e0, st = fftsa.nl._find_storage({n = 2048, readings = QUIET}, false)
+check('finds a 24-byte element whose first two readings are identical',
+      e0 == SELEM0 and st == 24,
+      string.format('elem0=%s stride=%s why=%s',
+                    tostring(e0), tostring(st), tostring(fftsa.nl._stor_why)))
+
+local LIVE = readings(0.125, 0.1875)
+place(24, LIVE)
+e0, st = fftsa.nl._find_storage({n = 2048, readings = LIVE}, false)
+check('still finds one whose readings all differ',
+      e0 == SELEM0 and st == 24,
+      string.format('elem0=%s stride=%s', tostring(e0), tostring(st)))
+
+-- And not promiscuous: a standing candidate must not confirm an element it does not match.
+place(40, QUIET)
+e0, st = fftsa.nl._find_storage({n = 2048, readings = QUIET}, false)
+check('confirms no stride for an element size it does not know, and says why',
+      e0 == nil and fftsa.nl._stor_why ~= nil
+      and string.find(fftsa.nl._stor_why, 'no stride confirmed', 1, true) ~= nil,
+      string.format('elem0=%s why=%s', tostring(e0), tostring(fftsa.nl._stor_why)))
+
+place(24, QUIET)
+e0, st = fftsa.nl._find_storage({n = 3, readings = QUIET}, false)
+check('refuses a record shorter than the confirmation, and says which term',
+      e0 == nil and fftsa.nl._stor_why ~= nil
+      and string.find(fftsa.nl._stor_why, 'short record', 1, true) ~= nil,
+      string.format('elem0=%s why=%s', tostring(e0), tostring(fftsa.nl._stor_why)))
+
+fftsa.nl.FINDS = FINDS_REAL
 
 print()
 print(string.format('%d passed, %d failed', pass, fail))

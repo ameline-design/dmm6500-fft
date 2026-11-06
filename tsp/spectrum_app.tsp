@@ -518,10 +518,18 @@ function fftsa.nl_bind()
   fftsa.nl_cap, fftsa.nl_cap_of = nil, nil
   local c = nl.describe(fftsa.cap, false)
   if c == nil then
-    fftsa.nl_lasterr = 'bind: describe found no descriptor for the capture buffer'
+    -- The sweep's own reason when it has one. Without it this reads as "no descriptor" for
+    -- a short record, an unconfirmed stride and a missed descriptor alike.
+    fftsa.nl_lasterr = 'bind: describe found no descriptor for the capture buffer -- '
+                       .. tostring(nl._stor_why)
     return false
   end
   fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
+  -- describe()'s cache slot holds the capture buffer only here. nl.init stashes as its last
+  -- act, before this buffer has ever been described, so the stash it takes carries the plan
+  -- buffer's key instead. Re-taking it now is what lets a relaunch re-read the descriptor
+  -- words rather than sweep the heap for storage it already found.
+  if type(nl.stash) == 'function' then nl.stash() end
   return true
 end
 
