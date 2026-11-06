@@ -331,7 +331,8 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     -- shorting block makes this the instrument's own noise rather than pickup, and a cold
     -- start reads worse, so a figure taken any other way is not this one. A DMM7510 reads
     -- -134 dBV on its 0.1 V range and -129 on 1 V, under what a -120 axis can show, which is
-    -- what fftsa.sg_dbmin_for() moves the floor to -140 for.
+    -- one of the two cases fftsa.sg_dbmin_for() moves the floor to -140 for; a bin narrowed
+    -- by a 16384 or 32768 count is the other.
     --
     -- log10 is safe without a guard: this branch needs cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)

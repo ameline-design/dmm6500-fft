@@ -3120,6 +3120,30 @@ check('an Apply on a DMM7510 drops the axis floor, and only when it moves', (fun
                        tostring(deep), tostring(ymin), tostring(dbfloor), pinned, again,
                        tostring(fftsa.sg_dbmin), tostring(OBJ[gh].ymin))
 end)())
+-- The count's half of the rule, end to end: the pure function has its own cases, and this
+-- says the axis and dsp.out.dbfloor got there through a real Apply. sg_dbmin_set() reads
+-- fftsa.n when its caller does not pass a count, so a regression there shows up only here.
+check('an Apply at 16384 on a DMM6500 1 V range drops the axis floor', (function()
+  local save, r0, n0 = fftsa.model_str, fftsa.range, fftsa.n
+  fftsa.model_str, fftsa.range, fftsa.n = 'DMM6500', 1, 16384
+  local yp0 = (OBJ[gh].ypins or 0)
+  fftsa.apply()
+  local deep, pinned = fftsa.sg_dbmin, (OBJ[gh].ypins or 0) - yp0
+  local ymin, dbfloor = OBJ[gh].ymin, dsp.out.dbfloor
+  -- The same count again writes nothing, and dropping back to a wide bin returns the axis.
+  fftsa.apply()
+  local again = (OBJ[gh].ypins or 0) - yp0 - pinned
+  fftsa.n = 2048
+  fftsa.apply()
+  local back, backpin = fftsa.sg_dbmin, (OBJ[gh].ypins or 0) - yp0 - pinned - again
+  fftsa.model_str, fftsa.range, fftsa.n = save, r0, n0
+  fftsa.apply()
+  return deep == -140 and ymin == -140 and dbfloor == -140 and pinned == 1 and again == 0
+         and back == -120 and backpin == 1,
+         string.format('at 16384 floor %s axis %s dbfloor %s pins %d then %d; '
+                       .. 'at 2048 floor %s pins %d', tostring(deep), tostring(ymin),
+                       tostring(dbfloor), pinned, again, tostring(back), backpin)
+end)())
 
 -- ---------- over-range: a reading the selected range cannot represent ----------
 -- The digitizer answers 9.9e+37 past the range, and a few of those in a record make the
@@ -4097,21 +4121,52 @@ check('the graph and the peak table both fit the panel',
 -- range and -129 on 1 V, where a DMM6500 reads -123 and -121. So -120 holds a DMM6500's own
 -- floor within a few dB of the axis, and would leave the 7510's two quiet ranges underneath
 -- it altogether.
-check('a DMM6500 plots to -120 dBV on every range', (function()
+check('a DMM6500 plots to -120 dBV on every range at the wide-bin counts', (function()
   local save = fftsa.model_str
   fftsa.model_str = 'DMM6500'
-  local a, b, c = fftsa.sg_dbmin_for(0.1), fftsa.sg_dbmin_for(1), fftsa.sg_dbmin_for(10)
+  local a, b, c = fftsa.sg_dbmin_for(0.1, 2048), fftsa.sg_dbmin_for(1, 2048),
+                  fftsa.sg_dbmin_for(10, 2048)
   fftsa.model_str = save
   return a == -120 and b == -120 and c == -120,
-         string.format('0.1 V %g, 1 V %g, 10 V %g', a, b, c)
+         string.format('0.1 V %g, 1 V %g, 10 V %g at 2048', a, b, c)
 end)())
-check('a DMM7510 plots to -140 on 1 V and below, and -120 on 10 V', (function()
+-- The whole grid, because the rule has two inputs and a single pair of calls cannot show
+-- which one carried the answer. Both halves of each count are asserted: the deeper floor on
+-- 1 V and below, the shallow one on 10 V, whose own noise is nowhere near -120.
+check('a narrow bin takes a DMM6500 1 V and below to -140', (function()
+  local save = fftsa.model_str
+  fftsa.model_str = 'DMM6500'
+  local deep, shallow, i = 0, 0, nil
+  for i = 1, table.getn(fftsa.sample_counts) do
+    local n, j = fftsa.sample_counts[i], nil
+    for j = 1, table.getn(fftsa.ranges) do
+      local r = fftsa.ranges[j]
+      local expect = -120
+      if r <= fftsa.sg_dbmin_deep_vmax and n >= fftsa.sg_dbmin_deep_n then expect = -140 end
+      local got = fftsa.sg_dbmin_for(r, n)
+      if got ~= expect then
+        fftsa.model_str = save
+        return false, string.format('%g V at %d gave %g, wanted %g', r, n, got, expect)
+      end
+      if got == -140 then deep = deep + 1 else shallow = shallow + 1 end
+    end
+  end
+  fftsa.model_str = save
+  -- Pinned, so a threshold that swallows the whole list or none of it is caught: two counts
+  -- at or above 16384, two ranges at or under 1 V.
+  return deep == 4 and shallow == 14,
+         string.format('%d deep, %d shallow over %d counts x %d ranges', deep, shallow,
+                       table.getn(fftsa.sample_counts), table.getn(fftsa.ranges))
+end)())
+check('a DMM7510 plots to -140 on 1 V and below at every count, and -120 on 10 V',
+      (function()
   local save = fftsa.model_str
   fftsa.model_str = 'DMM7510'
-  local a, b, c = fftsa.sg_dbmin_for(0.1), fftsa.sg_dbmin_for(1), fftsa.sg_dbmin_for(10)
+  local a, b, c = fftsa.sg_dbmin_for(0.1, 1024), fftsa.sg_dbmin_for(1, 1024),
+                  fftsa.sg_dbmin_for(10, 32768)
   -- A range the list cannot produce takes the shallow floor, which is the one that cannot
   -- hide a trace under the bottom of the plot.
-  local none, off = fftsa.sg_dbmin_for(nil), fftsa.sg_dbmin_for(100)
+  local none, off = fftsa.sg_dbmin_for(nil, 32768), fftsa.sg_dbmin_for(100, 32768)
   fftsa.model_str = save
   return a == -140 and b == -140 and c == -120 and none == -120 and off == -120,
          string.format('0.1 V %g, 1 V %g, 10 V %g, nil %g, 100 V %g', a, b, c, none, off)
@@ -4155,10 +4210,10 @@ end)())
 -- Against the floor in force, whichever model set it: at -140 a vfloor above it would clamp
 -- every quiet bin 40 dB up and the deeper axis would be empty space.
 check('the voltage floor is below the dB floor, so log10 never sees a zero',
-      20 * math.log10(fftsa.sg_vfloor) < fftsa.sg_dbmin_7510
-      and fftsa.sg_dbmin_7510 < fftsa.sg_dbmin_std,
+      20 * math.log10(fftsa.sg_vfloor) < fftsa.sg_dbmin_deep
+      and fftsa.sg_dbmin_deep < fftsa.sg_dbmin_std,
       string.format('vfloor %g = %.0f dBV against %g and %g', fftsa.sg_vfloor,
-                    20 * math.log10(fftsa.sg_vfloor), fftsa.sg_dbmin_7510,
+                    20 * math.log10(fftsa.sg_vfloor), fftsa.sg_dbmin_deep,
                     fftsa.sg_dbmin_std))
 check('a bin under the floor is plotted AT the floor, not dropped', (function()
   local save = fftsa.fft_pwr

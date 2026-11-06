@@ -86,15 +86,18 @@ fftsa.sg_gy      = 0
 fftsa.sg_gw      = 784
 fftsa.sg_gh      = 312
 
--- The dB axis floor: -120 dBV, and -140 on a DMM7510's 1 V and 0.1 V ranges. Measured floors,
--- which is what picks both numbers -- a DMM7510 reads -134 dBV on 0.1 V and -129 on 1 V, so
--- -120 leaves its two quiet ranges off the bottom of the plot and -140 clears them by 6 dB. A
--- DMM6500 reads -123 and -121 on the same ranges and stays at -120 everywhere, its floor
--- being within a few dB of the axis rather than under it. sg_dbmin is the floor in force and
--- fftsa.sg_dbmin_set() is the only thing that moves it, from the range apply() commits.
+-- The dB axis floor: -120 dBV, and -140 on the 1 V and 0.1 V ranges where the noise goes
+-- under it. Measured floors pick both numbers. A DMM7510 reads -134 dBV on 0.1 V and -129 on
+-- 1 V at any count, so -120 leaves its two quiet ranges off the bottom of the plot. A DMM6500
+-- reads -123 and -121 on the same ranges, which is a trace lying on the bottom edge, and a
+-- narrower bin takes the noise down with it -- 6 dB at 16384 against 2048, 9 dB at 32768 --
+-- so the deeper floor covers those counts too. sg_dbmin is the floor in force and
+-- fftsa.sg_dbmin_set() is the only thing that moves it, from the range and count apply()
+-- commits.
 fftsa.sg_dbmin_std       = -120
-fftsa.sg_dbmin_7510      = -140
-fftsa.sg_dbmin_7510_vmax = 1     -- the largest range the deeper floor covers
+fftsa.sg_dbmin_deep      = -140
+fftsa.sg_dbmin_deep_vmax = 1     -- the largest range the deeper floor covers
+fftsa.sg_dbmin_deep_n    = 16384 -- the smallest count whose bin needs it on a DMM6500
 fftsa.sg_dbmin           = fftsa.sg_dbmin_std   -- the floor in force
 fftsa.sg_dbmax           = 20
 fftsa.sg_vfloor          = 1e-9
@@ -822,12 +825,14 @@ function fftsa.is_7510()
   return string.find(fftsa.model_name(), "7510", 1, true) ~= nil
 end
 
--- The floor a range wants, in dBV. The deeper one is the DMM7510's 1 V and 0.1 V ranges and
--- nothing else: a range off the list and an unidentified instrument both take -120, which is
--- the floor that cannot hide a trace.
-function fftsa.sg_dbmin_for(range)
-  if range ~= nil and range <= fftsa.sg_dbmin_7510_vmax and fftsa.is_7510() then
-    return fftsa.sg_dbmin_7510
+-- The floor a range and count want, in dBV. The deeper one needs the 1 V or 0.1 V range and
+-- then either a DMM7510, whose floor is under -120 at every count, or a count whose bin is
+-- narrow enough to take a DMM6500 under it. A range off the list, a wide-bin count and an
+-- unidentified instrument all take -120, the floor that cannot hide a trace.
+function fftsa.sg_dbmin_for(range, n)
+  if range ~= nil and range <= fftsa.sg_dbmin_deep_vmax then
+    if fftsa.is_7510() then return fftsa.sg_dbmin_deep end
+    if n ~= nil and n >= fftsa.sg_dbmin_deep_n then return fftsa.sg_dbmin_deep end
   end
   return fftsa.sg_dbmin_std
 end
@@ -837,8 +842,11 @@ end
 -- marker needles, the restore's span and dsp.out.dbfloor through dsp_live_push(). The answer is
 -- what apply() pins the axis on, an axis write costing 60 ms and a full repaint, so an
 -- unchanged limit is never written.
-function fftsa.sg_dbmin_set(range)
-  local want = fftsa.sg_dbmin_for(range)
+function fftsa.sg_dbmin_set(range, n)
+  -- Defaulted here rather than at the call: a caller that passed only the range would
+  -- silently lose the deeper floor at the two counts that need it.
+  if n == nil then n = fftsa.n end
+  local want = fftsa.sg_dbmin_for(range, n)
   if want == fftsa.sg_dbmin then return false end
   fftsa.sg_dbmin = want
   return true
