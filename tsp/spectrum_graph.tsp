@@ -1314,17 +1314,20 @@ fftsa.sg_peaks_off = false      -- disables the peak table, to attribute display
 -- One peak as (frequency in hertz, volts), or nil where there is none.
 --
 -- pk_hz/pk_v are what the primitive already resolved -- sub-bin corrected in both axes, once
--- per frame inside dsp.spectrum() instead of the eighteen fftsa.peak_interp calls a frame the
--- three display users below used to make between them. Without them it falls back to the bin
--- index and does its own interpolation, which is the form tools/test_tsp.lua drives directly
--- and the one that survives if the primitive ever reports bins rather than frequencies.
+-- per frame, rather than the eighteen interpolations a frame the three display users below
+-- used to make between them. It is the only form the app ever passes.
+--
+-- Without them it falls back to the bin index and interpolates here, which is the form
+-- tools/test_tsp.lua drives directly. fftsa.peak_interp is in tsp/fft_interp.tsp, which the
+-- archive leaves out because csrc/ does that arithmetic -- so on the instrument the fallback
+-- has no interpolator to call and answers nil instead of indexing one.
 function fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
   if pk_hz ~= nil then
     local f = pk_hz[p]
     if f == nil then return nil end
     return f, pk_v[p]
   end
-  if bi == nil or bv == nil then return nil end
+  if bi == nil or bv == nil or fftsa.peak_interp == nil then return nil end
   local k = bi[p]
   if k == nil or k <= 0 or not (bv[p] > 0) then return nil end
   local dk, iv = fftsa.peak_interp(k, fftsa.sg_nbins)

@@ -386,9 +386,12 @@ end
 function fftsa.spectrum_interp(cap, buf)
   -- THERE IS NOTHING TO FALL BACK TO. The archive ships no interpreted transform, so a
   -- demotion from the compiled path is the end of the line: halt and say so once. Without
-  -- this the frame carries on, dsp.spectrum posts EUNSUPPORTED and then dsp.peak posts
-  -- "no spectrum yet" once per peak per frame, behind a panel that looks alive.
-  if fftsa.fft_init == nil then
+  -- this the frame carries on behind a panel that looks alive.
+  --
+  -- Both terms, because they go absent together but for different reasons: fft_init is the
+  -- transform and dsp.spectrum is the entry point bound to it, and the call below would
+  -- index a nil rather than be refused.
+  if fftsa.fft_init == nil or dsp.spectrum == nil then
     if not fftsa.halted then
       fftsa.halted = true
       fftsa.lasterr = 'the compiled DSP stopped and this archive has no interpreted fallback'
@@ -768,6 +771,12 @@ function fftsa.dsp_peaks(count)
     end
     return hz, v
   end
+  -- Absent, not merely unable to answer: the interpreted peak search is not in this archive,
+  -- so a frame that did not come from the compiled path found nothing to report.
+  if dsp.peak == nil then
+    for i = 1, count do hz[i], v[i] = nil, nil end
+    return hz, v
+  end
   for i = 1, count do
     hz[i], v[i] = dsp.peak(i)
   end
@@ -784,6 +793,7 @@ function fftsa.distortion()
     if res == nil then return nil, nil, nil end
     return res.thd, res.snr, res.noise
   end
+  if dsp.distortion == nil then return nil, nil, nil end
   return dsp.distortion()
 end
 

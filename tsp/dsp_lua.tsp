@@ -292,224 +292,6 @@ function fftsa.dsp_install()
     return dsp.OK
   end
 
-  -- The rate DELIVERED, off the digitizer's own timestamps, which is what every reported
-  -- frequency is a multiple of. The read-back of digitize.samplerate does not match what
-  -- arrives, so it is never the source here.
-  local function measured_binwidth(cap, n)
-    local fallback = fft_s.binwidth
-    if cap.n == nil or cap.n < 4 then return fallback end
-    local ts = cap.relativetimestamps
-    if ts == nil then return fallback end
-    local t1, tn = ts[1], ts[cap.n]
-    if t1 == nil or tn == nil or not (tn > t1) then return fallback end
-    return ((cap.n - 1) / (tn - t1)) / n
-  end
-
-  -- One point in dB. Used for the marker trace, where there are as many calls as peaks;
-  -- the segment loop inlines the same arithmetic because there are 255 of them and a call
-  -- is about 12 us on the instrument.
-  local function seg_value(hi)
-    local vfl = out_s.vfloor * out_s.vfloor
-    local db = out_s.dbfloor
-    if hi ~= nil and hi > vfl then
-      db = 10 * math.log10(hi)
-      if not (db > out_s.dbfloor) then db = out_s.dbfloor
-      elseif not (db < out_s.dbceil) then db = out_s.dbceil end
-    end
-    return db
-  end
-
-  -- Window, transform, power, reduce, find the peaks. Callable from a timer callback, and it
-  -- YIELDS: the yields inside fft_load_rd and fft_run are what let the display task dispatch
-  -- a touch, and at 16,384 samples those two are 0.5 s and 0.8 s of arithmetic.
-  function dsp.spectrum(cap, trace, marks)
-    -- THE ARCHIVE SHIPS NO INTERPRETED TRANSFORM. tsp/fft_interp.tsp is left out by
-    -- package_tspa.py, so on an instrument this refuses and the compiled path is the only
-    -- one. Posted rather than raised, like every other refusal here, so the frame path
-    -- counts it and the panel says why instead of the app dying in a timer callback.
-    if fftsa.fft_init == nil then
-      return post(dsp.EUNSUPPORTED, 'no interpreted transform in this archive')
-    end
-    if dsp.dirty then return post(dsp.EDIRTY, 'an attribute moved since commit()') end
-    if cap == nil or trace == nil then return post(dsp.EARG, 'nil buffer') end
-    if not span_ok() then return post(dsp.EARG, 'out.lowfreq is not below out.highfreq') end
-    -- Capacity is refused on the first frame rather than at commit: the destination buffer is
-    -- not an attribute, so commit() has never seen it. Checked once and remembered.
-    if not dsp.capchecked then
-      local cp = trace.capacity
-      if cp ~= nil and out_s.segments > cp then
-        return post(dsp.EARG, 'out.segments ' .. tostring(out_s.segments)
-                    .. ' over the trace buffer capacity ' .. tostring(cp))
-      end
-      if marks ~= nil then
-        cp = marks.capacity
-        if cp ~= nil and peaks_s.count > cp then
-          return post(dsp.EARG, 'peaks.count over the marks buffer capacity')
-        end
-      end
-      dsp.capchecked = true
-    end
-    local n = fft_s.samples
-    -- Short record: nothing written, the previous spectrum left in place, and counted.
-    -- Zero-padding the tail would give a convincing and false broadband spectrum, and a
-    -- trigger timeout is the ordinary cause.
-    if cap.n == nil or cap.n < fft_s.srclength then
-      dsp.shortreads = dsp.shortreads + 1
-      dsp.nseg = 0
-      return 0
-    end
-    fft_s.binwidth = measured_binwidth(cap, n)
-    local binhz = fft_s.binwidth
-    fftsa.fft_load(cap)
-    fftsa.fft_run()
-    fftsa.fft_power()
-    local nb = fftsa.fft_m
-    local pwr = fftsa.fft_pwr
-    local flo, fhi = out_s.lowfreq, out_s.highfreq
-    local kmin, kmax = fftsa.sg_window_bins(nb, binhz, flo, fhi)
-    dsp.kmin, dsp.kmax = kmin, kmax
-
-    -- The reduction takes the MAXIMUM of the bins a segment covers. At 16,384 samples and
-    -- 255 segments each spans 32 bins, and anything but a maximum loses a narrow tone.
-    local npts = kmax - kmin + 1
-    local ncol = out_s.segments
-    local floor, log10 = math.floor, math.log10
-    local dbmin, dbmax = out_s.dbfloor, out_s.dbceil
-    local vfl = out_s.vfloor * out_s.vfloor
-    local fstep = (npts / ncol) * binhz
-    local f0 = (kmin - 1) * binhz
-    local st_v, st_f = dsp.st_v, dsp.st_f
-    if st_v == nil then st_v, st_f = {}, {}; dsp.st_v, dsp.st_f = st_v, st_f end
-    local nseg, c = 0, nil
-    for c = 0, ncol - 1 do
-      local a = kmin + floor(c * npts / ncol)
-      local b = kmin + floor((c + 1) * npts / ncol) - 1
-      if b < a then b = a end
-      if b > kmax then b = kmax end
-      local hi, k = nil, nil
-      for k = a, b do
-        local v = pwr[k]
-        if v ~= nil and (hi == nil or v > hi) then hi = v end
-      end
-      -- Inlined rather than a call per segment: the two dB limits, the squared voltage floor and
-      -- math.log10 are hoisted above the loop, and at a measured 1.4 us a table read that
-      -- is about 1.8 ms of an 81.8 ms frame over 255 segments.
-      --
-      -- nil (a sparse power array after a short read) and anything at or below the floor
-      -- land on the floor, so log10 is never handed a zero. The range tests are positives
-      -- because every comparison with a NaN is false, so `db < dbmin` would pass one through
-      -- to buffer.write.reading and a refused parameter is event 1131.
-      local val = dbmin
-      if hi ~= nil and hi > vfl then
-        val = 10 * log10(hi)
-        if not (val > dbmin) then val = dbmin
-        elseif not (val < dbmax) then val = dbmax end
-      end
-      nseg = nseg + 1
-      -- The segment's own frequency, not the winning bin's: segments can be narrower than a
-      -- bin and several would then share one, so only this is strictly increasing.
-      st_v[nseg], st_f[nseg] = val, f0 + c * fstep
-    end
-
-    local bi, bv = fftsa.find_peaks(nb, peaks_s.count, kmin, kmax)
-    dsp.pk_hz, dsp.pk_v, dsp.pk_db = dsp.pk_hz or {}, dsp.pk_v or {}, dsp.pk_db or {}
-    local i
-    for i = 1, peaks_s.count do
-      local k = bi[i]
-      dsp.pk_hz[i], dsp.pk_v[i], dsp.pk_db[i] = nil, nil, nil
-      if k ~= nil and k > 0 then
-        local d, amp = fftsa.peak_interp(k, nb)
-        if amp == nil then d, amp = 0, math.sqrt(bv[i]) end
-        if amp > 0 then
-          dsp.pk_hz[i] = (k - 1 + d) * binhz
-          dsp.pk_v[i] = amp
-          dsp.pk_db[i] = 20 * log10(amp)
-        end
-      end
-    end
-
-    -- The primitive writes the trace and sets its count; the caller never clears it. A
-    -- clear-then-refill from outside opens a window in which the graph paints a half-filled
-    -- trace, which is worth designing out rather than working around.
-    --
-    -- buffer.write.reading HOISTED: looked up inside the loop it is two table reads per
-    -- point, 255 x 7 us on the instrument, and those are the only microseconds that fall
-    -- inside the window where the buffer holds less than a full trace.
-    local wr = buffer.write.reading
-    trace.clear()
-    for i = 1, nseg do
-      wr(trace, st_v[i], st_f[i], i, 0)
-    end
-    if marks ~= nil then
-      marks.clear()
-      for i = 1, peaks_s.count do
-        if dsp.pk_hz[i] ~= nil then
-          wr(marks, seg_value(dsp.pk_v[i] * dsp.pk_v[i]), dsp.pk_hz[i], i, 0)
-        end
-      end
-    end
-    dsp.ran = true
-    dsp.nseg = nseg
-    return nseg
-  end
-
-  -- The i'th peak, strongest first. Sub-bin corrected in both frequency and amplitude, which
-  -- is the part a caller cannot reproduce from the trace.
-  function dsp.peak(i)
-    if not dsp.ran then
-      post(dsp.EARG, 'no spectrum yet')
-      return nil
-    end
-    if i == nil or i < 1 or i > peaks_s.count then
-      post(dsp.EARG, 'peak index ' .. tostring(i))
-      return nil
-    end
-    if dsp.pk_hz[i] == nil then return nil end
-    return dsp.pk_hz[i], dsp.pk_v[i], dsp.pk_db[i]
-  end
-
-  -- Distortion, signal-to-noise and the noise floor, over the bins the peaks came from.
-  -- thd is a FRACTION of the fundamental; snr and floor are dB. Both ratios are nil when
-  -- nothing in the span is a tone, and the floor is a number regardless -- with the inputs
-  -- disconnected it is the instrument's own noise and the only one of the three that means
-  -- anything. A nil thd with a live snr is a tone whose harmonics all fall outside the span.
-  function dsp.distortion()
-    if not dsp.ran then
-      post(dsp.EARG, 'no spectrum yet')
-      return nil
-    end
-    if not span_ok() then
-      post(dsp.EARG, 'out.lowfreq is not below out.highfreq')
-      return nil
-    end
-    local nb, binhz = fftsa.fft_m, fft_s.binwidth
-    fftsa.thd_hmax = thd_s.harmonics
-    fftsa.thd_nsample = thd_s.bins
-    if thd_s.bins == 0 then fftsa.thd_nsample = nb end
-    -- Both regions, one of them, or neither. 0 is the caller saying the hum is the signal,
-    -- expressed to the shipped rule as a frequency no bin in any span is a multiple of.
-    -- Refused rather than ignored: a frequency that is neither mains would discount a band
-    -- nothing picks up and leave the figures looking plausible over the hole.
-    local m = thd_s.mains
-    if m == dsp.MAINS_BOTH then
-      fftsa.thd_mains = {50, 60}
-    elseif m == 50 or m == 60 then
-      fftsa.thd_mains = {m, m}
-    elseif m == 0 then
-      fftsa.thd_mains = {1e12, 1e12}
-    else
-      post(dsp.EARG, 'thd.mains must be MAINS_BOTH, 50, 60 or 0')
-      return nil
-    end
-    -- The span goes in as arguments. Reading fftsa.sg_flo_hz out of the display module
-    -- instead is the seam crossed backwards, and works only while both halves are Lua.
-    -- out.dbfloor is not passed: it bounds the trace, not the measured noise floor.
-    local thd, ndb, nh, snr = fftsa.thd_noise(nb, binhz, out_s.lowfreq, out_s.highfreq)
-    local f0 = nil
-    if thd ~= nil then thd = thd / 100 end        -- percent in the TSP, a fraction here
-    if snr ~= nil and dsp.pk_hz[1] ~= nil then f0 = dsp.pk_hz[1] end
-    return thd, snr, ndb, f0
-  end
 
   -- Release the plan: the arena goes, the attributes keep their values, and nothing runs
   -- until commit() again. A plan-attribute write marks the plan dirty and does NOT come
@@ -521,17 +303,26 @@ function fftsa.dsp_install()
   -- allocation, leaked per launch for the rest of the power cycle if nobody releases it.
   -- fftsa.stop() is the caller, and fftsa.start() opens with a stop().
   function dsp.release()
-    fftsa.fft_built_n, fftsa.fft_built_win, fftsa.fft_built_beta = nil, nil, nil
-    fftsa.fft_x, fftsa.fft_re, fftsa.fft_im, fftsa.fft_pwr = nil, nil, nil, nil
-    fftsa.fft_win, fftsa.fft_twr, fftsa.fft_twi = nil, nil, nil
-    fftsa.fft_utr, fftsa.fft_uti = nil, nil
-    fftsa.fft_swp_a, fftsa.fft_swp_b = nil, nil
-    fftsa.fft_gtab, fftsa.fft_dtab = nil, nil
+    -- The interpreted implementation's arena, where that module is loaded at all. In the
+    -- archive it is absent, so there is nothing of its to give back.
+    if type(fftsa.dsp_release_math) == 'function' then fftsa.dsp_release_math() end
     dsp.st_v, dsp.st_f = nil, nil
     dsp.dirty, dsp.dirty_tables, dsp.dirty_filter = true, true, true
     dsp.built, dsp.ran, dsp.capchecked = false, false, false
     set_times()
     return dsp.OK
+  end
+
+
+  -- The transform, the peak search and the distortion figures are NOT in this archive.
+  -- tsp/fft_interp.tsp carries them and package_tspa.py leaves it out, because csrc/ does
+  -- that work on the instrument -- so dsp.spectrum, dsp.peak and dsp.distortion are nil
+  -- here and the app's callers test for the native results instead of asking for them.
+  -- Bound when the harness has loaded that module, which is what keeps the pinned
+  -- arithmetic in tools/test_tsp.lua pinned to a real implementation.
+  if type(fftsa.dsp_install_math) == 'function' then
+    fftsa.dsp_install_math(dsp, {post = post, span_ok = span_ok, fft_s = fft_s,
+                                 out_s = out_s, peaks_s = peaks_s, thd_s = thd_s})
   end
 
   return dsp

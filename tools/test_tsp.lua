@@ -7028,6 +7028,56 @@ check('a successful bind re-stashes, a failed one does not', (function()
                        tostring(fftsa.cap ~= nil), tostring(fftsa.sg_buf ~= nil))
 end)())
 
+-- THE DSP THE ARCHIVE ACTUALLY SHIPS. Every case above loads tsp/fft_interp.tsp, so none of
+-- them sees what the instrument gets: the transform, the peak search and the distortion
+-- figures all live in that module and package_tspa.py leaves it out, because csrc/ does that
+-- work. So dsp.spectrum, dsp.peak and dsp.distortion are ABSENT there, not merely unable to
+-- answer, and a caller that asks anyway indexes a nil inside a timer callback.
+check('the shipped dsp has no spectrum, peak or distortion, and the app copes', (function()
+  local keep_dsp, keep_math, keep_init = dsp, fftsa.dsp_install_math, fftsa.fft_init
+  local keep_frame = fftsa.nl_frame
+  -- Both, because they go together in the archive: the module carries the transform and the
+  -- three entry points bound to it.
+  fftsa.dsp_install_math, fftsa.fft_init = nil, nil
+  fftsa.dsp_install()
+  local gone = (dsp.spectrum == nil and dsp.peak == nil and dsp.distortion == nil)
+  -- The attribute surface stays: fftsa.apply() writes it every press and plan_n reads
+  -- dsp.fft.samples whichever path ran.
+  local attrs = (dsp.fft ~= nil and dsp.out ~= nil and dsp.thd ~= nil and dsp.peaks ~= nil
+                 and type(dsp.commit) == 'function' and type(dsp.release) == 'function'
+                 and type(dsp.lastevent) == 'function')
+  -- A fresh install opens on its own defaults, so the attributes a commit needs are written
+  -- here rather than inherited from the app's live plan.
+  dsp.fft.samples = 2048
+  dsp.fft.samplerate = 100000
+  dsp.out.lowfreq, dsp.out.highfreq = 10, 50000
+  local rc = dsp.commit()
+  local cev = dsp.lastevent()
+  local cwhy = cev and cev.why
+  local rel = dsp.release()
+  -- And the two app callers answer instead of raising, with nl_frame false so they take the
+  -- branch that used to call into the interpreted implementation.
+  fftsa.nl_frame = false
+  local okp, hz = pcall(function() return fftsa.dsp_peaks(6) end)
+  local okd, thd = pcall(function() return fftsa.distortion() end)
+  fftsa.nl_frame = keep_frame
+  fftsa.dsp_install_math, fftsa.fft_init = keep_math, keep_init
+  dsp = keep_dsp
+  -- hz is only a table when the call returned; on a raise pcall puts the MESSAGE there, and
+  -- indexing that kills the run with no summary instead of failing this case.
+  local pk1, peaks_ok = nil, false
+  if okp and type(hz) == 'table' then
+    peaks_ok = true
+    pk1 = hz[1]
+  end
+  return gone and attrs and rc == 0 and rel == 0 and peaks_ok and okd
+         and thd == nil and pk1 == nil,
+         string.format('gone=%s attrs=%s commit=%s (%s) release=%s peaks=%s dist=%s pk1=%s',
+                       tostring(gone), tostring(attrs), tostring(rc), tostring(cwhy),
+                       tostring(rel), tostring(okp), tostring(okd),
+                       okp and tostring(pk1) or tostring(hz))
+end)())
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

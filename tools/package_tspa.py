@@ -109,7 +109,7 @@ MANIFEST = [
     # tree or an install cannot be told from the one it replaced. The minor part stays two
     # digits: the field may be compared as a string, where "8.9" sorts above "8.10", so a
     # one-digit minor would read as newer than this.
-    ('Version', '8.36'),
+    ('Version', '8.37'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was
@@ -292,7 +292,36 @@ def gate(body):
                              + r.stdout + r.stderr)
     finally:
         os.unlink(path)
-    print('  gate: lint clean, and Lua 5.0.2 parses the assembled script')
+    dup = c_duplicates(body)
+    if dup:
+        raise SystemExit(
+            'these are implemented in csrc/ and must not be defined in the archive:\n  '
+            + '\n  '.join(dup)
+            + '\nThey belong in a module this script leaves out. See OMITTED below.')
+    print('  gate: lint clean, no C duplicates, and Lua 5.0.2 parses the assembled script')
+
+
+# Modules deliberately left out of the archive because csrc/ carries the implementation.
+# Every fftsa function they define is asserted ABSENT from the assembled script, so moving
+# one back into a packaged module fails the build rather than shipping two implementations
+# of the same arithmetic -- which is what the peak search, the distortion figures and the
+# reduction were until 8.37.
+OMITTED = ['tsp/fft_interp.tsp']
+FUNC_DEF = re.compile(r'^\s*function\s+fftsa\.(\w+)', re.M)
+
+
+def c_duplicates(body):
+    """Names the omitted modules define that the assembled script also defines."""
+    omitted = set()
+    for m in OMITTED:
+        p = os.path.join(ROOT, m)
+        if os.path.exists(p):
+            with open(p) as f:
+                omitted |= set(FUNC_DEF.findall(f.read()))
+    if not omitted:
+        return []
+    shipped = set(FUNC_DEF.findall(body))
+    return sorted(omitted & shipped)
 
 
 def main():
