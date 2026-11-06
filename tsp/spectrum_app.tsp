@@ -2553,10 +2553,21 @@ function fftsa.stop()
   fftsa.loading_destroy(display.SCREEN_HOME)
   fftsa.del_scr(fftsa.errscr)
   fftsa.errscr = nil
-  if fftsa.cap ~= nil then
-    fftsa.del_buf(fftsa.cap)
-    fftsa.cap, fftsa.cap_cap = nil, nil
-  end
+  -- THE CAPTURE BUFFER IS KEPT, for the life of the power cycle and across every launch.
+  -- apply() reuses it whenever its capacity still serves, and the floor makes that every
+  -- count, so one allocation is all the app ever makes.
+  --
+  -- Deleting it here is what broke every relaunch. A new buffer has new storage, so
+  -- nl.describe() cannot use its cache and has to sweep the heap for it -- and on a second
+  -- launch that sweep comes back empty: measured with nl._stor_elem0 nil, nl.reattached
+  -- true and nl.entry resolved, which leaves nl_cap nil, drops every frame onto a path this
+  -- archive does not carry, and halts the app with the graph already drawn. Keeping the
+  -- buffer keeps its storage, so describe() answers from nl._stor_of on the first call of
+  -- the next launch and sweeps nothing.
+  --
+  -- The buffer outlives an End App, 65,536 readings until the power cycle. That is the price
+  -- of the address staying put, and it is the same trade sg_destroy() makes for the trace
+  -- pair.
   -- The pending re-plan goes with the app. Two stops under one frame reach the teardown
   -- from the second call, which clears stop_pending -- and fftsa.frame() then finds the flag
   -- set with nothing left to retune, where apply() strands a fresh capture buffer on a

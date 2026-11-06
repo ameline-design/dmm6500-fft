@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.31
+-- $Version: 8.33
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -883,9 +883,18 @@ function fftsa.sg_fmt_seed(b, want)
   -- 140 dB tall, so it is invisible and the box still has a height.
   local k, span = nil, want - 1
   if span < 1 then span = 1 end
-  local flo = fftsa.sg_flo_hz or fftsa.flo or fftsa.flomin
-  local fhi = fftsa.sg_fhi_hz or fftsa.fhi or fftsa.fhi_min
-  if not (fhi > flo) then flo, fhi = fftsa.flomin, fftsa.fhi_min end
+  -- sg_flo_hz and sg_fhi_hz are 0 and 1e9 until the first sg_store_xrange, and those are
+  -- VALUES rather than nil, so an `or` chain never falls through them. sg_build() runs
+  -- before apply() commits the span, so on the first build of a power cycle they are still
+  -- the sentinels -- which seeded X across a billion hertz onto an axis pinned to 50 kHz.
+  -- A stop above the fastest rate's Nyquist is the tell, since no span can ask for one.
+  local flo, fhi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  if flo == nil or fhi == nil or fhi > fftsa.sg_fmax_real then
+    flo, fhi = fftsa.flo, fftsa.fhi
+  end
+  if flo == nil or fhi == nil or not (fhi > flo) then
+    flo, fhi = fftsa.flomin, fftsa.fhi_min
+  end
   for k = 1, want do
     local t = (k - 1) / span
     fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t, flo + (fhi - flo) * t,
@@ -6851,10 +6860,21 @@ function fftsa.stop()
   fftsa.loading_destroy(display.SCREEN_HOME)
   fftsa.del_scr(fftsa.errscr)
   fftsa.errscr = nil
-  if fftsa.cap ~= nil then
-    fftsa.del_buf(fftsa.cap)
-    fftsa.cap, fftsa.cap_cap = nil, nil
-  end
+  -- THE CAPTURE BUFFER IS KEPT, for the life of the power cycle and across every launch.
+  -- apply() reuses it whenever its capacity still serves, and the floor makes that every
+  -- count, so one allocation is all the app ever makes.
+  --
+  -- Deleting it here is what broke every relaunch. A new buffer has new storage, so
+  -- nl.describe() cannot use its cache and has to sweep the heap for it -- and on a second
+  -- launch that sweep comes back empty: measured with nl._stor_elem0 nil, nl.reattached
+  -- true and nl.entry resolved, which leaves nl_cap nil, drops every frame onto a path this
+  -- archive does not carry, and halts the app with the graph already drawn. Keeping the
+  -- buffer keeps its storage, so describe() answers from nl._stor_of on the first call of
+  -- the next launch and sweeps nothing.
+  --
+  -- The buffer outlives an End App, 65,536 readings until the power cycle. That is the price
+  -- of the address staying put, and it is the same trade sg_destroy() makes for the trace
+  -- pair.
   -- The pending re-plan goes with the app. Two stops under one frame reach the teardown
   -- from the second call, which clears stop_pending -- and fftsa.frame() then finds the flag
   -- set with nothing left to retune, where apply() strands a fresh capture buffer on a

@@ -1401,7 +1401,14 @@ check('the seeded trace has a height, so its bounding box is not degenerate', (f
   -- Its own buffer, seeded by the real function: sg_mk_trace() would reassign FFTSA_TRACE
   -- and orphan the live trace, which four later cases count buffers against.
   local b = buffer.make(300, buffer.STYLE_WRITABLE_FULL)
+  -- THE FIRST BUILD OF A POWER CYCLE, not the relaunch state. sg_flo_hz/sg_fhi_hz are 0 and
+  -- 1e9 until the first sg_store_xrange, and they are values rather than nil -- so seeding
+  -- from them put X across a billion hertz. Driving this with the live span is what let that
+  -- through: it only ever tested the relaunch path.
+  local kflo, kfhi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = 0, 1e9
   fftsa.sg_fmt_seed(b, 255)
+  fftsa.sg_flo_hz, fftsa.sg_fhi_hz = kflo, kfhi
   if b == nil then return false, 'no trace buffer' end
   local n = b.n
   local lo, hi, i = b.readings[1], b.readings[1], nil
@@ -1416,7 +1423,7 @@ check('the seeded trace has a height, so its bounding box is not degenerate', (f
   -- And X inside the pinned frequency axis. A counter here put every point in the leftmost
   -- half-percent of the plot with the lowest ten below the axis minimum, which is the
   -- geometry the widget drew at the first paint of every launch.
-  local xlo, xhi, flo, fhi = nil, nil, fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  local xlo, xhi, flo, fhi = nil, nil, fftsa.flo, fftsa.fhi
   xlo, xhi = b.extravalues[1], b.extravalues[1]
   for i = 1, n do
     local x = b.extravalues[i]
@@ -6219,15 +6226,21 @@ fftsa.start()
 print('\nteardown (real code)')
 fftsa.stop()
 check('stop() deletes every display object', live() == 0, 'live=' .. live())
--- An exit RELEASES: every buffer the app made is deleted and every global naming one is
--- cleared, because a trace buffer left alive is adopted by the front panel as its current
--- buffer -- the home screen then shows a spectrum level in dB as though it were a
--- measurement. The handover to a next launch belongs to the rebuild path only.
-check('stop() frees every buffer it made and clears every global naming one',
-      livebufs() == base_bufs and fftsa.cap == nil
+-- An exit releases the TRACE buffers and clears every global naming one, because a trace
+-- buffer left alive is adopted by the front panel as its current buffer -- the home screen
+-- then shows a spectrum level in dB as though it were a measurement. The handover to a next
+-- launch belongs to the rebuild path only.
+--
+-- THE CAPTURE BUFFER IS THE ONE EXCEPTION and it is deliberate: deleting it moves its
+-- storage, and nl.describe()'s sweep for a moved capture buffer comes back empty on a second
+-- launch, which halts the app. It is kept for the power cycle, so exactly one buffer stands
+-- above the baseline and the globals are still clear.
+check('stop() frees the trace buffers and keeps only the capture buffer',
+      livebufs() == base_bufs + 1 and fftsa.cap ~= nil
       and FFTSA_TRACE == nil and FFTSA_MARK == nil
       and FFTSA_OLDTRACE == nil and FFTSA_OLDMARK == nil,
-      'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs
+      'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs .. ' cap='
+      .. tostring(fftsa.cap ~= nil)
       .. ' globals=' .. tostring(FFTSA_TRACE) .. '/' .. tostring(FFTSA_OLDTRACE))
 check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optscr == nil and fftsa.opt_flo == nil and fftsa.opt_fhi == nil
@@ -6235,9 +6248,33 @@ check('stop() nils every handle', fftsa.sg_scr == nil and fftsa.sg_graph == nil
       and fftsa.optimg == nil and fftsa.lockbtn == nil and fftsa.lockimg_c == nil
       and fftsa.lockimg_o == nil
       and fftsa.opt_n == nil
-      and fftsa.timer == nil and fftsa.cap == nil and fftsa.sg_buf == nil
+      and fftsa.timer == nil and fftsa.sg_buf == nil
       and fftsa.aboutscr == nil and fftsa.about_lines == nil)
 check('stop() twice is harmless', pcall(function() fftsa.stop() end))
+-- The capture buffer has to be the SAME OBJECT across launches, because its storage address
+-- is what nl.describe() caches against it. A replacement moves the storage, the sweep for
+-- the moved buffer comes back empty on a second launch -- measured with nl._stor_elem0 nil
+-- while nl.reattached was true -- and the app halts with the graph already drawn.
+--
+-- Three launches, not two, because the count has to be shown not to grow: the first attempt
+-- at keeping buffers across launches leaked a pair per launch and reached 21.
+check('relaunching reuses the capture buffer rather than replacing it', (function()
+  fftsa.start()
+  local first, n1 = fftsa.cap, livebufs()
+  if first == nil then return false, 'no capture buffer after the first launch' end
+  fftsa.stop()
+  fftsa.start()
+  local second, n2 = fftsa.cap, livebufs()
+  fftsa.stop()
+  fftsa.start()
+  local third, n3 = fftsa.cap, livebufs()
+  local alive = first.alive
+  fftsa.stop()
+  return second == first and third == first and alive == true
+         and n2 == n1 and n3 == n1,
+         string.format('same=%s/%s alive=%s buffers %d/%d/%d', tostring(second == first),
+                       tostring(third == first), tostring(alive), n1, n2, n3)
+end)())
 -- The pending re-plan goes with the app, in BOTH directions. Two stops under one frame reach
 -- the teardown from the second call, which clears stop_pending -- and frame() would then find
 -- the flag set with nothing to retune into, where apply() makes a capture buffer nothing owns
@@ -6352,9 +6389,10 @@ end
 -- modal dialog over a half-built app. Parking the screen set for reuse was tried on the
 -- instrument and reverted for exactly that.
 check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
-check('End App from the options screen frees every buffer',
-      livebufs() == base_bufs and FFTSA_TRACE == nil and FFTSA_MARK == nil,
-      'buffers=' .. livebufs())
+check('End App from the options screen frees every buffer but the capture one',
+      livebufs() == base_bufs + 1 and fftsa.cap ~= nil
+      and FFTSA_TRACE == nil and FFTSA_MARK == nil,
+      'buffers=' .. livebufs() .. ' vs baseline ' .. base_bufs)
 
 -- THE ORDER THE TRACE BUFFERS ARE ALLOCATED IN, which is the fix for the second launch
 -- drawing a static picture with its dB axis relabelled in volts. A buffer freed before its
@@ -6722,10 +6760,17 @@ check('a run of failed frames halts the loop', fftsa.halted == true,
 check('the halt is stated on screen', OBJ[fftsa.sg_xunit].text ~= nil
       and string.find(OBJ[fftsa.sg_xunit].text, 'HALTED') ~= nil,
       tostring(OBJ[fftsa.sg_xunit].text))
-check('a halted app still tears down cleanly',
-      (function() fftsa.stop()
-        return live() == 0 and livebufs() == base_bufs end)(),
-      'live=' .. live() .. ' buffers=' .. livebufs())
+-- Measured against the count on the way in rather than the file's baseline: this section
+-- runs after others that made buffers of their own, and what matters is that a halted
+-- teardown releases what a healthy one does -- the capture buffer being the one it keeps.
+check('a halted app still tears down cleanly', (function()
+  local before = livebufs()
+  fftsa.stop()
+  local after = livebufs()
+  return live() == 0 and after < before and fftsa.cap ~= nil,
+         string.format('live=%d buffers %d -> %d, capture kept=%s', live(), before, after,
+                       tostring(fftsa.cap ~= nil))
+end)())
 
 -- ---------- the transform against a direct DFT ----------
 -- The gate for replacing the transform. Every other check here looks at the

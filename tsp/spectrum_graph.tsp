@@ -444,9 +444,18 @@ function fftsa.sg_fmt_seed(b, want)
   -- 140 dB tall, so it is invisible and the box still has a height.
   local k, span = nil, want - 1
   if span < 1 then span = 1 end
-  local flo = fftsa.sg_flo_hz or fftsa.flo or fftsa.flomin
-  local fhi = fftsa.sg_fhi_hz or fftsa.fhi or fftsa.fhi_min
-  if not (fhi > flo) then flo, fhi = fftsa.flomin, fftsa.fhi_min end
+  -- sg_flo_hz and sg_fhi_hz are 0 and 1e9 until the first sg_store_xrange, and those are
+  -- VALUES rather than nil, so an `or` chain never falls through them. sg_build() runs
+  -- before apply() commits the span, so on the first build of a power cycle they are still
+  -- the sentinels -- which seeded X across a billion hertz onto an axis pinned to 50 kHz.
+  -- A stop above the fastest rate's Nyquist is the tell, since no span can ask for one.
+  local flo, fhi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
+  if flo == nil or fhi == nil or fhi > fftsa.sg_fmax_real then
+    flo, fhi = fftsa.flo, fftsa.fhi
+  end
+  if flo == nil or fhi == nil or not (fhi > flo) then
+    flo, fhi = fftsa.flomin, fftsa.fhi_min
+  end
   for k = 1, want do
     local t = (k - 1) / span
     fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t, flo + (fhi - flo) * t,
