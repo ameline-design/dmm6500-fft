@@ -5130,8 +5130,12 @@ check('all size transitions keep the original trace bound and plot without leaks
   for _, i in ipairs(transitions) do
     local oldcap = fftsa.cap
     local n = fftsa.sample_counts[i]
-    local wantcap = n * 4
-    if wantcap < fftsa.cap_floor_n * 4 then wantcap = fftsa.cap_floor_n * 4 end
+    -- From the multiplier the app uses, not a literal 4: the capacity is bounded above by
+    -- what nl.describe() can resolve, so it is a number that moves.
+    local wantcap = n * fftsa.cap_cap_mult
+    if wantcap < fftsa.cap_floor_n * fftsa.cap_cap_mult then
+      wantcap = fftsa.cap_floor_n * fftsa.cap_cap_mult
+    end
     if wantcap < capmax then wantcap = capmax end
     capmax = wantcap
     display.setvalue(fftsa.opt_n, fftsa.sample_labels[i])

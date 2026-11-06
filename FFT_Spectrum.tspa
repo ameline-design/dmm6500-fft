@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.30
+-- $Version: 8.31
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -4736,6 +4736,10 @@ fftsa.nl_nmax = 32768
 -- price is 131,072 readings held for the life of the app, about 3.2 MB of a 200 MB window,
 -- and it buys an Apply that sweeps nothing at any count.
 fftsa.cap_floor_n = fftsa.nl_nmax
+-- What the floor is multiplied by for the capture buffer's capacity. A ceiling in practice:
+-- see the block in fftsa.apply() that uses it for what nl.describe() does at 131,072
+-- readings.
+fftsa.cap_cap_mult = 2
 
 -- OFF, AND FOR ONE REASON: THE GRAPH DOES NOT REDRAW FROM AN IN-PLACE WRITE.
 --
@@ -4929,9 +4933,17 @@ function fftsa.apply()
   -- the same allocation serves every count and the buffer is made once per boot. Replacing
   -- it is what moves its storage, and finding storage again is a heap sweep of seconds; the
   -- grow-and-never-shrink rule below is kept for a floor that is ever lowered.
+  --
+  -- TWICE the longest record, not four times, and the factor is a constraint rather than
+  -- headroom. At four times, a 32768 count asks for 131,072 readings and nl.describe()
+  -- cannot find that buffer's descriptor -- measured on the instrument as "describe found
+  -- no descriptor for the capture buffer", which leaves nl_cap nil, drops every frame onto
+  -- a path this archive does not carry, and halts the app with the graph already on screen.
+  -- 65,536 is what the sweep resolved before the count list reached 32768, and it still
+  -- covers the longest record twice over.
   local want = need
   if want < fftsa.cap_floor_n then want = fftsa.cap_floor_n end
-  want = want * 4
+  want = want * fftsa.cap_cap_mult
   if fftsa.cap ~= nil and (fftsa.cap_cap == nil or fftsa.cap_cap < want) then
     fftsa.del_buf(fftsa.cap)
     fftsa.cap = nil
