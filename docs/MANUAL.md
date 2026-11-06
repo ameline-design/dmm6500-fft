@@ -121,7 +121,7 @@ present the signal margin — 45 dB over the per-bin floor — then answers `NoS
 value — and so is a quiet one above 1 kHz, even on a mains multiple.
 
 Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
-plotted bin, measured at 4.3 µs a bin — 1.1 ms at 512 samples and 35 ms at 16,384, about 2.1% of one
+plotted bin, measured at 4.3 µs a bin — 2.2 ms at 1024 samples and 35 ms at 16,384, about 2.1% of one
 frame at that size, once a second.
 
 **The line along the bottom reads back what is applied** — sample count, digitizer rate, bin width,
@@ -140,7 +140,7 @@ immediately and without opening Options.
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So every gesture is settled after the
 fact. The check runs every 0.15 s, floored by the frame period because it is driven from the frame:
-about 0.08 s at 512 samples and 0.3 s at 2048, so the settle follows the finger by roughly twice
+about 0.07 s at 1024 samples and 0.3 s at 2048, so the settle follows the finger by roughly twice
 that. A check that has had no gesture reported costs one clock read and no graph call.
 
 **A frequency gesture is adopted only once the axis stops moving.** A finger still on the glass is
@@ -215,7 +215,7 @@ that edge sticks at the limit while the other keeps coming in. Adopted limits ar
 hertz, so the Options fields can show and re-apply them unchanged.
 
 **An untouched view makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
-whole graph, which at 512 samples is most of an 81 ms frame — doing it every frame collapses the
+whole graph, which at 1024 samples is most of a 70 ms frame — doing it every frame collapses the
 update rate and visibly flickers the trace, which is what it did. So the app is told when to look:
 the graph reports its own pan and zoom, and a check that has had no report does nothing. One that has
 reads the limits back at 0.0094 ms each, and writes only a limit that has really moved.
@@ -249,7 +249,7 @@ works either way.
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
-| FFT Samples | 512, 1024, 2048 (default), 4096, 8192 or 16384. More samples give finer bins. Below 4096 they cost no frame rate: 512, 1024 and 2048 all run at the same 10 frames a second, because what sets the rate there does not depend on the count. |
+| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At the small counts the frame rate is set by per-frame overhead rather than by the count, so a step up costs less than doubling suggests; 1024 is measured at 13 to 15 frames a second. |
 
 Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
 open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
@@ -261,23 +261,24 @@ duration** (`N / fs`, in milliseconds). It refreshes as you edit the stop freque
 without changing acquisition until you press Apply. Cancel discards the edits.
 
 **Reset** puts all six fields back to their shipped values — 10 Hz, 50 kHz, 10 V, Hann, beta 12 and
-512 samples — and does nothing else. Acquisition is untouched until you press Apply, so Cancel after
+2048 samples — and does nothing else. Acquisition is untouched until you press Apply, so Cancel after
 Reset leaves the analyser exactly as it was and a mis-press costs a press.
 
 On reopening Options,
 the readout uses the rate measured from the active capture's timestamps. For an unapplied change to
-the sampling rate, it uses the rate the app will request: 100, 200, 500 or 1000 kS/s.
+the sampling rate, it uses the rate the app will request: 12.5, 25, 50, 100, 200, 500 or
+1000 kS/s.
 
 At 100 kS/s (stop frequency up to 50 kHz):
 
 | FFT samples | Bin spacing | Acquisition duration |
 |---:|---:|---:|
-| 512 | 195.31 Hz | 5.12 ms |
 | 1024 | 97.66 Hz | 10.24 ms |
 | 2048 | 48.83 Hz | 20.48 ms |
 | 4096 | 24.41 Hz | 40.96 ms |
 | 8192 | 12.21 Hz | 81.92 ms |
 | 16384 | 6.10 Hz | 163.84 ms |
+| 32768 | 3.05 Hz | 327.68 ms |
 
 Acquisition duration is the record length, not the complete frame time or the timestamp difference
 between the first and last samples (which is `(N - 1) / fs`). Processing and display add overhead.
@@ -285,7 +286,7 @@ Windowing spreads each tone across several bins, so bin spacing is not a guarant
 
 Apply rebuilds the window and its tables behind the loading screen, and resizes the acquisition
 buffer if needed. It rebuilds them only when they would differ: they are a function of the sample
-count and the window alone, so an Apply that changed only the span, the input range or the band-pass
+count and the window alone, so an Apply that changed only the span or the input range
 skips the rebuild — which is what keeps a Kaiser window from costing 0.3 s on a press that did not
 touch it. The graph buffer is one fixed size for every sample count and stays attached throughout,
 because the trace is capped at the graph's width (see **How many points the trace carries** below).
@@ -389,8 +390,10 @@ appears at 37 kHz and an 84 kHz tone at 16 kHz.
 of rejection above the Nyquist, but it is not worth the frame time: the filter is one
 multiply-accumulate per tap per output, 51 taps over 512 outputs, and the frame goes from 0.08 s to
 around a quarter of a second for nothing an operator can see. At 4096 samples and up the read budget
-leaves no room for it at any span. It remains settable over the socket as `fftsa.bp_on`, and the rest
-of this section describes what it does when it is on.
+leaves no room for it at any span. **There is no longer any way to turn it on from the app**: the
+filter lives in `csrc/` behind `DSP_BANDPASS` and the shipped build compiles it out, with no
+remaining switch in `tsp/`. The rest of this section describes what it does, and is kept because the
+measurements behind the decision not to offer it are worth having.
 
 On, the capture is low-pass filtered and then decimated to the span, so the transform
 sees only the band on screen. Two things come of that, and which one you get depends on the span.
@@ -439,8 +442,8 @@ pages with **PgUp** and **PgDn**. **Back** returns to the form.
 
 ## How many points the trace carries
 
-The plotted area is 680 pixels wide, measured off a panel capture, so a sample count above 512 gives
-more bins than there are columns to draw them in -- 8192 bins at 16384 samples. The app therefore
+The plotted area is 680 pixels wide, measured off a panel capture, so every sample count the app
+offers gives more bins than there are columns to draw them in -- 511 at 1024 and 8191 at 16384. The app therefore
 draws a fixed **255 columns** at every sample count, and the reduction is not a stride: each column
 reports the **maximum** of the bins that fall in it.
 
@@ -452,8 +455,9 @@ Three consequences, and the first is the point of it:
 - **The noise floor reads as a band, not a line**, because the minimum is drawn as well as the
   maximum. Maximum alone would lift the apparent floor by about 6 dB at 64 bins a column, since the
   largest of 64 noise samples sits well above their average.
-- **Below 256 points nothing is reduced.** 512 samples puts about 255 bins in a 10 Hz to
-  50 kHz span, so the default trace is every bin, exactly as it has always been.
+- **Below 256 points nothing is reduced**, and no count the app offers is below it any more. The
+  smallest, 1024, puts about 511 bins in a 10 Hz to 50 kHz span against 255 columns, so every
+  trace is now reduced.
 
 | FFT Samples | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|
@@ -516,7 +520,7 @@ for a tone within one main lobe of DC **the estimate is partly the tone**: remov
 `2·G(b)²` of the tone out of the tone's own bin. Measured on bin 1, a 1.000 V tone at 195.3 Hz reads
 0.589 V under Hann and swings to 1.110 V as the capture phase drifts.
 
-Nothing fixes that. A record 512 samples long cannot tell a steady offset from a tone one bin away
+Nothing fixes that. A finite record cannot tell a steady offset from a tone one bin away
 from it — they are the same resolution cell. Removing the plain arithmetic mean instead puts a
 spurious line of up to −27 dBc at bin 1 for any off-centre tone **anywhere** in the spectrum, which
 is 110 dB above the floor Kaiser β=18 is chosen for. Both were measured over every window and nine
@@ -531,20 +535,20 @@ below the limit shows up:
 | Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | **585.9 Hz** |
 
 The limit is in **bins**, so it moves with both the sample rate and the sample count: at a 500 kHz
-span and 512 samples the bins are 1953 Hz and two of them is 3.9 kHz, while at 16384 samples and a
+span and 1024 samples the bins are 977 Hz and two of them is 1.95 kHz, while at 16384 samples and a
 50 kHz span they are 6.10 Hz and two of them is 12.2 Hz. A narrower window main lobe reaches closer
 to DC, which is the one thing Kaiser β=4 is better at than β=18.
 
 What you get either side of it, measured over a 1.000 V tone swept in 0.01-bin steps at four phases:
 
-The two boundaries below are **in bins**, and the Hz are 512 samples at 100 kS/s. At
-16384 samples the same 0.3 bins is 1.8 Hz rather than 58.6.
+The two boundaries below are **in bins**, and the Hz are 1024 samples at 100 kS/s. At
+16384 samples the same 0.3 bins is 1.8 Hz rather than 29.3.
 
 | tone sits | the table |
 |---|---|
 | at or above the lowest reported bin | always reports it, within **0.11 bins and 0.19 dB** |
 | between 0.3 bins and that bin | usually empty; where it does report, within **0.28 bins and 1.7 dB** |
-| below **0.3 bins** (58.6 Hz at 512 samples, 1.8 Hz at 16384) | never reports it |
+| below **0.3 bins** (29.3 Hz at 1024 samples, 1.8 Hz at 16384) | never reports it |
 
 A peak the app cannot place is refused rather than guessed: the estimator saturates when the three
 bins around a candidate are not one tone centred there, and a candidate whose own estimate lands a
