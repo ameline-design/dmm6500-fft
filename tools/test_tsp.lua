@@ -3258,6 +3258,40 @@ check('the volt column cannot print a 45-character field', (function()
          string.format('volt [%s] %d chars, dB [%s]', tostring(vtxt),
                        string.len(tostring(vtxt)), tostring(dtxt))
 end)())
+-- The quiet ranges get more microvolt digits, and the width is the reason the column can
+-- take them: driven through the frame's own path into the formatter, and asserted against
+-- the widest string the field already prints rather than a pinned character count.
+check('the microvolt column gains digits on the quiet ranges, within the width it had',
+      (function()
+  local r0 = fftsa.range
+  local widest = string.len(string.format('%.2f mV', 999.99))
+  local want = {{0.1, '999.94 uV'}, {1, '999.9 uV'}, {10, '1000 uV'}}
+  local i
+  for i = 1, table.getn(want) do
+    fftsa.range = want[i][1]
+    -- 999.94 uV reads differently at every precision, so a formatter that ignored the
+    -- range would print one of these three strings for all three ranges.
+    fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, {12500}, {999.94e-6})
+    local got = obj_at(fftsa.sg_pk_v[1]).text
+    fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
+    if got ~= want[i][2] or string.len(got) > widest then
+      fftsa.range = r0
+      return false, string.format('%g V gave [%s] (%d chars), wanted [%s] within %d',
+                                  want[i][1], tostring(got), string.len(tostring(got)),
+                                  want[i][2], widest)
+    end
+  end
+  -- A range the list never produces, and a part-built app with no range at all, both take
+  -- the whole-microvolt format: this runs from the frame path, so it may not raise.
+  fftsa.range = 100
+  local off = fftsa.sg_uv_fmt(fftsa.range)
+  fftsa.range = nil
+  local none = fftsa.sg_uv_fmt(fftsa.range)
+  fftsa.range = r0
+  return off == fftsa.sg_uv_fmt_std and none == fftsa.sg_uv_fmt_std,
+         string.format('0.1 V and 1 V gain digits within %d chars; 100 V [%s], nil [%s]',
+                       widest, off, none)
+end)())
 -- End to end, through a real frame: the capture is clipped the way the instrument clips it,
 -- and the banner, its colour, the dashed table and the dashed distortion line all follow.
 check('a clipped capture reports over-range on every field it should', (function()
