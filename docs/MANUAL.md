@@ -201,7 +201,7 @@ sample count. The settings line reports the new rate and bin spacing when it com
 back and forth across a step re-plans each way; staying on one side of it does not.
 
 **A gesture cannot leave the allowed range.** Start clamps to 10 Hz … 499 kHz and Stop to
-2 kHz … 500 kHz — the limits the Options fields themselves declare, enforced through one function so
+500 Hz … 500 kHz — the limits the Options fields themselves declare, enforced through one function so
 the form cannot be handed a value its own field would refuse. A pan is not told apart from a pinch —
 both are just two limits to be snapped into range — so a drag that runs off an end *narrows* the span:
 that edge sticks at the limit while the other keeps coming in. Adopted limits are rounded to whole
@@ -238,7 +238,7 @@ works either way.
 | Field | |
 |---|---|
 | Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. The peak table has its own floor two or three bins up — see *The lowest frequency the table reports*. |
-| Stop Freq | Top of the display, 2 kHz to 500 kHz. It sets the sample rate, and so the bin width: at or below 12 kHz the digitizer runs at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. |
+| Stop Freq | Top of the display, 500 Hz to 500 kHz. It sets the sample rate, and so the bin width: at or below 12 kHz the digitizer runs at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. Below 12 kHz the rate is already at its floor, so a lower stop narrows the view and not the bin. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |

@@ -5684,6 +5684,32 @@ check('the column runs partition the span, so no bin escapes the maximum', (func
                        npts, ncol, missing, overlap, fftsa.sg_buf.n)
 end)())
 
+-- The narrowest stop the form offers has far fewer bins than columns, so the reduce runs
+-- with a zero quotient and every column carrying at most one bin. Driven through a real
+-- Apply and a frame, because lowering the floor is only safe if that regime draws.
+check('the narrowest stop the form offers still fills the trace', (function()
+  local lo0, hi0 = fftsa.flo, fftsa.fhi
+  display.setvalue(fftsa.opt_n, 1)
+  display.setvalue(fftsa.opt_flo, fftsa.flomin)
+  display.setvalue(fftsa.opt_fhi, fftsa.fhi_min)
+  local ok = fftsa.options_apply()
+  -- Only on refusal: lasterr outlives whichever earlier case last set it, and a stale
+  -- string beside a successful Apply reads as the reason this one failed.
+  local why = 'no refusal'
+  if not ok then why = tostring(fftsa.lasterr) end
+  fftsa.frame()
+  local kmin, kmax = fftsa.sg_window_bins(fftsa.sg_nbins, fftsa.binhz)
+  local npts, written, err = kmax - kmin + 1, fftsa.sg_buf.n, fftsa.errrun
+  display.setvalue(fftsa.opt_flo, lo0)
+  display.setvalue(fftsa.opt_fhi, hi0)
+  fftsa.options_apply()
+  return ok and err == 0 and written == fftsa.sg_ncol and npts >= 2
+         and npts < fftsa.sg_ncol,
+         string.format('%g to %g Hz: %d bins, %d written, errrun %d, apply %s (%s)',
+                       fftsa.flomin, fftsa.fhi_min, npts, written, err, tostring(ok),
+                       tostring(why))
+end)())
+
 -- The point of max-per-column: a tone in any bin reaches the trace. Stride sampling
 -- would miss it, and so can the firmware's own decimation.
 check('a tone survives decimation whatever bin it lands in', (function()

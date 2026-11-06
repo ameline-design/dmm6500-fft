@@ -144,11 +144,11 @@ fftsa.flomin  = 10          -- floor for the start frequency (Hz)
 fftsa.flo     = 10          -- display start frequency (Hz)
 fftsa.fhi     = 50000       -- display stop frequency (Hz)
 -- Nyquist at the fastest rate, so this is the widest view the hardware can give.
--- The low end is where the rate ladder runs out: 2 kHz already takes the slowest rate,
--- so a narrower stop would buy no further bin width, only a narrower view of the same
--- bins -- 82 of them across the plot at the smallest count.
+-- The low end is well under the slowest rate, so a stop down here narrows the view
+-- rather than the bin: 500 Hz holds 20 bins at the smallest count and 642 at the
+-- largest, drawn into 255 columns either way.
 fftsa.fhi_max = 500000
-fftsa.fhi_min = 2000
+fftsa.fhi_min = 500
 -- Ceiling for the start, a kilohertz under the stop's so the form cannot be set to a span
 -- of nothing. It is the Start field's own max, and span_clamp holds a gesture to the same
 -- line: without that, a pinch high up the range could hand Options a start its own field
