@@ -751,6 +751,51 @@ function fftsa.nl._find_desc(elem0)
   return nil
 end
 
+-- The descriptor from the buffer's CAPACITY AND n, which are descriptor fields at +0x74 and
+-- +0x78 rather than values in the record. Returns descriptor base, element 0, and the same
+-- geometry _find_desc returns.
+--
+-- WHY THIS EXISTS AND WHY IT GOES FIRST. The content scan identifies storage by the
+-- readings it holds, and a record whose readings are all identical cannot tell one of its
+-- chunks from another: confirmation at any stride passes everywhere, so the scan returns the
+-- lowest-addressed chunk, which is not chunk 0. Measured on a shorted input -- readings 1 and
+-- 2 both -1.0912892195e-06, the scan answering 0x3545240 against a true element 0 of
+-- 0x354D148, low by 32,520 bytes or exactly one chunk of 1355 elements. No descriptor
+-- references that address, so the bind failed one step later with the storage half reporting
+-- success. A quiet or shorted input is ordinary, so the capture buffer needs a route that
+-- does not depend on the signal at all.
+--
+-- Two adjacent big-endian words make a specific needle, and _read_desc applies the same
+-- validation as the other route: the storage self-pointer, both owner self-pointers and the
+-- chunk geometry. 878 hits on the instrument, exactly one of them a descriptor.
+function fftsa.nl._find_desc_by_sig(buf)
+  local nl = fftsa.nl
+  local cap, n = buf.capacity, buf.n
+  if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then return nil end
+  local needle = u32_pack(cap) .. u32_pack(n)
+  local windows = {
+    { 50331648, 83886080 },
+    { 17825792, 150994944 },
+  }
+  local wi
+  for wi = 1, table.getn(windows) do
+    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    local k
+    for k = 1, table.getn(hits) do
+      local base = hits[k] - 116          -- 0x74, the capacity field
+      local elem0 = W(base + 72)          -- 0x48, the storage pointer
+      if elem0 ~= nil and elem0 ~= 0 then
+        local b, es, pc, v, nc = nl._read_desc(base, elem0)
+        if b ~= nil then
+          nl._desc_of, nl._desc_at = elem0, base
+          return base, elem0, es, pc, v, nc
+        end
+      end
+    end
+  end
+  return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Params struct. Field order must match dsp_native_params in dsp_native.c exactly.
 -- ---------------------------------------------------------------------------
@@ -1749,24 +1794,52 @@ function fftsa.nl.describe(buf, has_extras)
   -- refusal from the entry point on every frame.
   local nl = fftsa.nl
   local elem0, stride
+  -- Carried out of the signature route, which returns the descriptor with the address.
+  local sdesc, selemsize, sperchunk, svec, snchunks
   if nl._stor_of == buf and nl._stor_x == has_extras and nl._stor_elem0 ~= nil then
     elem0, stride = nl._stor_elem0, nl._stor_stride
   else
     nl._stor_of, nl._stor_x, nl._stor_elem0, nl._stor_stride = nil, nil, nil, nil
-    elem0, stride = nl._find_storage(buf, has_extras)
+    nl._stor_why = nil
+    -- The signature route for a buffer with no extra values, which is the capture: its
+    -- readings are whatever was on the input, and an all-identical record defeats a content
+    -- scan. It answers with the descriptor too, so the second sweep is skipped. The buffers
+    -- init creates are seeded distinctly and carry extras, so they keep the content route
+    -- and the install path is unchanged.
+    if not has_extras then
+      local b, e0, es, pc, v, nc = nl._find_desc_by_sig(buf)
+      if b ~= nil then
+        elem0, stride = e0, es
+        sdesc, selemsize, sperchunk, svec, snchunks = b, es, pc, v, nc
+      end
+    end
+    if elem0 == nil then elem0, stride = nl._find_storage(buf, has_extras) end
     if elem0 then
       nl._stor_of, nl._stor_x = buf, has_extras
       nl._stor_elem0, nl._stor_stride = elem0, stride
     end
   end
   if not elem0 then return nil end
-  local desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
-  if not desc then return nil end
+  local desc, elemsize, perchunk, vec, nchunks = sdesc, selemsize, sperchunk, svec, snchunks
+  if desc == nil then
+    desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
+  end
+  -- Each of the two halves names itself. _find_storage sets _stor_why on its own failures
+  -- and clears it on the way in, so without these the caller reports "nil" for a refusal
+  -- that happened here rather than there.
+  if not desc then
+    nl._stor_why = 'no descriptor for elem0=' .. hx(elem0) .. ' stride=' .. tostring(stride)
+    return nil
+  end
   -- TWO INDEPENDENT ANSWERS TO THE SAME QUESTION, so they have to agree: the stride the
   -- content scan measured from the spacing of the readings, and the element size the
   -- descriptor states. Disagreement means the hit is not this buffer's storage, or the
   -- descriptor is not this buffer's descriptor, and either way nothing below is safe.
-  if elemsize ~= stride then return nil end
+  if elemsize ~= stride then
+    nl._stor_why = 'elemsize ' .. tostring(elemsize) .. ' disagrees with stride '
+                   .. tostring(stride) .. ' at elem0=' .. hx(elem0)
+    return nil
+  end
   -- The window must cover both payloads, and they are scattered: the second is often
   -- BELOW the first, measured at 0x360D600 and 0x36055F0. Taking hi from the second
   -- unconditionally gave hi < lo, which dsp_native_run rejects as EBOUNDS, so the native
@@ -1788,7 +1861,11 @@ function fftsa.nl.describe(buf, has_extras)
     local i
     for i = 1, nchunks do
       local a = W(vec + (i - 1) * 4)
-      if a == nil or a == 0 then return nil end
+      if a == nil or a == 0 then
+        nl._stor_why = 'chunk ' .. tostring(i) .. ' of ' .. tostring(nchunks) .. ' reads '
+                       .. tostring(a) .. ' at vec=' .. hx(vec)
+        return nil
+      end
       if a < lo then lo = a end
       if a + fftsa.nl.CHUNK_BYTES > hi then hi = a + fftsa.nl.CHUNK_BYTES end
       if i == 2 then ch2 = a end

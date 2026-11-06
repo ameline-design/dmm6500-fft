@@ -343,6 +343,80 @@ check('refuses a record shorter than the confirmation, and says which term',
       and string.find(fftsa.nl._stor_why, 'short record', 1, true) ~= nil,
       string.format('elem0=%s why=%s', tostring(e0), tostring(fftsa.nl._stor_why)))
 
+print('\nnl.describe on an all-identical record')
+
+-- The capture holds whatever was on the input, and on a quiet or shorted input every
+-- reading can be the same value. A content scan cannot then tell one chunk of that buffer
+-- from another -- confirmation at any stride passes everywhere -- so it answers with the
+-- lowest-addressed chunk, which is not chunk 0 and which no descriptor references.
+--
+-- Measured: readings 1 and 2 both -1.0912892195e-06, the scan answering 0x3545240 against a
+-- true element 0 of 0x354D148, low by exactly one chunk. These use those addresses.
+local TRUE_E0, LOW_E0 = 55890248, 55857728    -- 0x354D148, 0x3545240
+local DESC = 55959912                          -- 0x355D168
+local SAME = -1.0912892195e-06
+
+-- The descriptor as _read_desc validates it: storage pointer at +0x48, both owner
+-- self-pointers, and the geometry of a 24-byte element in a 32768-byte chunk payload.
+local VEC = 56000000
+local function place_desc(base, elem0, elemsize, perchunk, nchunks, cap, n)
+  WORDS[base + 72] = elem0
+  WORDS[base + 84] = base
+  WORDS[base + 100] = base
+  WORDS[base + 8] = elemsize
+  WORDS[base + 12] = perchunk
+  WORDS[base + 16] = nchunks
+  WORDS[base + 68] = VEC          -- 0x44, the chunk vector
+  WORDS[base + 116] = cap         -- +0x74
+  WORDS[base + 120] = n           -- +0x78
+  -- Real entries, because describe walks every one and refuses a zero.
+  local i
+  for i = 1, nchunks do
+    WORDS[VEC + (i - 1) * 4] = elem0 + (i - 1) * 32784
+  end
+end
+
+reset_heap()
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+-- The signature needle is capacity then n as adjacent big-endian words, so the hit lands on
+-- the capacity field and the descriptor base is 0x74 below it. Matched on CONTENT, not on
+-- length: a packed double is eight bytes too, so a length test would answer the content
+-- scan's needle with the descriptor's hit and prove nothing.
+local SIGPAT = string.char(0, 1, 0, 0, 0, 0, 8, 0)    -- capacity 65536, n 2048
+fftsa.nl.FINDS = function(lo, hi, pat)
+  if pat == SIGPAT then return {DESC + 116} end
+  return {LOW_E0}
+end
+local flat = {SAME, SAME, SAME, SAME, SAME, SAME}
+flat[64], flat[256] = SAME, SAME
+local CAPBUF = {n = 2048, capacity = 65536, readings = flat}
+
+local d = fftsa.nl.describe(CAPBUF, false)
+check('resolves element 0 from the descriptor, not from the identical readings',
+      d ~= nil and d.chunk1 == TRUE_E0 and d.elemsize == 24,
+      string.format('chunk1=%s elemsize=%s why=%s',
+                    d and string.format('%X', d.chunk1) or 'nil',
+                    d and tostring(d.elemsize) or 'nil', tostring(fftsa.nl._stor_why)))
+
+check('does not answer with the chunk the content scan would have found',
+      d ~= nil and d.chunk1 ~= LOW_E0,
+      string.format('chunk1=%s low=%X', d and string.format('%X', d.chunk1) or 'nil', LOW_E0))
+
+-- A buffer that carries extras is one we seeded ourselves, so it keeps the content route
+-- and the install path is untouched. The signature hit is left reachable to prove the
+-- has_extras gate is what excludes it rather than the mock.
+fftsa.nl._stor_of = nil
+reset_heap()
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+local probed = 0
+local REAL_FS = fftsa.nl._find_storage
+fftsa.nl._find_storage = function(b, x) probed = probed + 1; return REAL_FS(b, x) end
+fftsa.nl.describe({n = 2048, capacity = 65536, readings = flat,
+                   extravalues = {1, 2, 3}}, true)
+fftsa.nl._find_storage = REAL_FS
+check('a buffer with extras still goes through the content scan',
+      probed == 1, string.format('content scans=%d', probed))
+
 fftsa.nl.FINDS = FINDS_REAL
 
 print()
