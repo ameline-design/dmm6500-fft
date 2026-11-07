@@ -419,8 +419,15 @@ if(DSP_DST_NATIVE)
   # typed in here. It costs nothing that matters -- sin and cos run once a plan building the
   # window and the twiddles, and log10 runs once a trace point either way -- and computing
   # the window in double before storing it to float is the accurate direction.
+  #
+  # DSP_BANDPASS=0 because the app offers no filter at all: dsp_lua.tsp refuses a
+  # filter.state other than OFF, and the params struct carries init_decim = 1 on every
+  # call, so nothing on the instrument can reach a band. The host suite runs both settings,
+  # dsp_lowpass_single and dsp_lowpass_double, so this is a tested configuration and not an
+  # untested corner.
   target_compile_definitions(dsp_native_elf PUBLIC
       DSP_NO_SINGLE_MATH
+      DSP_BANDPASS=0
       DSP_CHECK_OVERLAP=1   # keep the overlap checks; they catch aliasing bugs
       )
   # -ffp-contract=fast here and nowhere else. The reason the host variants hold it off is to
@@ -432,7 +439,11 @@ if(DSP_DST_NATIVE)
   # with contraction off remain upper bounds on what the target does.
   target_compile_options(dsp_native_elf PRIVATE
       -Os -fno-common -Wno-int-to-pointer-cast
-      -ffunction-sections  # lets the linker script place dsp_native_run first
+      # One section per function and per datum: it lets the linker script place
+      # dsp_native_run first, and it lets --gc-sections below drop everything
+      # dsp_native_run does not reach. dsp.c is a library with about seventy entry points
+      # and dsp_native.c calls eight of them.
+      -ffunction-sections -fdata-sections
       -Wall -Wextra -Wconversion -Wdouble-promotion
       -ffp-contract=fast
       -fno-builtin)
@@ -444,11 +455,24 @@ if(DSP_DST_NATIVE)
   # absolute data references, and without the table every float constant, the error
   # string table and dsp_wincos read from the link-time address instead of the load
   # address. Do not strip, and do not drop this flag.
+  #
+  # --gc-sections, rooted at dsp_native_run, is what holds the image to the code the
+  # instrument can execute: dsp.c has about seventy entry points and this keeps the eight
+  # dsp_native.c calls and their callees. No second code root may be added, or everything it
+  # reaches comes back.
+  #
+  # -u dsp_native_sizes because that table is the one datum nothing in the image refers to:
+  # it exists for the Lua loader, which reads the target's struct sizes, PARAMS_SLOT and the
+  # bss bounds straight out of the linked ELF. Under -fdata-sections the collector has no
+  # reason to keep it, and emit_reloc.py refuses an image without it.
+  #
   # Plain ld.lld flags: the toolchain file links with ld.lld directly, not through the
   # clang driver, so there is no -Wl, wrapping here and no -nostdlib to ask for.
   target_link_options(dsp_native_elf PRIVATE
       -T ${CMAKE_CURRENT_SOURCE_DIR}/dsp_native.ld
       -e dsp_native_run
+      --gc-sections
+      -u dsp_native_sizes
       --no-dynamic-linker
       --unresolved-symbols=report-all
       --emit-relocs)

@@ -65,8 +65,13 @@ def link_at(base, objs, ldscript_src, workdir):
         fh.write(moved)
     elf = os.path.join(workdir, 'at_%08X.elf' % base)
     bin_ = os.path.join(workdir, 'at_%08X.bin' % base)
+    # Every flag the real link uses, --gc-sections and the dsp_native_sizes root included.
+    # This is an oracle only while it links the same program: without the collector the
+    # reference image carries the code the shipped one drops, and the comparison then fails
+    # at the first address that moved rather than at a relocation fault.
     subprocess.run([LD, '-T', sp, '-e', 'dsp_native_run', '--no-dynamic-linker',
                     '--unresolved-symbols=report-all', '--emit-relocs',
+                    '--gc-sections', '-u', 'dsp_native_sizes',
                     *objs, '-o', elf], check=True, capture_output=True)
     subprocess.run([OBJCOPY, '-O', 'binary', elf, bin_], check=True, capture_output=True)
     with open(bin_, 'rb') as fh:

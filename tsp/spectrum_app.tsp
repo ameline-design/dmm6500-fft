@@ -809,21 +809,6 @@ function fftsa.frame_body()
   else
     fftsa.sg_show_peaks(nil, nil, npk, fftsa.binhz, pk_hz, pk_v)
   end
-  -- The HELP key, at the end of the graph update so the check never reads a half-painted
-  -- screen. There is no event to hang it on: every delivery path the firmware offers
-  -- refuses the key.
-  --
-  -- Once a second rather than once a frame, and the cost is the wait and not the checksum,
-  -- which the firmware answers in 0.33 ms. getchecksum returns glass-derived data, so it
-  -- blocks until the display task answers, and at this point that task owes the 255 reading
-  -- messages the trace fill just batched and the repaint they cause: measured at 16,384
-  -- samples, 46.1 ms of a 274.3 ms frame against 0.1 ms with the call gone. A second of
-  -- latency on a human pressing HELP costs nothing.
-  local hnow = os.clock()
-  if fftsa.help_last == nil or (hnow - fftsa.help_last) >= fftsa.help_period then
-    fftsa.help_last = hnow
-    fftsa.help_main()
-  end
   -- Phase costs, last frame and the worst seen. Seven clock reads, about 15 us, against a
   -- frame of tens of milliseconds; fftsa.phases() formats them.
   local ph, pk = fftsa.ph, fftsa.ph_peak
@@ -1234,8 +1219,7 @@ function fftsa.build_options()
 
   fftsa.opt_info = create(fftsa.optscr, display.OBJ_TEXT, 400, fftsa.opt_info_y, "",
                         56575, display.FONT_SMALL, display.JUST_CENTER)   -- cyan 00DCFF
-  -- A timer on the options screen previews edits without configuring acquisition, and
-  -- answers the HELP key while this form is the screen a press lands on.
+  -- A timer on the options screen previews edits without configuring acquisition.
   local preview = create(fftsa.optscr, display.OBJ_TIMER, fftsa.opt_tick_period,
                          display.TIMER_FOREVER)
   display.setevent(preview, display.EVENT_PRESS,
@@ -1259,9 +1243,16 @@ function fftsa.build_options()
 end
 
 -- ==================== About ====================
--- An OBJ_TEXT y sits above its ink, by 37 px in the small fonts against a button's 50
--- (measured with the help geometry below), so these are lower than a button's y for the
--- same apparent position.
+-- An OBJ_TEXT y sits above its ink, by 37 px in the small fonts against a button's 50, so
+-- these are lower than a button's y for the same apparent position.
+--
+-- The fonts, measured on the panel because the numbered ones are absent from the display API
+-- reference and their order is not the SMALL/MEDIUM/LARGE one. Ink height, width of one
+-- fixed string, and how far the ink starts below the y given:
+--
+--   FONT_1  17 px  202 px  37 below      FONT_SMALL   17 px  244 px  37 below
+--   FONT_2  19 px  230 px  36 below      FONT_MEDIUM  24 px  380 px  32 below
+--   FONT_3  21 px  264 px  34 below      FONT_LARGE   29 px  434 px  28 below
 fftsa.about_x        = 12
 fftsa.about_title_x  = 400        -- centred, so the x is the screen's middle
 fftsa.about_title_y  = 30
@@ -1340,309 +1331,13 @@ function fftsa.about_pgdn()
   return fftsa.about_show_page(fftsa.about_page + 1)
 end
 
--- The options form's timer does two jobs, and the key goes first: the preview is cosmetic
--- where the operator is waiting on a dialog to clear. 100 ms against the firmware's 0.05 s
--- floor, and it costs nothing elsewhere -- a display timer fires only while its own screen
--- is on show, and the frame loop is frozen while this form is up.
+-- 100 ms against the firmware's 0.05 s floor, and it costs nothing elsewhere: a display
+-- timer fires only while its own screen is on show, and the frame loop is frozen for as
+-- long as this form is up.
 fftsa.opt_tick_period = 0.1
 
 function fftsa.opt_tick()
-  fftsa.help_check("opt")
   fftsa.options_preview()
-  return true
-end
-
--- ==================== help screens ====================
--- Two of them, raised by the HELP key: one for the spectrum screen and one for the options
--- form. Same shape as About -- rows of text, a page counter, PgUp, PgDn and Back -- so the
--- geometry constants above are shared and one builder makes both.
---
--- Which screen a press lands on is decided by which timer ran, not by tracking the visible
--- screen: a display timer only fires while its own screen is showing, so the frame timer
--- asks for "main" and the form's preview timer for "opt", and neither needs to know what
--- else is on the glass.
---
--- fftsa.help_screens and fftsa.help_cur are not declared here, the same as optscr, aboutscr
--- and errscr: opening the App re-runs this script body, so a handle field assigned at module
--- level is cleared while the previous launch's objects are still alive, and they then
--- survive unreachable until a power cycle at 40 of the 463 pool each time.
-
--- Help geometry, separate from About's: a bigger font wants a wider pitch, and these screens
--- start their text under the title bar where About leaves room for its author line.
---
--- Measured on the panel, because the numbered fonts are absent from the display API
--- reference and their order is not the SMALL/MEDIUM/LARGE one. Ink height, width of one
--- fixed string, and how far the ink starts below the y given:
---
---   FONT_1  17 px  202 px  37 below      FONT_SMALL   17 px  244 px  37 below
---   FONT_2  19 px  230 px  36 below      FONT_MEDIUM  24 px  380 px  32 below
---   FONT_3  21 px  264 px  34 below      FONT_LARGE   29 px  434 px  28 below
---
--- At FONT_3 a 49-character row runs to about 540 px and still clears the icon column, and
--- 12 rows is what fits: a 13th lands its ink on the button row at opt_btn_y.
-fftsa.help_font    = display.FONT_3
-fftsa.help_body_y  = 24
-fftsa.help_body_dy = 25
-fftsa.help_rows    = 12
-
-fftsa.help_text = {
--- Rows are wrapped by hand, OBJ_TEXT not wrapping, and wrapped to the measured width:
--- FONT_3 averages 10.2 px a character, so the 734 px from the icon column to the edge of
--- the panel is about 71. The width check enforces a conservative 11 px a character, which
--- leaves room for a row of unusually wide glyphs.
-  main = {
-    -- page 1, rows 1..12: the trace and the two buttons, illustrated with their own icons
-    "The trace is the amplitude spectrum of the input, redrawn every",
-    "frame. The vertical dB scale is always fixed.",
-    "",
-    "Options: start and stop frequency, input range, window and",
-    "sample count.",
-    "",
-    "Locked: the frequency span is held where Options set it, and a",
-    "drag or a pinch on the graph snaps back to it.",
-    "",
-    "Unlocked: drag or pinch the graph to move the frequency span or",
-    "zoom it. The analyser retunes to wherever you leave it.",
-    "Press HELP on the Options form for help with the settings.",
-    -- page 2, rows 13..24: the readouts under the trace
-    "THD is total harmonic distortion: the harmonics of the strongest",
-    "tone, measured against that tone.",
-    "",
-    "S/N compares the strongest tone with the mean of every other",
-    "plotted bin. Noise Floor is that mean, in dBV.",
-    "",
-    "The six numbered rows are the strongest peaks, each with its",
-    "frequency, its amplitude, and its amplitude in dBV.",
-    "",
-    "The bottom line is the settings in force: point count, sample",
-    "rate, bin width, capture time, window, range and terminals.",
-    "",
-  },
-  opt = {
-    -- Wrapped wider than the main screen's rows: this one has no icon column, so the text
-    -- starts at fftsa.about_x and has the whole 778 px of panel, about 76 characters.
-    -- page 1, rows 1..12: the settings
-    "Start and stop frequency set the span. The sample rate follows from",
-    "the stop frequency, and the bin width from the sample count.",
-    "",
-    "Range is the full scale input voltage. A signal past it reads",
-    "OVERRANGE, and the distortion and peak figures dash out.",
-    "",
-    "Samples set the resolution: more of them give a narrower bin and a",
-    "longer frame, and reduce the rate the graph updates at.",
-    "",
-    "Apply commits, Cancel abandons, Reset restores the defaults.",
-    "",
-    "Window is explained on page 2.",
-    -- page 2, rows 13..24: the windows. Side lobe levels and main lobe widths are the
-    -- standard figures for these four; the form's own beta labels carry Kaiser's.
-    "A window tapers the capture to zero at both ends. Without one the",
-    "FFT sees a step at the join and smears energy across every bin.",
-    "",
-    "The choice trades how narrow a peak is against how far the skirts",
-    "beside it fall away.",
-    "",
-    "Hann: skirts -31 dB, peak 4 bins. Narrowest, so it separates close",
-    "tones best. Blackman: -58 dB, 6 bins wide.",
-    "Blk-Harris: -92 dB, 8 bins, for a small tone beside a large one.",
-    "",
-    "Kaiser: beta sets the same trade by hand, and the form labels the",
-    "skirt level each beta gives.",
-  },
-}
-fftsa.help_titles = {main = "FFT ANALYSER HELP", opt = "FFT OPTIONS HELP"}
-
--- The main screen's help illustrates its two buttons with the images the buttons use, so it
--- costs no new asset. A function rather than a table at module level, because fftsa.img_cog
--- and the padlock pair are assigned further down the file and a table built here would
--- capture nil. row is the text row the icon sits beside and page the page it belongs to:
--- the objects live for the screen, so one that is not on the page showing has to be hidden
--- or it sits beside text about something else.
-fftsa.help_icon_x = 12
-fftsa.help_text_x = {main = 56, opt = nil}   -- nil means the shared fftsa.about_x
-
--- The page counter sits in the button row, between the PgUp/PgDn pair and Back. Derived
--- from two measured offsets, neither in the display API reference: a button's y is 50 px
--- above its top edge and its face is btn_h tall, so the row centres at
--- opt_btn_y + 50 + btn_h/2, while FONT_SMALL ink starts 38 px below the y and runs 16, so
--- it centres at y + 46. A function and not a constant, because fftsa.btn_h is assigned
--- further down and a value computed here would read nil.
-function fftsa.help_pageno_y()
-  return fftsa.opt_btn_y + 50 + fftsa.btn_h / 2 - 46
-end
-
-function fftsa.help_icon_list(key)
-  if key ~= "main" then return nil end
-  return {
-    {name = fftsa.img_help_cog, w = fftsa.cog_img_w, h = fftsa.cog_img_h,
-     row = 4, page = 1},
-    {name = fftsa.img_help_lkc, w = fftsa.lock_img_w, h = fftsa.lock_img_h,
-     row = 7, page = 1},
-    {name = fftsa.img_help_lko, w = fftsa.lock_img_w, h = fftsa.lock_img_h,
-     row = 10, page = 1},
-  }
-end
-
-function fftsa.destroy_help()
-  if fftsa.help_screens ~= nil then
-    local k, h
-    -- Never delete the screen on show, which bluescreens the instrument. One switch and one
-    -- yield for the whole set rather than fftsa.del_scr per screen, which pays the yield
-    -- four times over; see fftsa.del_scr for why the yield is needed at all.
-    fftsa.show_main()
-    delay(fftsa.sg_scr_yield)
-    for k, h in pairs(fftsa.help_screens) do
-      if h.scr ~= nil then fftsa.del_obj(h.scr) end
-    end
-  end
-  fftsa.help_screens, fftsa.help_cur = nil, nil
-
-end
-
-function fftsa.help_pages(h)
-  if h == nil then return 1 end
-  return math.ceil(table.getn(h.text) / fftsa.help_rows)
-end
-
--- Page p into the row objects, which are made once and rewritten. A row past the end of the
--- text is blanked rather than left holding the previous page.
-function fftsa.help_show_page(h, p)
-  if h == nil or h.lines == nil then return false end
-  local last = fftsa.help_pages(h)
-  if p < 1 then p = 1 end
-  if p > last then p = last end
-  h.page = p
-  local base, i = (p - 1) * fftsa.help_rows, nil
-  for i = 1, fftsa.help_rows do
-    local s = h.text[base + i]
-    if s == nil then s = "" end
-    fftsa.settxt(h.lines[i], s)
-  end
-  fftsa.settxt(h.pageno, string.format("page %d of %d", p, last))
-  -- Paging controls only where there is paging to do, and the counter with them. Asserted
-  -- on every page change rather than at build, so the one place that knows the count decides.
-  local vis = display.STATE_ENABLE
-  if last <= 1 then vis = display.STATE_INVISIBLE end
-  if h.b_up ~= nil then display.setstate(h.b_up, vis) end
-  if h.b_dn ~= nil then display.setstate(h.b_dn, vis) end
-  if h.pageno ~= nil then display.setstate(h.pageno, vis) end
-  -- The illustrations belong to a page. Hidden rather than moved: an OBJ_IMAGE cannot be
-  -- repositioned after it is made, so the ones for other pages go invisible.
-  if h.icons ~= nil and h.icon_page ~= nil then
-    for i = 1, table.getn(h.icons) do
-      if h.icons[i] ~= nil then
-        if h.icon_page[i] == p then
-          fftsa.icon_redraw(h.icons[i])
-        else
-          display.setstate(h.icons[i], display.STATE_INVISIBLE)
-        end
-      end
-    end
-  end
-  return true
-end
-
--- Always from the first page, so a screen reads the same every time it is raised.
-function fftsa.help_open(key)
-  if fftsa.help_screens == nil then return false end
-  local h = fftsa.help_screens[key]
-  if h == nil or h.scr == nil then return false end
-  fftsa.help_cur = h
-  fftsa.help_show_page(h, 1)
-  display.changescreen(h.scr)
-  return true
-end
-
-function fftsa.help_pgup()
-  if fftsa.help_cur == nil then return false end
-  return fftsa.help_show_page(fftsa.help_cur, fftsa.help_cur.page - 1)
-end
-
-function fftsa.help_pgdn()
-  if fftsa.help_cur == nil then return false end
-  return fftsa.help_show_page(fftsa.help_cur, fftsa.help_cur.page + 1)
-end
-
--- Back to whichever screen the help was raised from, by key rather than by a stored handle:
--- the screens are rebuilt on a reload and a saved handle would outlive its object.
-function fftsa.help_back()
-  local h = fftsa.help_cur
-  fftsa.help_cur = nil
-  if h ~= nil and h.home == "opt" and fftsa.optscr ~= nil then
-    display.changescreen(fftsa.optscr)
-    return true
-  end
-  return fftsa.show_main()
-end
-
-function fftsa.build_help_one(key, home)
-  local create = display.create
-  local h = {key = key, home = home, page = 1, lines = {},
-             text = fftsa.help_text[key]}
-  h.scr = create(display.ROOT, display.OBJ_SCREEN, fftsa.help_titles[key])
-  if h.scr == nil then return nil end
-  -- Before any child: creating a screen brings it to the front, so the cover goes back in
-  -- front now. Deferred to the end of the build it is a flicker for the whole build.
-  fftsa.loading_front()
-  h.lines = {}
-  local tx = fftsa.help_text_x[key]
-  if tx == nil then tx = fftsa.about_x end
-  local y, i = fftsa.help_body_y, nil
-  for i = 1, fftsa.help_rows do
-    h.lines[i] = create(h.scr, display.OBJ_TEXT, tx, y, "",
-                        fftsa.about_c_body, fftsa.help_font, display.JUST_LEFT)
-    y = y + fftsa.help_body_dy
-  end
-  -- The icons after the rows, so a pool refusal costs the illustration and not the words.
-  h.icons, h.icon_page = {}, {}
-  local icons = fftsa.help_icon_list(key)
-  if icons ~= nil then
-    for i = 1, table.getn(icons) do
-      local ic = icons[i]
-      local iy = fftsa.help_body_y + (ic.row - 1) * fftsa.help_body_dy
-      h.icons[i] = fftsa.icon_at(fftsa.help_icon_x, iy, ic.name, h.scr)
-      h.icon_page[i] = ic.page
-    end
-  end
-  h.pageno = create(h.scr, display.OBJ_TEXT, fftsa.about_title_x, fftsa.help_pageno_y(), "",
-                    fftsa.about_c_title, display.FONT_SMALL, display.JUST_CENTER)
-  -- Kept on the screen's record, because a one-page screen hides them: a PgUp that can only
-  -- clamp is a control doing nothing, and that cannot be told by looking.
-  h.b_up = create(h.scr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "PgUp", 140)
-  display.setevent(h.b_up, display.EVENT_PRESS,
-                   "if fftsa ~= nil then fftsa.guard(fftsa.help_pgup) end")
-  h.b_dn = create(h.scr, display.OBJ_BUTTON, 168, fftsa.opt_btn_y, "PgDn", 140)
-  display.setevent(h.b_dn, display.EVENT_PRESS,
-                   "if fftsa ~= nil then fftsa.guard(fftsa.help_pgdn) end")
-  local b_back = create(h.scr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y, "Back", 140)
-  display.setevent(b_back, display.EVENT_PRESS,
-                   "if fftsa ~= nil then fftsa.guard(fftsa.help_back) end")
-  -- A HELP press on a help screen would otherwise leave the firmware's dialog on the glass
-  -- with nothing running to clear it: this timer dismisses it and stays put.
-  local t = create(h.scr, display.OBJ_TIMER, 0.5, display.TIMER_FOREVER)
-  display.setevent(t, display.EVENT_PRESS,
-                   "if fftsa ~= nil then fftsa.guard(fftsa.help_stay) end")
-  -- End App is delivered to the visible screen, and this one can be it.
-  display.setevent(h.scr, display.EVENT_ENDAPP,
-                   "if fftsa ~= nil then fftsa.cleanup() end")
-  fftsa.help_show_page(h, 1)
-  return h
-end
-
--- Built at launch with every other screen, and after the two it returns to.
-function fftsa.build_help()
-  fftsa.destroy_help()
-  fftsa.help_screens = {}
-  local key, home
-  for key, home in pairs({main = "main", opt = "opt"}) do
-    local h = fftsa.build_help_one(key, home)
-    if h == nil then
-      fftsa.lasterr = "display object pool exhausted building the " .. key
-                      .. " help screen -- power cycle the instrument."
-      return false, fftsa.lasterr
-    end
-    fftsa.help_screens[key] = h
-  end
   return true
 end
 
@@ -1683,11 +1378,6 @@ function fftsa.build_about()
                         "Back", 140)
   display.setevent(b_back, display.EVENT_PRESS,
                    "if fftsa ~= nil then fftsa.guard(fftsa.about_back) end")
-  -- This screen has no help of its own and the frame timer does not run while it shows, so
-  -- without this a HELP press leaves the firmware's dialog up with nothing to clear it.
-  local t = create(fftsa.aboutscr, display.OBJ_TIMER, 0.5, display.TIMER_FOREVER)
-  display.setevent(t, display.EVENT_PRESS,
-                   "if fftsa ~= nil then fftsa.guard(fftsa.help_stay) end")
   -- End App is delivered to the visible screen, and this one can be it.
   display.setevent(fftsa.aboutscr, display.EVENT_ENDAPP,
                    "if fftsa ~= nil then fftsa.cleanup() end")
@@ -1956,12 +1646,6 @@ fftsa.cog_img_h  = 34
 fftsa.img_lock_c = "fftlockc"
 fftsa.img_lock_o = "fftlocko"
 fftsa.img_cog    = "fftcog"
--- The same three drawings remapped for a black background by tools/make_help_icons.py: the
--- button art is #9D9D9D on a #282828 field, which reads as a dark tile on a help screen.
--- These are white on black, so the field disappears into the screen. Same sizes.
-fftsa.img_help_lkc = "helplockc"
-fftsa.img_help_lko = "helplocko"
-fftsa.img_help_cog = "helpcog"
 
 -- The lock state on the glass is which of the padlock pair is visible.
 function fftsa.lock_icon()
@@ -1999,12 +1683,10 @@ function fftsa.toggle_lock()
 end
 
 -- A button whose icon did not load is blank but still works, so a nil here is recorded
--- rather than failing the start. parent defaults to the spectrum screen; the help screens
--- pass their own, to reuse the same embedded images as illustrations.
-function fftsa.icon_at(x, y, name, parent)
+-- rather than failing the start. Always a child of the spectrum screen, where the buttons are.
+function fftsa.icon_at(x, y, name)
   if name == nil then return nil end
-  if parent == nil then parent = fftsa.sg_scr end
-  local img = display.create(parent, display.OBJ_IMAGE, x, y, name)
+  local img = display.create(fftsa.sg_scr, display.OBJ_IMAGE, x, y, name)
   if img == nil then
     fftsa.lasterr = "image " .. tostring(name) .. " did not load"
     fftsa.say(fftsa.lasterr)
@@ -2053,9 +1735,6 @@ function fftsa.build()
   if optok == false then return false, optwhy end
   local aboutok, aboutwhy = fftsa.build_about()
   if aboutok == false then return false, aboutwhy end
-  -- After the two screens they return to, so Back has somewhere to go.
-  local helpok, helpwhy = fftsa.build_help()
-  if helpok == false then return false, helpwhy end
   return fftsa.sg_scr
 end
 
@@ -2184,10 +1863,6 @@ function fftsa.start()
   local built, why = fftsa.build()
   if built == false then return fftsa.start_failed(why or "build failed") end
 
-  -- Resolved once, here, so the 1 Hz tick tests one boolean instead of the six names the
-  -- HELP recogniser needs out of the undocumented ki namespace.
-  fftsa.help_probe()
-
   local hooked = fftsa.install_cleanup()
   -- The opening count, chosen before the only Apply start() runs, so it costs no second
   -- capture. Both names move together or Reset would restore a count this never opened at.
@@ -2300,7 +1975,6 @@ function fftsa.stop()
   pcall(function() fftsa.sg_destroy(true) end)   -- screen, graph, texts, trace buffers
   fftsa.destroy_options()
   fftsa.destroy_about()
-  fftsa.destroy_help()
   fftsa.loading_destroy(display.SCREEN_HOME)
   fftsa.del_scr(fftsa.errscr)
   fftsa.errscr = nil

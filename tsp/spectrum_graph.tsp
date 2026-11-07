@@ -42,7 +42,6 @@ if fftsa.sg_handles_inited == nil then
   fftsa.sg_pk_v  = nil     -- per-peak voltage text  (own field, fixed x)
   fftsa.sg_pk_d  = nil     -- per-peak dB text       (own field, fixed x)
   fftsa.sg_xunit = nil     -- settings line under the peak rows
-  fftsa.sg_stat  = nil
   fftsa.sg_mk    = nil
   -- The two trace buffers' own global names, which the display task's subscription
   -- resolves against. sg_name_buffers() says why they exist.
@@ -463,7 +462,6 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
-  fftsa.sg_stat = nil     -- no on-screen status object
   return fftsa.sg_scr
 end
 
@@ -475,7 +473,7 @@ function fftsa.sg_destroy(release)
   end
   fftsa.del_scr(fftsa.sg_scr)
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
   --
   -- Releasing is what an exit does: the buffers go, and defbuffer1 is made current first,
@@ -1007,100 +1005,12 @@ fftsa.sg_tick_last  = nil
 fftsa.sg_scale_last = nil
 fftsa.sg_term_last  = nil       -- the terminal selection the line currently names
 
--- The HELP key, answered by recognising the dialog it raises.
---
--- Nothing delivers the key to a script: display.setevent refuses a disp_key outright, and
--- display.setkeyenable takes only ON and OFF, where OFF substitutes a "help key is disabled"
--- dialog rather than silence. The dialog is invisible to every event path -- no EVENT_HIDE on
--- the screen it covers, nothing in ki.display.dump, no posted event -- so pixels are the only
--- thing that sees it.
---
--- The recogniser is therefore a checksum over a patch of the dialog's own title text. This
--- app's objects always resolve to "No Topic", help topics keying on an identity
--- display.create does not grant, so those pixels are constant.
---
--- 80x16 rather than the whole title row, because the cost is area over a fixed call overhead
--- -- 1.394 ms for 600x27 against 0.310 ms for 80x12 -- and smaller buys nothing. 1,280 pixels
--- is specific enough that none of the app's own screens collide with it, so the check needs
--- no knowledge of which screen is up and routing comes from which timer ran.
---
--- A list rather than one value: the patch is pixels of English text, so a firmware revision
--- that redraws the dialog, or a model whose metrics differ, has its own checksum. Adding one
--- is adding a number here, and membership is a few integer compares.
-fftsa.help_x1,  fftsa.help_y1 = 28, 50
-fftsa.help_x2,  fftsa.help_y2 = 108, 66
-fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
-fftsa.help_shown = 0            -- times the key has been answered
-fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
--- Off, by the operator's decision, because the key is not worth 44 ms of a 274 ms frame at
--- 16,384 samples. The cost is that pressing HELP leaves the firmware's own dialog on the
--- glass until EXIT. Set this true for the recogniser back: it then runs at help_period
--- rather than once a frame, so it costs a dropped tick a second instead of a sixth of the
--- rate.
-fftsa.help_enabled = false
--- How often the frame polls for the dialog, and not once a frame: getchecksum waits on the
--- display task, which at that point owes the trace fill's batched messages, measured at
--- 46.1 ms of a 274.3 ms frame at 16,384 samples against 0.1 ms with the call gone.
-fftsa.help_period = 1.0
-fftsa.help_last   = nil
-
-function fftsa.help_is_dialog(c)
-  if c == nil then return false end
-  local i
-  for i = 1, table.getn(fftsa.help_sigs) do
-    if fftsa.help_sigs[i] == c then return true end
-  end
-  return false
-end
-
--- Resolved once, by fftsa.start(). ki is undocumented and absent from the display API
--- reference, so every name is checked rather than assumed -- here and not in the tick, which
--- then costs one checksum call instead of six nil tests a second.
-function fftsa.help_probe()
-  fftsa.help_ok = false
-  -- The switch first, so a disabled recogniser costs one comparison at start and nothing per
-  -- frame. Tested through help_enabled rather than by stubbing the ki names, so the
-  -- recogniser stays covered while it ships off.
-  if not fftsa.help_enabled then return false end
-  if fftsa.help_sigs == nil or table.getn(fftsa.help_sigs) == 0 then return false end
-  if ki == nil or ki.display == nil then return false end
-  local k = ki.display
-  if k.getchecksum == nil or k.generate == nil then return false end
-  if k.ACTION_PRESS_ENTER == nil or k.ACTION_RELEASE_ENTER == nil then return false end
-  fftsa.help_ok = true
-  return true
-end
-
--- Both halves of the action, because press alone leaves the dialog up: the release is what
--- activates its OK button. ki.display.generate takes a disp_action, which makes it the one
--- consumer of the ki.display.ACTION_* enum.
-function fftsa.help_dismiss()
-  ki.display.generate(ki.display.ACTION_PRESS_ENTER)
-  ki.display.generate(ki.display.ACTION_RELEASE_ENTER)
-end
-
--- target names the help screen to raise, or nil to dismiss the firmware's dialog and stay
--- put, which is what a screen with no help of its own wants so a stray press does not leave
--- a modal nobody can clear.
---
--- No clock of its own: the caller's cadence is the rate. A display timer fires only while
--- its own screen shows, so none of those periods cost anything on a screen that is not up,
--- and the check itself is one getchecksum at 0.33 ms.
-function fftsa.help_check(target)
-  if not fftsa.help_ok then return false end
-  if not fftsa.help_is_dialog(ki.display.getchecksum(
-        fftsa.help_x1, fftsa.help_y1, fftsa.help_x2, fftsa.help_y2)) then
-    return false
-  end
-  fftsa.help_dismiss()
-  fftsa.help_shown = (fftsa.help_shown or 0) + 1
-  if target ~= nil and fftsa.help_open ~= nil then fftsa.help_open(target) end
-  return true
-end
-
--- One per caller, because a display event command names a function and passes it nothing.
-function fftsa.help_main() return fftsa.help_check("main") end
-function fftsa.help_stay() return fftsa.help_check(nil) end
+-- The HELP key is the firmware's own: nothing delivers it to a script. display.setevent
+-- refuses a disp_key outright, and display.setkeyenable takes only ON and OFF, where OFF
+-- substitutes a "help key is disabled" dialog rather than silence. The dialog it raises is
+-- invisible to every event path -- no EVENT_HIDE on the screen it covers, nothing in
+-- ki.display.dump, no posted event -- so a press leaves that dialog on the glass until EXIT
+-- is pressed, and the app neither sees it nor clears it.
 
 function fftsa.sg_slow_tick()
   local now = os.clock()
@@ -1150,12 +1060,6 @@ function fftsa.sg_rebind()
   return fftsa.sg_bind()
 end
 
--- Detach and re-add the trace. Not called by the app; tools/test_tsp.lua exercises it.
-function fftsa.sg_bind_min()
-  display.graph.removeall(fftsa.sg_graph)
-  display.graph.add(fftsa.sg_graph, fftsa.sg_buf, display.ELEMENT_DATA,
-                    fftsa.sg_buf, display.ELEMENT_EXTRA)
-end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint it; too
 -- short and the firmware posts 1706. That task runs only while Lua is blocked, so this and
@@ -1353,8 +1257,4 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
     end
   end
   return true
-end
-
-function fftsa.sg_status(txt)
-  if fftsa.sg_stat ~= nil then display.settext(fftsa.sg_stat, txt) end
 end
