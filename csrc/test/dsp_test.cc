@@ -1745,11 +1745,10 @@ double FirGainAt(double fs, double fhi, int n, int decim, int ntaps, const dsp_r
 }
 
 TEST(Fir, FlatAcrossTheSpanAndDownPastTheNyquist) {
-    // The two numbers that were wrong on the instrument. The filter has to be flat across
-    // the displayed span and down by the time the decimated Nyquist arrives. The old design
-    // was neither: its cutoff sat on the span top so the band was inside the roll-off, and
-    // 13 taps where 51 were needed left the near stopband barely attenuated. Measured
-    // against the same stimulus, that read 3.5 dB low at 16.6 kHz of a 20 kHz span.
+    // The filter has to be flat across the displayed span and down by the time the
+    // decimated Nyquist arrives, and both halves are needed: a cutoff on the span top puts
+    // the band inside the roll-off, which reads 3.5 dB low at 16.6 kHz of a 20 kHz span,
+    // and 13 taps where 51 are needed leave the near stopband barely attenuated.
     const double fs = 200000.0, fhi = 20000.0;
     const int n = 512;
     int d = dsp_fir_pick_decim(fs, 0.0, fhi, n, DSP_FIR_MAXTAPS);

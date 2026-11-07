@@ -41,8 +41,9 @@ CENSUS = ('do if fftsa.sg_scr == nil then print("H=noscreen") return end '
           '0, display.FONT_SMALL) print("H=" .. tostring(h)) '
           'if h ~= nil then display.delete(h) end end')
 
-# eventlog.next() returns six values; tostring() of the call keeps only the first,
-# which is the number, so a label reading "event text" used to carry no text.
+# eventlog.next() returns six values and tostring() of the call keeps only the first,
+# which is the number, so the message has to be taken as its own value or the label
+# carries no text.
 EVENTS = ('do local n = eventlog.getcount() local s = "" '
           'for i = 1, n do local num, msg, sev = eventlog.next() '
           's = s .. "|" .. tostring(num) .. " " .. tostring(msg) end '
@@ -68,9 +69,9 @@ def classify(handles):
     Returns (leaking, text): True, False, or None for inconclusive.
 
     The order matters. An exhausted pool is the leak fully realised, so it is
-    checked before any arithmetic -- the earlier version dropped every
-    non-numeric token and then compared the first surviving handle with the
-    last, which reported "NOT leaking" for a pool that was dry from press 1.
+    checked before any arithmetic: dropping the non-numeric tokens first and
+    comparing the first surviving handle with the last reports "NOT leaking"
+    for a pool that was dry from press 1.
     A gap cannot hide a climb that is still visible in what came back, so a
     visible climb is reported despite gaps; a flat readable series WITH gaps
     cannot rule a leak out, and says so.
@@ -134,9 +135,8 @@ def main():
         print(' ', d.q('print(localnode.model .. " fw " .. localnode.version)'))
         # The handle, not the table. A stopped app -- which is what End App leaves --
         # keeps fftsa in TSP memory with every display handle nil, and probing that
-        # posts event 1138 for each nil parent or nil field: 133 of them on
-        # 2026-10-23, because the first version of this check tested whether
-        # "table/nil" contained "table".
+        # posts event 1138 for each nil parent or nil field, 133 of them in one pass.
+        # Testing whether "table/nil" contains "table" is what does that.
         ready = str(d.q('print(tostring(fftsa ~= nil and fftsa.sg_scr ~= nil '
                         'and fftsa.optscr ~= nil))')).strip()
         print('  app built:', ready)

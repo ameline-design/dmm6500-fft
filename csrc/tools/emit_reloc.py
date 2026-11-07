@@ -155,7 +155,7 @@ def relocation_entries(elf):
     r_offset points **at the 16-bit field**, not at the start of the instruction, for the
     ADDR16 family. For the `lis r3,0` at 0x104 whose immediate lives at 0x106, ld.lld
     emits r_offset = 0x106. Adding 2 to reach the immediate lands on the next
-    instruction's opcode instead, which is what the first version of this did.
+    instruction's opcode instead of its immediate field.
     """
     symtab = None
     for s in elf.sections:

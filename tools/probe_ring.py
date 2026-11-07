@@ -22,7 +22,7 @@ design rests on:
 Leaves nothing behind: the model is aborted, the buffer deleted, and the event log reported
 so an out-of-band trigger refusal is visible rather than silent.
 
-MEASURED 2026-11-02 on 1.7.17a, and the answer is no:
+Measured on 1.7.17a, and the answer is no:
 
     delay(0.2), processor yielded     20 073 in 200.4 ms   100 164 S/s
     non-yielding Lua, 1204 ms         20 480                17 004 S/s

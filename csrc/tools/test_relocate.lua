@@ -91,8 +91,8 @@ local function hex(s)
   return table.concat(t)
 end
 
--- Hex of n bytes at 0-based byte offset off. Computing hex positions by hand is how the
--- first version of this file produced five wrong expectations.
+-- Hex of n bytes at 0-based byte offset off. A hand-computed expectation is as able to be
+-- wrong as the code it checks, so the offsets here are the ones the ABI documents.
 local function at(s, off, n)
   return hex(string.sub(s, off + 1, off + n))
 end

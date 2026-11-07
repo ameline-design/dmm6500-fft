@@ -29,9 +29,9 @@ INCOMPAT = [
     (r'[^<>=~!]&[^&]|\|[^|]|>>|<<', 'bitwise operator (not in 5.0.2)'),
     (r'\bmath\.log\s*\(\s*[^,)]+,', 'math.log with a base argument (5.0.2 takes one arg)'),
     (r'%b\b', 'string.format %b (not in 5.0.2)'),
-    # Cost a whole afternoon on 2026-10-23: hex parses on the host's Lua and on
-    # luac 5.0.2 only sometimes, but the instrument rejects it, and a parse error
-    # anywhere in the archive leaves fftsa nil and every call raising -286.
+    # Hex parses on the host's Lua, and on luac 5.0.2 only sometimes, but the instrument
+    # rejects it -- and a parse error anywhere in the archive leaves fftsa nil and every
+    # call raising -286.
     (r'0[xX][0-9a-fA-F]+', 'hex literal (the instrument rejects it -- use decimal)'),
     # string.match and string.gmatch arrived in 5.1. 5.0.2 has string.find, which returns its
     # captures after the two indices, and string.gfind. The host Lua has all four, so a module

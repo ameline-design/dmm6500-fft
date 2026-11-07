@@ -10,10 +10,10 @@ Two questions, one setup. No app and no heap code, so this costs no NLBOOT and c
 any boot:
 
   * the three statements timed apart, over a grid of sample count against buffer capacity.
-    The capture buffer is now allocated once at four times the longest record the app
-    offers -- 65,536 elements for every count -- where it used to be four times 2048 at the
-    small counts. If clear() or the capture scales with capacity rather than with the
-    record, that change moved every count's acquisition and this grid shows it.
+    The app allocates the capture buffer once, at a multiple of the longest record it
+    offers, so every count runs against the same large capacity. If clear() or the capture
+    scales with capacity rather than with the record, that costs every short count, and
+    this grid is what shows it.
   * the same capture at 100 kS/s, 200 kS/s, 500 kS/s and 1 MS/s. Raising the rate at a
     fixed count shortens the record in proportion and widens the bins in proportion, so
     the question is whether the overhead above the record length is fixed per capture or
@@ -33,8 +33,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 from dmmrun import DMM          # noqa: E402
 
 REPS = 8
-# The app's own grid: the count it offers against the capacity it allocates. 8192 is four
-# times 2048, which is what the capture buffer used to be floored at.
+# The app's own grid: the count it offers against the capacity it allocates. The two
+# capacities bracket the question -- a record-sized buffer against the app's own floor.
 COUNTS = (2048, 16384)
 CAPS = (8192, 65536)
 RATES = (100000, 200000, 500000, 1000000)

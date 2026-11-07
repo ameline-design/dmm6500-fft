@@ -467,9 +467,8 @@ backstop is a decision.
 | `dsp_spectrum_run` refusing a short filter run | It passes exactly `dsp_fir_srclength` samples, which yields exactly `p->n` outputs by construction. |
 | `dsp_spectrum_run` propagating a `dsp_load` failure | Every precondition `dsp_load` checks is already guaranteed by a built plan. |
 
-No line numbers here on purpose. An earlier version of this table carried them and every one
-went stale within a day of the band-pass going in, pointing at unrelated text while still
-reading as a measurement.
+No line numbers here on purpose: they go stale within a day of any edit to dsp.c, and a
+stale pointer into source still reads as a measurement.
 
 Two of these are worth keeping rather than deleting even though nothing reaches them: the
 `dsp_iceil` clamps and the four-step's tile clamps are what make the code correct under a change

@@ -117,17 +117,16 @@ TEST(WriteGate, FirmwareSectionsRefused) {
 }
 
 TEST(WriteGate, IoBuffersBelowHeapRefused) {
-  // The gap between .bss and .heap holds the splash, flash, ethernet and debug
-  // buffers. An earlier version of the guard used 0x01000000 as its lower bound and
-  // admitted 216 KB of this.
+  // The gap between .bss and .heap holds the splash, flash, ethernet and debug buffers.
+  // A lower bound of 0x01000000 admits 216 KB of it, so the guard starts at the heap.
   EXPECT_FALSE(WriteOk(kIoBuffers, 4));
   EXPECT_FALSE(WriteOk(kBssEnd, 4));
   EXPECT_FALSE(WriteOk(kHeapLo - 0x1000U, 4));
 }
 
 TEST(WriteGate, CallStacksRefused) {
-  // An earlier version used 0x0E000000 as its upper bound, which admitted all four
-  // stacks plus 7.7 MB beyond, while its comment claimed the opposite.
+  // An upper bound of 0x0E000000 admits all four stacks plus 7.7 MB beyond them, so the
+  // guard ends at the top of the heap and not at a round number near it.
   EXPECT_FALSE(WriteOk(kStack, 4));
   EXPECT_FALSE(WriteOk(kStack + 0x1000U, 4));
   EXPECT_FALSE(WriteOk(kStackEnd - 4, 4));

@@ -291,7 +291,7 @@ skips the rebuild — which is what keeps a Kaiser window from costing 0.3 s on 
 touch it. The graph buffer is one fixed size for every sample count and stays attached throughout,
 because the trace is capped at the graph's width (see **How many points the trace carries** below).
 
-**Apply costs roughly 0.2 ms per sample**, measured on 2026-10-24 and linear in the count. The
+**Apply costs roughly 0.2 ms per sample**, measured and linear in the count. The
 32768 figure follows that law rather than a measurement of its own:
 
 | FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
@@ -392,11 +392,11 @@ appears at 37 kHz and an 84 kHz tone at 16 kHz.
 of rejection above the Nyquist, but it is not worth the frame time: the filter is one
 multiply-accumulate per tap per output, 51 taps over 512 outputs, and the frame goes from 0.08 s to
 around a quarter of a second for nothing an operator can see. At 4096 samples and up the read budget
-leaves no room for it at any span. **There is no longer any way to turn it on from the app**: the
+leaves no room for it at any span. **The app offers no way to turn it on**: the
 filter lives in `csrc/` behind `DSP_BANDPASS` and the shipped build compiles it out, with no
 remaining switch in `tsp/`. The rest of this section describes what it does, and is kept because the
 measurements behind the decision not to offer it are worth having. **Those figures were taken at 512
-samples**, a count the form no longer offers, and on the interpreted path.
+samples**, below the counts the form offers, and on the interpreted path.
 
 On, the capture is low-pass filtered and then decimated to the span, so the transform
 sees only the band on screen. Two things come of that, and which one you get depends on the span.
@@ -482,10 +482,10 @@ lump and the harmonics are down in the noise of the trace — the table still fi
 of hertz out.
 
 Because each column reports its maximum, the noise floor reads about 6 dB high and as an upper
-envelope rather than a band. Writing the minimum as well was tried and withdrawn: it doubled the
-point count and made every second segment span the whole noise band, about 45 px, where a
-single-valued trace moves a few pixels between neighbours -- and the firmware's cost of drawing a
-trace is per segment length.
+envelope rather than a band. Writing the minimum as well is refused: it doubles the point count
+and makes every second segment span the whole noise band, about 45 px, where a single-valued trace
+moves a few pixels between neighbours -- and the firmware's cost of drawing a trace is per segment
+length.
 
 Reducing the trace does not reduce the **table**: `find_peaks` reads every bin at full resolution, so
 a reported frequency is never a column edge. It is also what makes the larger counts usable at all --

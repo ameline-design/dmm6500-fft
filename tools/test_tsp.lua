@@ -118,8 +118,8 @@ display = {
   YSCALE_SWIM = 3, YSCALE_SHARED = 4, YSCALE_OFF = 5,
   AXIS_NORMAL = 0, AXIS_LOG = 1, STYLE_LINE = 0, STYLE_MARKER = 1, STYLE_BOTH = 2,
   TRACE_ACTIVE = 0, TRACE_ALL = 1, MARKER_LAST_TRACE = 0, MARKER_LAST_CUSTOM = 1,
-  -- The firmware's own values, from its registration table. They used to be strings
-  -- here, which cannot be compared with ELEMENT_EXTRA and made a mixed-type mock.
+  -- The firmware's own values, from its registration table. Numbers, not strings: a string
+  -- cannot be compared with ELEMENT_EXTRA and makes a mixed-type mock.
   ELEMENT_DATA = 0, ELEMENT_TIME = 1, ELEMENT_EXTRA = 2, ELEMENT_SOURCE = 2,
   -- Object states. Only these two are modelled, because they are the two the
   -- app uses: STATE_DISABLE and STATE_READONLY are refused on a Graph with
@@ -508,7 +508,7 @@ function buffer.write.reading(b, val, extra, secs, frac)
   if frac == nil or frac < 0 or frac > FRAC_MAX then BADFRAC = BADFRAC + 1 end
   local i = b.wpos or (b.n + 1)
   if b.fillmode == buffer.FILL_CONTINUOUS then
-    -- Wraps with no event posted; n pins at capacity. Measured 2026-10-24.
+    -- Wraps with no event posted; n pins at capacity.
     -- Only within a logical run. Slot 1 against slot capacity is the ring's wrap seam,
     -- and after exactly capacity writes startindex is back at 1, so the firmware reads
     -- 1..capacity in order and that seam is not a discontinuity it ever sees.
@@ -573,9 +573,9 @@ dmm.terminals = dmm.TERMINALS_FRONT
 --   2801  DMM cannot measure when <side> function is set to None
 --
 -- Modelled because a pcall is no defence against a posted event, so a mock that raised would
--- have the suite testing a failure the instrument does not have. This table previously had no
--- function state at all, which is how 8.5 shipped a teardown that posted BOTH of these on the
--- operator's panel with all 482 cases green. DMM_EVENTS is what a gate asserts on.
+-- have the suite testing a failure the instrument does not have. Without the function state in
+-- this table a teardown can post both of these on the operator's panel with every case green.
+-- DMM_EVENTS is what a gate asserts on.
 DMM_EVENTS = {}
 local DIG, MEAS = {}, {}
 
@@ -979,8 +979,8 @@ for wi = 1, nwin do
     -- pick it up as leakage.
     check(nm .. ': a tone below the limit puts no row in the table at all',
           dc_leak() == 0, dc_leak() .. ' rows at the mask edge over 280 positions')
-    -- Both axes. The amplitude error used to be formatted into the message and
-    -- never compared, so it read 2.17 dB and passed.
+    -- Both axes, and both compared: an amplitude error only formatted into the message
+    -- reads 2.17 dB and passes.
     local lf, la, lmiss = win_sweep(kdc + 1, 0)
     check(nm .. ': the lowest reportable bin is found at every offset', lmiss == 0,
           'bin ' .. (kdc + 1) .. ', ' .. lmiss .. ' of 42 missed')
@@ -1292,7 +1292,7 @@ check('the widest span is the fastest rate Nyquist, so no bandwidth is thrown aw
       fftsa.fhi_max * 2 == fftsa.rates[table.getn(fftsa.rates)],
       string.format('fhi_max %g, fastest %g', fftsa.fhi_max,
                     fftsa.rates[table.getn(fftsa.rates)]))
--- The capture is no longer a small slice of a frame: 32768 samples at 25 kS/s is 1.31 s,
+-- The capture is not a small slice of a frame: 32768 samples at 25 kS/s is 1.31 s,
 -- which on its own outruns the 2 s floor under the busy guard. So the property asserted is
 -- that the estimate busy_max is built from carries the capture at every count and rate.
 check('the frame estimate carries the capture, so the busy guard clears a real frame',
@@ -1612,9 +1612,9 @@ check('markers come out in frequency order from an amplitude-ordered list', (fun
 end)())
 -- BOTH BUFFERS COMPLETE BEFORE THE PAINT, which is what the marker-first ordering bought and
 -- is the part that still has to hold. The markers cannot be filled first any more: the peaks
--- come out of the same dsp.spectrum() call that writes the trace. So the order is no longer
--- the invariant and the yield's position is -- and the window in which one of the two is
--- incomplete is now the 18 marker points rather than the 255 trace points.
+-- come out of the same dsp.spectrum() call that writes the trace, so the invariant is the
+-- yield's position rather than the order -- and the window in which one of the two is
+-- incomplete is the 18 marker points rather than the 255 trace points.
 check('both buffers are complete before the frame yields for the paint', (function()
   local order = {}
   local realwr = buffer.write.reading
@@ -2171,9 +2171,9 @@ end)())
 -- carries. The report registration sits in the same position, and sg_rebind() reaches
 -- sg_bind from the failed-frame path -- so one raised frame must not cost the settle.
 --
--- In BOTH lock states, because the report is no longer the lock's: the dB axis is restored
--- either way and an unlocked frequency gesture has to be read before it can be adopted. A
--- registration tied to the lock is what left the feature dead after an unlocked relaunch.
+-- In both lock states, because the report is not the lock's: the dB axis is restored either
+-- way and an unlocked frequency gesture has to be read before it can be adopted. A
+-- registration tied to the lock leaves the feature dead after an unlocked relaunch.
 check('sg_bind re-registers the pan report whatever the lock says', (function()
   local was = fftsa.sg_lock
   local function rebound(lock)
@@ -2454,8 +2454,8 @@ check('an Apply writes the frequency axis once and quotes the measured rate', (f
          string.format('pins %d/%d after the forced apply, legend [%s]', pins, p, t)
 end)())
 -- A re-planning gesture leaves the pin to apply(), so between them they write ONE axis. The
--- adopt used to pin and then apply() pinned the identical pair a moment later -- which is
--- the same 60 ms that came off the end of apply(), put back on the new path.
+-- adopt must not pin when apply() is about to pin the identical pair a moment later: that is
+-- a second 60 ms axis write for nothing.
 check('a gesture that re-plans writes the frequency axis once, not twice', (function()
   local lo0, hi0 = fftsa.flo, fftsa.fhi
   local p = (OBJ[gh].pins or 0)
@@ -3015,8 +3015,8 @@ check('locking snaps a dragged view back instead of adopting it', (function()
                        tostring(on), fftsa.flo, fftsa.fhi, lo, hi,
                        OBJ[gh].xmin, OBJ[gh].xmax, wx0, wx1, tostring(fftsa.sg_ev))
 end)())
--- A press with nothing out of place writes no axis, so Lock no longer flickers the trace:
--- the unconditional pair it used to write was 121 ms and one visible repaint every press.
+-- A press with nothing out of place writes no axis, so Lock does not flicker the trace: an
+-- unconditional pair would be 121 ms and one visible repaint every press.
 check('and a press with nothing moved writes no axis at all', (function()
   local p, yp = (OBJ[gh].pins or 0), (OBJ[gh].ypins or 0)
   fftsa.toggle_lock()                      -- off
@@ -3952,7 +3952,7 @@ end)())
 -- answers here; stripped of events it answers nil, and on the instrument -- before
 -- anything was ever registered -- nil is exactly what it gave, with no event posted.
 -- A view lock that skipped its pin on that nil did nothing at all on the glass and the
--- suite could not see it, because this mock used to answer unconditionally.
+-- suite cannot see it through a mock that answers unconditionally.
 check('a scale read-back answers only while event generation is on', (function()
   local g = fftsa.sg_graph
   local saved = display.events[g]
@@ -4913,8 +4913,7 @@ end)())
 
 -- And a failing start must keep the reason it failed. The teardown runs inside
 -- start_failed(), which has just put that reason where the panel reads it, so a note about
--- the current buffer must not replace it -- which is exactly what the first version of this
--- did, and the pool-exhaustion case caught it.
+-- the current buffer must not replace it, which is what the pool-exhaustion case catches.
 check('the exit teardown does not overwrite the reason a start failed', (function()
   fftsa.start()
   fftsa.lasterr = nil
@@ -4950,9 +4949,9 @@ check('the X axis is pinned, from dc when the shift is under a pixel', (function
                        fftsa.sg_flo_hz, fftsa.sg_fhi_hz, o.xmin, o.xmax)
 end)())
 -- The rule is against the PLOT WIDTH, not the bin width, and this is the case that
--- distinguishes them. Bin width was tried first: 10 Hz sits inside a 195 Hz bin at 512
--- samples, so the labels came out round there, and does NOT at 16384 where the bins are
--- 6.1 Hz -- so every size above the default kept the offset. Caught on the glass only.
+-- distinguishes them, and bin width does not: 10 Hz sits inside a 195 Hz bin at 512 samples,
+-- where the labels come out round, and outside a 6.1 Hz bin at 16384, where they do not. A
+-- bin-width test therefore leaves the offset at every large count.
 check('and from dc at every sample count, not just where Start is inside bin one',
       (function()
   local keep = fftsa.n
@@ -5403,10 +5402,10 @@ check('the trace never exceeds the column cap at any sample count', (function()
 end)())
 
 -- EVERY BIN IS COVERED BY SOME COLUMN'S RUN, which is the real guarantee and holds at every
--- size. This used to assert one bin per column at the default, true only while 512 was the
--- smallest count -- at 1024 the span holds 501 bins over 255 columns. Nothing is lost by
--- that: dsp_reduce takes the MAXIMUM over each column's run of bins, so a column covering
--- two bins reports the taller, and each column spans the same ~195 Hz it did at 512. The
+-- size. One bin per column holds only at the smallest count the app ever offered: at 1024 the
+-- span holds 501 bins over 255 columns. Nothing is lost by that, because dsp_reduce takes the
+-- maximum over each column's run of bins, so a column covering two reports the taller and
+-- each column spans about the same 195 Hz. The
 -- partition is what matters, so the partition is what is checked, against the same
 -- quotient-and-remainder walk the C uses.
 check('the column runs partition the span, so no bin escapes the maximum', (function()
@@ -5897,8 +5896,8 @@ if ev ~= nil and ev['endapp'] ~= nil then
 end
 -- End App tears everything down, and must: the firmware reclaims the app's display
 -- objects between launches, so a handle carried across one answers 1703 and raises a
--- modal dialog over a half-built app. Parking the screen set for reuse was tried on the
--- instrument and reverted for exactly that.
+-- modal dialog over a half-built app. Parking the screen set for reuse is refused for
+-- exactly that reason.
 check('End App from the options screen frees every object', live() == 0, 'live=' .. live())
 check('End App from the options screen frees every buffer but the capture one',
       livebufs() == base_bufs + 1 and fftsa.cap ~= nil
@@ -5974,10 +5973,9 @@ check('launches do not accumulate buffers, and the handed-on pair is released', 
                        parked, a1, a2, a3, tostring(o1 == nil))
 end)())
 
--- NO SECOND ALLOCATION INSIDE ONE LAUNCH. sg_retrace() used to replace the trace buffers on
--- a live graph about two seconds into a relaunch, and it is gone: on four consecutive
--- launches the operator saw the trace draw correctly from the first frame and freeze at
--- exactly the frame that fired. The naming in sg_mk_trace() is the half that works.
+-- No second allocation inside one launch. Replacing the trace buffers on a live graph freezes
+-- the trace at exactly the frame it happens, measured on four consecutive launches, so there
+-- is no recovery path of that shape. The naming in sg_mk_trace() is what makes a relaunch draw.
 --
 -- What this asserts is the absence -- no retrace entry point, and a launch that runs frames
 -- without ever allocating a trace buffer after the first one. An absence is worth a case
@@ -6567,7 +6565,7 @@ check('the shipped dsp has no spectrum, peak or distortion, and the app copes', 
   local cwhy = cev and cev.why
   local rel = dsp.release()
   -- And the two app callers answer instead of raising, with nl_frame false so they take the
-  -- branch that used to call into the interpreted implementation.
+  -- branch that reaches for the interpreted implementation.
   fftsa.nl_frame = false
   local okp, hz = pcall(function() return fftsa.dsp_peaks(6) end)
   local okd, thd = pcall(function() return fftsa.distortion() end)

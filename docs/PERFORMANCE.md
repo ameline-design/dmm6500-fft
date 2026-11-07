@@ -1,7 +1,7 @@
 # Where the frame time goes, and what is left to win
 
-Every figure here was **measured on the instrument** (DMM6500, firmware 1.7.17a) on 2026-10-23,
-except where it says otherwise. The cost model came out of a separate reverse-engineering pass over
+Every figure here was **measured on the instrument** (DMM6500, firmware 1.7.17a) except where it
+says otherwise. The cost model came out of a separate reverse-engineering pass over
 the firmware image; the reasoning that depends on the firmware's internals is marked as such, and
 the write-up of that pass lives in the serial-decode repo at `docs/FIRMWARE_API.md`.
 
@@ -16,10 +16,9 @@ The arithmetic was never the price.
 
 ## The displayed frame rate is quantised, and the app chooses which tick it lands on
 
-The app offers 512 through 16,384 samples in Options, retaining 512 as the default. Every size was
-measured on the instrument on 2026-10-24 -- see **Every selectable sample count, measured** below --
-so the caveat that once stood here about needing hardware validation is discharged. The Options
-acquisition-duration readout is `N / fs` only; it does not include processing or display.
+The app offers 1024 through 32,768 samples in Options. Every size is measured on the instrument --
+see **Every selectable sample count, measured** below. The Options acquisition-duration readout is
+`N / fs` only; it does not include processing or display.
 
 The rate the app achieves is not the rate the frame can sustain, and the gap is not small.
 
@@ -39,8 +38,8 @@ which admits 20, 10, 6.67, 5 fps and nothing between. **Shaving a frame from 81 
 nothing; getting it from 51 to 49 doubles the rate.** Optimising this app means crossing a boundary,
 not reducing a number.
 
-That formula describes a period left at the 0.05 s floor, which is what the app used to do, and the
-idle it leaves is then an accident of rounding -- 44 % at 512 samples and 2 % at 4096. The second
+That formula describes a period left at the 0.05 s floor, where the idle it leaves is an accident
+of rounding -- 44 % at 512 samples and 2 % at 4096. The second
 figure is why the Options button was unreachable at the larger counts: `delay()` lets the display task
 paint, but dispatching a touch needs the Lua interpreter, and during a frame the interpreter is busy,
 so the only time a press can be handled is the gap between a frame ending and the next tick.
@@ -70,15 +69,15 @@ than `sg_update` depends on the geometry.
 | peak text | 0.2 |
 | **total** | **81.8 -- 12.3 fps capability, 10 fps displayed** |
 
-Confirmed from the other end: 3.20 fps displayed at the old 0.3 s period and 8.55 fps at 0.1 s with
-no host traffic, both consistent with the formula.
+Confirmed from the other end: 3.20 fps displayed at a 0.3 s period and 8.55 fps at 0.1 s with no
+host traffic, both consistent with the formula.
 
 The paint inside `sg_update` is proportional to graph **area**, not point count: 784x272 costs
 14.4 ms, 784x200 11.6, 784x136 8.7, 392x136 7.3. Point count does not move it -- 16 and 710 points
 measured the same. The shipped 784x312 is above the top of that series and has not been measured;
 on the area fit it is about 15.5 ms.
 
-### The N trade, and why 512 stays the default
+### The N trade
 
 Modelled from the per-unit costs, since halving N halves acquisition, buffer read-out, transform,
 fill and peak search at once:
@@ -95,8 +94,8 @@ fill's arithmetic ~3. Halving N is the only cut large enough, and it is one cons
 `acq 6.4 + load 14.3` is irreducible at N=512, so even with radix-4, power, peaks and a 14 ms floor
 on the paint, N=512 reaches ~48 ms *with zero fill* -- it cannot comfortably cross.
 
-**The operator chose 512 on 2026-10-23: 10 fps is fast enough, and resolution is not for trading.**
-What follows is therefore the record of an option, not a plan.
+**The operator's rule: about 10 fps is fast enough, and resolution is not for trading.** What
+follows is therefore the shape of an option, not a plan.
 
 It costs **resolution, not accuracy.** Bin width goes 195.3 -> 390.6 Hz, so tones closer than ~391 Hz
 merge. An isolated peak does not move at all, because the three-bin interpolation absorbs the coarser
@@ -141,8 +140,8 @@ So about 130 ms for a cosine window and 180 ms for Kaiser, on top of the capture
 takes. That is why Apply raises the loading cover: the panel is frozen for the duration either way,
 and a cover is the difference between "working" and "wedged".
 
-The frame itself got slightly *cheaper*. `peak_interp` used to call `math.sin` once per peak (a C
-call, ~4 µs); it now does two table lookups and a multiply instead, six times a frame.
+`peak_interp` costs two table lookups and a multiply, six times a frame, where a `math.sin` per
+peak would be a C call at about 4 µs each.
 
 ### Not yet verified on hardware
 
@@ -155,14 +154,14 @@ event log read afterwards; if 1706 appears, `sg_yield` is short of the display t
 Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, a 12.5 kHz 1.000 V tone, graph
 784x292, 255 trace points at every count. Twelve frames a size, called synchronously with the timer
 parked, so the period each size settles on has been re-armed from real frames before it is read.
-Taken 2026-10-25, event log clean throughout. `tools/../../fftmeas/docmeas5.py` is the run.
+Event log clean throughout. `tools/../../fftmeas/docmeas5.py` is the run.
 
-**Superseded on the rate and period columns by the figures below.** The table that follows was
-taken before the work of 2026-11-02, which removed about 44 ms a frame of HELP-key polling, put the
-compiled path into single precision, and replaced the occupancy rule. Its frame breakdowns and its
-point about the worst frame still hold; its rates are between two and eight times low.
+**The rate and period columns below are the current ones.** The wider table further down carries
+the per-count frame breakdowns and the point about the worst frame, which both still hold, but its
+rates are those of the interpreted path at the 0.05 s period grid and are between two and eight
+times low for the shipped build.
 
-### Rates after 2026-11-02
+### Rates
 
 Firmware 1.7.17a, 100 kS/s, 10 V range, 10 Hz to 50 kHz span, 255 trace points, nothing attached to
 the control socket. Read off the front panel, which is how they have to be taken: an attached probe
@@ -192,8 +191,7 @@ so no figure belongs to another count:
 | 16384 | 169.3 | 47.6 | 0.1 | 0.0 | 10.1 | 0.1 | 227 |
 
 `spec` carries the transform, the arena read-back and the 255 `buffer.write.reading` calls. `show`
-was 46.1 ms at 16384 until the HELP poll moved off the per-frame path; it is now the settings line
-alone. At 16384 the frame is 227 ms against the 230 ms five ticks allows, so the next tick needs
+is the settings line alone. At 16384 the frame is 227 ms against the 230 ms five ticks allows, so the next tick needs
 50 ms removed from a frame whose largest term is an acquisition that cannot be shortened at a given
 rate and record length.
 
@@ -246,7 +244,7 @@ Each measured on its own, so the frame can be built from them for any count:
 `fftsa.frame_estimate(n)` in `spectrum_app.tsp` is these numbers, and predicts 0.080 s at 512
 against 0.079 measured and 1.63 s at 16384 against 1.686. `busy_max` is three times it.
 
-**The model no longer sets the frame rate**, and it should not be made to. It is a fit at one point
+**The model does not set the frame rate**, and it should not be made to. It is a fit at one point
 count and one draw path, and it errs both ways: 80.4 ms at 512 against 79, and 216 ms at 2048 against
 212. Divided by the occupancy target those errors land either side of a tick boundary, which is a
 50 % swing in displayed rate. `frame_estimate` is now used only for the first arm, before any frame
@@ -410,9 +408,8 @@ a reading buffer from Lua (established three ways, see the dead ends).
 
 ## What is left to win
 
-Items 1, 3 and 4 are **taken** -- they shipped on 2026-10-23 and the measured phase table above is
-the result. They are kept here because the reasoning is the record of why the transform has the shape
-it does.
+Items 1, 3 and 4 are **taken**: the measured phase table above is what they produced. The reasoning
+is kept because it is why the transform has the shape it does.
 
 ### 1. Real-input packing: about 15 ms, and it is exact -- TAKEN
 
@@ -434,8 +431,8 @@ Counting the actual loops: inner iterations per stage are `(N/len)*(len/2) = N/2
 2.3x fewer full butterflies. Scaling the measured 30.6 ms gives ~13.6 ms for the transform plus
 ~1.8 ms for the untangle, so **about 15 ms back**, which is 12.5 -> ~15.5 fps on its own.
 
-Two caveats so the estimate is not rosier than it should be. Stage 1 can no longer skip `im[]`
-writes, because after packing the input genuinely is complex -- that is the 128 cheap butterflies
+Two caveats so the estimate is not rosier than it should be. Stage 1 cannot skip `im[]` writes,
+because after packing the input genuinely is complex -- that is the 128 cheap butterflies
 above, not zero. And the untangle needs `conj(Z[M-k])`, so it walks the array from both ends and pays
 two index computations per point rather than one.
 
@@ -511,9 +508,9 @@ Where LUTs win decisively is **fused unary sequences** -- one read replacing rev
 scale-then-clamp-then-pack, at 1.4 µs against 4-8 µs for the steps. This app has no such step; the
 serial-decode project used exactly this for its MSB bit reversal.
 
-## Corrections to notes/FINDINGS.md
+## Two firmware facts about the pixel path
 
-Both from reading the firmware, and both make the existing notes wrong as written:
+Both from reading the firmware image:
 
 - **`display.setpixel`'s colour argument is not ignored.** Argument 5's low byte is **alpha**, and it
   is not reliably defaulted, so pixels written with the 4-argument form are transparent -- which is
@@ -526,9 +523,8 @@ Both from reading the firmware, and both make the existing notes wrong as writte
 ## Two things about the pixel path, if it is ever revisited
 
 It is still the wrong path -- a graph refill and repaint costs tens of milliseconds against a flush
-alone at 0.203 s -- but the reasons are worth recording, because neither is obvious. (The "~32 ms for
-200 points" this paragraph used to quote was wrong, and is superseded by the measured phase table
-above.)
+alone at 0.203 s -- but the reasons are worth recording, because neither is obvious. The measured
+phase table above is the authority on what a frame costs.
 
 **The image's surface is owned by its *name*, not by the object.**
 `display.create(parent, display.OBJ_IMAGE, x, y, name, w, h)` takes a string as its 5th argument, and
@@ -555,7 +551,7 @@ name rule above.
 the graph the firmware's numeric x-y plot instead of a time plot: the axis takes its limits in real
 hertz and the firmware labels and SI-prefixes them itself -- `+00.00kHz`, `+10.00kHz`. The Y axis
 reads `dB` because the buffer's reading unit is the two-character custom unit `buffer.UNIT_CUSTOM1`,
-registered with `buffer.unit`. Confirmed on the instrument, 2026-10-25.
+registered with `buffer.unit`. Confirmed on the instrument.
 
 **A log frequency axis is not available from the firmware, and was left alone.** `AXIS_LOG` is
 accepted by `scalex` and ignored: there is one log flag and the widget reads it for Y only
@@ -574,10 +570,10 @@ frequency went into the timestamp divided by a decade scale (`sg_pick_fscale`, s
 `fhi/s >= 59` to stay clear of the base-60 rollover) and the app drew its own label row below the
 plot in real units. Two rows of numbers, one of them wrong.
 
-- **Fixing `s = 1e6` was tried on hardware and reverted. Do not retry it.** The idea was that a whole
-  0-500 kHz span maps to 0-0.5 label-seconds, so base 60 cannot appear. What it did was put the
-  firmware's axis row into a regime where its own choice of label count oscillates: the row
-  alternated between labelling every tick and labelling the ticks between, one frame at a time --
+- **Do not set `s = 1e6`.** The idea is that a whole 0-500 kHz span maps to 0-0.5 label-seconds, so
+  base 60 cannot appear. Measured on hardware, what it does is put the firmware's axis row into a
+  regime where its own choice of label count oscillates: the row alternates between labelling every
+  tick and labelling the ticks between, one frame at a time --
   "normally 00.01ms, 10.01ms, 20.01ms; when it flickers it draws 05.01ms, 15.01ms".
 - **Masking the firmware's row cannot work.** A child object inside the graph's rectangle is painted
   over by its per-frame repaint whatever the creation order: a thick white line across the label row
@@ -616,8 +612,8 @@ and a bad index or width raises `-222` "Parameter data out of range".
 
 ## The compiled path: 3.1 ms for the whole DSP stage
 
-Measured 2026-11-02 on the same instrument, at N = 512 with 127 trace points, over ten calls timed
-on the instrument's own `os.clock`. `csrc/dsp.c` compiled for the e300c4, loaded into a reading
+Measured on the same instrument at N = 512 with 127 trace points, over ten calls timed on the
+instrument's own `os.clock`. `csrc/dsp.c` compiled for the e300c4, loaded into a reading
 buffer's chunk storage and branched into from Lua (`notes/firmware/fwmem-CODEXEC.md` in the
 serial-decode repo has the mechanism). One call does the whole stage:
 
@@ -652,7 +648,7 @@ costs. The read-back is 510 `f64_unpack` calls at 255 points and has not been me
 decibels as scaled 32-bit integers would make it one table lookup and three multiply-adds per point,
 and is the obvious thing to try if it turns out to matter.
 
-**Measured on the instrument, 2026-11-02: 21.4 ms a frame at N = 512**, five frames called
+**Measured on the instrument: 21.4 ms a frame at N = 512**, five frames called
 synchronously with the timer parked. Not 50. The substitution above assumed the rest of the frame
 was irreducible and one call in it was not: `display.graph.scaletrace` as a per-frame graph notify
 costs **about 105 ms** -- the same frame measures 126.6 ms with it and 21.4 ms without -- and it

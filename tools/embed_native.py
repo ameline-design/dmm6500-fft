@@ -38,10 +38,10 @@ B64_PIECE = 3072   # base64 characters per literal, a multiple of 4 so pieces co
 def lua_b64(data, var, piece=B64_PIECE):
     """`var` assigned from a table.concat of base64 literals, plus `var`_LEN.
 
-    FOUR CHARACTERS PER THREE BYTES instead of four per one. Decimal escapes are what
-    ki.memwrite needs and Lua 5.0.2 has no \\xNN, so the blob used to cost 4.0 characters a
-    byte: 27 KB of image became 109 KB of script source, which the instrument reads and
-    parses at every app launch. This is 1.34, and nl.init decodes it once.
+    Four characters per three bytes, against four per byte for the decimal escapes
+    ki.memwrite would otherwise need -- Lua 5.0.2 has no \\xNN. At 4.0 characters a byte a
+    27 KB image is 109 KB of script source, which the instrument reads and parses at every
+    app launch; this is about 1.37, and nl.init decodes it once.
 
     No '=' padding: the binary is padded to a multiple of three and the true length is
     emitted beside it, so the decoder is a flat four-to-three loop with no tail case. A

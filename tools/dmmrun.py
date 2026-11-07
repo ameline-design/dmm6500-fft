@@ -161,9 +161,8 @@ class DMM:
         # script.delete() succeeds but logs "-104 Data type error" to the event log
         # whichever way the script is identified. That is cosmetic -- the name really
         # is freed -- but it lands in the same event log used to judge whether the
-        # APP is healthy, so it is cleared here. Only a re-load reaches this branch,
-        # which is why a first load after a power cycle shows a clean log and every
-        # reload afterwards used to show exactly one -104.
+        # app is healthy, so it is cleared here. Only a re-load reaches this branch, so
+        # a first load after a power cycle leaves a clean log either way.
         self.q('if %s ~= nil then '
                '  pcall(function() script.delete(%s) end) '
                '  %s = nil '
