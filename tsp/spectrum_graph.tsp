@@ -17,10 +17,10 @@ fftsa.sg_npeak   = 6       -- number of peaks reported (shown in a 2x3 grid)
 -- high. Settable up to sg_maxpts while running: FILL_ONCE and cleared, so n follows.
 fftsa.sg_ncol    = 255
 
--- Peak markers, off by default. A second trace of one point a peak, carrying the
--- interpolated frequency and amplitude the peak table reports -- so a marker sits where
--- the peak really is, which is up to half a bin off the column the trace draws there.
--- Switching it on rebinds the graph, which repaints the axes, so it only happens on Apply.
+-- Peak markers, off by default: a second trace carrying the interpolated frequency and
+-- amplitude the peak table reports, so a marker sits where the peak really is, up to half a
+-- bin off the column the trace draws. Switching it on rebinds the graph, which repaints the
+-- axes, so it only happens on Apply.
 fftsa.sg_markers = false
 -- Needles, not dots: drawstyle is per graph, so markers on the peak trace would put one
 -- on all 255 spectrum points too. Three points a peak -- floor, peak, floor, a pixel
@@ -31,10 +31,9 @@ fftsa.sg_mk_per  = 3       -- points a needle: floor, peak, floor
 fftsa.sg_bufmin  = 10
 fftsa.sg_maxpts  = 680
 
--- Firmware handles, initialised only on the first load: opening the App again
--- re-runs this body and `fftsa = fftsa or {}` keeps the table, so nil-ing a live
--- handle here would strand the previous launch's objects. fftsa.sg_destroy()
--- reclaims them on the next start.
+-- Firmware handles, initialised only on the first load: opening the App again re-runs this
+-- body and `fftsa = fftsa or {}` keeps the table, so nil-ing a live handle here would strand
+-- the previous launch's objects. fftsa.sg_destroy() reclaims them on the next start.
 if fftsa.sg_handles_inited == nil then
   fftsa.sg_buf   = nil     -- WRITABLE_FULL buffer holding the spectrum
   fftsa.sg_scr   = nil     -- custom screen
@@ -58,8 +57,7 @@ end
 -- Touch pans and zooms the graph and the widget cannot be told not to: display.setstate
 -- answers event 1717 for STATE_DISABLE and STATE_READONLY on a Graph. So a gesture is
 -- settled after the fact, and this says how the frequency axis settles -- locked, back onto
--- the span in force; unlocked, the span follows the axis. dB is restored either way. Not a
--- handle, so a relaunch resets it.
+-- the span in force, unlocked, the span follows the axis, dB restored either way.
 fftsa.sg_lock = true
 
 -- Visible frequency window (Hz): fftsa.dsp_window() hands it to the primitive, which plots
@@ -67,14 +65,13 @@ fftsa.sg_lock = true
 fftsa.sg_flo_hz  = 0
 fftsa.sg_fhi_hz  = 1e9
 
--- The pinned window is the only stable choice. XSCALE_ALL derives the range from the
+-- The pinned window is the only stable choice: XSCALE_ALL derives the range from the
 -- buffer's own timestamps, which move while a frame refills, so a paint landing mid-fill
--- ranges on a partial trace and the axis walks -- on the glass, the trace sliding about as
--- though the point count were changing. Any auto-ranging method also fights the view lock,
--- which then writes an axis a second for as long as both are on.
+-- ranges on a partial trace and the axis walks. Any auto-ranging method also fights the view
+-- lock, which then writes an axis a second for as long as both are on.
 fftsa.sg_xmethod = display.XSCALE_OFF
--- The clear is the only notify compatible with FILL_ONCE. select, scaletrace, drawstyle
--- and re-asserting scalex all do make the task re-read a bound buffer, but each needs it
+-- The clear is the only notify compatible with FILL_ONCE. select, scaletrace, drawstyle and
+-- re-asserting scalex do all make the task re-read a bound buffer, but each needs it
 -- overwritten in place, which needs FILL_CONTINUOUS, which draws the wrap line.
 
 
@@ -87,13 +84,10 @@ fftsa.sg_gw      = 784
 fftsa.sg_gh      = 312
 
 -- The dB axis floor: -120 dBV, and -140 on the 1 V and 0.1 V ranges where the noise goes
--- under it. Measured floors pick both numbers. A DMM7510 reads -134 dBV on 0.1 V and -129 on
--- 1 V at any count, so -120 leaves its two quiet ranges off the bottom of the plot. A DMM6500
--- reads -123 and -121 on the same ranges, which is a trace lying on the bottom edge, and a
--- narrower bin takes the noise down with it -- 6 dB at 16384 against 2048, 9 dB at 32768 --
--- so the deeper floor covers those counts too. sg_dbmin is the floor in force and
--- fftsa.sg_dbmin_set() is the only thing that moves it, from the range and count apply()
--- commits.
+-- under it. Measured floors pick both numbers -- a DMM7510 reads -134 dBV on 0.1 V and -129
+-- on 1 V, a DMM6500 -123 and -121, which is a trace lying on the bottom edge, and a narrower
+-- bin takes the noise down with it, 6 dB at 16384 against 2048 and 9 dB at 32768.
+-- fftsa.sg_dbmin_set() is the only thing that moves the floor in force.
 fftsa.sg_dbmin_std       = -120
 fftsa.sg_dbmin_deep      = -140
 fftsa.sg_dbmin_deep_vmax = 1     -- the largest range the deeper floor covers
@@ -104,12 +98,12 @@ fftsa.sg_vfloor          = 1e-9
 
 fftsa.model_str = nil        -- localnode.model, read once by fftsa.model_name()
 
--- Past this, in volts, a reading is not a voltage. The digitizer answers 9.9e+37 for a reading
--- beyond the selected range, where the front panel shows "Overflow", and a handful of those in
--- a record makes the spectrum an impulse: flat against the ceiling at every frequency, with
--- the real tone buried under its own clipped samples. 15 V clears the largest range this app
--- offers, 10 V, and its headroom, while sitting 36 decades under the sentinel -- so the test
--- cannot catch a real reading and cannot miss a sentinel.
+-- Past this, in volts, a reading is not a voltage: the digitizer answers 9.9e+37 beyond the
+-- selected range, where the panel shows "Overflow", and a handful of those makes the
+-- spectrum an impulse -- flat against the ceiling at every frequency with the real tone
+-- buried under its own clipped samples. 15 V clears the largest range this app offers and
+-- its headroom while sitting 36 decades under the sentinel, so the test can neither catch a
+-- real reading nor miss a sentinel.
 fftsa.sg_vmax_real = 15
 fftsa.overrange    = false   -- the frame's verdict; the peak table and the THD line read it
 fftsa.sg_pk_over   = false   -- whether the dashed table is the one on screen
@@ -123,10 +117,9 @@ fftsa.sg_plotpx  = 680
 -- not a plottable axis, so sg_pin_x() makes no call until fftsa.apply() narrows it.
 fftsa.sg_fmax_real = 1e6
 
--- Peak table: 6 rows as two columns of three. freq/volt/dB are separate objects at
--- fixed x, so the volt and dB columns do not jitter as the proportional-font
--- frequency text changes width. The Options button sits in the right margin beside the
--- first row.
+-- Peak table: 6 rows as two columns of three. freq/volt/dB are separate objects at fixed x,
+-- so the volt and dB columns do not jitter as the proportional-font frequency text changes
+-- width.
 fftsa.sg_pky     = 350     -- first peak row baseline
 fftsa.sg_pkdy    = 20      -- row pitch
 fftsa.sg_pk_colx_f = {8,   360}   -- frequency field x, per column
@@ -138,9 +131,8 @@ fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
 fftsa.sg_xunit_x = 8
 fftsa.sg_xunit_y = 410       -- settings line, below the peak rows
 fftsa.sg_xunit_c = 56575     -- cyan 00DCFF, the colour of the Options preview line
--- Saturated red FF0000 for the over-range banner, against the pale palette the rest of the
--- panel uses: this is the one line that is a warning rather than a reading. Decimal, which
--- the display API requires -- "0x00rrggbb ... must be given as decimal".
+-- Saturated red FF0000 for the over-range banner, against the panel's pale palette: the one
+-- line that is a warning rather than a reading. Decimal, which the display API requires.
 fftsa.sg_over_c  = 16711680
 fftsa.sg_xunit_c_now = nil   -- the colour the line is actually carrying
 
@@ -151,17 +143,16 @@ fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
--- Decimals follow the record length: two below 8,192 samples, three from 8,192 and four from
--- 16,384. 0.016 % and 0.019 % both read 0.02 % at two, and a digit is only worth printing once
--- the record is long enough to hold a harmonic in one bin -- each doubling halves the bin
--- width and so the power leaking into its neighbours. Gated on the committed sample count, so
--- the line cannot offer a precision the plan in force did not deliver.
+-- Decimals follow the record length, because a digit is only worth printing once the record
+-- is long enough to hold a harmonic in one bin: each doubling halves the bin width and so
+-- the power leaking into its neighbours. Gated on the committed sample count, so the line
+-- cannot offer a precision the plan in force did not deliver.
 fftsa.sg_thd_n3 = 8192     -- samples the third decimal needs
 fftsa.sg_thd_n4 = 16384    -- and the fourth
 
 -- The nil test is the point: display.create answers nil on an exhausted pool, and the app
--- module deletes handles it may never have built. No pcall -- a refused delete posts an
--- event and returns, so a wrapper can never be false; the suite's live-object counts
+-- module deletes handles it may never have built. No pcall, a refused delete posting an
+-- event and returning, so a wrapper can never be false; the suite's live-object counts
 -- around a teardown are what catch one.
 function fftsa.del_obj(h)
   if h == nil then return true end
@@ -175,16 +166,14 @@ function fftsa.del_buf(b)
   return true
 end
 
--- Delete a SCREEN: switch away, let the switch land, then delete. The single owner of that
--- rule, because every part of it is necessary.
+-- Delete a screen: switch away, let the switch land, then delete. The single owner of that
+-- rule, every part of it being necessary.
 --
--- display.delete on the screen that is on show bluescreens the instrument at pc=00318FC0 --
--- measured from a probe that deleted a visible screen, where it took the whole box down: no
--- ping, no port 80, no port 5025, and a manual power cycle. Switching away first is not
--- sufficient on its own: changescreen does not wait, so the delete can still reach a screen
--- the panel is showing. The glass shows the home screen for an instant and then the same PC.
---
--- The yield is what makes the switch real, and it is the only part the app controls.
+-- display.delete on the screen that is on show bluescreens the instrument at pc=00318FC0,
+-- which takes the whole box down -- no ping, no port 80, no port 5025, and a manual power
+-- cycle. Switching away is not sufficient on its own, changescreen not waiting, so the
+-- delete can still reach a screen the panel is showing. The yield is what makes the switch
+-- real, and it is the only part the app controls.
 function fftsa.del_scr(h, showscr)
   if h == nil then return true end
   if showscr == nil then showscr = display.SCREEN_HOME end
@@ -195,10 +184,10 @@ function fftsa.del_scr(h, showscr)
 end
 
 -- The X limits the axis should hold, nil for a span that is not plottable. Shared by
--- sg_pin_x and sg_restore so the moved-or-not test cannot disagree with the pin. Start
--- moves to DC where that is under one pixel, because the firmware steps ticks from the
--- lower limit and a 10 Hz Start on a 50 kHz span would label them +00.01kHz; conditional,
--- or a real zoom loses its own limits.
+-- sg_pin_x and sg_restore so the moved-or-not test cannot disagree with the pin. Start moves
+-- to DC where that is under one pixel, because the firmware steps ticks from the lower limit
+-- and a 10 Hz Start on a 50 kHz span would label them +00.01kHz. Conditional, or a real zoom
+-- loses its own limits.
 function fftsa.sg_xwant()
   local lo, hi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if hi > fftsa.sg_fmax_real or hi <= lo then return nil, nil end
@@ -215,11 +204,10 @@ function fftsa.sg_pin_x()
   if lo == nil then return false end
   local m = fftsa.sg_xmethod
   if m == nil then m = display.XSCALE_OFF end
-  -- IN HERTZ, not scaled. The trace is bound as a numeric x-y plot, X from the reading's
-  -- extra field, which carries the bin's real frequency -- so the axis limits are the
-  -- real span and the firmware labels them itself, with an SI prefix: +00.00kHz and so
-  -- on. No pcall: the call does not raise, it posts an event, so a wrapper buys nothing
-  -- and costs a closure and a frame per call.
+  -- In hertz and not scaled: the trace is bound as a numeric x-y plot, X from the reading's
+  -- extra field, which carries the bin's real frequency, so the limits are the real span and
+  -- the firmware labels them itself with an SI prefix. No pcall, the call posting rather
+  -- than raising.
   display.graph.scalex(fftsa.sg_graph, m, display.AXIS_NORMAL, lo, hi)
   return true
 end
@@ -229,19 +217,17 @@ end
 -- after, so the rate and bin width it ends up showing are the measured ones.
 function fftsa.sg_xunit_text()
   -- Over-range replaces the line rather than appending to it: there is no room for both, and
-  -- a record the range could not represent makes the point count and the bin width beside the
-  -- point. The trace is left as it is -- flat against the ceiling, which is what the capture
-  -- actually was.
+  -- beside a record the range could not represent the point count and bin width are beside
+  -- the point. The trace is left flat against the ceiling, which is what the capture was.
   if fftsa.overrange then return fftsa.sg_overrange_text(fftsa.range) end
-  -- Total for the same reason opt_info_text is: apply() builds this line after the
-  -- hardware is already configured, so a nil count or a range index the labels do not
-  -- hold has to read as a gap rather than abort the Apply.
+  -- Total for the same reason opt_info_text is: apply() builds this line after the hardware
+  -- is configured, so a nil count or an unknown range index reads as a gap rather than
+  -- aborting the Apply.
   local t = string.format("%d pts   %s   %s", fftsa.n or 0,
                           tostring(fftsa.opt_info_text(fftsa.fs, fftsa.n)),
                           tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]))
-  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at any bin width: the
-  -- trace is a dot, five peak rows read ---, and this count is the only thing that says
-  -- why. The width is already in the line, so the count alone is enough.
+  -- Start 1999 / Stop 2000 is a legal pair and one plotted point at any bin width: the trace
+  -- is a dot, five peak rows read ---, and this count is the only thing that says why.
   local b = fftsa.binhz
   if b ~= nil and b > 0 then
     local k0, k1 = fftsa.sg_window_bins(fftsa.sg_nbins, b)
@@ -257,10 +243,9 @@ function fftsa.sg_xunit_text()
   return t .. fftsa.sg_fps_text() .. "   " .. fftsa.terminal_text()
 end
 
--- The measured rate, or nothing until a window has closed. Absent rather than zero before
--- the first one: 0.0 fps on a running analyser reads as a fault. Ahead of the terminal
--- selection, which stays last on the line, and off the over-range line, which replaces the
--- whole of this one and has no room.
+-- The measured rate, or nothing until a window has closed: absent rather than zero, because
+-- 0.0 fps on a running analyser reads as a fault. Ahead of the terminal selection, which
+-- stays last on the line.
 function fftsa.sg_fps_text()
   local f = fftsa.fps
   if f == nil or not (f > 0) then return "" end
@@ -268,40 +253,30 @@ function fftsa.sg_fps_text()
   return string.format("  %.0f fps", f)
 end
 
--- The trace buffer: WRITABLE_FULL carries value, extra and timestamp per point, the value
--- dB under a custom unit and the extra the bin's frequency in hertz. Made once at the
--- sg_maxpts ceiling rather than the current sg_ncol, so nothing reallocates while frames
--- run, and freed only by sg_destroy().
---
--- The clear is the notify: the display task holds its own copy of the readings and
--- re-reads only when handed a buffer, so overwriting one in place changes nothing.
+-- The trace buffer: WRITABLE_FULL carries value, extra and timestamp per point, the value dB
+-- under a custom unit and the extra the bin's frequency in hertz. Made once at the sg_maxpts
+-- ceiling rather than the current sg_ncol, so nothing reallocates while frames run, and
+-- freed only by sg_destroy(). The clear is the notify: the display task holds its own copy
+-- and re-reads only when handed a buffer, so overwriting one in place changes nothing.
 function fftsa.sg_make_buffer(nbins, npoints)
   fftsa.sg_nbins = nbins
   local want = npoints or fftsa.sg_maxpts
-  -- Already built at the right size: keep it, and write nothing but sg_nbins. sg_build()
-  -- is the only caller and start() the only caller of that, so this is the one place the
-  -- no-reallocation rule is stated in code rather than left implicit in the call graph.
+  -- Already built at the right size: keep it, and write nothing but sg_nbins. This is the
+  -- one place the no-reallocation rule is stated in code rather than left to the call graph.
   if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
     fftsa.sg_name_buffers()
     fftsa.sg_free_old()
     return fftsa.sg_buf
   end
-  -- Allocated before the previous pair is released, and that order is the whole of this.
-  --
-  -- A trace buffer freed and then reallocated at the same size comes back carrying the
-  -- freed one's identity, and the display task's trace subscription for the launch that is
-  -- gone comes with it. The graph then paints a ring nothing feeds: a picture that never
-  -- changes however the buffer is rewritten, with the dB axis relabelled in volts, while
-  -- every reading in the buffer reads back correct from Lua. That was the second launch of
-  -- the app, every time.
-  --
-  -- Measured on the instrument both ways. A buffer allocated while the previous one was
-  -- still alive bound and painted first time, twice; one allocated after it had been freed
-  -- did not, and no rebind, no clear and no rewrite recovered it.
+  -- Allocated before the previous pair is released, and that order is the whole of this: a
+  -- trace buffer freed and then reallocated at the same size comes back carrying the freed
+  -- one's identity, and the dead launch's trace subscription with it. The graph then paints
+  -- a ring nothing feeds -- a picture that never changes however the buffer is rewritten,
+  -- with the dB axis relabelled in volts -- while every reading in it reads back correct
+  -- from Lua. Measured both ways, and no rebind, clear or rewrite recovers it.
   local newbuf = fftsa.sg_mk_trace(want)
-  -- The marker trace, one point a peak. Made here with the trace buffer and freed with it,
-  -- whether or not markers are switched on: allocating it when the option is set would be
-  -- an allocation while frames are running.
+  -- The marker trace, made here with the trace buffer and freed with it whether or not
+  -- markers are on: allocating it on the option would allocate while frames are running.
   local mkcap = fftsa.sg_npeak * fftsa.sg_mk_per
   if mkcap < fftsa.sg_bufmin then mkcap = fftsa.sg_bufmin end
   local newmk = fftsa.sg_mk_mark(mkcap)
@@ -327,31 +302,21 @@ function fftsa.sg_make_buffer(nbins, npoints)
   return fftsa.sg_buf
 end
 
--- A SECOND ALLOCATION INSIDE ONE LAUNCH BREAKS THE TRACE, so there is no sg_retrace() here
--- any more. It replaced the trace buffers on a live graph -- allocate a new pair, rebind,
--- then release the old pair -- and that sequence did restore a blank trace by hand over the
--- socket, twice, which is why it shipped as a staged recovery about two seconds into a
--- relaunch.
---
--- What the operator then measured on four consecutive launches: the trace drew correctly
--- from the first frame and froze a couple of seconds in, at exactly the frame the recovery
--- fired. So the naming in sg_mk_trace() below is the half of the fix that works, the retrace
--- is the half that undid it, and an Apply from the panel -- which allocates and rebinds
--- through sg_make_buffer() -- is already the repair if one is ever needed.
---
--- The mechanism is NOT established. The suspicion is that the pair released at the previous
--- exit leaves holes a second allocation lands in, inheriting the dead launch's subscription,
--- which would make this specific to releasing them at exit rather than handing them on.
+-- A second allocation inside one launch breaks the trace, which is why there is no
+-- sg_retrace(): a recovery that replaced the trace buffers on a live graph froze the trace
+-- at exactly the frame it fired, on four consecutive launches. An Apply from the panel
+-- allocates and rebinds through sg_make_buffer(), so it is already the repair if one is
+-- ever needed. The mechanism is not established.
 
--- The previous launch's trace buffers, released only once this launch has allocated its
--- own. sg_make_buffer says what goes wrong when they are freed first; this is the other
--- half of it, because the launch that ends cannot allocate the next launch's buffers and
--- so cannot free its own in the right order.
+-- The previous launch's trace buffers, released only once this launch has allocated its own.
+-- sg_make_buffer says what goes wrong when they are freed first, and this is the other half
+-- of it: the launch that ends cannot allocate the next launch's buffers, so it cannot free
+-- its own in the right order.
 --
--- Buffers are handed across a launch where display handles cannot be -- a reading buffer
--- outlives the script that made it, and a display handle answers 1703 -- so a global is
--- the right place for them. The cost of an exit that is never followed by another launch
--- is 698 readings of 7,080,255 held until a power cycle.
+-- Buffers can be handed across a launch where display handles cannot -- a reading buffer
+-- outlives the script that made it, and a display handle answers 1703 -- so a global is the
+-- right place for them. An exit never followed by another launch costs 698 readings held
+-- until a power cycle.
 function fftsa.sg_free_old()
   if FFTSA_OLDTRACE ~= nil then
     fftsa.del_buf(FFTSA_OLDTRACE)
@@ -366,45 +331,30 @@ end
 
 -- A name for each trace buffer, because a table field is not one.
 --
--- display.graph.add does not hand the display task a buffer. It subscribes that task to
--- the buffer by name -- graph_trace_add calls bufsub_subscribe(0x407F, graph, name, slot)
--- and the message carries two 32-byte name fields -- and a null name means defbuffer1.
--- The axis unit comes from the subscription rather than from the add arguments, so a
--- trace that resolved to the wrong buffer shows up as a blank plot with the dB axis
--- relabelled in volts, while the buffer itself still reads back the right points from Lua.
---
--- A buffer reachable only through fftsa.* does not reliably resolve to itself. Measured
--- on the instrument: a graph bound to a ramp held in fftsa.ZZ painted the app's own
--- spectrum instead. So each trace buffer gets a global of its own, and these two names
--- are part of the display contract rather than conveniences.
---
--- Idempotent, and called from both branches of sg_make_buffer, so the reuse branch cannot
--- leave a buffer nameless.
+-- display.graph.add does not hand the display task a buffer, it subscribes that task to the
+-- buffer by name -- graph_trace_add calls bufsub_subscribe(0x407F, graph, name, slot) with
+-- two 32-byte name fields -- and a null name means defbuffer1. The axis unit comes from the
+-- subscription rather than the add arguments, so a trace that resolved to the wrong buffer
+-- is a blank plot with the dB axis relabelled in volts, while the buffer itself still reads
+-- back the right points from Lua. A buffer reachable only through fftsa.* does not reliably
+-- resolve to itself: a graph bound to a ramp held in fftsa.ZZ painted the app's own spectrum
+-- instead. So these two names are part of the display contract.
 function fftsa.sg_name_buffers()
   return FFTSA_TRACE == fftsa.sg_buf and FFTSA_MARK == fftsa.sg_mk
 end
 
--- A trace buffer is created INTO ITS OWN BARE GLOBAL, and that is not a style choice.
+-- A trace buffer is created into its own bare global, which is not a style choice: a buffer
+-- the display task cannot name is subscribed as defbuffer1 instead, the documented null-name
+-- default. The graph then draws defbuffer1's contents on defbuffer1's units -- volts on the
+-- value axis, kilovolts on an axis that should read kilohertz, nothing recognisable plotted
+-- -- while the app's own buffer reads back perfectly from Lua. Two "Reading buffer
+-- defbuffer1 is 0% filled" events are all the firmware says about it.
 --
--- display.graph.add subscribes the display task to the buffer by name, and a buffer the
--- task cannot name is subscribed as defbuffer1 instead -- the documented null-name default.
--- The graph then draws defbuffer1's contents on defbuffer1's units: volts on the value axis
--- and kilovolts on an axis that should read kilohertz, with nothing recognisable plotted,
--- while the app's own buffer reads back perfectly from Lua. Two "Reading buffer defbuffer1
--- is 0% filled" events are the only thing the firmware says about it.
---
--- What is measured: every buffer that bound and painted on this instrument was assigned to
--- a bare global, and buffers held only in fftsa.sg_buf did not. Creating into the global and
--- aliasing it afterwards are the same operation in Lua and 7.2 shipped the late alias and
--- fixed nothing, so the two cannot be separated offline -- but the retrace that used to sit
--- beside this has been, and it was the harmful half. Four launches drew correctly from the
--- first frame, which is this code with no recovery having run yet. That makes the naming the
--- fix, and it is why creating a trace buffer anywhere else is a defect rather than a style
--- slip. These two functions are the only places the trace buffers may be created, the
--- globals are the authority, and fftsa.sg_buf and fftsa.sg_mk are copies for the frame path.
---
--- Two functions with a literal global each rather than one taking a name, because
--- assigning through _G may not be the same thing to the firmware and has not been measured.
+-- Every buffer that binds and paints on this instrument is assigned to a bare global, and
+-- ones held only in fftsa.sg_buf do not. So these two functions are the only places a trace
+-- buffer may be created, the globals are the authority, and fftsa.sg_buf and fftsa.sg_mk are
+-- copies for the frame path. Two functions with a literal global each rather than one taking
+-- a name, because assigning through _G may not be the same thing to the firmware.
 function fftsa.sg_mk_trace(want)
   FFTSA_TRACE = buffer.make(want, buffer.STYLE_WRITABLE_FULL)
   return fftsa.sg_fmt_seed(FFTSA_TRACE, want)
@@ -415,40 +365,34 @@ function fftsa.sg_mk_mark(want)
   return fftsa.sg_fmt_seed(FFTSA_MARK, want)
 end
 
--- The format and the seed, shared by the two above. FILL_ONCE, formatted, seeded full:
--- capacity is sg_maxpts, so a frame writing sg_ncol points always fits, and
--- fftsa.dsp_live() clamps a raised sg_ncol to it -- one write past capacity is event 4915.
--- Seeded because an empty buffer binds no trace at all, and sg_build() binds this before
--- the first frame has run.
+-- The format and the seed, shared by the two above. Capacity is sg_maxpts, so a frame
+-- writing sg_ncol points always fits and fftsa.dsp_live() clamps a raised sg_ncol to it --
+-- one write past capacity is event 4915. Seeded because an empty buffer binds no trace at
+-- all, and sg_build() binds this before the first frame has run.
 function fftsa.sg_fmt_seed(b, want)
   if b == nil then return nil end
-  -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the
-  -- newest point to the oldest.
+  -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the newest
+  -- point to the oldest.
   --
-  -- A custom unit is how the axis gets to say decibels; without it the labels read
-  -- "+020.0V" on numbers that are not volts. Not buffer.UNIT_DECIBEL, which panics the
-  -- instrument during build. The firmware truncates a custom label to two characters
-  -- (event 4933), which is exactly "dB".
+  -- A custom unit is how the axis gets to say decibels; without it the labels read "+020.0V"
+  -- on numbers that are not volts. Not buffer.UNIT_DECIBEL, which panics the instrument
+  -- during build. The firmware truncates a custom label to two characters (event 4933).
   buffer.unit(buffer.UNIT_CUSTOM1, "dB")
   buffer.write.format(b, buffer.UNIT_CUSTOM1, buffer.DIGITS_4_5,
                          buffer.UNIT_HERTZ,   buffer.DIGITS_6_5)
-  -- The seed has to sit inside the axes the graph is pinned to, because it is the geometry
-  -- the widget draws at the first paint of every launch.
-  --
-  -- X across the plotted span, not 0..want-1. The X axis is bound to the frequency in the
-  -- extra field and pinned to flo..fhi, so a counter put all 255 points in the leftmost
-  -- half-percent of the plot with the first ten of them below the axis minimum.
-  --
-  -- Y a small ramp, not one repeated value: every point at sg_dbmin gives the trace a
-  -- bounding box of zero height. sg_seed_spread is 2 dB, about three pixels on an axis
-  -- 140 dB tall, so it is invisible and the box still has a height.
+  -- The seed has to sit inside the axes the graph is pinned to, being the geometry the widget
+  -- draws at the first paint of every launch. X across the plotted span and not 0..want-1,
+  -- the X axis being bound to the frequency in the extra field: a counter puts every point
+  -- in the leftmost half-percent of the plot with the first ten below the axis minimum. Y a
+  -- small ramp rather than one repeated value, or the trace has a bounding box of zero
+  -- height; sg_seed_spread is 2 dB, about three pixels on an axis 140 dB tall.
   local k, span = nil, want - 1
   if span < 1 then span = 1 end
   -- sg_flo_hz and sg_fhi_hz are 0 and 1e9 until the first sg_store_xrange, and those are
-  -- VALUES rather than nil, so an `or` chain never falls through them. sg_build() runs
-  -- before apply() commits the span, so on the first build of a power cycle they are still
-  -- the sentinels -- which seeded X across a billion hertz onto an axis pinned to 50 kHz.
-  -- A stop above the fastest rate's Nyquist is the tell, since no span can ask for one.
+  -- values rather than nil, so an `or` chain never falls through them. sg_build() runs before
+  -- apply() commits the span, so on the first build of a power cycle they are still the
+  -- sentinels -- which seeds X across a billion hertz onto an axis pinned to 50 kHz. A stop
+  -- above the fastest rate's Nyquist is the tell, no span being able to ask for one.
   local flo, fhi = fftsa.sg_flo_hz, fftsa.sg_fhi_hz
   if flo == nil or fhi == nil or fhi > fftsa.sg_fmax_real then
     flo, fhi = fftsa.flo, fftsa.fhi
@@ -465,10 +409,10 @@ function fftsa.sg_fmt_seed(b, want)
 end
 
 -- One point: value dB, extra the bin's frequency in Hz, timestamp a plain counter. The
--- timestamp carries nothing -- X is bound to the extra field -- but buffer.write.reading
--- documents chronological order, so it still has to be supplied and to increase. The slot
--- number serves, and as an integer cannot reach the fractional-seconds refusal at
--- 0.9999999 (event 1131, a modal dialog per point).
+-- timestamp carries nothing, X being bound to the extra field, but buffer.write.reading
+-- documents chronological order so it still has to increase. The slot number serves, and as
+-- an integer cannot reach the fractional-seconds refusal at 0.9999999 (event 1131, a modal
+-- dialog per point).
 function fftsa.sg_write_point(buf, db, f, slot)
   if slot == nil then slot = 1 end
   buffer.write.reading(buf, db, f, slot, 0)
@@ -485,9 +429,8 @@ function fftsa.sg_build(title, nbins, npoints)
   local small  = display.FONT_SMALL
   fftsa.sg_scr = create(display.ROOT, display.OBJ_SCREEN, title)
   -- create() returns nil when the pool is exhausted, posting one event and not raising.
-  -- Without this test every child is built against a nil parent, which DOES raise -- in
-  -- our code, not the firmware's. Answering nil and a reason is the same protection
-  -- without raising: fftsa.build() passes it to fftsa.start(), which reports it.
+  -- Without this test every child is built against a nil parent, which does raise, in this
+  -- code rather than the firmware's. fftsa.build() passes the reason to fftsa.start().
   if fftsa.sg_scr == nil then
     fftsa.lasterr = "display object pool exhausted building the spectrum screen -- "
                     .. "power cycle the instrument."
@@ -535,25 +478,19 @@ function fftsa.sg_destroy(release)
     fftsa.sg_xunit, fftsa.sg_stat, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
   --
-  -- Releasing, which is what an exit does: the buffers go, and defbuffer1 is made current
-  -- FIRST. The front panel adopts a user buffer as its current one, so an app that exits
-  -- leaving FFTSA_MARK alive leaves the home screen showing a spectrum level in dB as
-  -- though it were a measurement.
+  -- Releasing is what an exit does: the buffers go, and defbuffer1 is made current first,
+  -- because the front panel adopts a user buffer as its current one -- an app that exits
+  -- leaving FFTSA_MARK alive leaves the home screen showing a spectrum level in dB as though
+  -- it were a measurement. That restore needs a yield before the delete, for the same reason
+  -- fftsa.del_scr does: the panel picks up the new current buffer on its own schedule and
+  -- not on the return of dmm.digitize.read, and deleting a buffer it is still reading is
+  -- pc=00318FC0.
   --
-  -- THE RESTORE NEEDS A YIELD BEFORE THE DELETE, for the same reason fftsa.del_scr does:
-  -- the panel picks up the new current buffer on its own schedule, not on the return of
-  -- dmm.digitize.read. Caught on video: the home screen rendering -118.00 dB with
-  -- FFTSA_MARK named in the status bar and the spectrium screen's title still showing
-  -- through it, for about 50 ms, and then pc=00318FC0. So the panel was reading a buffer
-  -- this went on to delete.
-  --
-  -- Not releasing, which is what sg_build() does on a relaunch: the pair is handed on in
+  -- Not releasing is what sg_build() does on a relaunch: the pair is handed on in
   -- FFTSA_OLDTRACE and FFTSA_OLDMARK for sg_free_old() to take once the new pair exists,
   -- because freeing them first lets the new pair be allocated over them and inherit this
-  -- launch's trace subscription.
-  --
-  -- Only hand over when there is something to hand over: sg_destroy runs twice on a
-  -- relaunch and the second pass must not overwrite what the first one saved.
+  -- launch's trace subscription. Handed over only when there is something to hand over,
+  -- sg_destroy running twice on a relaunch.
   if release then
     fftsa.sg_restore_defbuffer()
     delay(fftsa.sg_scr_yield)
@@ -568,29 +505,25 @@ function fftsa.sg_destroy(release)
 end
 
 -- Make defbuffer1 the instrument's current buffer again. One reading into it is what names
--- it: the panel follows the buffer last used, and nothing else in the API points it.
+-- it: the panel follows the buffer last used, and nothing else in the API points it. One
+-- sample, this being a teardown. Guarded, and its failure must not stop the deletes below
+-- it -- a panel left on the wrong buffer is untidy, a buffer left allocated is a leak.
 --
--- One sample, because the count the app was running at could be 16,384 and this is a
--- teardown. Guarded, and its failure is not allowed to stop the deletes below it: a panel
--- left on the wrong buffer is untidy, a buffer left allocated is a leak.
---
--- BOTH GUARDS BELOW ARE EVENTS SEEN ON THE GLASS, not caution. Measure and digitize are
--- mutually exclusive -- setting the function of one sets the other's to None, and the idle
--- one reads FUNC_NONE -- and the firmware POSTS rather than raising when that is ignored, so
--- a pcall catches neither:
+-- Both guards below are events seen on the glass rather than caution. Measure and digitize
+-- are exclusive -- setting the function of one sets the other's to None, and the idle one
+-- reads FUNC_NONE -- and the firmware posts rather than raising when that is ignored, so a
+-- pcall catches neither:
 --
 --   2800  the count attribute is not available for the DC voltage function
 --   2801  DMM cannot measure when digitize function is set to None
 --
--- Both appeared, in that order, on the first launch of a power cycle: fftsa.start() opens
--- with fftsa.stop(), which lands here before hw_config has set a digitize function, and a
--- cold instrument is sitting on measure DC voltage. The second launch was clean because the
--- first one left the digitize function set. notes/HANDOFF-session64.md records 2800 against
--- this same write in the other app.
+-- Both arrive, in that order, on the first launch of a power cycle: fftsa.start() opens with
+-- fftsa.stop(), which lands here before any digitize function is set, and a cold instrument
+-- sits on measure DC voltage.
 function fftsa.sg_restore_defbuffer()
-  -- Nothing of ours can be current if nothing of ours was ever made, which is the cold
-  -- start above. Skipping leaves the digitizer alone, which is the whole point: a teardown
-  -- on the way into a launch must not be the thing that configures the instrument.
+  -- Nothing of this app's can be current if it never made any, which is that cold start.
+  -- Skipping leaves the digitizer alone: a teardown on the way into a launch must not be
+  -- the thing that configures the instrument.
   if FFTSA_TRACE == nil and FFTSA_MARK == nil and FFTSA_OLDTRACE == nil
      and FFTSA_OLDMARK == nil and fftsa.cap == nil then
     fftsa.sg_defbuf_ok = nil
@@ -607,19 +540,17 @@ function fftsa.sg_restore_defbuffer()
   elseif dmm.measure.func ~= dmm.FUNC_NONE then
     ok = pcall(function() dmm.measure.read(defbuffer1) end)
   end
-  -- NOT into fftsa.lasterr. A teardown runs inside fftsa.start_failed(), which has just
-  -- put the reason the start failed there, and the panel shows it: a note about the current
-  -- buffer would replace the one thing the operator needs to read. Its own field, so a
-  -- socket can still ask.
+  -- Not into fftsa.lasterr: a teardown runs inside fftsa.start_failed(), which has just put
+  -- the reason the start failed there and the panel shows it, so a note about the current
+  -- buffer would replace the one thing worth reading. Its own field, so a socket can ask.
   fftsa.sg_defbuf_ok = ok
   return ok
 end
 
 -- Delete both trace buffers and every global naming them, in the order that leaves nothing
--- dangling. THROUGH THE GLOBALS, because buffer.delete nils the variable it is handed:
--- deleting through a local or a table field clears that one reference and leaves all the
--- others pointing at a buffer that is gone, and a second delete through one of those is a
--- double delete.
+-- dangling. Through the globals, because buffer.delete nils the variable it is handed:
+-- deleting through a local or a table field clears that one reference and leaves the others
+-- pointing at a buffer that is gone, so a second delete through one of those is a double.
 function fftsa.sg_drop_buffers()
   if FFTSA_MARK ~= nil then pcall(function() buffer.delete(FFTSA_MARK) end) end
   if FFTSA_TRACE ~= nil then pcall(function() buffer.delete(FFTSA_TRACE) end) end
@@ -631,15 +562,14 @@ function fftsa.sg_drop_buffers()
 end
 
 
--- Bin index range covering the visible window, clamped into 1..nbins. Shared by
--- the plot and the peak search, so the table describes what is on screen.
+-- Bin index range covering the visible window, clamped into 1..nbins, and shared by the plot
+-- and the peak search so the table describes what is on screen.
 --
--- THE SINGLE OWNER of the ceil/floor convention. Both halves of the app need it -- the peak
--- search, the noise pass, and the "only N bins in the span" line that is the only thing
--- saying why a one-dot trace has five empty peak rows -- and a second copy is free to round
--- the other way, which is one bin of disagreement in exactly that message. flo/fhi default
--- to the window the display has stored; dsp.* passes its own span instead, so the
--- primitives never write a display field to make this read the right one.
+-- The single owner of the ceil/floor convention: the peak search, the noise pass and the
+-- "only N bins in the span" line all need it, and a second copy is free to round the other
+-- way -- one bin of disagreement in exactly that message. flo/fhi default to the window the
+-- display has stored, and dsp.* passes its own span instead, so the primitives never write
+-- a display field to make this read the right one.
 function fftsa.sg_window_bins(nbins, binhz, flo, fhi)
   if binhz == nil or binhz <= 0 then return 1, nbins end
   if flo == nil then flo = fftsa.sg_flo_hz end
@@ -656,22 +586,17 @@ function fftsa.sg_window_bins(nbins, binhz, flo, fhi)
   return kmin, kmax
 end
 
--- The window and the settings line, without the pin. Split out for the one caller that must
--- not pin: an adopted gesture about to re-plan has fftsa.apply() pinning from the same pair
--- a moment later, and an axis write is 60 ms.
--- The settings line, written so a raise cannot escape. Everything the line describes is
--- committed before it is built, and both writers sit inside apply() after the hardware is
--- configured, so a failure here is a stale line that says so in fftsa.lasterr rather than
--- an Apply that reports failure over cosmetics. The one place that writes it, so the two
--- callers cannot disagree about that. Not on the frame path: twice an Apply and once a
--- gesture, which is where a closure per call is affordable.
+-- The settings line, written so a raise cannot escape: everything it describes is committed
+-- before it is built, and both writers sit inside apply() after the hardware is configured,
+-- so a failure here is a stale line that says so in fftsa.lasterr rather than an Apply that
+-- reports failure over cosmetics. The one place that writes the line. Not on the frame path
+-- -- twice an Apply and once a gesture -- so a closure per call is affordable.
 function fftsa.sg_write_xunit()
   if fftsa.sg_xunit == nil then return false end
   local ok, err = pcall(function()
-    -- The colour belongs with the text, in the one place that writes the line: over-range is
-    -- a warning and should read as one. Written only when it changes, like the text -- this
-    -- is called twice an Apply and once a gesture, but the over-range transition brings it
-    -- here from the tick, and a setcolor a second for an unchanged colour is waste.
+    -- The colour belongs with the text, in the one place that writes the line, over-range
+    -- being a warning. Written only when it changes, like the text: the over-range
+    -- transition brings this here from the tick, where a setcolor a second would be waste.
     local c = fftsa.sg_xunit_c
     if fftsa.overrange then c = fftsa.sg_over_c end
     if c ~= fftsa.sg_xunit_c_now then
@@ -681,10 +606,9 @@ function fftsa.sg_write_xunit()
     display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   end)
   if not ok then
-    -- Every input, not just the message. A "bad argument #2 to format (string expected,
-    -- got nil)" was seen here once and could not be reproduced or explained: the call it
-    -- names cannot return nil for any value this records. If it recurs, the values come
-    -- with it rather than needing another afternoon.
+    -- Every input, not just the message: a "bad argument #2 to format (string expected, got
+    -- nil)" here has never been reproduced or explained, the call it names being unable to
+    -- return nil for any value this records. If it recurs, the values come with it.
     fftsa.lasterr = string.format(
       "settings line: %s [n=%s fs=%s fs_acq=%s range=%s rangetxt=%s win=%s "
       .. "binhz=%s nbins=%s term=%s]", tostring(err), tostring(fftsa.n), tostring(fftsa.fs),
@@ -695,6 +619,9 @@ function fftsa.sg_write_xunit()
   return ok
 end
 
+-- The window and the settings line, without the pin. Split out for the one caller that must
+-- not pin: an adopted gesture about to re-plan has fftsa.apply() pinning from the same pair
+-- a moment later, and an axis write is 60 ms.
 function fftsa.sg_store_xrange(flo_hz, fhi_hz)
   fftsa.sg_flo_hz = flo_hz
   fftsa.sg_fhi_hz = fhi_hz
@@ -707,14 +634,12 @@ end
 function fftsa.sg_thd_text(thd, snr, ndb, n, over)
   local t, s
   -- Over-range first, and dashed rather than named: every figure here would be arithmetic
-  -- about 9.9e+37 instead of about volts. NoSig is the opposite diagnosis -- a quiet input --
-  -- so using it would point an operator the wrong way. The floor goes too, being the one
-  -- figure that is otherwise printed unclamped.
+  -- about 9.9e+37 instead of about volts, and NoSig is the opposite diagnosis. The floor
+  -- goes too, being the one figure otherwise printed unclamped.
   if over then
     t, s, ndb = "THD: ---", "S/N: ---", nil
   -- Neither ratio means there is no fundamental to take them against, which is what a
-  -- shorted input looks like. Named, not dashed, and the labels stay so the fields hold
-  -- their places.
+  -- shorted input looks like. Named rather than dashed, and the labels stay.
   elseif thd == nil and snr == nil then
     t, s = "THD: NoSig", "S/N: NoSig"
   else
@@ -736,13 +661,11 @@ function fftsa.sg_thd_text(thd, snr, ndb, n, over)
   return t .. "    " .. s .. string.format("    Noise Floor: %.1f dBV", ndb)
 end
 
--- Written only when the text changes, like the terminal selection. On the peak table's
--- clock, not the frame.
---
--- The figures come from the primitive that produced the spectrum on screen, over the bins
--- it reduced, and it reports thd as a fraction where this line prints a percentage. Both go
--- through fftsa.distortion() and fftsa.plan_n(), which pick the live path: asking dsp.*
--- directly would describe a transform the native path never ran.
+-- Written only when the text changes, like the terminal selection, and on the peak table's
+-- clock rather than the frame. The figures come from the primitive that produced the
+-- spectrum on screen, over the bins it reduced, and it reports thd as a fraction where this
+-- line prints a percentage. Through fftsa.distortion() and fftsa.plan_n(), which pick the
+-- live path: asking dsp.* directly would describe a transform the native path never ran.
 function fftsa.sg_show_thd()
   if fftsa.sg_thd == nil then return false end
   local thd, snr, ndb = fftsa.distortion()
@@ -795,20 +718,15 @@ function fftsa.sg_bind()
 end
 
 -- Did the capture hold a reading the range cannot represent? From the statistics the firmware
--- maintains AS THE BUFFER FILLS -- "the instrument automatically updates reading buffer
--- statistics as data is added" -- so getstats hands back an already-current table and this is
--- one call a frame with no reading examined in Lua. A pass of our own would be 16,384
--- comparisons for the same answer.
---
--- Both ends tested: a clipped sine saturates symmetrically and -9.9e+37 is as much a sentinel
--- as +9.9e+37, so a test on the maximum alone would miss a negative-only clip.
---
--- n == 0 leaves every other field nil, which is an empty buffer rather than an over-range one.
+-- maintains as the buffer fills, so getstats hands back an already-current table and this is
+-- one call a frame rather than 16,384 comparisons in Lua. Both ends tested, because a clipped
+-- sine saturates symmetrically and -9.9e+37 is as much a sentinel as +9.9e+37. n == 0 leaves
+-- every other field nil, which is an empty buffer and not an over-range one.
 function fftsa.cap_overrange(buf)
   if buf == nil then return false end
-  -- Guarded because this runs inside the frame: a firmware without getstats would raise here
-  -- on every frame and the twenty-failure halt would take the app down over a warning it
-  -- could simply not offer. Answering false loses the detection and nothing else.
+  -- Guarded because this runs inside the frame: a firmware without getstats would raise on
+  -- every frame and the twenty-failure halt would take the app down over a warning it cannot
+  -- offer. Answering false loses the detection and nothing else.
   if buffer.getstats == nil then return false end
   local st = buffer.getstats(buf)
   if st == nil or st.n == nil or st.n == 0 then return false end
@@ -819,9 +737,8 @@ function fftsa.cap_overrange(buf)
 end
 
 -- What the settings line says instead when the capture held an unrepresentable reading. The
--- wording is deliberate: "values in the signal", because only the peaks of a signal a little
--- past the range are clipped and the rest of the record is real -- so this is not "no signal"
--- and not "the signal is 9.9e+37". One owner for the text, as the panel numbers are.
+-- wording is deliberate: only the peaks of a signal a little past the range are clipped and
+-- the rest of the record is real, so this is neither "no signal" nor "the signal is 9.9e+37".
 function fftsa.sg_overrange_text(range)
   local i = fftsa.range_to_idx(range)
   local lab = tostring(fftsa.range_labels[i])
@@ -832,10 +749,9 @@ function fftsa.sg_overrange_text(range)
   return "OVERRANGE: values in the signal exceed the " .. lab .. " range -- " .. fix
 end
 
--- The peak table under over-range: every row dashed, and written once per transition rather
--- than per frame. Every figure would be arithmetic about 9.9e+37, and a plausible-looking
--- number is worse than a dash. sg_show_peaks clears the latch on the way back, so returning
--- to range redraws the real block.
+-- The peak table under over-range: every row dashed, written once per transition rather than
+-- per frame, because every figure would be arithmetic about 9.9e+37 and a plausible-looking
+-- number is worse than a dash. sg_show_peaks clears the latch on the way back.
 function fftsa.sg_show_peaks_over()
   if fftsa.sg_pk_over then return false end
   if fftsa.sg_pk_f == nil then return false end
@@ -853,7 +769,7 @@ end
 
 -- The model, read once and kept: it cannot change while the app runs, and the floor rule
 -- below asks on every Apply. An instrument that will not say reads as "", which matches no
--- model, so an absent attribute takes the DMM6500 floor rather than raising.
+-- model, so an absent attribute takes the shallower floor rather than raising.
 function fftsa.model_name()
   if fftsa.model_str == nil then
     local m = nil
@@ -864,11 +780,9 @@ function fftsa.model_name()
   return fftsa.model_str
 end
 
--- The digits anywhere in the string, not the whole of it: the reference documents the
--- attribute as the bare model number, and matching on the part that names the front end
--- leaves a prefixed or suffixed form answering the same. Plain find, the fourth argument --
--- the pattern metacharacters have no business in a model number. string.match would be the
--- 5.1 spelling and is absent on this firmware; find is what 5.0.2 has.
+-- The digits anywhere in the string, not the whole of it, so a prefixed or suffixed form
+-- answers the same. Plain find, the fourth argument, pattern metacharacters having no
+-- business in a model number. string.match is the 5.1 spelling and is absent here.
 function fftsa.is_7510()
   return string.find(fftsa.model_name(), "7510", 1, true) ~= nil
 end
@@ -886,10 +800,9 @@ function fftsa.sg_dbmin_for(range, n)
 end
 
 -- Move the floor to what the range wants, answering whether it moved. One assignment is the
--- whole move: every reader takes fftsa.sg_dbmin live -- the trace fill, the peak column, the
--- marker needles, the restore's span and dsp.out.dbfloor through dsp_live_push(). The answer is
--- what apply() pins the axis on, an axis write costing 60 ms and a full repaint, so an
--- unchanged limit is never written.
+-- whole move, every reader taking fftsa.sg_dbmin live: the trace fill, the peak column, the
+-- marker needles, the restore's span and dsp.out.dbfloor through dsp_live_push(). The answer
+-- is what apply() pins the axis on, and an axis write costs 60 ms and a full repaint.
 function fftsa.sg_dbmin_set(range, n)
   -- Defaulted here rather than at the call: a caller that passed only the range would
   -- silently lose the deeper floor at the two counts that need it.
@@ -910,36 +823,30 @@ function fftsa.sg_pin_y(g)
 end
 
 -- Settling a gesture. Writing an axis limit costs 60 ms and repaints the whole widget, so
--- re-asserting both every frame is most of an 81 ms frame at 512 samples -- a slower,
--- flickering trace. Reading one back costs 0.0094 ms, so a settle reads before it writes.
+-- re-asserting both every frame is most of a short frame -- a slower, flickering trace.
+-- Reading one back costs 0.0094 ms, so a settle reads before it writes.
 --
--- The read-back's "return values are only valid when the objects event generation is set
--- to ALL", and non-button objects have none by default -- so on a graph with no event
--- registered, scalex and scaley answer nil and post nothing. sg_hook_scale is therefore
--- not an optimisation: nothing here works without it. It reports the gesture too, which
--- lets a tick that saw no fire skip even the reads.
+-- The read-back's "return values are only valid when the objects event generation is set to
+-- ALL", and non-button objects have none by default, so on a graph with no event registered
+-- scalex and scaley answer nil and post nothing. sg_hook_scale is not an optimisation:
+-- nothing here works without it. It reports the gesture too, which lets a tick that saw no
+-- fire skip even the reads. The app's own write also fires EVENT_SCALE, asynchronously, and
+-- needs no special case -- the echo reads back as the limits just written. EVENT_CURSOR
+-- never fires.
 --
--- Our own write also fires EVENT_SCALE, asynchronously, and needs no special case: the
--- echo reads back as the limits just written. EVENT_CURSOR never fires.
---
--- A handler containing %xmin does not run -- measured, and it takes a counter in the same
--- string down with it, so the failure looks like the event never firing. Substitution is
--- documented for command strings and icon_button relies on none of it, so why this one
--- fails is unestablished; do not re-reach for it without checking that first.
+-- A handler containing %xmin does not run, and it takes a counter in the same string down
+-- with it, so the failure looks like the event never firing. Substitution is documented for
+-- command strings, so why this one fails is unestablished: check that before reaching for it.
 fftsa.sg_ev = 0        -- EVENT_SCALE fires since the tick last looked
 
--- A limit counts as moved past this fraction of sg_moved's scale, which is the larger of
--- the span and the endpoint. Taking the endpoint is what keeps a narrow window far from
--- DC from writing on every tick: at Start 499000, Stop 499010 -- reachable from the form
--- -- the span is smaller than the rounding on its own endpoints.
---
--- The price is a dead zone in exactly that window. Scaled to the endpoint, the tolerance
--- there is 0.499 Hz against a pixel of pan at 0.0147, so about thirty pixels of drag go
--- unrestored while the padlock still reads closed. Accepted because the alternative is a
--- 60 ms write every tick for ever, and because a 10 Hz span at 499 kHz holds no bins at
--- all -- the trace is empty before the lock is the problem. What would settle it is the
--- read-back's actual precision, which is unmeasured: if it round-trips a fractional limit
--- exactly, the scale can be the span alone and the dead zone goes.
+-- A limit counts as moved past this fraction of sg_moved's scale, which is the larger of the
+-- span and the endpoint. Taking the endpoint is what stops a narrow window far from DC
+-- writing on every tick: at Start 499000, Stop 499010, reachable from the form, the span is
+-- smaller than the rounding on its own endpoints. The price is a dead zone in exactly that
+-- window -- about thirty pixels of drag go unrestored while the padlock reads closed --
+-- accepted because the alternative is a 60 ms write every tick for ever, and a 10 Hz span at
+-- 499 kHz holds no bins anyway. What would settle it is the read-back's own precision, which
+-- is unmeasured: round-trip a fractional limit exactly and the scale can be the span alone.
 fftsa.sg_tol = 1e-6
 
 -- The limits the previous gesture check read, or nil when nothing is in flight. What tells
@@ -947,11 +854,10 @@ fftsa.sg_tol = 1e-6
 fftsa.sg_seen_lo = nil
 fftsa.sg_seen_hi = nil
 
--- Turn the graph's pan-and-zoom reporting on. Unconditional, not tied to the lock: the dB
--- axis is restored either way and an unlocked frequency gesture has to be read before it
--- can be adopted. Measured at 512 samples it costs nothing per frame -- 74.7 ms of work
--- minimum with it on and off -- so there is nothing to switch off. Without the report
--- nothing settles, and the symptom is a view that pans while the padlock reads closed.
+-- Turn the graph's pan-and-zoom reporting on. Unconditional rather than tied to the lock:
+-- the dB axis is restored either way and an unlocked frequency gesture has to be read before
+-- it can be adopted, and it costs nothing per frame. Without the report nothing settles, and
+-- the symptom is a view that pans while the padlock reads closed.
 function fftsa.sg_hook_scale()
   local g = fftsa.sg_graph
   if g == nil then return false end
@@ -972,17 +878,17 @@ function fftsa.sg_moved(got, want, span)
   local a = want
   if a < 0 then a = -a end
   if a > scale then scale = a end
-  -- Nothing to measure against: an axis of no height, which only a socket can set. A
-  -- zero scale makes every difference exceed the tolerance, so this would otherwise be a
-  -- 60 ms write on every reported gesture for the life of the app.
+  -- Nothing to measure against: an axis of no height, which only a socket can set. A zero
+  -- scale makes every difference exceed the tolerance, so this would be a 60 ms write on
+  -- every reported gesture for the life of the app.
   if scale <= 0 then return false end
   return (got - want) > scale * fftsa.sg_tol
       or (want - got) > scale * fftsa.sg_tol
 end
 
--- The dB axis, put back whenever a gesture moved it, lock or no lock. Nothing stands behind
--- this axis for a gesture to be asking for -- its limits are constants and Options does not
--- offer them -- so a dragged dB scale is only a worse view of the same data.
+-- The dB axis, put back whenever a gesture moved it, lock or no lock: its limits are
+-- constants and Options does not offer them, so a dragged dB scale is only a worse view of
+-- the same data.
 function fftsa.sg_restore_y(g)
   if g == nil then g = fftsa.sg_graph end
   if g == nil then return false end
@@ -1001,19 +907,17 @@ function fftsa.sg_restore_y(g)
 end
 
 -- Adopt the frequency axis a gesture left behind: unlocked, a drag or a pinch retunes the
--- analyser to what it asked to see. A pan is not told from a pinch -- whatever the two
--- limits read, snapped into the legal range, is the new span. The pin that follows puts the
--- axis on the CLAMPED pair, so a drag past a limit visibly stops at it.
+-- analyser to what it asked to see. A pan is not told from a pinch -- whatever the two limits
+-- read, snapped into the legal range, is the new span -- and the pin that follows puts the
+-- axis on the clamped pair, so a drag past a limit visibly stops at it.
 function fftsa.sg_adopt_x(lo, hi)
-  -- Refused, not repaired: a NaN limit survives every comparison in span_clamp, so it would
-  -- reach the axis write, pick_fs and both Options fields. Tested against itself, NaN being
-  -- the one value that is not equal to itself. The span then stays as it is and the next
-  -- gesture settles it.
+  -- Refused and not repaired: a NaN limit survives every comparison in span_clamp, so it
+  -- would reach the axis write, pick_fs and both Options fields. The span then stays as it
+  -- is and the next gesture settles it.
   if lo ~= lo or hi ~= hi then return false end
   -- Rounded, because an axis limit is a float and an Options field is not: unrounded, the
-  -- form could neither show nor re-apply the span the gesture had just set. It is also what
-  -- makes this a one-step fixed point -- the pin writes integers, so the read-back that
-  -- follows rounds to itself.
+  -- form could neither show nor re-apply the span the gesture just set. It is also what makes
+  -- this a one-step fixed point, the pin writing integers that read back as themselves.
   local nlo, nhi = fftsa.span_clamp(math.floor(lo + 0.5), math.floor(hi + 0.5))
   -- Asked before fftsa.fhi moves, since the question is whether the plan in force covers
   -- the new stop.
@@ -1021,9 +925,8 @@ function fftsa.sg_adopt_x(lo, hi)
   fftsa.flo, fftsa.fhi = nlo, nhi
   if replan then
     -- No pin here: fftsa.apply() pins from this same pair, so one would be a second 60 ms
-    -- write of identical limits. The axis keeps the gesture's own limits until then, which
-    -- is where the finger left it. A new plan cannot be installed from inside a frame --
-    -- apply() reconfigures the digitizer and captures -- so fftsa.frame() runs it between.
+    -- write of identical limits, and the axis keeps the gesture's own limits until then. A
+    -- new plan cannot be installed from inside a frame, so fftsa.frame() runs it between.
     fftsa.sg_store_xrange(nlo, nhi)
     fftsa.retune_pending = true
   else
@@ -1059,10 +962,10 @@ function fftsa.sg_settle_x(g)
     fftsa.sg_pin_x()
     return true
   end
-  -- Unlocked, adopt only once the gesture has STOPPED moving. A pair that differs from the
-  -- last check is a finger still on the glass: it is remembered and left alone, and the
-  -- next check with the same pair adopts it. That is what pays for checking often -- one
-  -- drag costs one retune rather than one per check, and a retune is a whole capture.
+  -- Unlocked, adopt only once the gesture has stopped moving: a pair that differs from the
+  -- last check is a finger still on the glass, so it is remembered and left alone, and the
+  -- next check with the same pair adopts it. One drag then costs one retune, which is a
+  -- whole capture, rather than one per check.
   if fftsa.sg_seen_lo == nil
      or fftsa.sg_moved(x1, fftsa.sg_seen_lo, whi - wlo)
      or fftsa.sg_moved(x2, fftsa.sg_seen_hi, whi - wlo) then
@@ -1093,16 +996,12 @@ function fftsa.sg_scale_check()
   return fftsa.sg_settle()
 end
 
--- Two jobs on two clocks. The icons only have to be re-asserted often enough that a focus
--- repaint does not sit there, which is the peak table's period. A gesture has to be
--- answered while the finger is still near where it stopped, and a second of that period on
--- top of a frame is what makes a drag at 2048 samples feel ignored -- 1.3 s before the app
--- even looks. A check with no gesture reported costs one os.clock() and no graph call --
--- measured at 16384 samples, 1.6723 s a frame with this period against 1.686 s recorded
--- for the one-second period -- so the shorter period is free whenever nothing is moving.
---
--- Driven from the frame, so the frame period is the floor: 0.3 s at 2048 samples, 0.08 s
--- at 512. A halted app settles only on a Lock press.
+-- Two jobs on two clocks. The icons need re-asserting only often enough that a focus repaint
+-- does not sit there, which is the peak table's period, but a gesture has to be answered
+-- while the finger is still near where it stopped. A check with no gesture reported costs one
+-- os.clock() and no graph call, so the shorter period is free whenever nothing is moving.
+-- Driven from the frame, so the frame period is the floor, and a halted app settles only on
+-- a Lock press.
 fftsa.sg_scale_period = 0.15    -- seconds between gesture checks
 fftsa.sg_tick_last  = nil
 fftsa.sg_scale_last = nil
@@ -1110,46 +1009,38 @@ fftsa.sg_term_last  = nil       -- the terminal selection the line currently nam
 
 -- The HELP key, answered by recognising the dialog it raises.
 --
--- Nothing delivers the key to a script. display.setevent refuses a disp_key outright --
--- "Parameter 1, expected type 'number', but found type 'key'" -- and display.setkeyenable
--- takes only display.ON and display.OFF, where OFF substitutes a "help key is disabled"
--- dialog rather than silence. The dialog itself is invisible to every event path: it fires
--- no EVENT_HIDE on the screen it covers, never appears in ki.display.dump, and posts no
--- event. Pixels are the only thing that sees it.
+-- Nothing delivers the key to a script: display.setevent refuses a disp_key outright, and
+-- display.setkeyenable takes only ON and OFF, where OFF substitutes a "help key is disabled"
+-- dialog rather than silence. The dialog is invisible to every event path -- no EVENT_HIDE on
+-- the screen it covers, nothing in ki.display.dump, no posted event -- so pixels are the only
+-- thing that sees it.
 --
--- So the recogniser is a checksum over a patch of the dialog's own title text, which reads
--- "You selected help on:" in yellow. Our objects always resolve to "No Topic" -- help topics
--- key on an identity display.create does not grant -- so those pixels are constant, and the
--- value below repeated exactly across presses on the instrument.
+-- The recogniser is therefore a checksum over a patch of the dialog's own title text. This
+-- app's objects always resolve to "No Topic", help topics keying on an identity
+-- display.create does not grant, so those pixels are constant.
 --
--- 80x16 rather than the whole title row, because the cost is area over a fixed call
--- overhead: 1.394 ms for 600x27, 0.310 ms for 80x12, 0.184 ms for 4x4. So this is about a
--- quarter the price of the row, and smaller still buys nothing. 1,280 pixels is specific
--- enough that none of the app's own screens collide with it -- checked against the
--- spectrum, options, about and help screens -- so the check needs no knowledge of which
--- screen is up, and routing comes from which timer ran instead.
--- A LIST, not one value. The patch is pixels of English text, so a panel in another language
--- has its own checksum -- no front-panel localisation is documented for this instrument and
--- the only language attribute in the API is sysinfo.lang, which selects TSP or SCPI rather
--- than the UI, but a firmware revision that redraws the dialog and a DMM7510 whose metrics
--- differ land in the same place. Adding one is adding a number here. Membership is a few
--- integer compares against one checksum call, so the length costs nothing measurable.
+-- 80x16 rather than the whole title row, because the cost is area over a fixed call overhead
+-- -- 1.394 ms for 600x27 against 0.310 ms for 80x12 -- and smaller buys nothing. 1,280 pixels
+-- is specific enough that none of the app's own screens collide with it, so the check needs
+-- no knowledge of which screen is up and routing comes from which timer ran.
+--
+-- A list rather than one value: the patch is pixels of English text, so a firmware revision
+-- that redraws the dialog, or a model whose metrics differ, has its own checksum. Adding one
+-- is adding a number here, and membership is a few integer compares.
 fftsa.help_x1,  fftsa.help_y1 = 28, 50
 fftsa.help_x2,  fftsa.help_y2 = 108, 66
 fftsa.help_sigs  = {1575696368} -- English, DMM6500 1.7.17a at 800x480
 fftsa.help_shown = 0            -- times the key has been answered
 fftsa.help_ok    = false        -- whether the ki names the recogniser needs are present
--- Off, by the operator's decision, because the key is not worth what it costs the frame
--- rate. The poll waits on the display task -- see help_period below -- and measured 44 ms of
--- a 274 ms frame at 16,384 samples. What it buys back is that pressing HELP now leaves the
--- firmware's own dialog on the glass until EXIT is pressed, instead of the app noticing and
--- dismissing it. Set this true to get the recogniser back; it then runs at help_period, not
--- once a frame, so the cost is a dropped tick once a second rather than a sixth of the rate.
+-- Off, by the operator's decision, because the key is not worth 44 ms of a 274 ms frame at
+-- 16,384 samples. The cost is that pressing HELP leaves the firmware's own dialog on the
+-- glass until EXIT. Set this true for the recogniser back: it then runs at help_period
+-- rather than once a frame, so it costs a dropped tick a second instead of a sixth of the
+-- rate.
 fftsa.help_enabled = false
--- How often the frame polls for the dialog. Not once a frame: getchecksum waits on the
--- display task, which at that point owes the trace fill's batched messages, and the wait
--- measured 46.1 ms of a 274.3 ms frame at 16,384 samples against 0.1 ms with the call gone.
--- The gate itself is at the call site in frame_body, which is where the position matters.
+-- How often the frame polls for the dialog, and not once a frame: getchecksum waits on the
+-- display task, which at that point owes the trace fill's batched messages, measured at
+-- 46.1 ms of a 274.3 ms frame at 16,384 samples against 0.1 ms with the call gone.
 fftsa.help_period = 1.0
 fftsa.help_last   = nil
 
@@ -1163,13 +1054,12 @@ function fftsa.help_is_dialog(c)
 end
 
 -- Resolved once, by fftsa.start(). ki is undocumented and absent from the display API
--- reference, so every name is checked rather than assumed -- but checked here and not in the
--- tick, which then costs one checksum call instead of six nil tests a second. A firmware
--- without these loses the feature and nothing else.
+-- reference, so every name is checked rather than assumed -- here and not in the tick, which
+-- then costs one checksum call instead of six nil tests a second.
 function fftsa.help_probe()
   fftsa.help_ok = false
-  -- The switch first, so a disabled recogniser costs one comparison at start and nothing
-  -- per frame. Tested through help_enabled rather than by stubbing the ki names, so the
+  -- The switch first, so a disabled recogniser costs one comparison at start and nothing per
+  -- frame. Tested through help_enabled rather than by stubbing the ki names, so the
   -- recogniser stays covered while it ships off.
   if not fftsa.help_enabled then return false end
   if fftsa.help_sigs == nil or table.getn(fftsa.help_sigs) == 0 then return false end
@@ -1190,15 +1080,12 @@ function fftsa.help_dismiss()
 end
 
 -- target names the help screen to raise, or nil to dismiss the firmware's dialog and stay
--- put -- which is what a screen with no help of its own wants, so a stray press does not
--- leave a modal nobody can clear.
+-- put, which is what a screen with no help of its own wants so a stray press does not leave
+-- a modal nobody can clear.
 --
--- No clock of its own: the caller's cadence IS the rate. The spectrum screen calls this at
--- the end of a graph update, the options form off its 200 ms timer, and the screens with no
--- help of their own off theirs. A display timer fires only while its own screen shows, so
--- none of those periods cost anything on a screen that is not up. The check is one
--- getchecksum, 0.33 ms, against an 0.08 s frame at 512 samples -- 0.4% of the fastest frame
--- the app runs, which is why it needs no floor.
+-- No clock of its own: the caller's cadence is the rate. A display timer fires only while
+-- its own screen shows, so none of those periods cost anything on a screen that is not up,
+-- and the check itself is one getchecksum at 0.33 ms.
 function fftsa.help_check(target)
   if not fftsa.help_ok then return false end
   if not fftsa.help_is_dialog(ki.display.getchecksum(
@@ -1229,11 +1116,10 @@ function fftsa.sg_slow_tick()
      or (now - fftsa.sg_tick_last) >= fftsa.sg_pk_period then
     fftsa.sg_tick_last = now
     if fftsa.icons_reassert ~= nil then fftsa.icons_reassert() end
-    -- The FRONT/REAR button is pressed on the panel, not through Options, so nothing else
-    -- rewrites the line when it moves -- and the pair not selected is an open input. On
-    -- this clock rather than the gesture one: the change is a human pressing a button, so
-    -- a second of latency costs nothing and it is one attribute read a second instead of
-    -- seven. The text write happens only when the answer actually changes.
+    -- The FRONT/REAR button is pressed on the panel and not through Options, so nothing
+    -- else rewrites the line when it moves, and the pair not selected is an open input. On
+    -- this clock rather than the gesture one, a human press affording a second of latency,
+    -- and the text is written only when the answer changes.
     local term = fftsa.terminal_text()
     if term ~= fftsa.sg_term_last then
       fftsa.sg_term_last = term
@@ -1245,21 +1131,17 @@ function fftsa.sg_slow_tick()
       fftsa.sg_over_shown = fftsa.overrange
       fftsa.sg_write_xunit()
     end
-    -- Distortion and noise: the noise mean is a pass over every plotted bin, measured at
-    -- 4.3 us a bin -- 1.1 ms at 512 samples, 35 ms at 16384, 2.1% of one frame there.
-    -- That is why it is on this clock and not the frame's.
+    -- Distortion and noise: the noise mean is a pass over every plotted bin at 4.3 us a bin,
+    -- so 35 ms at 16384, which is why it is on this clock and not the frame's.
     fftsa.sg_show_thd()
     did = true
     heavy = true
   end
-  -- Two answers, because the callers want different questions. did says any of this ran, and
-  -- the gesture clock above sets it every 0.15 s. heavy says the one-a-second block ran,
-  -- which is the one that carries the noise pass and the icon re-assert.
-  --
-  -- The period rule needs heavy. Keyed on did, every frame at a count whose period is longer
-  -- than 0.15 s reads as a block frame -- which is every count from 4096 up -- so the worst
-  -- plain frame is never recorded, and pacing from it silently reverts to pacing from the
-  -- worst frame of all, exactly at the counts it was aimed at.
+  -- Two answers, because the callers want different questions: did says any of this ran, and
+  -- the gesture clock sets it every 0.15 s, while heavy says the one-a-second block ran --
+  -- the one carrying the noise pass and the icon re-assert. The period rule needs heavy, or
+  -- every frame from 4096 up reads as a block frame and the worst plain frame is never
+  -- recorded.
   return did, heavy
 end
 
@@ -1276,22 +1158,16 @@ function fftsa.sg_bind_min()
 end
 
 -- Seconds the frame stays blocked after the refill so the display task can paint it; too
--- short and the firmware posts 1706. The display task runs only while Lua is blocked, so
--- this and the timer's idle are the whole of its budget: fftsa.tick_idle reserves 20 ms of
--- every period whatever the frame cost, which at 16,384 samples is about a tenth of what a
--- fifth of the frame used to leave.
+-- short and the firmware posts 1706. That task runs only while Lua is blocked, so this and
+-- the timer's idle are the whole of its budget.
 --
--- Measured at 2048 samples, this is neutral from 5 to 20 ms -- 9.53, 9.51 and 9.52 frames a
--- second -- and costs a whole tick at 30. At 5 ms the frame grew by about 50 ms at 16,384,
--- because the task does not finish inside the shorter slice and the remainder contends with
--- the next frame's work, which is ten times what the yield saved.
---
--- And the failure is recorded, not inferred: docs/PERFORMANCE.md measures a 5 ms yield at
--- 35.6 Hz in Lua, 194 dropped-message events (1706), and a trace updating about three times
--- a second. Nothing in the app can see that happen -- fftsa.fps counts completed Lua frames
--- against the wall clock, so it would have read 35.6 while the glass showed 3. So this is
--- not a figure to shave: the saving is nothing, the loss is a stale trace, and the settings
--- line would go on reporting the rate Lua achieved.
+-- Measured at 2048 samples this is neutral from 5 to 20 ms and costs a whole tick at 30. At
+-- 5 ms the frame grows by about 50 ms at 16,384, the task not finishing inside the shorter
+-- slice and the remainder contending with the next frame's work -- ten times what the yield
+-- saved -- and docs/PERFORMANCE.md measures that case at 35.6 Hz in Lua with 194
+-- dropped-message events and a trace updating three times a second. Nothing in the app can
+-- see it: fftsa.fps counts completed Lua frames against the wall clock, so it reads 35.6
+-- while the glass shows 3. Not a figure to shave.
 fftsa.sg_yield = 0.010
 -- Given to the widget's first draw of a freshly bound trace, before any frame can clear the
 -- buffer under it. Paid once a launch, behind a load that already takes seconds.
@@ -1313,14 +1189,11 @@ fftsa.sg_peaks_off = false      -- disables the peak table, to attribute display
 
 -- One peak as (frequency in hertz, volts), or nil where there is none.
 --
--- pk_hz/pk_v are what the primitive already resolved -- sub-bin corrected in both axes, once
--- per frame, rather than the eighteen interpolations a frame the three display users below
--- used to make between them. It is the only form the app ever passes.
---
--- Without them it falls back to the bin index and interpolates here, which is the form
--- tools/test_tsp.lua drives directly. fftsa.peak_interp is in tsp/fft_interp.tsp, which the
--- archive leaves out because csrc/ does that arithmetic -- so on the instrument the fallback
--- has no interpolator to call and answers nil instead of indexing one.
+-- pk_hz/pk_v are what the primitive already resolved, sub-bin corrected in both axes once a
+-- frame rather than once per display user, and it is the only form the app passes. Without
+-- them it falls back to the bin index and interpolates here, which is the form
+-- tools/test_tsp.lua drives. fftsa.peak_interp is in tsp/fft_interp.tsp, which the archive
+-- leaves out, so on the instrument that fallback answers nil rather than indexing a nil.
 function fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
   if pk_hz ~= nil then
     local f = pk_hz[p]
@@ -1335,11 +1208,10 @@ function fftsa.sg_peak_at(p, bi, bv, binhz, pk_hz, pk_v)
   return (k - 1 + dk) * binhz, iv
 end
 
--- Refill the marker trace: one point a peak, at the frequency the peak table reports
--- rather than the column the trace drew. Sorted by frequency, because the peaks arrive
--- strongest-first and the trace is drawn with a line through it -- in amplitude order that
--- line zigzags across the plot. Filled before the spectrum refill, so the paint at the
--- frame's yield sees both buffers complete.
+-- Refill the marker trace: one point a peak, at the frequency the peak table reports rather
+-- than the column the trace drew. Sorted by frequency, because the peaks arrive
+-- strongest-first and a line through them in amplitude order zigzags across the plot. Filled
+-- before the spectrum refill, so the paint at the frame's yield sees both buffers complete.
 function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
   local mk = fftsa.sg_mk
   if mk == nil or not fftsa.sg_markers then return 0 end
@@ -1364,10 +1236,9 @@ function fftsa.sg_update_markers(bi, bv, count, binhz, pk_hz, pk_v)
     end
   end
   if n == 0 then return 0 end
-  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a
-  -- pixel above. The x values have to stay increasing or the line doubles back, so each
-  -- foot is held at or above the previous needle's -- two peaks within two pixels then
-  -- read as one slightly wider needle, which is what they look like anyway.
+  -- A needle a peak: the floor a pixel below the peak frequency, the peak, the floor a pixel
+  -- above. The x values have to stay increasing or the line doubles back, so each foot is
+  -- held at or above the previous needle's and two peaks within two pixels read as one.
   local span = fftsa.sg_fhi_hz - fftsa.sg_flo_hz
   local dx = span / fftsa.sg_plotpx
   if not (dx > 0) then dx = binhz end
@@ -1431,14 +1302,11 @@ function fftsa.sg_show_peaks(bi, bv, count, binhz, pk_hz, pk_v)
   return fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
 end
 
--- The microvolt format the peak table's volt column uses. One decimal on the 1 V and 0.1 V
--- ranges, where a whole-microvolt step throws away resolution, and whole microvolts on
--- 10 V.
---
--- One decimal and not two: the digitizer is 4.5 digits, an LSB of about 2 uV on 0.1 V and
--- 20 uV on 1 V, and the measured per-bin noise floor is 2.95 uV, so a second decimal states
--- precision the measurement does not have. The widest result is "999.9 uV", inside what
--- "%.2f mV" and "%.4f V" already print in the same field and its 82 px to the dB column.
+-- The microvolt format the peak table's volt column uses: one decimal on the 1 V and 0.1 V
+-- ranges, where a whole-microvolt step throws away resolution, and whole microvolts on 10 V.
+-- One decimal and not two, because the digitizer is 4.5 digits -- an LSB of about 2 uV on
+-- 0.1 V -- and the measured per-bin noise floor is 2.95 uV. The widest result is "999.9 uV",
+-- inside what "%.2f mV" and "%.4f V" already print in the same 82 px field.
 fftsa.sg_uv_fmt_std  = "%0.0f uV"
 fftsa.sg_uv_fmt_fine = "%0.1f uV"
 fftsa.sg_uv_fine_vmax = 1        -- the largest range that gets the decimal
@@ -1459,11 +1327,9 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       elseif f >= 1000 then ftxt = string.format("%d  %.3f kHz", p, f / 1000)
       else ftxt = string.format("%d  %.1f Hz", p, f) end
       -- An amplitude past the largest range is not a voltage, so both columns dash rather
-      -- than one of them stating a figure. The volt field is also a WIDTH matter: %.4f of
-      -- the 9.9e+37 sentinel is 45 characters where the column holds 8, and at a fixed x it
-      -- overwrites the dB column and the whole second column with it. The over-range check
-      -- upstream means neither is reached in the case this exists for; it bounds the fields
-      -- so that no value can take the layout apart.
+      -- than one of them stating a figure. It is also a width matter: %.4f of the 9.9e+37
+      -- sentinel is 45 characters where the column holds 8, and at a fixed x that overwrites
+      -- the dB column and the whole second column with it.
       local vtxt, dtxt
       if v ~= v then vtxt, dtxt = "", ""
       elseif v > fftsa.sg_vmax_real then vtxt, dtxt = "---", "--- dBV"

@@ -1,16 +1,15 @@
--- fft_interp.tsp -- the interpreted FFT, and the ONLY module that is deliberately left out
--- of the archive.
+-- fft_interp.tsp -- the interpreted FFT, and the one module deliberately left out of the
+-- archive.
 --
 -- Everything the compiled image replaces lives here: the window build, the interpolation
 -- tables, the transform, the power pass and the peak interpolation. package_tspa.py does not
--- list it, so it reaches no instrument; test_tsp.lua does, so the offline gates still drive a
+-- list it, so it reaches no instrument, and test_tsp.lua does, so the offline gates drive a
 -- real spectrum rather than a stub. It is the reference implementation and the test oracle,
--- and it is maintained as shipped code even though it does not ship.
+-- maintained as shipped code even though it does not ship.
 --
--- Loaded AFTER fft_core.tsp, which holds the window enums these read.
---
--- dsp_lua.tsp tests for fftsa.fft_init before using any of it, so an archive without this
--- module commits plans and refuses to transform rather than raising.
+-- Loaded after fft_core.tsp, which holds the window enums these read. dsp_lua.tsp tests for
+-- fftsa.fft_init before using any of it, so an archive without this module commits plans and
+-- refuses to transform rather than raising.
 fftsa = fftsa or {}   -- the single global this app exposes
 
 fftsa.fft_n      = 0      -- number of samples N (power of two)
@@ -227,7 +226,7 @@ end
 -- Everything built here is a function of N and the window alone -- no rate, no span -- so a
 -- call changing neither has nothing to do. That is the whole of the pause after an adopted
 -- gesture: 0.163 ms a sample, which is 83 ms at 512 and a measured 2.667 s at 16384.
--- Keyed on the window INDICES, all win_build() reads; win_tables() also reads the five
+-- Keyed on the window indices, all win_build() reads; win_tables() also reads the five
 -- interpolation constants, left out because nothing in the tree assigns them and a grid too
 -- short raises. Cleared on the way in, so a raise part way is not taken for a finished build.
 fftsa.fft_built_n = nil
@@ -307,34 +306,32 @@ function fftsa.fft_init(N)
   fftsa.fft_built_win, fftsa.fft_built_beta = fftsa.win_i, fftsa.kbeta_i
 end
 
--- Load N samples from a reading buffer, remove DC, window, and pack sample pairs into
--- the M complex points. Two passes, because the mean must be known before it is
--- subtracted; samples are staged in fftsa.fft_x, a buffer element costing far more to
--- read than a table entry. Returns the mean.
---
--- The mean is window-weighted, sum(w*x)/sum(w). What has to vanish is the DC of the
--- sequence the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the weighted
--- mean makes it. The arithmetic mean zeroes the true DC instead and leaves the window's
--- own DC response spread over the first few bins: a 1.000 V tone at bin 10.5 then leaves
--- a -27 dBc line at bin 1 under every window, against -147 here.
---
--- The price is that near DC the estimate is the tone, so win_tables() measures how far
--- that reaches and find_peaks() stops reporting there.
 -- The display task shares this core with the interpreter and runs only while Lua is
 -- blocked, so a stretch with no delay() in it cannot dispatch a touch -- and at 16384
 -- samples fft_load and fft_run are 0.5 s and 0.8 s of arithmetic. Hence many yield points
 -- rather than one long one, placed where the enclosing loop is cheap so the per-sample
--- inner loops are untouched. Both gates are sized so 512 samples reaches neither.
+-- inner loops are untouched.
 fftsa.fft_yield     = 0.005   -- seconds blocked at a yield point
 fftsa.fft_yield_n   = 2048    -- fft_load samples between yields
 fftsa.fft_yield_m   = 1024    -- fft_run yields per stage only above this half-length
 
+-- Load N samples from a reading buffer, remove DC, window, and pack sample pairs into the M
+-- complex points. Returns the mean.
 function fftsa.fft_load(buf)
   return fftsa.fft_load_rd(buf.readings)
 end
 
--- The load from a plain array of readings. fftsa.fft_load above is the buffer-taking
--- wrapper; this is where the weighted-mean removal and the windowing live, in one copy.
+-- The same from a plain array of readings, which is where the weighted-mean removal and the
+-- windowing live, in one copy. Two passes, because the mean has to be known before it is
+-- subtracted, and the samples are staged in fftsa.fft_x, a buffer element costing far more
+-- to read than a table entry.
+--
+-- The mean is window-weighted, sum(w*x)/sum(w). What has to vanish is the DC of the sequence
+-- the transform sees, sum(w*(x-m)) = sum(w*x) - m*sum(w), and only the weighted mean makes
+-- it: the arithmetic mean zeroes the true DC instead and leaves the window's own DC response
+-- spread over the first few bins, a 1.000 V tone at bin 10.5 leaving a -27 dBc line at bin 1
+-- against -147 here. The price is that near DC the estimate is the tone, so win_tables()
+-- measures how far that reaches and find_peaks() stops reporting there.
 function fftsa.fft_load_rd(rd)
   local N   = fftsa.fft_n
   local M   = fftsa.fft_m
@@ -493,10 +490,10 @@ end
 -- ===========================================================================
 -- The interpreted peak search and distortion figures.
 --
--- Here rather than in tsp/spectrum_ui.tsp because this module is NOT packaged:
--- package_tspa.py asserts it out of the archive, since csrc/ does this work on the
--- instrument. tools/test_tsp.lua loads it as the reference implementation the compiled
--- path is checked against, which is the only thing that still calls any of it.
+-- Here rather than in tsp/spectrum_ui.tsp because this module is not packaged:
+-- package_tspa.py asserts it out of the archive, csrc/ doing this work on the instrument.
+-- tools/test_tsp.lua loads it as the reference the compiled path is checked against, which
+-- is the only thing that calls any of it.
 -- ===========================================================================
 -- ---------- peak finder ----------
 
@@ -526,8 +523,8 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
       -- flank of an out-of-window tone does not read as a peak.
       if ml == nil then ml = -1 end
       if mr == nil then mr = -1 end
-      -- m == m and mr == mr ARE THE NaN TESTS. This firmware implements a >= b as
-      -- not (a < b), so m >= mr is TRUE when mr is a NaN and a bin beside one would be
+      -- m == m and mr == mr are the NaN tests. This firmware implements a >= b as
+      -- not (a < b), so m >= mr is true when mr is a NaN and a bin beside one would be
       -- reported as a peak. Strict > needs no guard; >= does.
       if m == m and mr == mr and m > ml and m >= mr then
         -- A tone inside the DC region leaks enough into the first reportable bin to
@@ -554,7 +551,7 @@ function fftsa.find_peaks(nbins, count, kmin, kmax)
   return bi, bv
 end
 
--- A harmonic is h times an INTERPOLATED fundamental, so it misses the bin centre and the
+-- A harmonic is h times an interpolated fundamental, so it misses the bin centre and the
 -- window spreads it: halfw is the search radius.
 fftsa.thd_halfw = 2
 
@@ -564,7 +561,7 @@ fftsa.thd_halfw = 2
 -- 16384 samples. The first null in bins is 2 for Hann, 3 for Blackman, 4 for Blk-Harris
 -- and sqrt(1 + (beta/pi)^2) for Kaiser -- 5.82 at beta 18 -- plus one bin of guard.
 --
--- Sidelobes are NOT covered and cannot be: Kaiser 4's are 30 dB down and integrate to a
+-- Sidelobes are not covered and cannot be: Kaiser 4's are 30 dB down and integrate to a
 -- 36.7 dB ceiling whatever the skirt does. That is the window, not a measurement error.
 fftsa.thd_lobes = {2, 3, 4}      -- Hann, Blackman, Blk-Harris
 
@@ -584,7 +581,7 @@ fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops 
 
 -- The fundamental must clear the per-bin noise mean by this ratio before THD and S/N mean
 -- anything: 45 dB. Measured at 16384 samples -- a shorted input's strongest bin stood
--- 17.1 dB over the mean, a FLOATING input's best surviving candidate stood 38.8 (a mains
+-- 17.1 dB over the mean, a floating input's best surviving candidate stood 38.8 (a mains
 -- harmonic at 1019 Hz, past the cutoff below), and an 8 Vp-p tone stood 117.9. The margin
 -- goes between the floating case and the tone, which is where the useful gap is.
 --
@@ -594,15 +591,6 @@ fftsa.thd_hmax  = 20      -- ceiling on harmonics; the window top usually stops 
 -- would discount legitimate quiet tones landing on multiples of 50.
 fftsa.thd_minratio = 31623
 
--- A noise bin above this multiple of the running mean is an outlier, not noise. The plain
--- mean of a windowed spectrum is set by whichever few bins carry a line's leakage skirt:
--- measured at 16384 samples with the tone off a bin centre, Hann's skirt put the reported
--- floor at -80.2 dBV over a trace sitting at -100, and swung it 62 dB purely on where the
--- tone fell between bins. Widening the skirt cannot reach it -- Hann is still 45 dB down
--- four bins out -- but clipping can, since those bins are orders of magnitude up.
---
--- Each pass tightens the threshold and the loop stops when one removes nothing. On noise
--- with no outliers the clip trims the top few per cent and costs 0.5 dB.
 -- Mains pickup is not the signal under test. A floating input reads 60 Hz at -25.4 dBV
 -- with harmonics out to 540, which made the hum the fundamental and reported its own
 -- distortion as the instrument's: 11.04% measured, over a -105.2 dBV floor. A candidate at
@@ -622,6 +610,14 @@ fftsa.thd_mains_fmax = 1000        -- above this a tone on a mains multiple is a
 -- that updates once a second. Striding holds it to a few per cent.
 fftsa.thd_nsample = 1024
 
+-- A noise bin above thd_clip times the running mean is an outlier and not noise, because the
+-- plain mean of a windowed spectrum is set by whichever few bins carry a line's leakage
+-- skirt: measured at 16384 samples with the tone off a bin centre, Hann's skirt put the
+-- reported floor at -80.2 dBV over a trace sitting at -100, and swung it 62 dB purely on
+-- where the tone fell between bins. Widening the skirt cannot reach that -- Hann is still
+-- 45 dB down four bins out -- but clipping can, those bins being orders of magnitude up.
+-- Each pass tightens the threshold and the loop stops when one removes nothing; on noise
+-- with no outliers the clip trims the top few per cent and costs 0.5 dB.
 fftsa.thd_clip  = 4
 fftsa.thd_clips = 6
 
@@ -656,8 +652,8 @@ function fftsa.thd_noise_pass(pwr, kmin, kmax, ex, nex, skirt, ceil, stride)
     while e <= nex and ex[e] + skirt < k do e = e + 1 end
     if e > nex or k < ex[e] - skirt then
       local p = pwr[k]
-      -- p == p IS THE NaN TEST. Measured on this firmware, nan >= 0 and nan <= 1/0 are
-      -- both TRUE -- it implements a >= b as not (a < b), which inverts the unordered
+      -- p == p is the NaN test. Measured on this firmware, nan >= 0 and nan <= 1/0 are
+      -- both true -- it implements a >= b as not (a < b), which inverts the unordered
       -- case -- so neither ordered guard rejects one. Strict > and < are correct, which
       -- is why the searches above can rely on them. Unguarded, one NaN bin makes the sum
       -- NaN and the whole readout degrades to NoSig; one infinity reads "inf dBV".
@@ -711,7 +707,7 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
       end
     end
   end
-  -- No fundamental is NOT the end of it: the floor is the useful number with the inputs
+  -- No fundamental is not the end of it: the floor is the useful number with the inputs
   -- disconnected, and a flat spectrum has no local maximum at all. vf nil carries that
   -- through to the noise pass with nothing excluded.
   local df, vf = 0, nil
@@ -785,11 +781,11 @@ function fftsa.thd_noise(nb, binhz, flo, fhi)
     --
     -- log10 is safe without a guard: this branch needs cnt > 0 and sum > 0 above.
     ndb = 10 * log10(mean)
-    -- NO FUNDAMENTAL, NO RATIOS. With the inputs shorted the strongest bin is a noise
+    -- No fundamental, no ratios. With the inputs shorted the strongest bin is a noise
     -- peak, and both ratios built on it are arithmetic about nothing -- 31.8% and -22 dB.
     -- The floor still reports: shorted, it is the instrument's own and the useful number.
     if vf ~= nil and vf * vf > mean * fftsa.thd_minratio then
-      -- Against the INTEGRATED noise, not the per-bin mean, so it holds still when the
+      -- Against the integrated noise, not the per-bin mean, so it holds still when the
       -- sample count changes. Harmonics are out of the sum, so this is not THD restated.
       -- The halves of both mean squares cancel in the ratio.
       -- sum * stride is the integrated noise: the sampled sum scaled back up, which is
@@ -816,7 +812,7 @@ function fftsa.dsp_install_math(dsp, ctx)
   local post, span_ok = ctx.post, ctx.span_ok
   local fft_s, out_s, peaks_s, thd_s = ctx.fft_s, ctx.out_s, ctx.peaks_s, ctx.thd_s
 
-  -- The rate DELIVERED, off the digitizer's own timestamps, which is what every reported
+  -- The rate delivered, off the digitizer's own timestamps, which is what every reported
   -- frequency is a multiple of. The read-back of digitize.samplerate does not match what
   -- arrives, so it is never the source here.
   local function measured_binwidth(cap, n)
@@ -847,10 +843,10 @@ function fftsa.dsp_install_math(dsp, ctx)
   -- YIELDS: the yields inside fft_load_rd and fft_run are what let the display task dispatch
   -- a touch, and at 16,384 samples those two are 0.5 s and 0.8 s of arithmetic.
   function dsp.spectrum(cap, trace, marks)
-    -- THE ARCHIVE SHIPS NO INTERPRETED TRANSFORM. tsp/fft_interp.tsp is left out by
-    -- package_tspa.py, so on an instrument this refuses and the compiled path is the only
-    -- one. Posted rather than raised, like every other refusal here, so the frame path
-    -- counts it and the panel says why instead of the app dying in a timer callback.
+    -- The archive ships no interpreted transform, so on an instrument this refuses and the
+    -- compiled path is the only one. Posted rather than raised, like every other refusal
+    -- here, so the frame path counts it and the panel says why instead of the app dying in
+    -- a timer callback.
     if fftsa.fft_init == nil then
       return post(dsp.EUNSUPPORTED, 'no interpreted transform in this archive')
     end
@@ -893,7 +889,7 @@ function fftsa.dsp_install_math(dsp, ctx)
     local kmin, kmax = fftsa.sg_window_bins(nb, binhz, flo, fhi)
     dsp.kmin, dsp.kmax = kmin, kmax
 
-    -- The reduction takes the MAXIMUM of the bins a segment covers. At 16,384 samples and
+    -- The reduction takes the maximum of the bins a segment covers. At 16,384 samples and
     -- 255 segments each spans 32 bins, and anything but a maximum loses a narrow tone.
     local npts = kmax - kmin + 1
     local ncol = out_s.segments
@@ -956,7 +952,7 @@ function fftsa.dsp_install_math(dsp, ctx)
     -- clear-then-refill from outside opens a window in which the graph paints a half-filled
     -- trace, which is worth designing out rather than working around.
     --
-    -- buffer.write.reading HOISTED: looked up inside the loop it is two table reads per
+    -- buffer.write.reading is hoisted: looked up inside the loop it is two table reads per
     -- point, 255 x 7 us on the instrument, and those are the only microseconds that fall
     -- inside the window where the buffer holds less than a full trace.
     local wr = buffer.write.reading
@@ -993,7 +989,7 @@ function fftsa.dsp_install_math(dsp, ctx)
   end
 
   -- Distortion, signal-to-noise and the noise floor, over the bins the peaks came from.
-  -- thd is a FRACTION of the fundamental; snr and floor are dB. Both ratios are nil when
+  -- thd is a fraction of the fundamental; snr and floor are dB. Both ratios are nil when
   -- nothing in the span is a tone, and the floor is a number regardless -- with the inputs
   -- disconnected it is the instrument's own noise and the only one of the three that means
   -- anything. A nil thd with a live snr is a tone whose harmonics all fall outside the span.

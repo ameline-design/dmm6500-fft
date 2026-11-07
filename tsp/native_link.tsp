@@ -1,19 +1,18 @@
 -- native_link.tsp -- load the native DSP binary into heap and make it callable.
 --
--- Called once at startup; sets fftsa.nl.ready when the native path is available.
--- Falls back silently on any failure: the app then uses dsp.spectrum as before.
+-- Called once at startup; sets fftsa.nl.ready when the native path is available. Every
+-- failure is recorded and swallowed, and the app reports it from the frame that needs it.
 --
--- No firmware address is written down here. The six libm entries come from FNF, which
--- finds them in the code of Lua's own math wrappers; the ki.peek8 closure and its f
--- pointer come from tostring and a read; the trampoline is self-contained PowerPC that
--- flushes the cache itself; and neither it nor the image reads the Lua stack, so the two
--- helpers that used to transport their arguments are not needed. What the call reports
--- comes back through a word of the params struct.
+-- No firmware address is written down here. The six libm entries come from FNF, which finds
+-- them in the code of Lua's own math wrappers; the ki.peek8 closure and its f pointer come
+-- from tostring and a read; the trampoline is self-contained PowerPC that flushes the cache
+-- itself. Neither it nor the image reads the Lua stack, and what the call reports comes back
+-- through a word of the params struct.
 --
--- What remains firmware-shaped is ranges and layouts, not entry points: the .text extent
--- in TEXT_LO and TEXT_HI, the heap extent the image is compiled with, the closure's f at
--- +12 and the reading-buffer descriptor offsets. Every one of those is a test that
--- refuses, so a build that moves them loses the native path and keeps the interpreter.
+-- What remains firmware-shaped is ranges and layouts, not entry points: the .text extent in
+-- TEXT_LO and TEXT_HI, the heap extent the image is compiled with, the closure's f at +12
+-- and the reading-buffer descriptor offsets. Every one of those is a test that refuses, so a
+-- build that moves them loses the native path.
 --
 -- Lua 5.0.2: no '#', no hex literals, no multi-return string.byte, math.mod not fmod.
 
@@ -61,18 +60,14 @@ fftsa.nl.FFT_FOURSTEP = 1
 -- Chunk payload is a fixed 32,768 bytes; 1024 elements follows from 32768/32.
 fftsa.nl.CHUNK_BYTES = 32768
 
--- THE ALLOCATOR ONLY GUARANTEES 16-BYTE ALIGNMENT, AND DSP_ALIGN IS 32. Measured payload
--- addresses alternate: 0x360D600 and 0x3613180 are 32-aligned, 0x36055F0, 0x360B170 and
--- 0x3603C90 are 16-aligned. dsp_native_run refuses a misaligned segment with DSPN_EBOUNDS,
--- so an arena built straight from the chunk vector works or fails depending on which
--- payload the allocator happened to put first -- it passed three times and then failed,
--- which is a coin flip rather than a regression.
+-- The allocator only guarantees 16-byte alignment and DSP_ALIGN is 32: measured payload
+-- addresses alternate between the two, and dsp_native_run refuses a misaligned segment
+-- with DSPN_EBOUNDS, so an arena built straight from the chunk vector is a coin flip.
 --
--- So every segment base is rounded up to 32 and the usable size drops by one alignment
--- unit. SEG_BYTES stays a multiple of DSP_ALIGN, and rounding up adds at most 31, so
--- align32(payload) + SEG_BYTES never leaves the payload. The same value has to go to
--- MODE_SEGS as to MODE_INIT, or the chunk count is computed for a size the arena does not
--- have.
+-- Every segment base is therefore rounded up to 32 and the usable size drops by one
+-- alignment unit. SEG_BYTES stays a multiple of DSP_ALIGN and rounding up adds at most 31,
+-- so align32(payload) + SEG_BYTES never leaves the payload. The same value has to go to
+-- MODE_SEGS as to MODE_INIT, or the chunk count is computed for a size the arena lacks.
 fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
@@ -97,13 +92,11 @@ fftsa.nl.HEAP_HI = 0
 fftsa.nl.RES_PEAKS   = 0
 fftsa.nl.RES_DOUBLES = 0
 
--- Picker index to DSP_WINDOW_*, the enum in csrc/dsp.h. A SEPARATE MAP FROM
--- fftsa.win_dsp, which goes to Keithley's dsp.WINDOW_*. The two enums coincide today and
--- nothing holds them together: spectrum_app.tsp:49 spells out what a mismatch costs --
--- the wrong window selected with nothing on the glass to say so, every amplitude out by a
--- scalloping factor. Our side of the seam gets its own map for the same reason theirs
--- does, and the window_enum gate compares this table against dsp.h so a renumbering is a
--- build failure rather than a measurement error. Index-parallel to fftsa.win_names.
+-- Picker index to DSP_WINDOW_*, the enum in csrc/dsp.h, and a separate map from
+-- fftsa.win_dsp, which goes to dsp.WINDOW_*. The two enums coincide today and nothing holds
+-- them together, so each side of the seam carries its own map; the window_enum gate
+-- compares this table against dsp.h, making a renumbering a build failure rather than a
+-- measurement error. Index-parallel to fftsa.win_names.
 fftsa.nl.WIN = {}
 fftsa.nl.WIN[1] = 1    -- DSP_WINDOW_HANN
 fftsa.nl.WIN[2] = 2    -- DSP_WINDOW_BLACKMAN
@@ -122,15 +115,12 @@ end
 -- What localnode.version answered, for a probe to report. Nothing is gated on it.
 fftsa.nl.fw_seen = nil
 
--- The cache-flush trampoline, assembled from csrc/flush_tramp.S. It pushes a range out of
--- the D-cache with dcbst, invalidates the same range in the I-cache with icbi and isyncs,
--- all in instructions of its own, so it depends on no firmware address. It takes no Lua
--- arguments: the range is the two words at TRAMP_RANGE, which nl.flush writes before the
--- call and the code reaches through a bl/mflr pair.
---
--- Position-independent and relocation-free, which csrc/tools/emit_tramp.py checks when it
--- regenerates this literal. That tool is also the gate that keeps the two in step; the
--- bytes are not editable by hand.
+-- The cache-flush trampoline, assembled from csrc/flush_tramp.S: dcbst out of the D-cache,
+-- icbi and isync over the same range in the I-cache, in instructions of its own, so it
+-- depends on no firmware address. It takes no Lua arguments -- the range is the two words at
+-- TRAMP_RANGE, which nl.flush writes before the call and the code reaches through a bl/mflr
+-- pair. Position-independent and relocation-free, which csrc/tools/emit_tramp.py checks when
+-- it regenerates this literal. The bytes are not editable by hand.
 fftsa.nl._TRAMP = '\072\000\000\012\000\000\000\000\000\000\000\000\125\104\002\166\072\000\000\005\125\040\002\166\128\105\255\240\128\137\255\244\125\104\003\166\040\004\000\000\065\130\000\068\124\163\034\020\056\165\000\031\084\165\000\052\084\099\000\052\124\102\027\120\124\000\024\108\056\099\000\032\124\003\040\064\065\128\255\244\124\000\004\172\124\000\055\172\056\198\000\032\124\006\040\064\065\128\255\244\124\000\004\172\076\000\001\044\056\096\000\000\078\128\000\032'
 fftsa.nl.TRAMP_RANGE = 4
 
@@ -154,13 +144,9 @@ fftsa.nl._DSP_RELOC_BSS_LO = 0
 fftsa.nl._DSP_RELOC_BSS_HI = 0
 
 -- ---------------------------------------------------------------------------
--- Base64, so the image costs 1.37 characters a byte in the archive instead of 4.
---
--- ki.memwrite takes its length from lua_strlen rather than strlen, so the embedded NULs a
--- binary is full of survive a Lua string either way; what does not survive is Lua 5.0.2
--- having no \xNN escape, which leaves decimal as the only literal form for raw bytes. The
--- archive's source is read and parsed at every app launch, where this is decoded once in
--- nl.init. The byte figures move with every rebuild of the image; the ratio does not.
+-- Base64, so the image costs 1.37 characters a byte in the archive instead of the 4 that
+-- decimal escapes take -- Lua 5.0.2 has no \xNN, and the archive's source is parsed at
+-- every launch where this is decoded once in nl.init.
 --
 -- No padding and no tail case: embed_native.py pads the binary to a multiple of three and
 -- emits the true length beside it, so this is a flat four-to-three mapping and the length
@@ -170,17 +156,15 @@ fftsa.nl._DSP_RELOC_BSS_HI = 0
 local B64A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 local b64map = nil
 
--- string.gsub with a function rather than a loop over string.byte: the pattern scan and
--- the assembly of the result both happen in C, so this is one Lua call per four
--- characters instead of four string.byte calls plus a table store. The map is keyed by the
--- CHARACTER, which is what the captures are, so there is no string.byte at all.
+-- string.gsub with a function rather than a loop over string.byte: the scan and the
+-- assembly both happen in C, so this is one Lua call per four characters. The map is keyed
+-- by the character, which is what the captures are, so there is no string.byte at all.
 local function b64decode(s, len)
   if s == nil or len == nil then return nil end
   local slen = string.len(s)
   if math.mod(slen, 4) ~= 0 then return nil end
-  -- Validated before the substitution, not inside it: a function replacement that returns
-  -- nil leaves the match in place, so one stray character would pass silently through as
-  -- itself rather than failing.
+  -- Validated before the substitution and not inside it: a function replacement returning
+  -- nil leaves the match in place, so a stray character would pass through as itself.
   if string.find(s, '[^A-Za-z0-9+/]') ~= nil then return nil end
   if b64map == nil then
     b64map = {}
@@ -227,17 +211,14 @@ end
 local function hx(v) return string.format('%X', v) end
 
 -- An IEEE-754 binary64 as the two 32-bit halves the target reads it back from, high half
--- first. The params struct is a wire format and Lua 5.0.2 has no way to lay out a double,
--- so every double in it crosses as a word pair; pw_double in dsp_native.c reassembles one.
+-- first: the params struct is a wire format and Lua 5.0.2 cannot lay out a double, so every
+-- double in it crosses as a word pair and pw_double in dsp_native.c reassembles one.
 --
--- math.frexp and math.ldexp are both present on 1.7.17a, measured rather than assumed. The
--- arithmetic is exact: every multiply is by a power of two, so nothing rounds and the
--- result is the bit pattern a host would have written. Checked against struct.pack in
--- csrc/tools/test_f64.lua, including the signs, the infinities and a NaN.
---
--- Subnormals flush to zero, and so does anything whose exponent overflows, to an infinity.
--- The smallest normal is 2.2e-308; what crosses here is a frequency, a decibel limit or a
--- voltage floor, and the closest any of them comes is the squared voltage floor at 1e-18.
+-- The arithmetic is exact, every multiply being by a power of two, so the result is the bit
+-- pattern a host would have written; csrc/tools/test_f64.lua checks it against struct.pack,
+-- signs, infinities and a NaN included. Subnormals flush to zero and an overflowing
+-- exponent to an infinity, which nothing crossing here comes near: the smallest value is
+-- the squared voltage floor at 1e-18 against a smallest normal of 2.2e-308.
 local function f64_words(x)
   local sign = 0
   if x < 0 then sign = 2147483648; x = -x end
@@ -280,14 +261,11 @@ local function line_hi(a, n) return line_lo(a + n - 1) + 32 end
 
 -- Progress breadcrumbs for nl.init, off unless fftsa.nl.trace is set.
 --
--- nl.init is one Lua call that installs code and then branches into it, so when it
--- bluescreens the Lua state goes with the instrument and there is nothing left to ask.
--- A PC on the glass in the heap says only that something executed garbage, and init has
--- three places that branch to a heap address. print() in TSP reaches the socket as the
--- statement runs, so a trace crosses the wire BEFORE the crash and the last line received
--- names the step. That is the only diagnostic available here short of splitting init into
--- separately-callable stages, which is worth doing for nl.reinit but would not have been
--- worth doing blind.
+-- nl.init installs code and then branches into it, so a bluescreen takes the Lua state with
+-- the instrument and there is nothing left to ask; a PC on the glass in the heap says only
+-- that something executed garbage, and init has three places that branch to a heap address.
+-- print() in TSP reaches the socket as the statement runs, so a trace crosses the wire
+-- before the crash and the last line received names the step.
 local function trace(tag, a, b)
   if not fftsa.nl.trace then return end
   local s = 'NLT|' .. tostring(tag)
@@ -319,10 +297,9 @@ end
 -- power: m + 2^52 is at most 2^53 - 1 and so exact, and scaling by a power of two rounds
 -- nothing, which makes the round trip bit-exact. check_f64.py tests both directions.
 --
--- An infinity or a NaN comes back as NIL rather than as a number. Neither can be written
--- to a display field -- a refused graph parameter is a modal dialog -- and this firmware's
--- comparisons are not IEEE for a NaN, so a NaN that got past here would not be caught by
--- the usual v ~= v test downstream either.
+-- An infinity or a NaN comes back as nil rather than as a number: neither can be written to
+-- a display field, a refused graph parameter being a modal dialog, and this firmware's
+-- comparisons are not IEEE for a NaN, so the usual v ~= v test downstream would miss it.
 local function f64_unpack(s, p)
   local b1 = string.byte(s, p)
   local b2 = string.byte(s, p + 1)
@@ -337,13 +314,10 @@ local function f64_unpack(s, p)
 end
 fftsa.nl._f64_unpack = f64_unpack
 
--- The same, out of four big-endian bytes, for a single-precision image. The reduced trace
--- is the one place dsp_real crosses to Lua as its own width: everything else in the wire
--- format is a double whatever the image was built in.
---
--- Subnormals decode exactly here rather than flushing, because unlike f64_words this is a
--- read and the values are a decibel figure and a frequency. An infinity or a NaN comes back
--- as nil, on the same grounds as above.
+-- The same, out of four big-endian bytes, for a single-precision image. The reduced trace is
+-- the one place dsp_real crosses to Lua as its own width; everything else in the wire format
+-- is a double whatever the image was built in. Subnormals decode exactly rather than
+-- flushing, this being a read, and an infinity or a NaN comes back as nil as above.
 local function f32_unpack(s, p)
   local b1 = string.byte(s, p)
   local b2 = string.byte(s, p + 1)
@@ -359,11 +333,10 @@ end
 fftsa.nl._f32_unpack = f32_unpack
 
 -- ---------------------------------------------------------------------------
--- FNF: find the firmware function behind a Lua math wrapper.
---
--- Scans a Form E closure's .text handler for the first bl targeting >= 0x00400000;
--- that is the GHS C function, double in f1 to double in f1. Works across builds as
--- long as the wrapper structure is preserved.
+-- FNF: find the firmware function behind a Lua math wrapper, by scanning a Form E closure's
+-- .text handler for the first bl targeting >= 0x00400000. That is the GHS C function,
+-- double in f1 to double in f1, and it works across builds as long as the wrapper's shape
+-- is preserved.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.FNF(fn)
   local s = tostring(fn)
@@ -393,9 +366,8 @@ fftsa.nl.MATH_NAMES = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
 
 function fftsa.nl.resolve_math()
   local fn = fftsa.nl.fn
-  -- Recorded, not tested against anything: every address below is found by reading this
-  -- build's own code, so a build this has never seen either yields six addresses or
-  -- yields fewer and loses the native path.
+  -- Recorded and not tested against anything: every address below is found by reading this
+  -- build's own code, so an unseen build either yields six or loses the native path.
   local v = nil
   if localnode ~= nil then v = localnode.version end
   fftsa.nl.fw_seen = tostring(v)
@@ -411,9 +383,8 @@ function fftsa.nl.resolve_math()
 end
 
 -- The resolved math addresses and the first words at each, as hex, for a probe to report.
--- Reading the entry back is the only check available on an address FNF derived: two of
--- them answering the same address, or one landing somewhere that is not a function
--- prologue, is visible here and nowhere else.
+-- Reading the entry back is the only check available on an address FNF derived: two of them
+-- answering alike, or one landing somewhere that is not a prologue, shows up only here.
 function fftsa.nl.fw_probe(words)
   local fn = fftsa.nl.fn
   local names = fftsa.nl.MATH_NAMES
@@ -440,14 +411,14 @@ end
 -- ---------------------------------------------------------------------------
 -- Relocation.
 --
--- On PPC32 every data reference is `lis rX,hi` plus a `lo(rX)` access, an absolute
--- address fixed at link time, and clang's PPC backend has no small-data addressing to
--- avoid that. The image is linked at zero, so each relocation target doubles as an
--- offset into it, and patching is target plus load address.
+-- On PPC32 every data reference is `lis rX,hi` plus a `lo(rX)` access, an absolute address
+-- fixed at link time, and clang's PPC backend has no small-data addressing to avoid that.
+-- The image is linked at zero, so each relocation target doubles as an offset into it and
+-- patching is target plus load address.
 --
--- The patch is applied to the Lua string before it is written, so the instrument sees
--- one ki.memwrite rather than one per relocation. Verified against hand-computed
--- answers in csrc/tools/test_relocate.lua, including the ha carry boundary.
+-- The patch is applied to the Lua string before it is written, so the instrument sees one
+-- ki.memwrite rather than one per relocation. csrc/tools/test_relocate.lua checks it against
+-- hand-computed answers, the ha carry boundary included.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.relocate(image, reloc, code_base, bss_hi)
   local out  = {}
@@ -525,29 +496,24 @@ function fftsa.nl.FINDS(lo, hi, pat)
   return out
 end
 
--- Element storage of a buffer, by content scan over the buffer's OWN first readings.
+-- Element storage of a buffer, by content scan over the buffer's own first readings.
 --
--- No fixed sentinel. The needle is reading 1 as the eight bytes the element holds, so this
--- works on a capture as well as on a buffer seeded for the purpose -- and two buffers
--- seeded alike cannot be mistaken for one another, which they could when the needle was
--- the literal 1000001.0 in every call. Only the order of the writes kept that apart: the
--- image landed on the code buffer's sentinel before the plan buffer was scanned for the
--- same one.
+-- No fixed sentinel: the needle is reading 1 as the eight bytes the element holds, so this
+-- works on a capture as well as on a buffer seeded for the purpose, and two buffers seeded
+-- alike cannot be mistaken for one another. Two passes, the arena recent allocations land
+-- in first and then the wider heap, the narrow pass being 32 MB rather than 126 MB.
 --
--- Returns the slot 0 address, or nil. Two passes: the arena recent allocations land in
--- first, then the wider heap. The narrow pass is 32 MB rather than 126 MB and has found it
--- every time so far.
---
--- CONFIRMATION USES THE EXTRA VALUES AS WELL AS THE READINGS. fftsa.sg_mkbuf seeds the
--- trace buffer with the axis floor in every element and a distinct extra in each, so
--- readings alone match at every element and the scan returns whichever lies lowest in
--- memory -- which for a two-chunk buffer is not element 0, because the second payload is
--- often below the first. A trace shifted by a whole chunk is still a plausible trace.
--- Readings nl.init seeds a buffer it means to find. It has to be at least the largest
--- FAR_INDEX below, or the one check that no small record can imitate does not apply to the
--- buffers we create for ourselves -- which are exactly the ones whose readings are a
--- regular series and so most likely to be mimicked by a statistics record. 256 writes is
--- under two milliseconds, once, at install.
+-- Confirmation uses the extra values as well as the readings, because fftsa.sg_mkbuf seeds
+-- the trace buffer with the axis floor in every element and a distinct extra in each:
+-- readings alone match at every element and the scan then returns whichever lies lowest in
+-- memory, which for a two-chunk buffer need not be element 0. A trace shifted by a whole
+-- chunk is still a plausible trace.
+
+-- Readings nl.init seeds into a buffer it means to find, which has to be at least the
+-- largest FAR_INDEX below or the check no small record can imitate does not cover the
+-- buffers this module creates for itself -- exactly the ones whose readings are a regular
+-- series and so the likeliest to be mimicked by a statistics record. 256 writes is under
+-- two milliseconds, once, at install.
 fftsa.nl.SEED_READS = 256
 
 -- Consecutive readings a hit is confirmed against, and the far indices confirmed as well.
@@ -557,16 +523,15 @@ fftsa.nl.SEED_READS = 256
 local READ_CONFIRM = 6
 local FAR_INDEX = { 64, 256 }
 
--- Returns the slot 0 address and the MEASURED element stride, or nil.
+-- Returns the slot 0 address and the measured element stride, or nil.
 --
--- has_extras IS THE CALLER'S KNOWLEDGE, not something to discover. Reading .extravalues on
--- a STYLE_STANDARD buffer posts event 4927 and the firmware puts a MODAL DIALOG on the
--- glass for it, over the running app. pcall does not help -- the firmware posts where it
--- does not raise, so the call succeeds and returns nil while the operator gets a dialog.
--- Every caller created the buffer it is asking about and knows the style it asked for.
+-- has_extras is the caller's knowledge and not something to discover: reading .extravalues
+-- on a STYLE_STANDARD buffer posts event 4927, for which the firmware puts a modal dialog
+-- on the glass over the running app, and pcall does not help where it posts rather than
+-- raises. Every caller created the buffer it is asking about.
 function fftsa.nl._find_storage(buf, has_extras)
-  -- Which term failed, for whoever reports the refusal: a sweep that answers only nil
-  -- leaves the caller saying "no descriptor" with nothing to act on.
+  -- Which term failed, for whoever reports the refusal: a sweep that answers only nil leaves
+  -- the caller saying "no descriptor" with nothing to act on.
   local n = buf.n
   fftsa.nl._stor_why = nil
   if n == nil or n < READ_CONFIRM then
@@ -586,14 +551,12 @@ function fftsa.nl._find_storage(buf, has_extras)
       if ex[i] == nil then return nil end
     end
   end
-  -- READINGS FROM THE FAR END, which is what no small record can imitate. The firmware
-  -- keeps separate 16-byte records of the same values -- the extra-value records and the
-  -- statistics accumulators -- and a seeded buffer's first six readings were MEASURED at
-  -- stride 16 at an address that is not element storage at all.
-  --
-  -- The largest index is 256, which is inside the FIRST chunk whatever the element size
-  -- turns out to be: the smallest plausible element is 8 bytes, which still puts 4096 in a
-  -- chunk. Only indices the buffer actually has are used.
+  -- Readings from the far end, which no small record can imitate: the firmware keeps
+  -- separate 16-byte records of the same values -- extra-value records, statistics
+  -- accumulators -- and a seeded buffer's first six readings are measurable at stride 16 at
+  -- an address that is not element storage at all. The largest index, 256, is inside the
+  -- first chunk whatever the element size is, the smallest plausible element of 8 bytes
+  -- still putting 4096 in a chunk. Only indices the buffer has are used.
   local far, fn = {}, 0
   for i = 1, table.getn(FAR_INDEX) do
     local j = FAR_INDEX[i]
@@ -616,22 +579,19 @@ function fftsa.nl._find_storage(buf, has_extras)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      -- 8, NOT 16. The reading at +0 is a double the firmware itself loads, so element 0
-      -- is 8-aligned; it is NOT 16-aligned, which a 16-byte filter cost an hour to learn --
-      -- the trace buffer's element 0 was measured at 0x037C71C8 and refused by its own
-      -- scan. Element 0 is not the chunk payload, so the allocator's guarantee does not
-      -- reach it. This rejects nothing real and costs nothing; the discrimination is the
-      -- extras and the far readings below.
+      -- 8 and not 16: the reading at +0 is a double the firmware itself loads, so element 0
+      -- is 8-aligned and nothing more. It is not the chunk payload, so the allocator's
+      -- guarantee does not reach it, and a 16-byte filter rejects real storage -- the trace
+      -- buffer's element 0 is measurable at 0x037C71C8. The discrimination is the extras and
+      -- the far readings below.
       if math.mod(h, 8) == 0 then
-        -- CANDIDATE STRIDES: 32 AND 24, BOTH UNCONDITIONALLY. They are the two element
-        -- sizes this firmware uses -- WRITABLE_FULL and STANDARD -- and both are measured,
-        -- 32 being the only one that can hold the extra value at +20. The discovered
-        -- offsets after them cover an element neither size matches, and they can only be
-        -- measured where readings 1 and 2 differ: with every reading equal each offset
-        -- matches and the list fills with noise. A quiet capture is exactly that case, its
-        -- first two readings often identical at 4.5 digits, which left 24 untried and no
-        -- stride able to confirm. Each candidate still gets the FULL confirmation, and
-        -- describe() then checks the winner against the descriptor's own element size.
+        -- Candidate strides 32 and 24, both unconditionally: they are the two element sizes
+        -- this firmware uses, WRITABLE_FULL and STANDARD, and 32 is the only one that can
+        -- hold the extra value at +20. The discovered offsets after them cover an element
+        -- neither size matches, and they can only be measured where readings 1 and 2 differ
+        -- -- with every reading equal each offset matches and the list fills with noise,
+        -- which is a quiet capture at 4.5 digits. Each candidate still gets the full
+        -- confirmation, and describe() checks the winner against the descriptor's elemsize.
         local cands, cn = { 32, 24 }, 2
         if rd[2] ~= rd[1] then
           local off
@@ -653,9 +613,8 @@ function fftsa.nl._find_storage(buf, has_extras)
             if not eq64(h + (far[i] - 1) * s, buf.readings[far[i]]) then good = false end
           end
           -- The extra values, which also tell two elements of a seeded buffer apart when
-          -- every reading in it is the same. They only exist in an element long enough to
-          -- hold one, so a buffer that HAS them is a buffer whose element is at least 28 --
-          -- which makes this a stride test as well as a value test.
+          -- every reading in it is the same. They only fit an element of at least 28, so
+          -- this is a stride test as well as a value test.
           if ex ~= nil then
             if s < 28 then good = false
             else
@@ -675,15 +634,11 @@ function fftsa.nl._find_storage(buf, has_extras)
   return nil
 end
 
--- The column descriptor for a buffer, from its element storage address.
--- Steps 3 to 5 of the recipe in fwmem-BUFFER.md: find the storage address as a word,
--- the descriptor starts 0x48 below it, then confirm with the two self-pointers and the
--- chunk geometry. Returns descriptor base, elemsize, perchunk, chunk vector.
--- The descriptor fields, from a base this function did not have to search for. Split out so
--- the words can be re-read without the sweep below: they are five peek32, and re-reading
--- them is how a caller picks up a chunk vector that has lengthened. The validation is the
--- same, so a base that no longer describes this buffer is refused here and the caller
--- sweeps again.
+-- The descriptor fields, from a base the caller already has. Five peek32, so re-reading
+-- them is how a caller picks up a chunk vector that has lengthened, without the sweep
+-- below. Confirmed by the two self-pointers and the chunk geometry, so a base that no
+-- longer describes this buffer is refused here and the caller sweeps again. Returns the
+-- base, elemsize, perchunk, the chunk vector and the chunk count.
 function fftsa.nl._read_desc(base, elem0)
   if base == nil then return nil end
   if W(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
@@ -701,9 +656,8 @@ end
 function fftsa.nl._find_desc(elem0)
   -- The cached base first, re-validated rather than trusted. This is the expensive half of
   -- describe(): the sweep below walks 33 MB as 32 kB reads on its first window and 133 MB on
-  -- its second, which the tree measures at about a minute. Keyed on the storage address, so
-  -- a buffer whose storage moved misses, and _read_desc refuses a base that no longer points
-  -- back at elem0 even if the key matched.
+  -- its second, about a minute. Keyed on the storage address, so a buffer whose storage
+  -- moved misses, and _read_desc refuses a stale base even if the key matched.
   local nl = fftsa.nl
   if nl._desc_of == elem0 then
     local b, es, pc, v, nc = nl._read_desc(nl._desc_at, elem0)
@@ -727,21 +681,19 @@ function fftsa.nl._find_desc(elem0)
         local elemsize = W(base + 8)
         local perchunk = W(base + 12)
         local nchunks  = W(base + 16)   -- 0x10, chunk count
-        -- PERCHUNK IS HOW MANY ELEMENTS FIT IN A CHUNK, NOT CHUNK_BYTES / 32. The payload
-        -- is a fixed 32,768 bytes but the element size is a runtime field, and a
-        -- STYLE_STANDARD element is 24 -- measured -- which does not divide it: 1365
-        -- elements fill 32,760 and leave 8 spare. Demanding an exact product was demanding
-        -- a 32-byte element, so the capture buffer's descriptor was refused and the native
-        -- path silently fell back. The test below still pins perchunk exactly: one more
-        -- element would not fit.
+        -- perchunk is how many elements fit in a chunk, which is not CHUNK_BYTES / 32: the
+        -- payload is a fixed 32,768 bytes but the element size is a runtime field, and a
+        -- STYLE_STANDARD element of 24 does not divide it -- 1365 elements fill 32,760 and
+        -- leave 8 spare. So the test is a fit and not an exact product, and it still pins
+        -- perchunk exactly, one more element not fitting.
         if elemsize ~= nil and perchunk ~= nil and nchunks ~= nil and
            nchunks > 0 and nchunks < 4096 and elemsize >= 8 and perchunk > 0 and
            elemsize * perchunk <= fftsa.nl.CHUNK_BYTES and
            elemsize * (perchunk + 1) > fftsa.nl.CHUNK_BYTES then
           -- 0x44 is the chunk vector. The count comes back with it because a caller
-          -- indexing the vector has no other way to know where it ends: reading one
-          -- entry too far returns whatever follows it in the heap, and an address that
-          -- happens to land in the heap would pass the backstop and be written to.
+          -- indexing the vector has no other way to know where it ends, and an entry too
+          -- far returns whatever follows in the heap -- which could pass the backstop and
+          -- be written to.
           nl._desc_of, nl._desc_at = elem0, base
           return base, elemsize, perchunk, W(base + 68), nchunks
         end
@@ -751,23 +703,20 @@ function fftsa.nl._find_desc(elem0)
   return nil
 end
 
--- The descriptor from the buffer's CAPACITY AND n, which are descriptor fields at +0x74 and
--- +0x78 rather than values in the record. Returns descriptor base, element 0, and the same
--- geometry _find_desc returns.
+-- The descriptor from the buffer's capacity and n, which are descriptor fields at +0x74 and
+-- +0x78 rather than values in the record. Returns the descriptor base, element 0, and the
+-- same geometry _find_desc returns.
 --
--- WHY THIS EXISTS AND WHY IT GOES FIRST. The content scan identifies storage by the
--- readings it holds, and a record whose readings are all identical cannot tell one of its
--- chunks from another: confirmation at any stride passes everywhere, so the scan returns the
--- lowest-addressed chunk, which is not chunk 0. Measured on a shorted input -- readings 1 and
--- 2 both -1.0912892195e-06, the scan answering 0x3545240 against a true element 0 of
--- 0x354D148, low by 32,520 bytes or exactly one chunk of 1355 elements. No descriptor
--- references that address, so the bind failed one step later with the storage half reporting
--- success. A quiet or shorted input is ordinary, so the capture buffer needs a route that
--- does not depend on the signal at all.
+-- This goes first because the content scan identifies storage by the readings it holds, and
+-- a record whose readings are all identical cannot tell one of its chunks from another:
+-- confirmation at any stride passes everywhere, so the scan returns the lowest-addressed
+-- chunk and that is not chunk 0. Measured on a shorted input, the scan answered 32,520 bytes
+-- low -- exactly one chunk of 1355 elements -- and no descriptor references that address, so
+-- the bind failed one step later with the storage half reporting success. A quiet or shorted
+-- input is ordinary, so the capture buffer needs a route that ignores the signal.
 --
 -- Two adjacent big-endian words make a specific needle, and _read_desc applies the same
--- validation as the other route: the storage self-pointer, both owner self-pointers and the
--- chunk geometry. 878 hits on the instrument, exactly one of them a descriptor.
+-- validation as the other route. 878 hits on the instrument, exactly one a descriptor.
 function fftsa.nl._find_desc_by_sig(buf)
   local nl = fftsa.nl
   local cap, n = buf.capacity, buf.n
@@ -801,11 +750,11 @@ end
 -- ---------------------------------------------------------------------------
 function fftsa.nl.write_params(t)
   local fn = fftsa.nl.fn
-  -- THE WORD COUNT AGAINST THE STRUCT THE COMPILER LAID OUT. PARAM_WORDS is a number in
-  -- this file and SIZEOF_PARAMS comes out of the linked image, so this is the one check
-  -- that catches a field added on one side only -- which would otherwise shift every word
-  -- after it and hand dsp_native_run a valid-looking address for something else entirely.
-  -- Skipped when SIZEOF_PARAMS is zero, which is a module with no generated code to run.
+  -- The word count against the struct the compiler laid out: PARAM_WORDS is a number in
+  -- this file and SIZEOF_PARAMS comes out of the linked image, so this is the one check that
+  -- catches a field added on one side only -- which would shift every word after it and hand
+  -- dsp_native_run a valid-looking address for something else. Skipped when SIZEOF_PARAMS is
+  -- zero, which is a module with no generated code to run.
   if fftsa.nl.SIZEOF_PARAMS ~= 0 and
      fftsa.nl.PARAM_WORDS * 4 ~= fftsa.nl.SIZEOF_PARAMS then
     return false
@@ -865,9 +814,9 @@ local function via_peek8(addr)
   -- nothing to pass; both take what they need from memory Lua wrote beforehand.
   local ok, r = pcall(ki.peek8)
   ki.poke32(slot, orig)
-  -- Whether the branch returned normally, which is all the return value can say: both
-  -- pieces of native code leave zero Lua values, so r is nil on success and nil on a
-  -- raised error. What they computed is read out of memory afterwards.
+  -- Whether the branch returned normally is all the return value can say: both pieces of
+  -- native code leave zero Lua values, so r is nil either way and what they computed is
+  -- read out of memory afterwards.
   fftsa.nl.last_call = ok
   if not ok then
     fftsa.nl.last_err = tostring(r)
@@ -883,14 +832,11 @@ local function flush(addr, len)
   local nl = fftsa.nl
   if nl.tramp == nil or nl.tramp == 0 then return false end
   if addr == nil or len == nil or len <= 0 then return false end
-  -- Refuse to flush the trampoline's own range. icbi on a line the CPU is executing from,
-  -- followed by isync, forces a re-fetch mid-function; that is the fault behind two
-  -- bluescreens. The caller has no business asking for it -- the barrier alone bootstraps
-  -- a fresh line -- so this is a refusal rather than a special case.
-  --
-  -- Line by line, not byte by byte. The flush works in whole lines, so a range ending a
+  -- Refuse to flush the trampoline's own range: icbi on a line the CPU is executing from,
+  -- followed by isync, forces a re-fetch mid-function, which bluescreens. Tested line by
+  -- line and not byte by byte, because the flush works in whole lines -- a range ending a
   -- few bytes short of the trampoline still invalidates its first line, and a byte test
-  -- passes that straight through. The image's length is whatever the compiler makes it.
+  -- would pass that straight through.
   local tlo = nl.tramp
   if line_hi(addr, len) > line_lo(tlo) and
      line_lo(addr) < line_hi(tlo, string.len(nl._TRAMP)) then
@@ -904,13 +850,11 @@ local function flush(addr, len)
 end
 fftsa.nl.flush = flush
 
--- Call native code at addr and read back the status it wrote into the params struct.
---
--- Returns the status as a signed number, or nil and a reason. Three distinct failures and
--- each says which: the branch raised, the word could not be read, and the word still
--- holds STATUS_UNSET -- the last meaning the code ran and returned without passing
--- through any exit of dsp_native_run, which is what landing in the wrong place looks
--- like from here.
+-- Call native code at addr and read back the status it wrote into the params struct, as a
+-- signed number, or nil and a reason. Three distinct failures, each naming itself: the
+-- branch raised, the word could not be read, or the word still holds STATUS_UNSET -- which
+-- means the code returned without passing any exit of dsp_native_run, and that is what
+-- landing in the wrong place looks like from here.
 local function call_native(addr)
   local nl = fftsa.nl
   local function refuse(why)
@@ -941,12 +885,11 @@ function fftsa.nl.restore_peek8()
   return true
 end
 
--- Every failure exit from nl.init comes through here. Deleting the buffers is not enough:
--- nl.entry, nl.tramp and nl.params point into chunk storage that the delete frees, so a
+-- Every failure exit from nl.init comes through here, and deleting the buffers is not
+-- enough: nl.entry, nl.tramp and nl.params point into chunk storage the delete frees, so a
 -- later via_peek8 through a stale nl.entry would branch into whatever the allocator hands
--- out next. call_dsp is gated on nl.ready and that stays false, but a dangling function
--- pointer sitting in a module table is a trap, not a guard. peek8_cls and peek8_f are kept
--- deliberately: restore_peek8 needs them, and they are firmware addresses, not heap.
+-- out next. peek8_cls and peek8_f are kept, restore_peek8 needing them, and they are
+-- firmware addresses rather than heap.
 function fftsa.nl._abort(cb, pb)
   local nl = fftsa.nl
   if pb ~= nil then pcall(function() buffer.delete(pb) end) end
@@ -964,62 +907,51 @@ function fftsa.nl._abort(cb, pb)
 end
 
 -- ---------------------------------------------------------------------------
--- Init. Called once per boot, at startup, before any frame.
+-- Init. Called once per boot, at startup, before any frame. Once per boot is conservative
+-- rather than necessary, and it stays because nothing needs a second install: nl.reinit
+-- re-plans without one, so relaxing it would buy nothing and give up a backstop.
 --
--- Once per boot is a conservative rule rather than a necessary one. It was written when
--- a second install wedged the interpreter, which the trampoline flushing its own range is
--- what caused; with that removed, an image rewritten over an already-fetched range and
--- flushed through the trampoline was measured computing correctly. The guard stays because
--- nothing needs a second install -- nl.reinit re-plans without one -- so relaxing it would
--- buy nothing and give up a backstop.
---
--- barrier_buf is accepted and validated but not used as the barrier. init fills its own
--- code buffer with three readings and uses that, because buffer.getstats is the barrier
--- only when it makes the service-task call and on an empty buffer it need not -- and the
--- caller's buffer is empty more often than not.
+-- barrier_buf is accepted and validated but not used as the barrier. init fills its own code
+-- buffer and barriers on that, because buffer.getstats is the barrier only when it makes the
+-- service-task call, which on an empty buffer it need not -- and the caller's buffer is
+-- empty more often than not.
 --
 -- Returns true with nl.ready set, or false with every heap-derived field nil'd.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg)
   local nl = fftsa.nl
 
-  -- ONE INSTALL PER BOOT, AND A MODULE FIELD CANNOT ENFORCE IT. fftsa.start() calls this
-  -- on every app start, and a stop/restart with no power cycle reloads the script, so any
-  -- flag kept in nl is gone while the heap code and its I-cache lines are not. A second
-  -- install at a fresh address wedges the interpreter: the IPC barrier drains the store
-  -- buffer to DRAM but does not invalidate the I-cache, and the trampoline cannot flush a
-  -- replacement for itself. A Lua global is the only storage scoped to the boot rather
-  -- than to the script, so that is what holds it.
+  -- One install per boot, and a module field cannot enforce it: fftsa.start() calls this on
+  -- every app start and a stop/restart with no power cycle reloads the script, so any flag
+  -- kept in nl is gone while the heap code and its I-cache lines are not. A second install
+  -- at a fresh address wedges the interpreter, the IPC barrier draining the store buffer to
+  -- DRAM without invalidating the I-cache and the trampoline being unable to flush a
+  -- replacement for itself. A Lua global is the only storage scoped to the boot rather than
+  -- the script. NLBOOT is shared with the probes on purpose: both install heap code, so
+  -- either blocks the other.
   --
-  -- Refusing leaves the app on dsp.spectrum -- degraded, and the alternative is an
-  -- instrument that answers ping and nothing else. NLBOOT is shared with the probes on
-  -- purpose: both install heap code, so either blocks the other.
-  --
-  -- THIS IS THE FIRST STATEMENT, ahead of nl.ready = false, so a refusal cannot damage an
-  -- install that is already working. Within one script session a second call would
-  -- otherwise clear ready on a good install and drop the app to the fallback for no
-  -- reason.
+  -- The first statement, ahead of nl.ready = false, so a refusal cannot damage an install
+  -- that is already working: within one script session a second call would otherwise clear
+  -- ready on a good install.
   if NLBOOT ~= nil then
     nl.boot_spent = true
-    -- Spent means installed, not unusable. nl.reattach resumes the install this boot
-    -- already made, which is what lets a relaunch run compiled instead of dropping to
-    -- dsp.spectrum for the rest of the power cycle. It validates before it believes, and
-    -- on any doubt answers false and leaves the app on the interpreted path.
+    -- Spent means installed, not unusable: nl.reattach resumes the install this boot already
+    -- made, which is what lets a relaunch run compiled at all. It validates before it
+    -- believes and answers false on any doubt.
     if nl.reattach(want_n, kind, beta, decim, method) then return true end
     return false
   end
   nl.boot_spent = false
 
   nl.ready = false
-  -- want_n sizes the ARENA, so it is the largest count the app can ask for and not the one
+  -- want_n sizes the arena, so it is the largest count the app can ask for and not the one
   -- in force: nl.reinit re-plans for anything at or below it without touching the heap,
   -- and a count above it has no arena to be planned into.
   want_n = want_n or 512
   want_nseg = want_nseg or 255
 
-  -- Decoded once and kept: the base64 is what the archive carries and this is the only
-  -- place that turns it into bytes. A second init reuses the decode rather than paying
-  -- for it again.
+  -- Decoded once and kept: the base64 is what the archive carries, and this is the only
+  -- place that turns it into bytes.
   if nl._DSP_CODE == nil and nl._DSP_CODE_B64 ~= nil then
     trace('b64', nl._DSP_CODE_B64_LEN, nl._DSP_RELOC_B64_LEN)
     nl._DSP_CODE  = b64decode(nl._DSP_CODE_B64, nl._DSP_CODE_B64_LEN)
@@ -1028,11 +960,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
   if nl._DSP_CODE == nil or string.len(nl._DSP_CODE) == 0 then return false end
   if nl._DSP_RELOC == nil then return false end
-  -- Zero or nil means the generated module never loaded, and every size below would be
-  -- wrong in a way that still produces addresses. PARAMS_SLOT and STATUS_OFF are in the
-  -- list because without them the image gets no params address and reports nothing: that
-  -- is a call into code whose one pointer is zero, which is worth refusing here rather
-  -- than discovering at the entry.
+  -- Zero or nil means the generated module never loaded, and every size below would then be
+  -- wrong in a way that still produces addresses. PARAMS_SLOT and STATUS_OFF are in the list
+  -- because without them the image gets no params address and reports nothing, which is a
+  -- call into code whose one pointer is zero.
   if nl.SIZEOF_REAL == 0 or nl.SIZEOF_PLAN == 0 or nl.SIZEOF_PARAMS == 0 or
      nl.RES_DOUBLES == 0 or nl.RES_PEAKS == 0 or
      nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
@@ -1041,14 +972,12 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
 
   -- No array has to fit a chunk whole: dsp_plan_init_segs cuts one too long for a segment
-  -- into slices, and the transform reads the capture in place rather than de-striding it.
-  -- What bounds n is the number of chunks the image reports from dsp_plan_segs at step 7,
-  -- against DSPN_MAX_SEGS; a count needing more is refused there. DSP_N_MAX is the
-  -- library's own ceiling.
+  -- into slices, and the transform reads the capture in place. What bounds n is the chunk
+  -- count dsp_plan_segs reports at step 7 against DSPN_MAX_SEGS, and a count needing more is
+  -- refused there. DSP_N_MAX is the library's own ceiling.
   local nmax = 65536
   nl.nceil = nmax
-  -- The plan struct has a chunk to itself, which is the one size still checked here: it
-  -- grew when the slice tables went into it.
+  -- The plan struct has a chunk to itself, which is the one size still checked here.
   if align8(nl.SIZEOF_PLAN) + 32 > nl.CHUNK_BYTES then
     trace('size.plan', nl.SIZEOF_PLAN)
     return false
@@ -1075,12 +1004,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   if not e then return false end
   local cls = tonumber(string.sub(s, e + 1), 16)
   if not cls then return false end
-  -- This value is written back into a live lua_CFunction pointer by every redirect, so
-  -- it is the most dangerous number in the module and it is validated before it is kept.
-  -- A single transport read is not enough: a desynchronised socket once returned a heap
-  -- address here, the restore wrote it into the dispatch path, and the next call executed
-  -- a deleted buffer's stale readings -- bc at +0 fell through to an illegal 0x00000000
-  -- at +4, PC 0x03518424. Two agreeing reads, both inside firmware .text, or refuse.
+  -- This value is written back into a live lua_CFunction pointer by every redirect, so it
+  -- is validated before it is kept, and one transport read is not enough: a desynchronised
+  -- socket can return a heap address here, which the restore then writes into the dispatch
+  -- path. Two agreeing reads, both inside firmware .text, or refuse.
   local orig_f = W(cls + 12)
   if orig_f == nil then return false end
   if not fftsa.nl._text_ok(orig_f) then return false end
@@ -1094,34 +1021,30 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   buffer.write.format(cb, buffer.UNIT_VOLT, buffer.DIGITS_6_5,
                       buffer.UNIT_VOLT, buffer.DIGITS_6_5)
   -- Distinct readings and distinct extras, nl.SEED_READS of each, because _find_storage
-  -- confirms a hit against that many and refuses a buffer it cannot tell apart element
-  -- from element.
+  -- confirms a hit against that many and refuses a buffer it cannot tell element from
+  -- element.
   local k
   for k = 1, fftsa.nl.SEED_READS do
     buffer.write.reading(cb, 1000000 + k, 3000000 + k, k, 0)
   end
 
-  -- THE BARRIER USES cb, THE BUFFER THIS FUNCTION JUST FILLED, NOT THE CALLER'S.
-  -- buffer.getstats is the barrier only when it actually makes the service-task call,
-  -- and on an empty buffer it need not. Passing defbuffer1, empty after a power cycle,
-  -- bluescreened the instrument once: the trampoline had not reached DRAM, the I-cache
-  -- filled from stale heap and the CPU executed a deleted buffer's readings. The caller
-  -- cannot be trusted to hand over a live buffer -- fftsa.start() passes fftsa.cap,
-  -- which is empty until the first capture completes -- so init no longer depends on it.
-  -- barrier_buf is still accepted, and validated rather than used, so a caller that
-  -- passes something unusable is told rather than crashed.
+  -- The barrier uses cb, the buffer this function just filled, and not the caller's:
+  -- buffer.getstats is the barrier only when it makes the service-task call, which on an
+  -- empty buffer it need not, and an empty one bluescreens the instrument -- the trampoline
+  -- never reaching DRAM, the I-cache filling from stale heap. fftsa.start() passes
+  -- fftsa.cap, empty until the first capture, so barrier_buf is validated and not used.
   if barrier_buf ~= nil and barrier_buf.n == nil then return fftsa.nl._abort(cb) end
   local bar = cb
   if bar.n == nil or bar.n < 1 then return fftsa.nl._abort(cb) end
   buffer.getstats(bar)
 
   trace('scan.code')
-  -- true: cb is STYLE_WRITABLE_FULL, seeded with distinct readings AND distinct extras.
+  -- true: cb is STYLE_WRITABLE_FULL, seeded with distinct readings and distinct extras.
   local code_base, code_stride = nl._find_storage(cb, true)
   if code_stride ~= nil and code_stride ~= 32 then
     -- The layout below places the trampoline and the params struct by byte offset inside
-    -- this chunk, which is true whatever the element size is -- but a WRITABLE_FULL element
-    -- being anything but 32 would mean the measured layout has moved under us.
+    -- this chunk, which holds whatever the element size is -- but a WRITABLE_FULL element
+    -- of anything but 32 means the measured layout has moved.
     trace('code.stride.BAD', code_stride)
     return fftsa.nl._abort(cb)
   end
@@ -1130,15 +1053,14 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.code_buf  = cb
   nl.code_base = code_base
 
-  -- 4. Layout, derived from the image rather than fixed: the image is tens of
-  --    kilobytes, so a trampoline at a fixed +256 sits inside it.
+  -- 4. Layout, derived from the image rather than fixed: the image is tens of kilobytes, so
+  --    a trampoline at a fixed +256 would sit inside it.
   --
-  -- The trampoline starts on a cache line, aligned on the absolute address rather than on
-  -- an offset, so it holds whatever the chunk payload is aligned to. The flush of the
-  -- image rounds up to a whole line, and the image ends wherever the compiler leaves it:
-  -- without this, flushing the image invalidates the trampoline's first line while the
-  -- CPU is fetching from it. nl.flush refuses that case too, so a layout mistake costs an
-  -- unflushed image rather than a bluescreen.
+  -- The trampoline starts on a cache line, aligned on the absolute address so it holds
+  -- whatever the chunk payload is aligned to. The image's flush rounds up to a whole line
+  -- and the image ends wherever the compiler leaves it, so without this, flushing the image
+  -- invalidates the trampoline's first line while the CPU is fetching from it. nl.flush
+  -- refuses that case as well, so a layout mistake costs an unflushed image.
   local img_span   = align8(nl._DSP_RELOC_BSS_HI)
   if img_span < align8(string.len(nl._DSP_CODE)) then
     img_span = align8(string.len(nl._DSP_CODE))
@@ -1150,23 +1072,21 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.params = params_at
   trace('layout', hx(tramp_at), hx(params_at))
 
-  -- 5. Trampoline first, so later writes can be flushed properly. Its own first
-  --    execution rides on the IPC barrier alone.
+  -- 5. Trampoline first, so later writes can be flushed properly. Its own first execution
+  --    rides on the IPC barrier alone.
   --
-  -- The boot is claimed here, in its own statement, before the first write rather than
-  -- after the last. A failure or a wedge from this point on has still consumed the one
-  -- install the boot allows, so refusing a retry that might have been safe is the right
-  -- way round: that costs a power cycle, and allowing one that is not costs a wedge and a
-  -- power cycle. Nothing clears NLBOOT, including _abort.
+  -- The boot is claimed here, before the first write rather than after the last: a failure
+  -- or a wedge from this point on has still consumed the one install the boot allows, and
+  -- refusing a retry that might have been safe costs a power cycle where allowing one that
+  -- is not costs a wedge and a power cycle. Nothing clears NLBOOT, _abort included.
   NLBOOT = tramp_at
   trace('tramp.write', hx(tramp_at), string.len(nl._TRAMP))
   ki.memwrite(hx(tramp_at), nl._TRAMP)
   buffer.getstats(bar)
 
-  -- Confirm the bytes are where we think before branching to them. A read goes through the
-  -- D-cache so this cannot prove DRAM visibility -- that is the barrier's job -- but it does
-  -- catch a write that landed somewhere else entirely, which otherwise costs a bluescreen
-  -- and a power cycle to discover.
+  -- Confirm the bytes are where they are expected before branching to them. A read goes
+  -- through the D-cache, so this proves nothing about DRAM visibility -- the barrier's job
+  -- -- but it catches a write that landed elsewhere, which otherwise costs a bluescreen.
   local back = ki.memread(hx(tramp_at), hx(string.len(nl._TRAMP)))
   if back ~= nl._TRAMP then
     trace('tramp.readback.BAD', (back == nil) and 'nil' or string.len(back))
@@ -1175,12 +1095,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('tramp.readback.ok')
 
   nl.tramp = tramp_at
-  -- The trampoline is never flushed, and nl.flush refuses a range covering it. icbi on a
+  -- The trampoline is never flushed, and nl.flush refuses a range covering it: icbi on a
   -- line the core is executing from, followed by isync, re-fetches the instruction stream
-  -- mid-function; that is the fault behind two bluescreens, PC trampoline+64 in one of
-  -- them. It does not need flushing either: the barrier above puts the bytes in DRAM, and
-  -- a line that has not been instruction-fetched since boot fills from there. It earns
-  -- its keep on other ranges, which is what the image needs.
+  -- mid-function, which bluescreens at trampoline+64. It needs no flush either -- the
+  -- barrier above puts the bytes in DRAM and a line not instruction-fetched since boot
+  -- fills from there.
   trace('tramp.ok')
 
   -- 6. The image, patched for this load address.
@@ -1188,9 +1107,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
                                nl._DSP_RELOC_BSS_HI)
   if img == nil then return fftsa.nl._abort(cb) end
   trace('img.reloc', string.len(img))
-  -- The params address into the word the image reads it from, patched into the bytes
-  -- before they are written so the image is never in memory with the slot unset. The
-  -- offset comes out of the linked image, from the symbol, so it follows a rebuild.
+  -- The params address into the word the image reads it from, patched into the bytes before
+  -- they are written so the image is never in memory with the slot unset. The offset comes
+  -- from the linked image's symbol, so it follows a rebuild.
   if nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
      nl.PARAMS_SLOT + 4 > string.len(img) then
     trace('params.slot.BAD', tostring(nl.PARAMS_SLOT))
@@ -1201,10 +1120,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('params.slot', nl.PARAMS_SLOT, hx(params_at))
   ki.memwrite(hx(code_base), img)
 
-  -- The slot read back before anything is called. It is the one pointer the image takes
-  -- on trust, and the entry writes a word through it: an address that landed wrong but
-  -- still inside the heap would pass the bounds test there and put that word in somebody
-  -- else's allocation. Four bytes to rule it out.
+  -- The slot read back before anything is called: it is the one pointer the image takes on
+  -- trust and the entry writes a word through it, so an address that landed wrong but still
+  -- inside the heap would pass the bounds test there. Four bytes to rule it out.
   local slot = ki.memread(hx(code_base + nl.PARAMS_SLOT), hx(4))
   if slot == nil or string.len(slot) < 4 or u32_at(slot, 1) ~= params_at then
     trace('params.slot.readback.BAD', (slot == nil) and 'nil' or hx(u32_at(slot, 1)))
@@ -1212,24 +1130,21 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
   buffer.getstats(bar)
   -- The image is a different range from the trampoline, so this is the trampoline's
-  -- legitimate use. The result is checked: a silent failure here leaves the I-cache able
-  -- to serve stale lines for the image, which is a wrong answer rather than a fault.
-  --
-  -- A failure is not fatal on a first install, because the image's lines have not been
-  -- fetched since boot either and the barrier covers them -- which is why this worked
-  -- before the flush result was ever examined. It is recorded rather than ignored.
+  -- legitimate use. Recorded rather than ignored, because a silent failure leaves the
+  -- I-cache able to serve stale lines for the image, which is a wrong answer and not a
+  -- fault. Not fatal on a first install, where the image's lines have not been fetched
+  -- since boot either and the barrier covers them.
   trace('img.flush')
   nl.flushed = flush(code_base, string.len(img))
   trace('img.flush.ok', tostring(nl.flushed))
   nl.entry = code_base
   trace('img.ok')
 
-  -- 7. How many chunks the arena needs, asked of the binary rather than guessed.
-  --    The arrays are laid out one per chunk by dsp_plan_init_segs, so the arena does
-  --    not need contiguous memory -- which it could not have, since chunk payloads are
-  --    placed independently by the allocator.
-  -- SEG_BYTES, the same value MODE_INIT gets. Asking with CHUNK_BYTES would compute a
-  -- chunk count for an arena 32 bytes per segment larger than the one actually built.
+  -- 7. How many chunks the arena needs, asked of the binary rather than guessed. The arrays
+  --    are laid out one per chunk by dsp_plan_init_segs, so the arena needs no contiguous
+  --    memory -- which it could not have, the allocator placing chunk payloads
+  --    independently. SEG_BYTES, the same value MODE_INIT gets: asking with CHUNK_BYTES
+  --    would count chunks for an arena 32 bytes per segment larger than the one built.
   nl.write_params({ mode = nl.MODE_SEGS, cap_n = want_n,
                     seg_bytes = nl.SEG_BYTES,
                     init_decim = decim or 1, init_method = method or 0 })
@@ -1243,11 +1158,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     return fftsa.nl._abort(cb)
   end
 
-  -- 8. Plan buffer: one chunk per segment, one for the plan struct and the de-strided
-  --    capture, and one for the reduction's two arrays. Three lifetimes, three chunks:
-  --    sharing the host chunk would make the largest n depend on the largest trace, and a
-  --    refusal there reads as "the native path is unavailable" with nothing to say which
-  --    of the two sizes was the one that did not fit.
+  -- 8. Plan buffer: one chunk per segment, one for the plan struct, one for the reduction's
+  --    two arrays. Three lifetimes, three chunks -- sharing the host chunk would make the
+  --    largest n depend on the largest trace, and the refusal would not say which of the
+  --    two sizes failed to fit.
   local chunks_wanted = nseg + 2
   local pb = buffer.make(chunks_wanted * 1024, buffer.STYLE_WRITABLE_FULL)
   buffer.write.format(pb, buffer.UNIT_VOLT, buffer.DIGITS_6_5,
@@ -1263,22 +1177,19 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   if pdesc == nil or pdesc.vec == nil then return fftsa.nl._abort(cb, pb) end
   trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
 
-  -- The vector has to actually hold the entries about to be read out of it. The chunk
-  -- count is the descriptor's own field at +0x10, so this is the allocator's answer and
-  -- not an inference from the capacity asked for. Without it, one entry past the end
-  -- returns whatever follows the vector in the heap, and a value that happened to look
-  -- like a heap address would pass the native backstop and be written through -- into
-  -- somebody else's allocation.
+  -- The vector has to hold the entries about to be read out of it. The chunk count is the
+  -- descriptor's own field at +0x10, so this is the allocator's answer and not an inference
+  -- from the capacity asked for: one entry past the end returns whatever follows in the
+  -- heap, and anything that looks like a heap address passes the native backstop.
   if pdesc.nchunks == nil or pdesc.nchunks < chunks_wanted then
     return fftsa.nl._abort(cb, pb)
   end
   nl.plan_buf = pb
 
-  -- Chunk payload addresses from the vector. They are not in address order and not
-  -- adjacent; dsp_plan_init_segs does not care, and nothing here may assume otherwise.
-  -- Each is checked against the heap here as well as by the native entry point, so a
-  -- bad vector is a refusal from Lua rather than a status code from a call that has
-  -- already been handed the address.
+  -- Chunk payload addresses from the vector. They are neither in address order nor
+  -- adjacent, which dsp_plan_init_segs does not care about and nothing here may assume.
+  -- Each is checked against the heap here as well as by the native entry point, so a bad
+  -- vector is a refusal from Lua rather than a status code from a call already handed it.
   local payload = {}
   local i
   for i = 1, chunks_wanted do
@@ -1292,10 +1203,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     payload[i] = a
   end
 
-  -- Segment bases rounded up to DSP_ALIGN. The allocator only guarantees 16 and dsp.c
-  -- needs 32, so a raw payload is refused with DSPN_EBOUNDS half the time depending on
-  -- which one the allocator put first. The raw payloads still define the window below --
-  -- the rounding loses addressable bytes at the front of a segment, not permission.
+  -- Segment bases rounded up to DSP_ALIGN: the allocator guarantees 16 and dsp.c needs 32,
+  -- so a raw payload is refused with DSPN_EBOUNDS half the time. The raw payloads still
+  -- define the window below, the rounding losing addressable bytes and not permission.
   local segbase = {}
   for i = 1, nseg do
     segbase[i] = align32(payload[i])
@@ -1305,9 +1215,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
 
   -- The first nseg chunks are the arena, then the plan struct, then the reduction's two
-  -- arrays. The struct has its chunk to itself: the transform reads the capture in place,
-  -- so there is no de-strided copy to place after it, and the room for that copy -- n
-  -- doubles -- is what used to bound n at 4092 whatever the arena could hold.
+  -- arrays. The struct has its chunk to itself, and nothing shares it: the transform reads
+  -- the capture in place, so there is no de-strided copy to place after it.
   local host      = align32(payload[nseg + 1])
   local plan_addr = host
   if (host - payload[nseg + 1]) + align8(nl.SIZEOF_PLAN) > nl.CHUNK_BYTES then
@@ -1315,9 +1224,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   end
 
   -- dsp_reduce writes nseg entries into each of db and hz, and the trace count is a
-  -- front-panel choice, so the room is reserved for the largest the app can ask for
-  -- rather than for the one in force. Both are dsp_real, four bytes in the shipped image;
-  -- SIZEOF_REAL comes out of the image so a single-precision build moves it.
+  -- front-panel choice, so the room is for the largest the app can ask for rather than the
+  -- one in force. Both are dsp_real, and SIZEOF_REAL comes out of the image.
   local red_host = align32(payload[nseg + 2])
   local red_db   = red_host
   local red_hz   = red_host + want_nseg * nl.SIZEOF_REAL
@@ -1392,32 +1300,24 @@ end
 -- ---------------------------------------------------------------------------
 -- Keeping an install across a relaunch.
 --
--- The code, the trampoline, the params struct and the arena all live in the chunk storage
--- of two reading buffers, and a reading buffer outlives the script that made it. So a
--- relaunch has not lost the install -- it has lost the Lua side of it, because the module
--- body rebuilds fftsa.nl and takes every address with it. Nothing but a power cycle clears
--- a global, which is where NLBOOT already lives, so the addresses go beside it.
+-- The code, the trampoline, the params struct and the arena all live in the chunk storage of
+-- two reading buffers, and a reading buffer outlives the script that made it. So a relaunch
+-- has not lost the install, only the Lua side of it: the module body rebuilds fftsa.nl and
+-- takes every address with it. Nothing but a power cycle clears a global, which is where
+-- NLBOOT already lives, so the addresses go beside it. That is what lets a second launch in
+-- one power cycle run compiled, and it needs no second install, so the hazard the
+-- one-install-per-boot rule exists for never arises.
 --
--- What this buys: a second launch in one power cycle runs compiled instead of falling back
--- to dsp.spectrum, which at 2048 samples is about 9.5 frames a second against 2.4. And it
--- needs no second install, so the hazard the one-install-per-boot rule exists for -- a
--- replacement image whose I-cache lines the trampoline cannot flush for itself -- never
--- arises. No cap on relaunches follows from that, because nothing is being allocated.
+-- Scalars, the two buffer handles, and fn, which holds the resolved firmware math addresses.
+-- Functions are deliberately not copied: they have to come from the module being loaded, or
+-- a relaunch would run the previous build's Lua.
 --
--- Scalars, the two buffer handles, and fn, which holds the resolved firmware math
--- addresses. Functions are deliberately not copied: they must come from the module being
--- loaded, or a relaunch would run the previous build's Lua.
---
--- _stor_of goes too, and it is the CAPTURE buffer's handle rather than one of ours, because
--- it is describe()'s cache key. The address that cache holds, _stor_elem0, is a number and
--- so already survived -- but without the key the `_stor_of == buf` test failed on every
--- relaunch, describe() discarded a still-valid address and swept the heap, and that sweep
--- comes back empty. Measured on the instrument: _stor_of nil with the capture buffer alive
--- at 65,536 readings and reattached true, which halted the app on every second launch.
---
--- Safe because apply() keeps that buffer for the power cycle, so its storage cannot have
--- moved; and a handle for a buffer that did go compares unequal to the live one, so a stale
--- key falls back to the sweep rather than being believed.
+-- _stor_of goes too, and it is the capture buffer's handle rather than one of this module's,
+-- because it is describe()'s cache key. The address that cache holds is a number and
+-- survives anyway, but without the key the `_stor_of == buf` test fails and describe()
+-- discards a still-valid address to sweep the heap again. Safe because apply() keeps that
+-- buffer for the power cycle, so its storage cannot have moved, and a handle for a buffer
+-- that did go compares unequal to the live one.
 function fftsa.nl.stash()
   local nl, out = fftsa.nl, {}
   local k, v
@@ -1447,28 +1347,26 @@ local function buf_alive(b)
   return ok and type(cap) == 'number' and cap > 0
 end
 
--- Resume the install this boot already made. Returns true with nl.ready set, or false,
--- having changed nothing that matters -- the caller then runs on dsp.spectrum.
+-- Resume the install this boot already made. Returns true with nl.ready set, or false
+-- having changed nothing that matters.
 --
--- Four things are checked before any of it is believed, because the alternative to a
--- refusal here is a call into whatever now occupies those addresses:
+-- Four things are checked before any of it is believed, the alternative to a refusal being
+-- a call into whatever now occupies those addresses:
 --
---   1. both buffers are still alive, so their chunk storage is still ours
+--   1. both buffers are still alive, so their chunk storage is still this module's
 --   2. the trampoline's own bytes still match the literal this module carries
 --   3. the params address still sits in the image's slot
 --   4. reinit, which calls the installed code, returns a zero status
 --
--- 2 is the one that matters most: it reads the heap where the image was written and
--- compares it with what was written there, so an image that has been overwritten fails
--- before anything is called rather than after.
+-- 2 matters most: it reads the heap where the image was written and compares it with what
+-- was written there, so an overwritten image fails before anything is called.
 function fftsa.nl.reattach(want_n, kind, beta, decim, method)
   local nl = fftsa.nl
   local s = NLSTASH
   if type(s) ~= 'table' then return false end
-  -- Everything the checks below need, including the two constants that come from the
-  -- generated module: they are taken from the stash rather than from nl, because the stash
-  -- is what the install actually used and a relaunch reloads the modules in an order this
-  -- has no business depending on.
+  -- Everything the checks below need, from the stash rather than from nl: the stash is what
+  -- the install actually used, and a relaunch reloads the modules in an order this has no
+  -- business depending on.
   if s.entry == nil or s.params == nil or s.tramp == nil or s.code_base == nil
      or s.PARAMS_SLOT == nil or s.TRAMP_RANGE == nil or s._TRAMP == nil then
     return false
@@ -1477,13 +1375,11 @@ function fftsa.nl.reattach(want_n, kind, beta, decim, method)
     trace('reattach.dead')
     return false
   end
-  -- The trampoline's code, byte for byte, read back rather than trusted.
-  --
-  -- Every byte except the two range words at nl.TRAMP_RANGE. Those are the trampoline's
-  -- arguments: nl.flush writes the address and the length into them before each call, so
-  -- the zeros the literal carries there are stale from the first flush onwards and a whole
-  -- compare can never pass. One-based here, so the words occupy TRAMP_RANGE+1 through
-  -- TRAMP_RANGE+8 and the code resumes at TRAMP_RANGE+9.
+  -- The trampoline's code, byte for byte, read back rather than trusted -- every byte
+  -- except the two range words at nl.TRAMP_RANGE, which are its arguments: nl.flush writes
+  -- the address and the length into them before each call, so the zeros the literal carries
+  -- there are stale from the first flush onwards. One-based here, so the words occupy
+  -- TRAMP_RANGE+1 through TRAMP_RANGE+8 and the code resumes at TRAMP_RANGE+9.
   local want = s._TRAMP
   local got = ki.memread(hx(s.tramp), hx(string.len(want)))
   local head, tail = s.TRAMP_RANGE, s.TRAMP_RANGE + 9
@@ -1518,17 +1414,16 @@ end
 -- Re-plan without reinstalling.
 --
 -- Only MODE_INIT depends on the sample count, the window and the beta, and all three are
--- front-panel choices: fftsa.apply() moves them on a press. The code, the trampoline, the
--- params struct and the arena are all exactly where init left them, so a press costs one
--- write_params and one call rather than a content scan, a relocation and an install -- and
--- an install is the thing that cannot be repeated without the trampoline being right.
+-- front-panel choices. The code, the trampoline, the params struct and the arena are where
+-- init left them, so a press costs one write_params and one call rather than a content
+-- scan, a relocation and an install.
 --
--- The arena was sized for the count init was given, so this only goes DOWN from nl.nmax.
--- A larger count has no arena to be planned into and is refused here rather than left to
--- dsp_plan_init_segs, which would zero the plan and leave the app with a status code.
+-- The arena was sized for the count init was given, so this only goes down from nl.nmax: a
+-- larger count has no arena to be planned into and is refused here rather than left to
+-- dsp_plan_init_segs, which would zero the plan and answer with a status code.
 --
--- nl.ready is cleared for the duration: a frame dispatched from the timer between the
--- write and the return would otherwise run against a plan being rebuilt under it.
+-- nl.ready is cleared for the duration, or a frame dispatched from the timer between the
+-- write and the return would run against a plan being rebuilt under it.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.reinit(want_n, kind, beta, decim, method)
   local nl = fftsa.nl
@@ -1576,17 +1471,17 @@ end
 --   lo, hi           the span the native code may touch in that buffer
 --   out.desc         the column descriptor base, for the cursor rewind
 --
--- Chunk payloads are placed independently by the allocator: 0x8010 is the block size, not
--- a pitch, and the second payload can sit below the first. So lo and hi span from the
--- lowest payload to the highest plus CHUNK_BYTES, and the native side additionally requires
--- each strided access to stay inside the chunk it starts in -- the span alone would permit
--- whatever else lives between two scattered payloads.
--- ---------------------------------------------------------------------------
+-- Chunk payloads are placed independently by the allocator -- 0x8010 is the block size and
+-- not a pitch, so the second payload can sit below the first. lo and hi therefore span from
+-- the lowest payload to the highest plus CHUNK_BYTES, and the native side additionally
+-- requires each strided access to stay inside the chunk it starts in, the span alone
+-- permitting whatever else lives between two scattered payloads.
+--
 -- red carries the reduction, which is everything the trace depends on and nothing the plan
--- does: nseg, the bin window k0..k1 (zero based, where the Lua implementation's bins are
--- one based), the decibel limits, the voltage floor, and the bin-to-hertz map. binhz is
--- measured per frame off the capture's own timestamps, so it is not a constant and does not
--- belong in the plan.
+-- does: nseg, the bin window k0..k1 (zero based, where the Lua implementation's bins are one
+-- based), the decibel limits, the voltage floor and the bin-to-hertz map. binhz is measured
+-- per frame off the capture's timestamps, so it is not a constant and is not in the plan.
+-- ---------------------------------------------------------------------------
 function fftsa.nl.call_dsp(cap, out, red)
   local nl = fftsa.nl
   if not nl.ready then return nil end
@@ -1594,17 +1489,16 @@ function fftsa.nl.call_dsp(cap, out, red)
   -- The record is read in place through the chunk vector, so a descriptor without one is
   -- refused here rather than reaching the entry point as a zero address.
   if cap.vec == nil or cap.nchunks == nil or cap.nchunks < 1 then return nil end
-  -- Checked here as well as natively, because a refusal from dsp_native_run arrives as a
-  -- status code after the params have been written and reads the same as a bad address.
+  -- Checked here as well as natively, a refusal from dsp_native_run arriving as a status
+  -- code after the params are written and reading the same as a bad address.
   local ns = red.nseg
   if ns == nil or ns < 1 or nl.nseg_max == nil or ns > nl.nseg_max then return nil end
   if red.binhz == nil or not (red.binhz > 0) then return nil end
   if red.k0 == nil or red.k1 == nil or red.k0 < 0 or red.k1 < red.k0 then return nil end
   if red.dbmin == nil or red.dbmax == nil or not (red.dbmin < red.dbmax) then return nil end
   -- out nil asks for the reduction and nothing else. The trace reaches the graph through
-  -- buffer.write.reading, so there is nothing for the primitive to write into a reading
-  -- buffer, and a descriptor of zero is what tells it so -- which also means no content
-  -- scan to find that buffer's storage.
+  -- buffer.write.reading, so the primitive has nothing to write into a reading buffer, and
+  -- a descriptor of zero is what tells it so -- and so no content scan for that storage.
   local out_lo, out_hi, out_ch1, out_ch2, out_per, out_desc = 0, 0, 0, 0, 0, 0
   if out ~= nil then
     out_lo, out_hi = out.lo, out.hi
@@ -1646,20 +1540,18 @@ end
 -- The figures the last run produced that are not the trace: the ranked peaks, and the
 -- distortion and noise measurement.
 --
--- ONE ki.memread for the whole block and a decode per value, rather than a pair of peek32
--- per double or a reading buffer of its own. A buffer would need a chunk, a content scan
+-- One ki.memread for the whole block and a decode per value, rather than a pair of peek32
+-- per double or a reading buffer of its own -- a buffer would need a chunk, a content scan
 -- to find it and a window to validate, and Lua can only read as many elements as the
--- descriptor says are present -- so the scalars would have to live inside the trace the
--- graph plots.
+-- descriptor says are present, so the scalars would have to live inside the plotted trace.
 --
--- The tables are allocated once and refilled, because this runs in a frame and the house
--- rule is to allocate at Apply. The peak tables are cleared to nil past the count found,
--- so a frame that finds fewer peaks than the last one cannot leave a stale row on screen.
+-- The tables are allocated once and refilled, this running in a frame, and the peak tables
+-- are cleared to nil past the count found so a frame that finds fewer peaks than the last
+-- cannot leave a stale row on screen.
 --
--- Returns nil when there is nothing to read, which is what the caller gets before the
--- first run and after a failure. thd, snr and noise are nil when the measurement did not
--- apply: 0 dB and 0% are both real answers, so the native side sends a flag per figure
--- rather than a sentinel value.
+-- Returns nil when there is nothing to read, which is what a caller gets before the first
+-- run and after a failure. thd, snr and noise are nil where the measurement did not apply:
+-- 0 dB and 0% are both real answers, so the native side sends a flag per figure.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.results()
   local nl = fftsa.nl
@@ -1704,14 +1596,12 @@ end
 -- That write is the only route onto a graph. The native side can put the same numbers into
 -- the bound buffer's chunk storage and rewind its descriptor -- the buffer then reads back
 -- correct from Lua and buf.n says the right count -- and the graph stays blank, because the
--- display task works from its own copy of a bound buffer and buffer.write.reading is what
--- feeds it. No notify call reaches a write it never saw.
+-- display task works from its own copy and no notify call reaches a write it never saw.
 --
--- A value that does not decode to a finite number fails the whole call rather than leaving
--- a hole, because a nil reaching buffer.write.reading is a posted event per point.
---
--- The tables are allocated once and refilled, since this runs in a frame. The decibels are
--- refilled every call and the frequencies only when the plan behind them moves.
+-- A value that does not decode to a finite number fails the whole call rather than leaving a
+-- hole, a nil reaching buffer.write.reading being a posted event per point. The tables are
+-- allocated once and refilled, this running in a frame: the decibels every call and the
+-- frequencies only when the plan behind them moves.
 -- ---------------------------------------------------------------------------
 function fftsa.nl.reduce(nseg)
   local nl = fftsa.nl
@@ -1734,14 +1624,11 @@ function fftsa.nl.reduce(nseg)
   local i, p
   -- The frequencies are an affine series the plan fixes: the primitive forms every one as
   -- f0 + c * fstep from two numbers it derives before the segment loop, so no sample can
-  -- change one. They are decoded once a plan rather than once a frame, which is half the
-  -- values this call used to carry.
-  --
-  -- The two elements read here are those same two numbers -- element 1 is f0 and element 2
-  -- is f0 + fstep -- so an equal pair, at an equal count and an equal address, is the same
-  -- series to the last bit. Asking the array rather than recomputing the series from the
-  -- span keeps one owner of the arithmetic: a cache that agreed with a formula here and not
-  -- with the primitive would plot the right trace against the wrong axis.
+  -- change one and they are decoded once a plan rather than once a frame. The two elements
+  -- read here are those same two numbers, so an equal pair at an equal count and address is
+  -- the same series to the last bit. Asking the array rather than recomputing the series
+  -- from the span keeps one owner of the arithmetic: a cache agreeing with a formula here
+  -- and not with the primitive would plot the right trace against the wrong axis.
   local probe = 2 * sz
   if nseg < 2 then probe = sz end
   local sp = ki.memread(hx(nl.red_hz), hx(probe))
@@ -1783,15 +1670,11 @@ end
 -- Describe a buffer's storage for call_dsp, from the content scan and descriptor walk.
 -- Returns nil if either step fails, so a caller cannot build a half-filled table.
 function fftsa.nl.describe(buf, has_extras)
-  -- The two halves cost orders of magnitude apart, so they are cached apart. Finding
-  -- storage sweeps the heap window, and its answer is a property of the allocation, which
-  -- only a replacement can move -- so it is kept against the buffer it was measured on.
-  -- Both halves sweep the heap, and both are cached, against different keys. Finding
-  -- storage is keyed on the buffer, since only a replacement moves it. Finding the
-  -- descriptor is keyed on the storage address, inside _find_desc, and its five words are
-  -- re-read every call -- which is what makes calling describe() again cheap, and is how a
-  -- chunk vector that lengthened is picked up. A chunk left outside lo..hi would be a
-  -- refusal from the entry point on every frame.
+  -- Both halves sweep the heap and both are cached, against different keys. Finding storage
+  -- is keyed on the buffer, since only a replacement moves it. Finding the descriptor is
+  -- keyed on the storage address, inside _find_desc, and its five words are re-read every
+  -- call -- which is what makes calling describe() again cheap, and is how a chunk vector
+  -- that has lengthened is picked up.
   local nl = fftsa.nl
   local elem0, stride
   -- Carried out of the signature route, which returns the descriptor with the address.
@@ -1804,8 +1687,7 @@ function fftsa.nl.describe(buf, has_extras)
     -- The signature route for a buffer with no extra values, which is the capture: its
     -- readings are whatever was on the input, and an all-identical record defeats a content
     -- scan. It answers with the descriptor too, so the second sweep is skipped. The buffers
-    -- init creates are seeded distinctly and carry extras, so they keep the content route
-    -- and the install path is unchanged.
+    -- init creates are seeded distinctly and carry extras, so they keep the content route.
     if not has_extras then
       local b, e0, es, pc, v, nc = nl._find_desc_by_sig(buf)
       if b ~= nil then
@@ -1824,39 +1706,33 @@ function fftsa.nl.describe(buf, has_extras)
   if desc == nil then
     desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
   end
-  -- Each of the two halves names itself. _find_storage sets _stor_why on its own failures
+  -- Each of the two halves names itself: _find_storage sets _stor_why on its own failures
   -- and clears it on the way in, so without these the caller reports "nil" for a refusal
-  -- that happened here rather than there.
+  -- that happened here.
   if not desc then
     nl._stor_why = 'no descriptor for elem0=' .. hx(elem0) .. ' stride=' .. tostring(stride)
     return nil
   end
-  -- TWO INDEPENDENT ANSWERS TO THE SAME QUESTION, so they have to agree: the stride the
-  -- content scan measured from the spacing of the readings, and the element size the
-  -- descriptor states. Disagreement means the hit is not this buffer's storage, or the
-  -- descriptor is not this buffer's descriptor, and either way nothing below is safe.
+  -- Two independent answers to the same question, so they have to agree: the stride measured
+  -- from the spacing of the readings, and the element size the descriptor states.
+  -- Disagreement means one of the two is not this buffer's, and nothing below is then safe.
   if elemsize ~= stride then
     nl._stor_why = 'elemsize ' .. tostring(elemsize) .. ' disagrees with stride '
                    .. tostring(stride) .. ' at elem0=' .. hx(elem0)
     return nil
   end
-  -- The window must cover both payloads, and they are scattered: the second is often
-  -- BELOW the first, measured at 0x360D600 and 0x36055F0. Taking hi from the second
-  -- unconditionally gave hi < lo, which dsp_native_run rejects as EBOUNDS, so the native
-  -- path would have failed closed on every frame and fallen back to dsp.spectrum. Span
-  -- from the lowest to the highest, the same way nl.init does it.
+  -- The window must cover every payload, and they are scattered -- the second often sits
+  -- below the first -- so it spans from the lowest to the highest, the way nl.init does it.
+  -- Taking hi from the second gives hi < lo, which dsp_native_run rejects as EBOUNDS.
   local ch2 = 0
   local lo  = elem0
   local hi  = elem0 + fftsa.nl.CHUNK_BYTES
   -- Every chunk the vector holds, because the native side reads the record in place and a
-  -- long one spans many: 16,384 readings of 24 bytes is twelve chunks. The window is what
-  -- it validates each payload address against, so a chunk left out of lo..hi is a refusal
-  -- from the entry point rather than a bad read.
-  --
-  -- Bounded by the descriptor's own chunk count at +0x10, not by the capacity asked for.
-  -- Reading one entry past the end returns whatever follows the vector in the heap, and a
-  -- value that happened to look like a heap address would widen the window -- loosening
-  -- the confinement instead of failing closed.
+  -- long one spans many: 16,384 readings of 24 bytes is twelve chunks. The window is what it
+  -- validates each payload address against, so a chunk left out of lo..hi is a refusal from
+  -- the entry point on every frame. Bounded by the descriptor's own chunk count at +0x10 and
+  -- not by the capacity asked for: one entry past the end returns whatever follows in the
+  -- heap, and anything looking like a heap address would widen the window.
   if vec ~= nil and nchunks ~= nil and nchunks >= 1 then
     local i
     for i = 1, nchunks do

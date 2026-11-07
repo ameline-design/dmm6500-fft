@@ -1,31 +1,24 @@
--- dsp_lua.tsp -- the app's signal-processing math, in a table of its own. Lua 5.0.2.
+-- dsp_lua.tsp -- the app's signal-processing interface, in a table of its own. Lua 5.0.2.
 --
--- The division this file exists for: the transform, the reduction, the peak search and the
--- distortion figures are reached through one table, dsp, and the app's data path calls
--- nothing else. Attributes to configure and one call to run, in the style of dmm.digitize --
--- commit, spectrum, plan, peak, distortion, release and lastevent, over the attribute groups
--- dsp.fft, dsp.filter, dsp.out, dsp.peaks and dsp.thd.
---
--- Keeping the math behind one table is what makes it replaceable: the app cannot reach past
--- it, so an implementation bound under the same names behaves the same or not at all.
+-- The whole data path reaches the math through one table, dsp: attributes to configure and
+-- one call to run, in the style of dmm.digitize -- commit, spectrum, plan, peak,
+-- distortion, release and lastevent, over dsp.fft, dsp.filter, dsp.out, dsp.peaks and
+-- dsp.thd. The app cannot reach past it, so an implementation bound under the same names
+-- behaves the same or not at all.
 --
 -- Nothing is installed at load time: the body is a function, so the gate at the head of
--- tsp/spectrum_app.tsp can decline to call it and leave a dsp this instrument already has.
--- There is no runtime module loading here, so the gate chooses between what the archive
--- already carries rather than loading either.
+-- tsp/spectrum_app.tsp can decline to call it and leave a dsp the instrument already has.
 --
--- The arithmetic underneath is fftsa's own, pinned by tools/test_tsp.lua, so a figure that
--- moves is whatever replaced this table and not the table. Every argument the interface
--- says is illegal is refused here too: an implementation kinder than its own rules hides
--- the defect the rules exist to catch.
+-- Every argument the interface says is illegal is refused here too, an implementation
+-- kinder than its own rules hiding the defect the rules exist to catch.
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
 function fftsa.dsp_install()
   dsp = {}
 
-  -- Return codes. Negative, so a caller can test one answer for failure, and fixed values
-  -- rather than an enum the firmware might number differently.
+  -- Negative, so a caller can test one answer for failure, and fixed rather than an enum
+  -- the firmware might number differently.
   dsp.OK, dsp.EARG, dsp.EPOW2, dsp.ENOMEM = 0, -1, -2, -3
   dsp.EUNSUPPORTED, dsp.ESHORT, dsp.EBETA = -4, -5, -6
   dsp.EDECLINE, dsp.EALIGN, dsp.EZONE = -7, -8, -9
@@ -40,15 +33,10 @@ function fftsa.dsp_install()
 
   dsp.version = 1
 
-  -- Posted rather than raised, which is the convention throughout: a raise inside
-  -- a timer or button callback posts -286 and leaves the app on screen and dead. The list
-  -- stands in for the instrument's event log so a test can assert that a refusal posted AND
-  -- returned a code.
-  -- One record, not a list. nevents stays monotonic, so a test can assert that a refusal
-  -- posted and a caller can tell a fresh one from a stale one, but the records cannot
-  -- accumulate: this app runs unattended for the rest of a power cycle and nothing reads an
-  -- event except the one lastevent() returns. Natively these go to the instrument's own
-  -- event log, which has its own bound.
+  -- Posted rather than raised, the convention throughout: a raise inside a timer or button
+  -- callback posts -286 and leaves the app on screen and dead. One record and a monotonic
+  -- count, so a test can assert a refusal posted and a caller can tell a fresh one from a
+  -- stale one without the records accumulating across an unattended power cycle.
   dsp.events = {}
   dsp.nevents = 0
   local function post(code, why)
@@ -57,32 +45,28 @@ function fftsa.dsp_install()
     return code
   end
 
-  -- The last refusal, as a code and a reason string. This is what turns a negative integer
-  -- into something that can go on the glass: fftsa.options_apply writes it behind
-  -- "APPLY FAILED:" and fftsa.frame puts the first 60 characters of it behind the HALTED
-  -- banner. Without it the operator gets "-2".
+  -- The last refusal, as a code and a reason string: what turns a negative integer into
+  -- something that can go on the glass, the operator getting "-2" otherwise.
   function dsp.lastevent()
     if dsp.nevents < 1 then return nil end
     return dsp.events[1]
   end
 
-  -- Three attribute classes, not two, and which one an attribute is in is the whole of what
-  -- a commit costs:
+  -- Which class an attribute is in is the whole of what a commit costs:
   --
   --   'tables'  fft.samples, fft.window, fft.beta, filter.decimate -- the window, the
   --             twiddles and the interpolation tables, or the size of the arena. 0.163 ms a
-  --             sample: 83 ms at 512 and a measured 2.667 s at 16384.
-  --   'filter'  fft.samplerate, filter.state/lowcutoff/highcutoff/order -- no
-  --             table depends on them, so a commit that only moved these builds nothing.
-  --   'frame'   out.*, peaks.*, thd.* -- nothing is built from them, so they are read per
-  --             call and a span gesture or a mains setting costs no rebuild at all.
+  --             sample, so a measured 2.667 s at 16384.
+  --   'filter'  fft.samplerate, filter.state/lowcutoff/highcutoff/order -- no table depends
+  --             on them, so a commit that only moved these builds nothing.
+  --   'frame'   out.*, peaks.*, thd.* -- read per call, so a span gesture or a mains
+  --             setting costs no rebuild at all.
   --
-  -- And a write that does not CHANGE the value dirties nothing. fftsa.apply() rewrites every
-  -- attribute unconditionally on every press and every adopted gesture; without this rule
-  -- each of those would force a full commit, which is the 2.667 s above.
-  -- The class is per ATTRIBUTE, not per namespace: fft.samples and fft.samplerate sit behind
-  -- one name and cost two different things. One proxy a namespace, so a read crosses one
-  -- metamethod and no more.
+  -- A write that does not change the value dirties nothing, and fftsa.apply() rewrites every
+  -- attribute unconditionally on every press and every adopted gesture: without that rule
+  -- each of those forces the full rebuild above. The class is per attribute and not per
+  -- namespace -- fft.samples and fft.samplerate cost two different things. One proxy a
+  -- namespace, so a read crosses one metamethod and no more.
   local set_times
   local function group(settable, readback, classof)
     local store, req, p = {}, {}, {}
@@ -92,15 +76,15 @@ function fftsa.dsp_install()
     setmetatable(p, {
       __index = function(_, key) return store[key] end,
       __newindex = function(_, key, val)
-        -- An unknown name is refused rather than accepted: a typo on a settings attribute is
-        -- otherwise invisible until the spectrum looks wrong.
+        -- An unknown name is refused: a typo on a settings attribute is otherwise invisible
+        -- until the spectrum looks wrong.
         if settable[key] == nil then
           post(dsp.EARG, 'not a settable attribute: ' .. tostring(key))
           return
         end
-        -- Against the REQUEST, not the read-back. filter.decimate reads back the decimation
-        -- chosen while the request is still 0, so comparing against the read-back would make
-        -- rewriting 0 look like a change to 0 from 4 and dirty the plan every press.
+        -- Against the request, not the read-back: filter.decimate reads back the decimation
+        -- chosen while the request is still 0, so comparing read-backs would make rewriting
+        -- 0 look like a change from 4 and dirty the plan on every press.
         if req[key] == val then return end
         req[key] = val
         store[key] = val
@@ -121,9 +105,8 @@ function fftsa.dsp_install()
 
   local fft_s, filter_s, out_s, peaks_s, thd_s, filter_req
   -- fft.samplerate is cheap: the rate places the taps and the band, reaching neither the
-  -- window nor the twiddles. filter.decimate is expensive despite sitting among the filter's
-  -- attributes, because it sizes the arena -- srclength follows from it, and so does
-  -- dsp_plan_bytes.
+  -- window nor the twiddles. filter.decimate is expensive despite sitting among the
+  -- filter's attributes, because it sizes the arena.
   dsp.fft, fft_s = group(
     {samples = 512, window = dsp.WINDOW_HANN, beta = 12, samplerate = 0},
     {srclength = 0, binwidth = 0, binzerohz = 0, binsense = 1, zone = 0,
@@ -134,9 +117,9 @@ function fftsa.dsp_install()
     {ntaps = 0},
     {state = 'filter', lowcutoff = 'filter', highcutoff = 'filter', order = 'filter',
      decimate = 'tables'})
-  -- dbfloor defaults to -140, not -120: the default has to clear the quietest front end in
-  -- the family, and a DMM7510 measures -134 dBV on its 0.1 V range. A caller that sets it --
-  -- which the app does every frame, from its own axis -- is unaffected.
+  -- dbfloor defaults to -140 because the default has to clear the quietest front end in the
+  -- family: a DMM7510 measures -134 dBV on its 0.1 V range. The app sets it every frame
+  -- from its own axis, so the default only matters to another caller.
   dsp.out, out_s = group({segments = 255, lowfreq = 10, highfreq = 50000,
                           dbfloor = -140, dbceil = 20, vfloor = 1e-9}, {}, 'frame')
   dsp.peaks, peaks_s = group({count = 6}, {}, 'frame')
@@ -150,30 +133,23 @@ function fftsa.dsp_install()
   dsp.ran = false             -- whether a spectrum exists for peak() and distortion()
   dsp.builds = 0              -- table rebuilds a commit has done, for the cost tests
 
-  -- 0.163 ms a sample, measured; docs/PERFORMANCE.md has it. Zero when the tables a commit
-  -- would build are already the ones in force, which is every adopted gesture and most
-  -- presses -- so a caller can tell a commit it has to cover the screen for from one it
-  -- does not.
+  -- 0.163 ms a sample, measured; docs/PERFORMANCE.md has it. Zero when the tables are
+  -- already the ones in force, so a caller can tell a commit it must cover the screen for
+  -- from one it need not.
   local function commit_cost(n)
-    -- Nothing to build when tsp/fft_interp.tsp is not in the archive, which is the shipped
-    -- case: the tables this cost is for are the interpreted transform's.
+    -- The tables are the interpreted transform's, and that module is not in the archive.
     if fftsa.fft_init == nil then return 0 end
     if dsp.dirty_tables or not dsp.built then return 0.163e-3 * (n or 0) end
     return 0
   end
 
-  -- Seconds one spectrum() costs at the plan in force, which is the model
-  -- docs/PERFORMANCE.md calibrates: 0.080 s at 512 against 0.079 measured and 1.63 s at
-  -- 16384 against 1.686.
-  --
-  -- THE WHOLE FRAME, not the transform alone: the model was calibrated against frames, and
-  -- splitting it into a primitive's share and the app's would be re-deriving a measured
-  -- figure without measuring. Switch day re-derives it against the native path, which is
-  -- what docs/PERFORMANCE.md's phase table is for.
+  -- Seconds one spectrum() costs at the plan in force, the model docs/PERFORMANCE.md
+  -- calibrates: 1.63 s at 16384 against 1.686 measured. The whole frame and not the
+  -- transform alone, because that is what it was calibrated against.
   local function spectrum_cost(n)
-    -- The model is of the INTERPRETED frame, so it describes nothing when that module is not
-    -- in the archive. Zero, and frame_estimate falls through to its own floor: the modelled
-    -- period was 0.407 s at 4096 against a real compiled frame of 0.037.
+    -- A model of the interpreted frame describes nothing without that module: zero, and
+    -- frame_estimate falls through to its own floor. Modelled 0.407 s at 4096 against a
+    -- compiled frame of 0.037.
     if fftsa.fft_init == nil then return 0 end
     if n == nil or n < 2 then n = 512 end
     local log2n = math.log(n) / 0.69314718055995
@@ -185,19 +161,16 @@ function fftsa.dsp_install()
   end
   set_times()
 
-  -- THE WINDOW ENUM IS NOT THE PICKER INDEX. dsp.WINDOW_HANN happens to be 1 and
-  -- fftsa.win_names[1] happens to be "Hann", and relying on that coincidence means a native
-  -- enum numbered differently selects the wrong window with nothing on the glass to say so --
-  -- every amplitude wrong by a scalloping factor. Mapped, in both directions, one map on each
-  -- side of the seam: this one, and fftsa.win_to_dsp in tsp/spectrum_app.tsp.
+  -- The enum back to the picker index: the other half of the map, fftsa.win_to_dsp, is in
+  -- tsp/spectrum_app.tsp. That the two coincide today is a coincidence.
   local win_of = {}
   win_of[dsp.WINDOW_HANN] = 1
   win_of[dsp.WINDOW_BLACKMAN] = 2
   win_of[dsp.WINDOW_BLACKMAN_HARRIS] = 3
   win_of[dsp.WINDOW_KAISER] = 4
 
-  -- One of the six betas the shipped window builder has tables for. The C library takes any
-  -- beta in its range, so this is the Lua implementation's limit rather than the API's.
+  -- One of the six betas the Lua window builder has tables for. The C library takes any
+  -- beta in its range, so this is that implementation's limit and not the interface's.
   local function beta_index(b)
     local i
     for i = 1, table.getn(fftsa.kbetas) do
@@ -213,16 +186,15 @@ function fftsa.dsp_install()
     return t == n
   end
 
-  -- The span, read per call rather than at commit. Passed on to the bin-window arithmetic
-  -- rather than written into the display's own fields: fftsa.sg_window_bins is the single
-  -- owner of the ceil/floor convention and takes the span as arguments, so nothing about the
-  -- display reaches in here and nothing here reaches back out.
+  -- The span, read per call rather than at commit, and passed to the bin-window arithmetic
+  -- as arguments: fftsa.sg_window_bins is the single owner of the ceil/floor convention, so
+  -- nothing about the display reaches in here and nothing here reaches back out.
   local function span_ok()
     local flo, fhi = out_s.lowfreq, out_s.highfreq
     return (fhi > flo) and (flo >= 0)
   end
 
-  -- Build the window, the interpolation tables, the twiddles and the filter taps. The slow
+  -- Build the window, the interpolation tables, the twiddles and the filter taps: the slow
   -- call, and the one a frame must never make.
   function dsp.commit()
     local n = fft_s.samples
@@ -246,38 +218,34 @@ function fftsa.dsp_install()
     if out_s.segments < 2 then return post(dsp.EARG, 'out.segments below 2') end
     if peaks_s.count < 1 then return post(dsp.EARG, 'peaks.count below 1') end
 
-    -- The acquisition rate has to be known HERE: the decimation, the tap count and so
-    -- srclength all follow from it, and the caller needs srclength before it acquires.
+    -- The rate has to be known here: the decimation, the tap count and so srclength all
+    -- follow from it, and the caller needs srclength before it acquires.
     local fs = fft_s.samplerate
     if type(fs) ~= 'number' or not (fs > 0) then
       return post(dsp.EARG, 'fft.samplerate is needed to place the band and the taps')
     end
 
-    -- Refused rather than ignored: a filter silently left out reads as a flat passband that is
-    -- really the unfiltered record aliased into the band.
+    -- Refused rather than ignored: a filter silently left out reads as a flat passband that
+    -- is really the unfiltered record aliased into the band.
     if filter_s.state ~= dsp.OFF and filter_s.state ~= false then
       return post(dsp.EUNSUPPORTED, 'no filter in this implementation')
     end
     local binhz = fs / n
 
-    -- Set before fft_init, which keys its cache on them. This is the one place the window
-    -- enum becomes the shipped index, and it happens on every commit so the two cannot
-    -- drift even when the expensive rebuild below is skipped.
+    -- Set before fft_init, which keys its cache on them, and on every commit so the two
+    -- cannot drift even when the rebuild below is skipped.
     fftsa.win_i, fftsa.kbeta_i = wi, bi
-    -- EXPENSIVE, and only when something it is built from moved. fft_init has its own cache
-    -- on (n, win_i, kbeta_i), so a commit whose only change was the decimation costs the
-    -- taps alone even though decimate is in the expensive class for the arena's sake.
-    -- Guarded, because tsp/fft_interp.tsp is not in the archive: a commit still has to
-    -- settle srclength and the bin width for the caller that is about to acquire, whether or
-    -- not anything here can transform the record.
+    -- The expensive call, and only when something it is built from moved. Guarded because
+    -- tsp/fft_interp.tsp is not in the archive: a commit still has to settle srclength and
+    -- the bin width for the caller about to acquire, transform or no transform.
     if (dsp.dirty_tables or not dsp.built) and fftsa.fft_init ~= nil then
       fftsa.fft_init(n)
       dsp.builds = dsp.builds + 1
     end
     -- With no filter the record the caller must acquire is the transform length itself.
     fft_s.srclength = n
-    -- Provisional. spectrum() measures the rate the digitizer actually delivered and
-    -- replaces this, which is the only timebase the instrument has.
+    -- Provisional: spectrum() replaces it with the rate measured off the capture's own
+    -- timestamps, which is the only timebase the instrument has.
     fft_s.binwidth = binhz
     fft_s.binzerohz, fft_s.binsense, fft_s.zone = 0, 1, 0
     fft_s.spectrumtime = spectrum_cost(n)
@@ -294,17 +262,13 @@ function fftsa.dsp_install()
 
 
   -- Release the plan: the arena goes, the attributes keep their values, and nothing runs
-  -- until commit() again. A plan-attribute write marks the plan dirty and does NOT come
-  -- here -- only this call and a commit that needs a different size free anything, which is
-  -- what keeps a re-plan from opening a window where a smaller arena has been given back
-  -- and the larger one is not yet allocated.
-  --
-  -- In Lua the arena is these tables and they are garbage once dropped; natively it is one
-  -- allocation, leaked per launch for the rest of the power cycle if nobody releases it.
-  -- fftsa.stop() is the caller, and fftsa.start() opens with a stop().
+  -- until commit() again. A plan-attribute write only marks the plan dirty, so nothing is
+  -- freed outside this call and a commit that needs a different size -- which is what keeps
+  -- a re-plan from opening a window with the smaller arena given back and the larger one
+  -- not yet allocated. Natively the arena is one allocation, leaked for the rest of the
+  -- power cycle if nobody releases it; fftsa.start() opens with the stop() that does.
   function dsp.release()
-    -- The interpreted implementation's arena, where that module is loaded at all. In the
-    -- archive it is absent, so there is nothing of its to give back.
+    -- Absent from the archive, so there is nothing of the interpreted arena to give back.
     if type(fftsa.dsp_release_math) == 'function' then fftsa.dsp_release_math() end
     dsp.st_v, dsp.st_f = nil, nil
     dsp.dirty, dsp.dirty_tables, dsp.dirty_filter = true, true, true
@@ -314,12 +278,11 @@ function fftsa.dsp_install()
   end
 
 
-  -- The transform, the peak search and the distortion figures are NOT in this archive.
-  -- tsp/fft_interp.tsp carries them and package_tspa.py leaves it out, because csrc/ does
-  -- that work on the instrument -- so dsp.spectrum, dsp.peak and dsp.distortion are nil
-  -- here and the app's callers test for the native results instead of asking for them.
-  -- Bound when the harness has loaded that module, which is what keeps the pinned
-  -- arithmetic in tools/test_tsp.lua pinned to a real implementation.
+  -- The transform, the peak search and the distortion figures are not in this archive:
+  -- csrc/ does that work on the instrument, so package_tspa.py leaves tsp/fft_interp.tsp
+  -- out and dsp.spectrum, dsp.peak and dsp.distortion are nil here -- which the app's
+  -- callers test for. Bound when the harness has loaded that module, which is what keeps
+  -- the arithmetic tools/test_tsp.lua pins pinned to a real implementation.
   if type(fftsa.dsp_install_math) == 'function' then
     fftsa.dsp_install_math(dsp, {post = post, span_ok = span_ok, fft_s = fft_s,
                                  out_s = out_s, peaks_s = peaks_s, thd_s = thd_s})

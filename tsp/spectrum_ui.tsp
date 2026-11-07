@@ -1,14 +1,14 @@
--- spectrum_ui.tsp -- the loading cover and the peak finder.
+-- spectrum_ui.tsp -- the loading cover.
+--
+-- A screen holding nothing but a line of text, kept in front while the real screens are
+-- built and while Apply reconfigures the hardware. Creating a screen makes it active, so
+-- every screen build raises this again before its first child, or the operator watches a
+-- screen assemble itself one create at a time. Made once and deleted once by stop(): raising
+-- it is a changescreen and nothing else, a create/delete per raise churning the 463-object
+-- pool.
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
--- ---------- loading cover ----------
--- A screen holding nothing but a line of text, kept in front while the real screens are
--- built and while Apply rebuilds the window tables. Creating a screen makes it active, so
--- every screen build raises this again before its first child, or the operator watches a
--- screen assemble itself one create at a time. Made once, deleted once by stop(); raising
--- it is a changescreen and nothing else, since a create/delete per raise would churn the
--- 463-object pool.
 if fftsa.load_handles_inited == nil then
   fftsa.loadscr = nil
   fftsa.loadtxt = nil
