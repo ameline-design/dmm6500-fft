@@ -1558,6 +1558,12 @@ function fftsa.options()
   display.changescreen(fftsa.optscr)
   delay(fftsa.sg_yield)
   fftsa.opt_fill(fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i, fftsa.kbeta_i, fftsa.n)
+  -- Counted so the remaining first-press lag can be measured rather than described. It is
+  -- only the FIRST open that is slow, which rules out the press and the fill -- both cost the
+  -- same every time -- and points at work the display task does once per screen. A probe
+  -- timing that has to know whether this open is the first, and asking is cheaper than
+  -- arranging a launch and trusting it.
+  fftsa.opt_opens = (fftsa.opt_opens or 0) + 1
   return true
 end
 
