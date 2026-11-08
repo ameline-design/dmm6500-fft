@@ -1813,9 +1813,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- empty buffer it need not, and an empty one bluescreens the instrument -- the trampoline
   -- never reaching DRAM, the I-cache filling from stale heap. fftsa.start() passes
   -- fftsa.cap, empty until the first capture, so barrier_buf is validated and not used.
-  if barrier_buf ~= nil and barrier_buf.n == nil then return fftsa.nl._abort(cb) end
+  if barrier_buf ~= nil and barrier_buf.n == nil then
+    return fftsa.nl._abort(cb, nil, 'the barrier buffer passed in has no n: it is not a '
+                           .. 'live reading buffer')
+  end
   local bar = cb
-  if bar.n == nil or bar.n < 1 then return fftsa.nl._abort(cb) end
+  if bar.n == nil or bar.n < 1 then
+    return fftsa.nl._abort(cb, nil, 'the code buffer seeded to ' .. tostring(bar.n)
+                           .. ' readings, so buffer.write.reading is not storing')
+  end
   buffer.getstats(bar)
 
   trace('scan.code')
@@ -1826,9 +1832,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     -- this chunk, which holds whatever the element size is -- but a WRITABLE_FULL element
     -- of anything but 32 means the measured layout has moved.
     trace('code.stride.BAD', code_stride)
-    return fftsa.nl._abort(cb)
+    return fftsa.nl._abort(cb, nil, 'the code buffer element is ' .. tostring(code_stride)
+                           .. ' bytes, not 32, so the trampoline and params layout inside '
+                           .. 'its chunk has moved')
   end
-  if not code_base then return fftsa.nl._abort(cb) end
+  if not code_base then
+    return fftsa.nl._abort(cb, nil, 'code buffer: no storage found -- '
+                           .. tostring(nl._stor_why) .. ' inst=' .. hx(nl.inst or 0)
+                           .. ' ' .. fftsa.nl.windows_str())
+  end
   trace('code_base', hx(code_base))
   nl.code_buf  = cb
   nl.code_base = code_base
@@ -1848,7 +1860,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local tramp_at   = align32(code_base + img_span)
   local params_at  = tramp_at + align8(string.len(nl._TRAMP))
   local span       = (params_at - code_base) + nl.PARAM_WORDS * 4
-  if span > nl.CHUNK_BYTES then return fftsa.nl._abort(cb) end
+  if span > nl.CHUNK_BYTES then
+    return fftsa.nl._abort(cb, nil, 'the image, trampoline and params need '
+                           .. tostring(span) .. ' bytes of a ' .. tostring(nl.CHUNK_BYTES)
+                           .. '-byte chunk')
+  end
   nl.params = params_at
   trace('layout', hx(tramp_at), hx(params_at))
 
@@ -1870,7 +1886,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local back = ki.memread(hx(tramp_at), hx(string.len(nl._TRAMP)))
   if back ~= nl._TRAMP then
     trace('tramp.readback.BAD', (back == nil) and 'nil' or string.len(back))
-    return fftsa.nl._abort(cb)
+    return fftsa.nl._abort(cb, nil, 'the trampoline read back '
+                           .. ((back == nil) and 'nil' or tostring(string.len(back)))
+                           .. ' bytes of ' .. tostring(string.len(nl._TRAMP))
+                           .. ' at ' .. hx(tramp_at) .. ': the write landed elsewhere')
   end
   trace('tramp.readback.ok')
 
@@ -1885,7 +1904,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- 6. The image, patched for this load address.
   local img, err = nl.relocate(nl._DSP_CODE, nl._DSP_RELOC, code_base,
                                nl._DSP_RELOC_BSS_HI)
-  if img == nil then return fftsa.nl._abort(cb) end
+  if img == nil then
+    return fftsa.nl._abort(cb, nil, 'relocation refused: ' .. tostring(err))
+  end
   trace('img.reloc', string.len(img))
   -- The params address into the word the image reads it from, patched into the bytes before
   -- they are written so the image is never in memory with the slot unset. The offset comes
@@ -1893,7 +1914,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   if nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
      nl.PARAMS_SLOT + 4 > string.len(img) then
     trace('params.slot.BAD', tostring(nl.PARAMS_SLOT))
-    return fftsa.nl._abort(cb)
+    return fftsa.nl._abort(cb, nil, 'the params slot is ' .. tostring(nl.PARAMS_SLOT)
+                           .. ' in an image of ' .. tostring(string.len(img))
+                           .. ': the generated module does not match the image')
   end
   img = string.sub(img, 1, nl.PARAMS_SLOT) .. u32_pack(params_at) ..
         string.sub(img, nl.PARAMS_SLOT + 5)
@@ -1906,7 +1929,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local slot = ki.memread(hx(code_base + nl.PARAMS_SLOT), hx(4))
   if slot == nil or string.len(slot) < 4 or u32_at(slot, 1) ~= params_at then
     trace('params.slot.readback.BAD', (slot == nil) and 'nil' or hx(u32_at(slot, 1)))
-    return fftsa.nl._abort(cb)
+    return fftsa.nl._abort(cb, nil, 'the params slot read back '
+                           .. ((slot == nil) and 'nil' or hx(u32_at(slot, 1)))
+                           .. ' and not ' .. hx(params_at) .. ': the image landed wrong')
   end
   buffer.getstats(bar)
   -- The image is a different range from the trampoline, so this is the trampoline's
@@ -1935,7 +1960,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     -- Zero means no chunk can hold one of the arrays: the window is n * 8 bytes, so
     -- this is the bound on n rather than a failure of the mechanism.
     nl.nmax = 0
-    return fftsa.nl._abort(cb)
+    return fftsa.nl._abort(cb, nil, 'MODE_SEGS answered ' .. tostring(nseg)
+                           .. ' segments for n=' .. tostring(want_n) .. ' at '
+                           .. tostring(nl.SEG_BYTES) .. ' bytes a segment: no chunk holds '
+                           .. 'one of the arrays')
   end
 
   -- 8. Plan buffer: one chunk per segment, one for the plan struct, one for the reduction's

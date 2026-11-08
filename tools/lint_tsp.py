@@ -140,6 +140,51 @@ def check_globals(code, name):
     return errs
 
 
+def strip_comments_only(src):
+    """Comments out, STRINGS LEFT IN. strip() blanks string literals too, which is right for
+    counting block keywords and wrong here: a reason is usually a bare string literal, so
+    against stripped source every refusal looks silent."""
+    src = re.sub(r'--\[\[.*?\]\]', ' ', src, flags=re.S)
+    return re.sub(r'--[^\n]*', '', src)
+
+
+def check_silent_refusals(code, name):
+    """Every refusal has to name itself.
+
+    nl.init has over twenty ways to give up before any native code runs, and the error page
+    reports the same "ready=false entry=nil rc=nil" for all of them. A DMM7510 reported
+    exactly that and there was nothing to act on; the second report named its own cause and
+    the fix followed from one photograph. A bare `_abort(cb)` or `_no()` puts a blank back on
+    that page, so it fails here rather than on someone else's instrument.
+    """
+    errs = []
+    for m in re.finditer(r'_abort\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)', code):
+        args = m.group(1)
+        # The definition itself, and a call whose third argument is present.
+        if args.strip().startswith('cb, pb, why'):
+            continue
+        depth, parts, cur = 0, [], ''
+        for ch in args:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            if ch == ',' and depth == 0:
+                parts.append(cur)
+                cur = ''
+            else:
+                cur += ch
+        parts.append(cur)
+        if len(parts) < 3 or not parts[2].strip():
+            line = code[:m.start()].count('\n') + 1
+            errs.append('%s:%d: _abort with no reason -- the error page would say '
+                        '"unspecified"' % (name, line))
+    for m in re.finditer(r'_no\s*\(\s*\)', code):
+        line = code[:m.start()].count('\n') + 1
+        errs.append('%s:%d: _no() with no reason' % (name, line))
+    return errs
+
+
 def main(paths):
     bad = 0
     for p in paths:
@@ -157,7 +202,8 @@ def main(paths):
                 continue
             body = '\n'.join(lines[a + 1:b])
         code = strip(body)
-        errs = check_blocks(code, p) + check_compat(code, p) + check_globals(code, p)
+        errs = (check_blocks(code, p) + check_compat(code, p) + check_globals(code, p)
+                + check_silent_refusals(strip_comments_only(body), p))
         if errs:
             bad += 1
             print(f'{p}: {len(errs)} problem(s)')
