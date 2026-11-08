@@ -73,6 +73,10 @@ def opt(flag, default, cast=int):
 
 DO_WRITE = '--write' in sys.argv
 DO_PASS = '--pass' in sys.argv
+# --pass writes a widget's cursors, which is the one step here that is not just a value.
+# Requiring the word is not ceremony: the nearest thing to it, leaving a SUBSCRIPTION ring's
+# cursors advanced, ended in a modal 2350 that only a power cycle cleared.
+SAY_YES = '--yes' in sys.argv
 NREC = opt('--nrec', 32)
 WDB = opt('--db', -20.0, float)
 SHIFT = opt('--shift', 20.0, float)
@@ -157,6 +161,14 @@ def whole_pass(d, ring):
     n = min(ncol, nrec - 1, bn)
     if n < 8:
         print('pass   : only %d points available, not enough to judge' % n)
+        return
+    # A ring this short is not the one the display task draws a spectrum from, and the thing
+    # it is most likely to be instead is the buffer-side staging ring -- whose cursors are
+    # the ones that must never be left moved. The header test already separates them; this is
+    # the second lock on the same door.
+    if nrec < 64:
+        print('pass   : the ring holds only %d records, which is too few to be the trace '
+              'ring. Refusing to write it.' % nrec)
         return
     # Fused or split. On a 6500 the value pair, the flags and the x pair are 20 contiguous
     # bytes, so one write a record does it; anywhere else it is two. Halving the call count
@@ -245,11 +257,23 @@ def whole_pass(d, ring):
     # RESTORE: the header first, because an inconsistent cursor is the part that must not be
     # left behind, then the records. Each in its own statement so one failing does not skip
     # the other.
-    d.q(one("do KG.p32(%d, ZH[1]) KG.p32(%d, ZH[2]) KG.p32(%d, ZH[3])" % (hdr, hdr + 4, hdr + 8),
-            "KG.p32(%d, ZH[4]) KG.p32(%d, ZH[5])" % (hdr + 12, hdr + 20),
-            "print('Z2|1') end"), timeout=60)
-    d.q("print('Z3|' .. tostring(KG.write(%d, ZS)))" % lo, timeout=120)
-    d.q('do KG.armed = false KG.wb = nil ZS, ZH, ZW = nil, nil, nil end', timeout=60)
+    # Each in its own call and each in its own try, so a failure in one does not skip the
+    # rest. The header goes first: an inconsistent cursor is the part that must not be left
+    # behind, and a stale record is only a wrong value drawn for one frame.
+    for label, stmt, t in (
+        ('header', one("do KG.p32(%d, ZH[1]) KG.p32(%d, ZH[2]) KG.p32(%d, ZH[3])"
+                       % (hdr, hdr + 4, hdr + 8),
+                       "KG.p32(%d, ZH[4]) KG.p32(%d, ZH[5])" % (hdr + 12, hdr + 20),
+                       "print('Z2|1') end"), 60),
+        ('records', "print('Z3|' .. tostring(KG.write(%d, ZS)))" % lo, 120),
+        ('guard', 'do KG.armed = false KG.wb = nil ZS, ZH, ZW = nil, nil, nil end', 60),
+    ):
+        try:
+            d.q(stmt, timeout=t)
+        except Exception as e:                                       # noqa: BLE001
+            print('restore: %s FAILED -- %s' % (label, e))
+            print('         the app rewrites every record on its next frame, so closing this')
+            print('         socket and letting frames resume recovers the picture.')
     print('restore: header and all %d bytes of records put back' % (hi - lo))
 
 
@@ -399,6 +423,13 @@ def main():
         print('guard  : installed')
 
         if DO_PASS:
+            if not SAY_YES:
+                print()
+                print('--pass writes %d records AND the ring header: the count and both'
+                      % min(255, ring.get('nrec', 0)))
+                print('cursors. Everything is saved on the instrument first and restored in')
+                print('the finally, but a widget cursor is not a value -- add --yes to run it.')
+                return
             whole_pass(d, ring)
             if not DO_WRITE:
                 return

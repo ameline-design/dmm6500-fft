@@ -151,7 +151,8 @@ def main():
 
     for argv, name, want in (
         ([], 'the read-only phase', 'Read only'),
-        (['--pass', '--hold', '2'], 'the whole-pass prototype', 'restore: header'),
+        (['--pass'], 'the whole-pass refusal without --yes', 'add --yes'),
+        (['--pass', '--yes', '--hold', '2'], 'the whole-pass prototype', 'restore: header'),
         (['--write'], 'the single-record experiment', 'restore: '),
     ):
         buf = io.StringIO()
@@ -197,7 +198,7 @@ def main():
           'clashing: %s' % (', '.join(clashes) or 'none'))
 
     print()
-    print('%d checks, %d failed' % (6 + 2, len(FAIL)))
+    print('%d checks, %d failed' % (8 + 2, len(FAIL)))
     for f in FAIL:
         print('  ' + f)
     return 1 if FAIL else 0
