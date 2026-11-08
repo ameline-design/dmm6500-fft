@@ -257,13 +257,15 @@ writes: about 0.035 s at any count, which is also what makes the frame time line
 
 ### The refill, and the window it opens
 
-The trace buffer is bound to the graph for the life of the app and refilled in place, so it is at
-n = 0 from `clear()` until the last write and a paint landing there draws a blank or partial trace.
-That window is the flicker, and it cannot be removed: the firmware needs the clear before a
-`FILL_ONCE` buffer can be rewritten.
+The trace buffer is bound to the graph for the life of the app and refilled in place, so under
+`FILL_ONCE` it sits at n = 0 from `clear()` until the last write, and a paint landing there draws a
+blank or partial trace. That window is the flicker. An append blocks Lua for about 80 us and that
+is the only time the display task runs, so the task gets one chance to paint per point and the rate
+works out at `fps x window / period` -- which predicts 1.9/s at 2048 against about 1/s observed.
+Only the trace flickers, never the axis, because no graph call runs in a frame.
 
-So the window is made narrow instead. Every value is computed into two preallocated arrays *before*
-the clear, while the buffer still holds the previous complete trace, leaving only
+The window is made narrow first. Every value is computed into two preallocated arrays *before* the
+clear, while the buffer still holds the previous complete trace, leaving only
 `buffer.write.reading` inside it. Measured at 255 points:
 
 | | time |
@@ -274,8 +276,64 @@ the clear, while the buffer still holds the previous complete trace, leaving onl
 
 A point costs about 109 us to produce and 51.6 of that is the write, so this is the better half of
 the work moved out. There is no bulk route into a reading buffer (`FIRMWARE_API.md`), so one write a
-point is the floor, and caching the function in a local -- 65 us against 72 through the table -- is
-the only other lever.
+point is the floor. The argument count does not change it either -- 255 appends cost 19.7 ms with
+five arguments, 20.5 with three and 25.0 with two, so the 80 us is the IPC round trip and dropping
+the cosmetic timestamp buys nothing.
+
+### Removing the window instead of narrowing it
+
+A `FILL_CONTINUOUS` ring is never partially populated, so there is no window at all. Two things
+make it usable where the earlier attempt was not.
+
+**Capacity equals the points a pass writes.** The cursor then returns to the same slot every pass
+and `startindex`/`endindex` are stationary. The ring that was tried and abandoned wrote 255 to 340
+points into a 680 ring, so its extent moved every frame, which is what an axis derived from the
+trace extent follows.
+
+**The pass is a fold.** A closed path through points that rise monotonically in frequency has to
+cross the band twice, so there is always one long return edge. Parking it below the axis floor does
+not work: **the widget clamps a below-floor point to the axis rather than clipping it**, measured on
+the glass as a dashed green line along the bottom rule at every count. Writing the pass up the band
+and then back down it instead makes both joins a point repeated, zero length, drawing nothing:
+
+    slots   1..255   spectrum ascending   flo -> fhi
+    slots 256..510   spectrum descending  fhi -> flo
+
+Every edge is then drawn twice in opposite directions and the picture is exactly the spectrum. A
+short spectrum repeats its last point to fill the lap, so the pass is still exactly capacity.
+
+The cost is twice the appends and twice the points the widget draws, and it is paid in full.
+Measured on the glass, all three on a DMM6500 at a 50 kHz span:
+
+| | 2048 | 4096 | 8192 | 16384 | 32768 |
+|---|---|---|---|---|---|
+| `FILL_ONCE`, 255 appends | 9.5 | — | — | — | 2.4 |
+| ring, 257 appends, seam visible | **14** | — | — | 3.8 | 2.4 |
+| **folded ring, 510 appends** | 9.5 | 8.3 | 5.9 | 3.6 | 1.9 |
+
+The one-lap ring is half again faster than `FILL_ONCE` at 2048 despite doing the same number of
+appends, so the limit there was the display task's work and not the fill -- emptying the buffer
+every frame makes the task rebuild its copy from nothing. The fold then spends that gain back:
+510 appends against 257 is about 20 ms, which at a 70 ms frame is exactly 14 fps down to 9.5.
+
+So the net against the shipped `FILL_ONCE` is **the same frame rate and no flicker**, not a gain.
+The appends are the single biggest controllable cost in the frame: at 8192 the phase counters read
+`acq 85.1  spec 52.9  yld 10.1  frame 148.3`, and the fill is about 41 of that 52.9.
+
+### A sample-count threshold was tried and removed -- do not retry it
+
+The window is a smaller fraction of a long frame, 20 ms of 420 at 32768 against 20 of 105 at 2048,
+so 8.42 used the ring below 4096 and `FILL_ONCE` above on the expectation that the dropout would
+fade at the long counts. **It does not. 8192, 16384 and 32768 all flickered plainly on the glass.**
+
+The rate argument counts dropouts and ignores how long each one is visible. A truncated paint stays
+up until the next paint, so at 1.8 fps it is on the glass for about half a second against 70 ms at
+14 fps. A low frame rate makes a dropout *more* noticeable, not less, and the two effects do not
+cancel -- they compound. So the ring runs at every count, and `fftsa.sg_ring` is a plain switch
+rather than a function of N.
+
+Both modes keep the same capacity, `2 x sg_ncol`, so the switch is a flag and not a rebuild:
+reallocating the trace buffer on a live graph freezes the trace at the frame it fires.
 
 ### Apply, and why it is the figure an operator notices
 

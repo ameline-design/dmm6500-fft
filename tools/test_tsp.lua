@@ -4667,7 +4667,7 @@ check('all size transitions keep the original trace bound and plot without leaks
     end
     if fftsa.n ~= n or fftsa.fft_n ~= n or fftsa.sg_nbins ~= n / 2
        or dmm.digitize.count ~= n or fftsa.cap.cap ~= wantcap
-       or fftsa.sg_buf.capacity ~= fftsa.sg_maxpts
+       or fftsa.sg_buf.capacity ~= fftsa.sg_capacity()
        or OBJ[graph0].buffer ~= graphbuf0
        or fftsa.sg_buf ~= graphbuf0 or not graphbuf0.alive
        or OBJ[graph0].adds ~= adds0 or OBJ[graph0].removes ~= removes0
@@ -4811,10 +4811,10 @@ check('the trace buffer is never allocated or freed while the app runs', (functi
   if err ~= nil then return false, tostring(err) end
   return madefull == 0 and freed == 0 and trace.alive
          and fftsa.sg_buf == trace
-         and trace.capacity == fftsa.sg_maxpts,
+         and trace.capacity == fftsa.sg_capacity(),
          string.format('made %d freed %d, alive %s, capacity %d of %d',
                        madefull, freed, tostring(trace.alive),
-                       trace.capacity, fftsa.sg_maxpts)
+                       trace.capacity, fftsa.sg_capacity())
 end)())
 -- The guard inside sg_make_buffer, called directly. sg_build() is its only caller and
 -- start() the only caller of that, so nothing in the app reaches it a second time, and
@@ -4827,7 +4827,7 @@ check('making the trace buffer again at the same size keeps the one in use', (fu
     if style == buffer.STYLE_WRITABLE_FULL then made = made + 1 end
     return realmake(cap, style)
   end
-  local got = fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_maxpts)
+  local got = fftsa.sg_make_buffer(fftsa.sg_nbins, fftsa.sg_capacity())
   buffer.make = realmake
   return made == 0 and got == trace and fftsa.sg_buf == trace and trace.alive
          and OBJ[fftsa.sg_graph].buffer == trace,
@@ -5168,14 +5168,129 @@ end)())
 -- oldest: a straight line across the whole plot, with the buffer itself perfectly
 -- aligned while that line is on the glass, so the line is the fill mode and not a
 -- rotation.
-check('the trace buffer is FILL_ONCE, never a ring', (function()
+check('the fill mode on the buffer matches the one chosen', (function()
   display.setvalue(fftsa.opt_n, 1)
   if not fftsa.options_apply() then return false, fftsa.lasterr end
-  return fftsa.sg_buf.fillmode == buffer.FILL_ONCE
+  local want = buffer.FILL_ONCE
+  if fftsa.sg_ring then want = buffer.FILL_CONTINUOUS end
+  return fftsa.sg_buf.fillmode == want
          and buffer.FILL_ONCE ~= buffer.FILL_CONTINUOUS,
-         string.format('fillmode=%s, continuous would be %s',
-                       tostring(fftsa.sg_buf.fillmode),
-                       tostring(buffer.FILL_CONTINUOUS))
+         string.format('ring=%s fillmode=%s wanted %s',
+                       tostring(fftsa.sg_ring),
+                       tostring(fftsa.sg_buf.fillmode), tostring(want))
+end)())
+
+-- The shipped fill mode, pinned deliberately rather than left to drift. 8.40 ships the ring
+-- ON, which is the build that puts it in front of the operator; it goes back to false if the
+-- axis moves or the seam draws inside the plot. Either way the value is a decision and this
+-- is where it is recorded, so a change to it cannot be silent.
+check('the shipped fill mode is the ring', (function()
+  return fftsa.sg_ring == true, string.format('sg_ring=%s', tostring(fftsa.sg_ring))
+end)())
+
+-- Capacity has to equal the writes a pass makes, or the ring's cursor walks and the wrap
+-- seam sweeps across the plot instead of staying parked under it. That is the whole
+-- difference from the ring that was tried and abandoned, so it gets its own case.
+check('a ring pass writes exactly its capacity', (function()
+  local cap = fftsa.sg_ring_cap(200)
+  local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
+  b.fillmode = buffer.FILL_CONTINUOUS
+  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
+  fftsa.sg_ring, fftsa.sg_buf = true, b
+  local db, hz, i = {}, {}, nil
+  for i = 1, 200 do db[i], hz[i] = -50 - i, 1000 * i end
+  local wrote = fftsa.sg_fill(db, hz, 200)
+  local n1, s1, e1 = b.n, b.startindex, b.endindex
+  fftsa.sg_fill(db, hz, 200)
+  local n2, s2, e2 = b.n, b.startindex, b.endindex
+  fftsa.sg_ring, fftsa.sg_buf = keep, kb
+  fftsa.del_buf(b)
+  return cap == 400 and wrote == 200 and n1 == cap and n2 == cap
+         and s1 == s2 and e1 == e2,
+         string.format('cap=%d wrote=%s pass1=%d/%s..%s pass2=%d/%s..%s',
+                       cap, tostring(wrote), n1, tostring(s1), tostring(e1),
+                       n2, tostring(s2), tostring(e2))
+end)())
+
+-- The sentinels are what park the seam: first and last in the pass, at the band edges and
+-- far below the axis floor, so the newest-to-oldest join runs under the plot rather than
+-- from one end of the frequency axis to the other.
+check('a ring pass folds back on itself, so both joins are a repeated point', (function()
+  -- The seam is why. A closed ring over a curve that rises monotonically in x has one long
+  -- return edge somewhere, and parking it below the axis floor does not work: the widget
+  -- CLAMPS to the floor rather than clipping, measured on the glass as a green line along the
+  -- bottom rule. Folding the pass -- up the band, then back down it -- makes the fold join and
+  -- the wrap join the same point twice, so both have zero length and draw nothing.
+  local n = 8
+  local cap = fftsa.sg_ring_cap(n)
+  local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
+  b.fillmode = buffer.FILL_CONTINUOUS
+  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
+  fftsa.sg_ring, fftsa.sg_buf = true, b
+  local db, hz, i = {}, {}, nil
+  for i = 1, n do db[i], hz[i] = -100 + i, 100 * i end
+  local t0 = fftsa.sg_stamp
+  fftsa.sg_fill(db, hz, n)
+  -- The fold: slot n and slot n+1 are the same point, and so are slot cap and slot 1.
+  local fold = b.readings[n] == b.readings[n + 1]
+               and b.extravalues[n] == b.extravalues[n + 1]
+  local wrap = b.readings[cap] == b.readings[1]
+               and b.extravalues[cap] == b.extravalues[1]
+  -- And it really is the spectrum twice, not the spectrum and something else.
+  local same = true
+  for i = 1, n do
+    if b.readings[i] ~= db[i] or b.extravalues[i] ~= hz[i] then same = false end
+    if b.readings[cap + 1 - i] ~= db[i] or b.extravalues[cap + 1 - i] ~= hz[i] then
+      same = false
+    end
+  end
+  local rose = fftsa.sg_stamp > t0
+  fftsa.sg_ring, fftsa.sg_buf = keep, kb
+  fftsa.del_buf(b)
+  return cap == 2 * n and fold and wrap and same and rose and b.n == cap,
+         string.format('cap=%d of 2x%d fold=%s wrap=%s mirrored=%s stamp rose=%s n=%s',
+                       cap, n, tostring(fold), tostring(wrap), tostring(same),
+                       tostring(rose), tostring(b.n))
+end)())
+
+-- A short spectrum repeats its last point to fill the lap, so the pass is still exactly
+-- capacity and the cursor still returns to slot 1. The repeats are zero-length edges.
+check('a short ring pass is padded, not left short', (function()
+  local cap = fftsa.sg_ring_cap(10)
+  local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
+  b.fillmode = buffer.FILL_CONTINUOUS
+  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
+  fftsa.sg_ring, fftsa.sg_buf = true, b
+  local db, hz, i = {}, {}, nil
+  for i = 1, 4 do db[i], hz[i] = -70 - i, 250 * i end
+  local wrote = fftsa.sg_fill(db, hz, 4)
+  local n1, s1, e1 = b.n, b.startindex, b.endindex
+  fftsa.sg_fill(db, hz, 4)
+  local s2, e2 = b.startindex, b.endindex
+  local tail = b.readings[10] == db[4] and b.extravalues[10] == hz[4]
+  fftsa.sg_ring, fftsa.sg_buf = keep, kb
+  fftsa.del_buf(b)
+  return wrote == 4 and n1 == cap and s1 == s2 and e1 == e2 and tail,
+         string.format('wrote=%s n=%d cursor %s..%s then %s..%s padded tail=%s',
+                       tostring(wrote), n1, tostring(s1), tostring(e1),
+                       tostring(s2), tostring(e2), tostring(tail))
+end)())
+
+-- Off, sg_fill is the shipped fill and nothing else: a clear, then one append a point.
+check('with the ring off sg_fill clears and writes nseg', (function()
+  local b = buffer.make(300, buffer.STYLE_WRITABLE_FULL)
+  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
+  fftsa.sg_ring, fftsa.sg_buf = false, b
+  local db, hz, i = {}, {}, nil
+  for i = 1, 40 do db[i], hz[i] = -60 - i, 50 * i end
+  fftsa.sg_fill(db, hz, 40)
+  local a = b.n
+  fftsa.sg_fill(db, hz, 40)
+  local c = b.n
+  fftsa.sg_ring, fftsa.sg_buf = keep, kb
+  fftsa.del_buf(b)
+  return a == 40 and c == 40, string.format('first=%d second=%d, a missing clear gives 80',
+                                            a, c)
 end)())
 
 -- sg_ncol is a live knob, and changing it must not touch the allocation: the buffer stays
@@ -5192,18 +5307,31 @@ check('the point count can be changed without reallocating anything', (function(
     if style == buffer.STYLE_WRITABLE_FULL then made = made + 1 end
     return realmake(cap, style)
   end
+  -- What a raise does depends on the mode, and THAT is the ring's one cost. FILL_ONCE has
+  -- the sg_maxpts ceiling as headroom, so sg_ncol goes up to it live. A ring is exactly as
+  -- big as a pass, so a raise past it is clamped and a real raise needs an Apply, which
+  -- reallocates. A lower count still works live either way: under the ring the shortfall
+  -- is padded with sentinels below the floor, which is what keeps the cursor stationary.
+  local want_up = 340
+  if fftsa.sg_ring then want_up = fftsa.sg_points_max() end
   fftsa.sg_ncol = 340
   fftsa.frame()
-  local at340 = fftsa.sg_buf.n
+  local at340 = fftsa.sg_nwrote
+  local full = fftsa.sg_buf.n
   fftsa.sg_ncol = keep
   fftsa.frame()
-  local restored = fftsa.sg_buf.n
+  local restored = fftsa.sg_nwrote
   buffer.make = realmake
-  return at340 == 340 and restored == keep and made == 0
+  -- Only the compiled path goes through sg_fill. The interpreted one clears sg_buf inside
+  -- dsp.spectrum, so under the ring it would leave the buffer part full -- which is why the
+  -- ring requires that path, and why this asserts the ring invariant only when it ran.
+  local held = full == at340
+  if fftsa.sg_ring and fftsa.nl_frame then held = full == fftsa.sg_capacity() end
+  return at340 == want_up and restored == keep and made == 0 and held
          and fftsa.sg_buf == trace and livebufs() == bufs0
-         and trace.capacity == fftsa.sg_maxpts,
-         string.format('340 -> %d points, %d -> %d, allocations %d, capacity %d',
-                       at340, keep, restored, made, trace.capacity)
+         and trace.capacity == fftsa.sg_capacity(),
+         string.format('raise -> %d (wanted %d), %d -> %d, allocations %d, n %d, capacity %d',
+                       at340, want_up, keep, restored, made, full, trace.capacity)
 end)())
 
 -- THE WINDOW. The trace buffer is bound for the life of the app and refilled in place,
@@ -5579,13 +5707,16 @@ check('a column count past capacity is clamped, not refused', (function()
   local failed, err = fftsa.errrun, fftsa.lasterr
   local wrote = fftsa.sg_nwrote
   local n = fftsa.sg_buf.n
+  -- Read before the restore, so the budget describes the frame that actually ran.
+  local budget = fftsa.sg_capacity()
+  local room = fftsa.sg_points_max()
   fftsa.sg_ncol = keep
   display.setvalue(fftsa.opt_n, 1)
   fftsa.options_apply()
   fftsa.errrun, fftsa.errcount = 0, 0
-  return failed == 0 and wrote == 680 and n <= fftsa.sg_maxpts and n <= 680,
-         string.format('ncol=4096 wrote %s points, n=%d, budget %d, errrun %d (%s)',
-                       tostring(wrote), n, fftsa.sg_maxpts, failed, tostring(err))
+  return failed == 0 and wrote == room and n <= budget,
+         string.format('ncol=4096 wrote %s points, n=%d, budget %d, room %d, errrun %d (%s)',
+                       tostring(wrote), n, budget, room, failed, tostring(err))
 end)())
 
 -- Repeated refills rewrite the SAME buffer, with the trace never detached and never

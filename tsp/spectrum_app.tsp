@@ -291,7 +291,7 @@ end
 function fftsa.dsp_live()
   local ncol = fftsa.sg_ncol
   local cap = nil
-  if fftsa.sg_buf ~= nil then cap = fftsa.sg_buf.capacity end
+  if fftsa.sg_buf ~= nil then cap = fftsa.sg_points_max() end
   if cap ~= nil and ncol ~= nil and ncol > cap then ncol = cap end
   if ncol == nil or ncol < 2 then ncol = 2 end
   -- Kept for the native path, which has no dsp.out to read back. A second clamp elsewhere
@@ -749,18 +749,21 @@ function fftsa.frame_body()
         fftsa.binhz = binhz
         fftsa.nl_frame = true
         fftsa.nl_res = fftsa.nl.results()
-        -- Cleared and refilled, so the window between the clear and the last append is
-        -- where the trace drops out for a frame. Hiding the graph across it does not help,
-        -- setstate posting without waiting; writing the elements in place and re-subscribing
-        -- repaints the whole widget, axes included, once a frame; and clearing only every
-        -- other frame halves the dropouts by drawing two spectra overlaid, which is refused.
-        local wr = buffer.write.reading
-        local tb, db, hz = fftsa.sg_buf, rd.db, rd.hz
-        local i
-        tb.clear()
-        for i = 1, nseg do
-          wr(tb, db[i], hz[i], i, 0)
-        end
+        -- buffer.write.reading is the only way points reach the glass. The display task
+        -- paints from its own copy and that copy is fed one point per call: measured by
+        -- replacing all 255 elements in place with the descriptor untouched, which the
+        -- buffer read back correctly and the trace ignored, then appending once, which drew
+        -- that one point and nothing else. So the cost is nseg appends at ~80 us, and the
+        -- argument count does not change it -- five args 19.7 ms against two args 25.0 ms
+        -- for 255 points, because the cost is the IPC round trip.
+        --
+        -- Under FILL_ONCE that means a clear first, and the buffer then holds fewer than
+        -- nseg points for the length of the fill: 20.75 ms of a 105 ms frame at 255 points.
+        -- A paint landing in there draws a truncated trace, which is the flicker, at a rate
+        -- of about fps * window / period.
+        --
+        -- fftsa.sg_ring is the way out that does not shrink the window but removes it.
+        fftsa.sg_fill(rd.db, rd.hz, nseg)
       end
     end
   else
@@ -1716,7 +1719,8 @@ function fftsa.build()
   fftsa.loading_front()
   -- The trace buffer at sg_maxpts and not at sg_ncol, so the point count stays adjustable
   -- upwards while running without anything being resized or reallocated.
-  local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
+  local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2,
+                                  fftsa.sg_capacity())
   if scr == nil then return false, why end
   -- The buttons died with the screen fftsa.sg_build() just destroyed: clear the stale
   -- handles rather than deleting them.

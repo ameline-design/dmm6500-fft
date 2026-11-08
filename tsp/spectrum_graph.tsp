@@ -259,7 +259,7 @@ end
 -- and re-reads only when handed a buffer, so overwriting one in place changes nothing.
 function fftsa.sg_make_buffer(nbins, npoints)
   fftsa.sg_nbins = nbins
-  local want = npoints or fftsa.sg_maxpts
+  local want = npoints or fftsa.sg_capacity()
   -- Already built at the right size: keep it, and write nothing but sg_nbins. This is the
   -- one place the no-reallocation rule is stated in code rather than left to the call graph.
   if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
@@ -370,8 +370,10 @@ end
 -- all, and sg_build() binds this before the first frame has run.
 function fftsa.sg_fmt_seed(b, want)
   if b == nil then return nil end
-  -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the newest
-  -- point to the oldest.
+  -- FILL_ONCE unless fftsa.sg_ring is on, where the wrap line is accepted and parked under
+  -- the plot by the two sentinels sg_fill writes. Set before the seed so the seed itself
+  -- lays down one full lap and leaves the cursor back at slot 1.
+  if fftsa.sg_ring then b.fillmode = buffer.FILL_CONTINUOUS end
   --
   -- A custom unit is how the axis gets to say decibels; without it the labels read "+020.0V"
   -- on numbers that are not volts. Not buffer.UNIT_DECIBEL, which panics the instrument
@@ -399,10 +401,14 @@ function fftsa.sg_fmt_seed(b, want)
   if flo == nil or fhi == nil or not (fhi > flo) then
     flo, fhi = fftsa.flomin, fftsa.fhi_min
   end
+  -- No sentinels here, however the ring is set: the seed is the geometry the widget draws
+  -- at the first paint of a launch, before sg_bind pins anything, and a point 1000 dB
+  -- under the floor makes that first box 1002 dB tall. The first pass writes the real
+  -- sentinels a frame later, by which time both axes are pinned.
   for k = 1, want do
     local t = (k - 1) / span
-    fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t, flo + (fhi - flo) * t,
-                         k)
+    fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t,
+                         flo + (fhi - flo) * t, k)
   end
   return b
 end
@@ -415,6 +421,124 @@ end
 function fftsa.sg_write_point(buf, db, f, slot)
   if slot == nil then slot = 1 end
   buffer.write.reading(buf, db, f, slot, 0)
+end
+
+
+-- The fill window, and the ring that removes it.
+--
+-- FILL_ONCE must be cleared before it is refilled, so the bound buffer holds fewer than
+-- sg_ncol points for the length of the fill: 20.75 ms of a 105 ms frame at 255 points. An
+-- append blocks Lua for ~80 us and that is the only time the display task runs, so the task
+-- gets sg_ncol chances to paint inside the window, and a paint landing there draws a
+-- truncated trace. That is the flicker, at about fps * window / period.
+--
+-- The ring is never partially populated, so a mid-pass paint draws this frame mixed with
+-- the last -- a tear, not a dropout. Capacity equals the points a pass writes, so the
+-- cursor returns to slot 1 every pass and startindex/endindex are stationary. That is the
+-- difference from the ring that was tried and abandoned, which wrote 255 to 340 points into
+-- a 680 ring and moved the extent every frame.
+--
+-- The cost would be the wrap seam: the widget joins newest to oldest, which in frequency
+-- order is the two ends of the axis -- a line across the whole plot, drawn whenever the
+-- cursor is mid-pass, so it flickers at exactly the rate the dropout used to. 8.40 tried
+-- parking it below the axis floor and the widget CLAMPS rather than clips: it came out as a
+-- green line along the bottom rule, measured on the glass.
+--
+-- So the pass folds back on itself instead. Ascending flo..fhi, then descending fhi..flo:
+-- the join at the fold is the same point twice and so is the wrap, both zero length, and
+-- every edge is drawn twice in opposite directions. There is no seam at any cursor
+-- position, and the picture is exactly the spectrum. It costs twice the appends.
+-- Every count, and a sample count threshold was tried and removed. The arithmetic said the
+-- dropout should fade at the long counts, the fill window being 20 ms of a 420 ms frame at
+-- 32768 against 20 of 105 at 2048 -- so 8.42 used the ring below 4096 only. On the glass
+-- 8192, 16384 and 32768 all still flickered plainly. The rate argument counts dropouts and
+-- ignores how long each one is on the glass: a truncated paint stays up until the next
+-- paint, which at 1.8 fps is about half a second rather than 70 ms, so a low frame rate
+-- makes a dropout more visible and not less. The ring costs 1.8 fps against 2.4 at 32768
+-- and that is the price of no flicker anywhere.
+--
+-- The switch stays because it is the revert: FILL_ONCE is still the shipped behaviour of
+-- every build before 8.41, the suite covers both branches, and no other instrument has run
+-- the ring yet.
+fftsa.sg_ring  = true
+fftsa.sg_stamp = 0       -- ring timestamps, monotonic across passes
+
+-- Capacity a ring needs: the spectrum plus one sentinel at each end. Capacity must equal
+-- the writes a pass makes or the cursor walks, so this is the one place that decides it and
+-- sg_make_buffer asks here rather than using sg_maxpts.
+function fftsa.sg_ring_cap(ncol)
+  return 2 * (ncol or fftsa.sg_ncol)
+end
+
+-- The trace buffer's capacity, and the one thing the ring costs. FILL_ONCE takes the
+-- sg_maxpts ceiling, which is what lets sg_ncol be raised and lowered while frames run
+-- without reallocating. A ring cannot: capacity has to equal the points a pass writes, so
+-- under the ring a changed sg_ncol needs a reallocation, and the only safe place for one
+-- is Apply -- replacing the trace buffers on a live graph freezes the trace.
+-- The same capacity in both modes. The ring needs capacity to equal the points a pass
+-- writes; FILL_ONCE does not care that capacity exceeds what it writes. Keeping them equal
+-- is what lets fftsa.sg_ring be flipped without a new buffer -- a reallocation on a live
+-- graph freezes the trace at the frame it fires, which is the one thing neither mode may do.
+function fftsa.sg_capacity()
+  return fftsa.sg_ring_cap()
+end
+
+
+
+-- The most points a frame may plot, which is half the capacity under the ring: the pass
+-- writes each point twice. fftsa.dsp_live() clamps to this, so the primitive is asked for a
+-- count the fill can write without clamping it again -- a second clamp is how the trace and
+-- the primitive come to disagree.
+function fftsa.sg_points_max(buf)
+  local b = buf or fftsa.sg_buf
+  if b == nil then return fftsa.sg_maxpts end
+  if fftsa.sg_ring then return math.floor(b.capacity / 2) end
+  return b.capacity
+end
+
+-- The frame's trace write, both modes. Returns the points written, sentinels excluded.
+--
+-- THE RING NEEDS THE COMPILED PATH. fftsa.spectrum_interp writes the trace through
+-- dsp.spectrum, which clears sg_buf itself before filling it, and a clear resets the ring
+-- cursor -- leaving the buffer part full and the seam sweeping. That path cannot produce a
+-- spectrum in this archive anyway (no dsp.spectrum, so the frame halts and says so), which
+-- is what makes the ring safe here rather than a second thing to get right.
+function fftsa.sg_fill(db, hz, nseg)
+  local wr = buffer.write.reading
+  local tb = fftsa.sg_buf
+  local i
+  if tb == nil or nseg == nil or nseg < 1 then return 0 end
+  if not fftsa.sg_ring then
+    tb.clear()
+    for i = 1, nseg do
+      wr(tb, db[i], hz[i], i, 0)
+    end
+    return nseg
+  end
+  -- Timestamps keep climbing across passes, because the slot being overwritten holds an
+  -- older one and buffer.write.reading documents chronological order. Integers, so they
+  -- cannot reach the 0.9999999 fractional refusal.
+  -- Exactly capacity points, always, or the cursor walks and the fold stops landing on
+  -- itself. Up the band then back down it, so both joins are a point repeated. A short
+  -- spectrum repeats its last point to fill the lap -- duplicates are zero-length edges and
+  -- draw nothing -- and a long one is clamped.
+  local cap = tb.capacity
+  local room = math.floor(cap / 2)
+  if nseg > room then nseg = room end
+  local t = fftsa.sg_stamp
+  local last = nseg
+  for i = 1, room do
+    local j = i
+    if j > last then j = last end
+    wr(tb, db[j], hz[j], t + i, 0)
+  end
+  for i = 1, room do
+    local j = room + 1 - i
+    if j > last then j = last end
+    wr(tb, db[j], hz[j], t + room + i, 0)
+  end
+  fftsa.sg_stamp = t + 2 * room
+  return nseg
 end
 
 
