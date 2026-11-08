@@ -333,6 +333,14 @@ if(Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_f64.py)
 
+    # And the single-precision packer, which exists to build a memory needle: the display task
+    # keeps its trace as float32, so a value is found there only if the pack rounds the way
+    # frsp does -- nearest, ties to even. A needle one bit out is simply not found, and that
+    # reads as "the ring is not in memory" rather than as a rounding bug.
+    add_test(NAME f32_pack
+             COMMAND ${Python3_EXECUTABLE} -I
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_f32.py)
+
     # The archive carries the image as base64, so there is a decoder between the compiler
     # and the CPU. A wrong byte there is not a failure to load: it is one instruction or
     # one float constant quietly different, which relocation then places perfectly.

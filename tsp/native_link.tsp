@@ -333,6 +333,44 @@ local function f32_unpack(s, p)
 end
 fftsa.nl._f32_unpack = f32_unpack
 
+-- And the forward direction, as the four big-endian bytes a single-precision store leaves.
+-- Needed to search memory for a value the app put there: the display task keeps its trace as
+-- float32, so a double packed the double way matches nothing.
+--
+-- Rounding is to nearest with ties to even, which is what frsp does on this core -- a needle
+-- one bit out is a needle that is not found, and the failure looks like "the ring is not in
+-- memory" rather than like a rounding bug. csrc/tools/check_f32.py checks every case below
+-- against struct.pack.
+local function f32_pack(x)
+  local sign = 0
+  if x < 0 then sign = 128; x = -x end
+  -- A NaN loses every ordered comparison, so it has to go before any of them.
+  if x ~= x then return string.char(sign + 127, 192, 0, 0) end
+  if x == 0 then return string.char(sign, 0, 0, 0) end
+  if x + x == x then return string.char(sign + 127, 128, 0, 0) end
+  local m, e = math.frexp(x)              -- 0.5 <= m < 1 and x = m * 2^e
+  local eb, f = e + 126, nil              -- 2m is the 1.f form, so its exponent is e - 1
+  if eb <= 0 then
+    -- Subnormal: the value is f * 2^-149 with f below 2^23, so the significand is the whole
+    -- of it and the exponent field is zero. A round that carries into 2^23 lands on the
+    -- smallest normal, which the carry below already handles.
+    eb, f = 0, math.ldexp(x, 149)
+  else
+    f = (m * 2 - 1) * 8388608
+  end
+  local fi = math.floor(f)
+  local r = f - fi
+  if r > 0.5 then fi = fi + 1
+  elseif r == 0.5 and math.mod(fi, 2) == 1 then fi = fi + 1 end
+  if fi >= 8388608 then fi = fi - 8388608; eb = eb + 1 end
+  if eb >= 255 then return string.char(sign + 127, 128, 0, 0) end
+  return string.char(sign + math.floor(eb / 2),
+                     math.mod(eb, 2) * 128 + math.floor(fi / 65536),
+                     math.mod(math.floor(fi / 256), 256),
+                     math.mod(fi, 256))
+end
+fftsa.nl._f32_pack = f32_pack
+
 -- ---------------------------------------------------------------------------
 -- Find the firmware math entries behind the Lua math wrappers.
 --
@@ -1166,6 +1204,291 @@ function fftsa.nl._find_desc_by_sig(buf)
     end
   end
   return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- The display task's own trace ring.
+--
+-- What the graph widget draws is not the buffer and not the buffer-side staging ring. It is a
+-- ring of records the display task keeps, fed one record per buffer.write.reading, and writing
+-- it directly is the only way past 510 blocking appends a frame: no bulk write exists, the
+-- staging ring's pending count cannot be pre-loaded because the push sets it, and
+-- display.setvalue refuses a graph with event 1717. All three measured.
+--
+-- NOTHING HERE IS A COMPILED ADDRESS AND NOTHING HERE IS AN ASSUMED OFFSET. The record stride
+-- and the distance between a record's value and its x are both derived, because a DMM7510's
+-- have never been measured and the operator's instruction is not to assume them. What is
+-- assumed is only that the records are evenly spaced and hold the two fields as float32 pairs,
+-- and the cross-check below fails closed if even that is wrong.
+-- ---------------------------------------------------------------------------
+
+-- A record is this far apart at most, and a ring holds between these many. Both are bounds on
+-- a search rather than knowledge: the one measured geometry is 721 records of 56 bytes.
+fftsa.nl.REC_MIN, fftsa.nl.REC_MAX = 16, 128
+fftsa.nl.RING_MIN, fftsa.nl.RING_MAX = 8, 4096
+
+-- Find the records the display task is drawing, from values only this app could have appended.
+--
+-- sentinels is the list of {db, hz} pairs just appended, in order, at least three of them with
+-- distinct db values. The needle is a db packed as float32 TWICE, because the record holds two
+-- copies of it side by side, and eight bytes of a specific float is not something the heap is
+-- full of.
+--
+-- Returns a geometry table or nil, with nl.ring_why saying which term failed:
+--   val0    address of sentinel 1's value field
+--   stride  bytes between consecutive records, measured from two sentinels
+--   dx      value field to x field, measured, and signed -- the x may precede the value
+--   nconf   how many sentinels were confirmed at that geometry
+function fftsa.nl.find_ring_records(sentinels)
+  local nl = fftsa.nl
+  nl.ring_why = nil
+  local ns = sentinels ~= nil and table.getn(sentinels) or 0
+  if ns < 3 then
+    nl.ring_why = 'need 3 sentinels, got ' .. tostring(ns)
+    return nil
+  end
+  local pat, i = {}, nil
+  for i = 1, ns do
+    local s = sentinels[i]
+    if s == nil or type(s.db) ~= 'number' or type(s.hz) ~= 'number' then
+      nl.ring_why = 'sentinel ' .. tostring(i) .. ' is not a db/hz pair'
+      return nil
+    end
+    pat[i] = f32_pack(s.db)
+  end
+  if pat[1] == pat[2] then
+    nl.ring_why = 'sentinels 1 and 2 pack to the same float32'
+    return nil
+  end
+  local n1, n2 = pat[1] .. pat[1], pat[2] .. pat[2]
+
+  -- Both needles over the same windows. The second is what gives the stride: the display task
+  -- appends in order, so sentinel 2's record is exactly one stride above sentinel 1's.
+  local windows = nl.scan_windows(nil, nil)
+  local h1, h2, wi = {}, {}, nil
+  for wi = 1, table.getn(windows) do
+    local a = nl.FINDS(windows[wi][1], windows[wi][2], n1)
+    local b = nl.FINDS(windows[wi][1], windows[wi][2], n2)
+    local k
+    for k = 1, table.getn(a) do h1[table.getn(h1) + 1] = a[k] end
+    for k = 1, table.getn(b) do h2[table.getn(h2) + 1] = b[k] end
+    if table.getn(h1) > 0 and table.getn(h2) > 0 then break end
+  end
+  nl.ring_hits = table.getn(h1) .. '/' .. table.getn(h2)
+  if table.getn(h1) == 0 or table.getn(h2) == 0 then
+    nl.ring_why = 'value needle not in memory, hits ' .. tostring(nl.ring_hits)
+    return nil
+  end
+
+  -- EVERY confirmed candidate, not the first. The buffer-side staging ring holds the same two
+  -- float32 pairs in a 28-byte record, appended in the same order, so it confirms at a stride
+  -- just as well -- and it is not what the widget draws. Only the header tells them apart, and
+  -- the staging ring has no adjacent bounds pair to find, so the caller walks the list.
+  local out, nout = {}, 0
+  local a, b
+  for a = 1, table.getn(h1) do
+    for b = 1, table.getn(h2) do
+      local s = h2[b] - h1[a]
+      if s >= nl.REC_MIN and s <= nl.REC_MAX and math.mod(s, 4) == 0 then
+        local g = nl._ring_confirm(h1[a], s, sentinels, pat)
+        if g ~= nil then nout = nout + 1; out[nout] = g end
+      end
+    end
+  end
+  nl.ring_cands = out
+  if nout == 0 then
+    nl.ring_why = 'no stride between ' .. nl.REC_MIN .. ' and ' .. nl.REC_MAX
+                  .. ' confirmed, hits ' .. tostring(nl.ring_hits)
+    return nil
+  end
+  return out[1]
+end
+
+-- The whole discovery: the records, then the header that identifies which candidate is the
+-- display task's ring rather than a staging ring that looks like one.
+function fftsa.nl.find_ring(sentinels)
+  local nl = fftsa.nl
+  if nl.find_ring_records(sentinels) == nil then return nil end
+  local c = nl.ring_cands
+  local i
+  for i = 1, table.getn(c) do
+    if nl.find_ring_header(c[i]) ~= nil then
+      nl.ring = c[i]
+      nl.ring_why = nil
+      return c[i]
+    end
+  end
+  nl.ring_why = 'no header for any of ' .. tostring(table.getn(c)) .. ' record candidates: '
+                .. tostring(nl.ring_why)
+  return nil
+end
+
+-- Every sentinel at the proposed geometry, read as one block, plus the x field's offset.
+-- Reading the whole span once rather than a field at a time is what makes a wrong candidate
+-- cheap: a block that does not hold sentinel 3 is rejected on one memread.
+function fftsa.nl._ring_confirm(val0, stride, sentinels, pat)
+  local nl = fftsa.nl
+  local ns = table.getn(sentinels)
+  local span = (ns - 1) * stride + 8
+  local blk = ki.memread(hx(val0), hx(span))
+  if blk == nil or string.len(blk) < span then return nil end
+  local i
+  for i = 1, ns do
+    local at = (i - 1) * stride + 1
+    if string.sub(blk, at, at + 7) ~= pat[i] .. pat[i] then return nil end
+  end
+  -- The x field, by searching one record's worth of bytes for the x the same append carried.
+  -- Its offset comes back relative to the value field, which is all a writer needs: the record
+  -- base, and therefore the offsets the firmware's own header uses, are never required.
+  local xp = f32_pack(sentinels[1].hz)
+  local one = ki.memread(hx(val0 - stride), hx(2 * stride))
+  if one == nil or string.len(one) < 2 * stride then return nil end
+  local p2 = f32_pack(sentinels[2].hz)
+  local xn, at = xp .. xp, 1
+  while true do
+    local j = string.find(one, xn, at, true)
+    if j == nil then return nil end
+    local dx = j - 1 - stride
+    -- Confirm the offset on a DIFFERENT record, because the eight bytes before the record can
+    -- hold anything and the first match need not be the field. Every match is tried, so a
+    -- decoy ahead of the real one costs one eight-byte read rather than the whole geometry.
+    local x2 = ki.memread(hx(val0 + stride + dx), hx(8))
+    if x2 ~= nil and x2 == p2 .. p2 then
+      return { val0 = val0, stride = stride, dx = dx, nconf = ns }
+    end
+    at = j + 1
+  end
+end
+
+-- The ring's own header, found from a record address and the stride rather than from an
+-- offset. A writer needs it for the count and the cursors: the records alone are a picture
+-- the task will overwrite from wherever its cursor happens to sit.
+--
+-- The header starts with the two bounds as adjacent words, which is what makes it findable:
+-- a word pair (lo, hi) with hi above lo, their difference a whole number of records, and the
+-- record we have already confirmed inside it. The two cursors and the count then have to be
+-- consistent with those bounds, which is what rejects an unrelated pair.
+--
+-- The scan is local and bounded. The header measured 40 KB below the ring on a 6500 1.7.17a,
+-- and the ring is at most RING_MAX records long, so a window either side of the record covers
+-- it without sweeping anything.
+fftsa.nl.HDR_BELOW, fftsa.nl.HDR_ABOVE = 262144, 65536
+fftsa.nl.HDR_OLD, fftsa.nl.HDR_WRITE, fftsa.nl.HDR_COUNT = 8, 12, 20
+
+function fftsa.nl.find_ring_header(g)
+  local nl = fftsa.nl
+  nl.ring_why = nil
+  if g == nil or g.val0 == nil or g.stride == nil then
+    nl.ring_why = 'no record geometry to find a header from'
+    return nil
+  end
+  local v, s = g.val0, g.stride
+  local lo = v - nl.HDR_BELOW
+  if lo < nl.BACKSTOP_LO then lo = nl.BACKSTOP_LO end
+  local hi = v + nl.HDR_ABOVE
+  local found, nfound = nil, 0
+  -- The candidate bounds are a pointer whose value is within one ring of the record, so its
+  -- top half is one of a handful of values. Searching for those two bytes jumps between
+  -- candidate positions instead of testing every word: a 2-byte prefix lands about five times
+  -- in 320 KB, against 80,000 word positions to test blind.
+  local maxspan = nl.RING_MAX * s
+  local pre, np = {}, 0
+  local t = math.floor(v / 65536)
+  local lot = math.floor((v - maxspan) / 65536)
+  local k
+  for k = lot, t do
+    np = np + 1
+    pre[np] = string.char(math.mod(math.floor(k / 256), 256), math.mod(k, 256))
+  end
+  local a = lo
+  while a < hi do
+    local step = 32768
+    if a + step > hi then step = hi - a end
+    local blk = ki.memread(hx(a), hx(step))
+    if blk ~= nil then
+      local pi
+      for pi = 1, np do
+        local i = 1
+        while true do
+          local j = string.find(blk, pre[pi], i, true)
+          if j == nil then break end
+          local at = a + j - 1
+          if math.mod(at, 4) == 0 and at + 24 <= a + step then
+            local c = nl._ring_hdr_ok(at, blk, j, g)
+            if c ~= nil then
+              nfound = nfound + 1
+              if found == nil then found = c end
+            end
+          end
+          i = j + 1
+        end
+      end
+    end
+    if a + step >= hi then break end
+    -- Overlap by the longest structure a test reads, or a header straddling a slice edge is
+    -- missed -- the same tail case FINDS has.
+    a = a + step - 24
+  end
+  nl.ring_hdrs = nfound
+  if found == nil then
+    nl.ring_why = 'no ring header near the record, ' .. tostring(np) .. ' prefixes swept'
+    return nil
+  end
+  if nfound > 1 then
+    nl.ring_why = tostring(nfound) .. ' candidate headers, so none is identified'
+    return nil
+  end
+  g.hdr = found.hdr
+  g.lo, g.hi, g.nrec = found.lo, found.hi, found.nrec
+  -- The field offsets inside a record, which only the ring start can give. A writer does not
+  -- need them -- it addresses fields relative to val0 -- but a report that names them is how
+  -- an operator on an unmeasured model can say what their instrument's record looks like.
+  g.ov, g.ox = found.ov, found.ox
+  return g
+end
+
+-- One candidate, judged entirely on consistency. Six terms, and the value field's own address
+-- is NOT one of them being on the record grid: that address is a field inside a record, not a
+-- record base, so its distance from the ring start is the field offset and is a multiple of
+-- nothing. What it does have to satisfy is that both eight-byte fields fit inside one record
+-- at the offsets already measured, which is the term that replaces it.
+function fftsa.nl._ring_hdr_ok(at, blk, j, g)
+  local nl = fftsa.nl
+  local v, s = g.val0, g.stride
+  local w = function(off)
+    local p = j + off
+    if p + 3 <= string.len(blk) then return u32_at(blk, p) end
+    return nl._wg(at + off)
+  end
+  local lo, hi = w(0), w(4)
+  if lo == nil or hi == nil or hi <= lo then return nil end
+  local span = hi - lo
+  if math.mod(span, s) ~= 0 then return nil end
+  local n = span / s
+  if n < nl.RING_MIN or n > nl.RING_MAX then return nil end
+  if v < lo or v >= hi then return nil end
+  -- Where the two fields sit inside a record, and whether they both fit in one.
+  local ov = math.mod(v - lo, s)
+  local ox = math.mod(ov + g.dx, s)
+  if ov + 8 > s or ox + 8 > s then return nil end
+  local old, wr, cnt = w(nl.HDR_OLD), w(nl.HDR_WRITE), w(nl.HDR_COUNT)
+  if old == nil or wr == nil or cnt == nil then return nil end
+  if old < lo or old >= hi or math.mod(old - lo, s) ~= 0 then return nil end
+  if wr < lo or wr >= hi or math.mod(wr - lo, s) ~= 0 then return nil end
+  if cnt < 1 or cnt > n then return nil end
+  return { hdr = at, lo = lo, hi = hi, nrec = n, ov = ov, ox = ox }
+end
+
+-- The header as five numbers. A caller proves the field order by CAUSE rather than by layout:
+-- read this, append one reading, read it again. The count must rise by one and the write
+-- cursor advance by exactly one stride. Nothing else in memory does that.
+function fftsa.nl.ring_header(g)
+  local nl = fftsa.nl
+  if g == nil or g.hdr == nil then return nil end
+  return { lo = nl._wg(g.hdr), hi = nl._wg(g.hdr + 4),
+           oldest = nl._wg(g.hdr + nl.HDR_OLD),
+           write = nl._wg(g.hdr + nl.HDR_WRITE),
+           count = nl._wg(g.hdr + nl.HDR_COUNT) }
 end
 
 -- ---------------------------------------------------------------------------

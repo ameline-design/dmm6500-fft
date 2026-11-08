@@ -1012,6 +1012,200 @@ do
         'why=' .. tostring(fftsa.nl.why))
 end
 
+-- ========================================================================================
+-- The display task's trace ring, found from values only this app appended.
+--
+-- The geometry here is the one measured on a DMM6500 1.7.17a: ring 0x03B53038..0x03B5CDF0,
+-- span 40,376 = 721 records of 56 bytes, value float32 twice at record +0x20, x float32 twice
+-- at +0x2C, header 40,904 bytes below the ring with lo/hi/oldest/write at +0, +4, +8, +0xC and
+-- the count at +0x14.
+--
+-- NONE OF THOSE NUMBERS IS AN INPUT. The finder is given four appended db/hz pairs and has to
+-- come back with the stride and the value-to-x distance on its own, because a DMM7510's have
+-- never been measured and assuming them is what the operator ruled out. So the fixture is
+-- built at the measured geometry and the test is whether the finder RECOVERS it -- and the
+-- same fixture is then rebuilt at a different stride and a negative dx, which it must recover
+-- just as well or it is reading its own assumption back.
+-- ========================================================================================
+
+print('\nnl.find_ring_records and find_ring_header')
+
+do
+  local SAVEDT = tostring
+  fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 12288, 268435456
+
+  -- A flat byte image, sparse by word, assembled on demand. memread has to serve unaligned
+  -- addresses because FINDS overlaps its slices by the needle length minus one.
+  local IMG = {}
+  local function wr32(a, v)
+    IMG[a] = string.char(math.floor(v / 16777216), math.mod(math.floor(v / 65536), 256),
+                         math.mod(math.floor(v / 256), 256), math.mod(v, 256))
+  end
+  local function wrs(a, s)
+    local i
+    for i = 0, string.len(s) / 4 - 1 do
+      IMG[a + i * 4] = string.sub(s, i * 4 + 1, i * 4 + 4)
+    end
+  end
+  ki.memread = function(ah, lh)
+    local a, n = tonumber(ah, 16), tonumber(lh, 16)
+    if a == nil or n == nil or n <= 0 then return nil end
+    local w0 = a - math.mod(a, 4)
+    local w1 = a + n + 3
+    w1 = w1 - math.mod(w1, 4)
+    local acc, k, p = {}, 0, nil
+    for p = w0, w1 - 4, 4 do
+      k = k + 1
+      acc[k] = IMG[p] or '\0\0\0\0'
+    end
+    return string.sub(table.concat(acc), a - w0 + 1, a - w0 + n)
+  end
+  ki.peek32 = function(ah)
+    local a = tonumber(ah, 16)
+    local s = IMG[a]
+    if s == nil then return '0' end
+    return string.format('%X', ((string.byte(s, 1) * 256 + string.byte(s, 2)) * 256
+                                + string.byte(s, 3)) * 256 + string.byte(s, 4))
+  end
+
+  local SENT = { {db = -100.0, hz = 1024.0}, {db = -101.0, hz = 2048.0},
+                 {db = -102.0, hz = 4096.0}, {db = -103.0, hz = 8192.0} }
+
+  -- lo, stride, how many records, the value and x offsets inside a record, and how far below
+  -- the ring the header sits. Everything the finder must not be told.
+  local function build(lo, stride, nrec, ov, ox, below)
+    IMG = {}
+    local hdr = lo - below
+    wr32(hdr, lo)
+    wr32(hdr + 4, lo + nrec * stride)
+    wr32(hdr + 8, lo)
+    wr32(hdr + 12, lo + (nrec - 2) * stride)
+    wr32(hdr + 20, 255)
+    local i
+    for i = 1, table.getn(SENT) do
+      local rec = lo + (i - 1) * stride
+      local v = fftsa.nl._f32_pack(SENT[i].db)
+      local x = fftsa.nl._f32_pack(SENT[i].hz)
+      wrs(rec + ov, v .. v)
+      wrs(rec + ox, x .. x)
+      wr32(rec + ov + 8, 0)                 -- flags, zero on a numeric axis
+      wr32(rec + ox + 8, 1073741824)        -- 2.0f, which the firmware puts there
+    end
+    -- The arena hint is what keeps the sweep's first window tight, and on the instrument it is
+    -- set by whichever descriptor was found first.
+    fftsa.nl.arena = lo
+    return hdr
+  end
+
+  local RLO, STRIDE, NREC = 62206008, 56, 721       -- 0x03B53038, the measured ring
+  local HDR = build(RLO, STRIDE, NREC, 32, 44, 40904)
+
+  local g = fftsa.nl.find_ring_records(SENT)
+  check('recovers the record stride and the value-to-x distance from four appends',
+        g ~= nil and g.val0 == RLO + 32 and g.stride == STRIDE and g.dx == 12,
+        g == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('val0=%X stride=%d dx=%d nconf=%d', g.val0, g.stride, g.dx, g.nconf))
+
+  local h = fftsa.nl.find_ring_header(g)
+  check('finds the ring header from the record, with no offset given',
+        h ~= nil and h.hdr == HDR and h.lo == RLO and h.nrec == NREC,
+        h == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('hdr=%X lo=%X nrec=%d', h.hdr, h.lo, h.nrec))
+
+  local hv = fftsa.nl.ring_header(g)
+  check('reads the header back as five numbers',
+        hv ~= nil and hv.lo == RLO and hv.hi == RLO + NREC * STRIDE
+        and hv.oldest == RLO and hv.count == 255,
+        hv == nil and 'nil' or string.format('count=%d write=%X', hv.count, hv.write))
+
+  -- THE SAME FIXTURE AT A GEOMETRY NOBODY HAS MEASURED. A 7510 need not use 56 bytes, and the
+  -- x may precede the value, which makes dx negative. If either of these fails the finder is
+  -- recognising the 6500 rather than measuring the instrument.
+  local RLO2, S2 = 48234496, 64
+  local HDR2 = build(RLO2, S2, 512, 40, 20, 8192)
+  local g2 = fftsa.nl.find_ring_records(SENT)
+  check('recovers a different stride, and an x field that precedes the value',
+        g2 ~= nil and g2.val0 == RLO2 + 40 and g2.stride == S2 and g2.dx == -20,
+        g2 == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('val0=%X stride=%d dx=%d', g2.val0, g2.stride, g2.dx))
+  local h2 = fftsa.nl.find_ring_header(g2)
+  check('and its header, 8 KB below instead of 40 KB',
+        h2 ~= nil and h2.hdr == HDR2 and h2.nrec == 512,
+        h2 == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('hdr=%X nrec=%d', h2.hdr, h2.nrec))
+
+  -- Refusals. Each of these is a way the finder could answer confidently and wrongly.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  check('three sentinels are the minimum, and two are refused by name',
+        fftsa.nl.find_ring_records({SENT[1], SENT[2]}) == nil
+        and string.find(tostring(fftsa.nl.ring_why), 'need 3', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl.ring_why))
+  check('sentinels that pack alike are refused rather than searched for',
+        fftsa.nl.find_ring_records({SENT[1], SENT[1], SENT[1]}) == nil
+        and string.find(tostring(fftsa.nl.ring_why), 'same float32', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl.ring_why))
+
+  -- A third sentinel that is not where the stride says it should be. Two records in a row can
+  -- line up by accident; the whole run cannot, and this is the test that says so.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  local bad = fftsa.nl._f32_pack(-109.0)
+  wrs(RLO + 2 * STRIDE + 32, bad .. bad)
+  check('a run that breaks at the third record confirms no stride',
+        fftsa.nl.find_ring_records(SENT) == nil
+        and string.find(tostring(fftsa.nl.ring_why), 'no stride', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl.ring_why))
+
+  -- THE DECOY THAT MATTERS. The buffer-side staging ring holds the same two float32 pairs in a
+  -- 28-byte record, written in the same order by the same append, and it is NOT what the widget
+  -- draws -- writing it buys nothing and advancing its cursors ends in a modal 2350. It
+  -- confirms at a stride just as convincingly, so the display ring has to be picked out by its
+  -- header: the staging ring keeps its bounds at +0x8C and +0x94, which are not adjacent, so
+  -- there is no pair to find. Placed BELOW the real ring so it is the first candidate.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  local STG = RLO - 131072
+  local si
+  for si = 1, table.getn(SENT) do
+    local rec = STG + (si - 1) * 28
+    local v = fftsa.nl._f32_pack(SENT[si].db)
+    local x = fftsa.nl._f32_pack(SENT[si].hz)
+    wrs(rec + 4, v .. v)
+    wrs(rec + 16, x .. x)
+  end
+  -- Its bounds exist but eight bytes apart, as the subscription keeps them.
+  wr32(STG - 256 + 140, STG)
+  wr32(STG - 256 + 148, STG + 16 * 28)
+  local gd = fftsa.nl.find_ring_records(SENT)
+  check('a 28-byte staging record confirms a stride too, so there are two candidates',
+        gd ~= nil and table.getn(fftsa.nl.ring_cands) >= 2,
+        'candidates=' .. tostring(fftsa.nl.ring_cands and table.getn(fftsa.nl.ring_cands)))
+  local gr = fftsa.nl.find_ring(SENT)
+  check('find_ring picks the one with a header, not the first one found',
+        gr ~= nil and gr.stride == STRIDE and gr.lo == RLO and gr.hdr == HDR,
+        gr == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('stride=%d lo=%X', gr.stride, gr.lo))
+
+  -- A header whose bounds are not a whole number of records, which is the discriminator that
+  -- separates the real pair from any other two adjacent pointers.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  wr32(HDR + 4, RLO + NREC * STRIDE + 4)
+  local g3 = fftsa.nl.find_ring_records(SENT)
+  check('a span that is not a whole number of records is not a header',
+        g3 ~= nil and fftsa.nl.find_ring_header(g3) == nil
+        and string.find(tostring(fftsa.nl.ring_why), 'no ring header', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl.ring_why))
+
+  -- And a count larger than the ring holds, which is the other half of the same judgement.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  wr32(HDR + 20, NREC + 1)
+  local g4 = fftsa.nl.find_ring_records(SENT)
+  check('a count larger than the ring is not a header either',
+        g4 ~= nil and fftsa.nl.find_ring_header(g4) == nil,
+        'why=' .. tostring(fftsa.nl.ring_why))
+
+  fftsa.nl.arena = nil
+  tostring = SAVEDT
+end
+
 ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR
 
 print()

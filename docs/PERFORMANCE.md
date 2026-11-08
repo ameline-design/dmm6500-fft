@@ -309,31 +309,45 @@ Measured on the glass, all three on a DMM6500 at a 50 kHz span:
 |---|---|---|---|---|---|---|
 | `FILL_ONCE`, 255 appends | — | 9.5 | — | — | — | 2.4 |
 | one-lap ring, always ascending, **line visible** | 17 | 14 | — | — | 3.8 | 2.4 |
-| folded ring, 510 appends | 11 | 9.5 | 8.3 | 5.9 | 3.6 | 1.9 |
-| **one lap, alternating direction, 255 appends** | **17** | **14** | — | — | — | **2.4** |
+| **folded ring, 510 appends — what ships** | **11** | **9.5** | **8.3** | **5.9** | **3.6** | **1.9** |
+| one lap, alternating direction, **double curve** | 17 | 14 | — | — | — | 2.4 |
 
-### What draws the line, and why alternating removes it
+The operator's own reading of the shipped fold at 8.51, independently: 1024 10 fps, 2048 10,
+4096 8.2, 8192 6.0, 16384 3.6, 32768 1.9. No flicker, no double trace, no seam.
 
-**The display task accumulates into its own ring across frames.** The trace object holds 720
-records and the appender wraps when it fills, so the plot shows roughly the last 720 points
-however they arrived -- about 2.8 passes at 255 points each. The line is therefore the join
-**between consecutive passes**, not the trace closing on itself: a pass that always runs
-`flo -> fhi` leaves a `fhi -> flo` step at every frame boundary inside that ring, and the
-widget draws it. Confirmed on the glass, appearing on alternate frames as the wrap moves.
+### What draws the line, why the fold removes it, and why alternating direction cannot
 
-That is also why the fold works. A fold ends at `flo`, where the next fold begins, so its
-frame-to-frame join is a repeated point -- but it pays 510 appends for the property.
-**Alternating the direction of each pass buys the same property at 255:**
+**The display task accumulates into its own ring across frames**, so what the widget draws is
+not one pass. The line is the join **between consecutive passes**, not the trace closing on
+itself: a pass that always runs `flo -> fhi` leaves a `fhi -> flo` step at every frame boundary
+inside that ring, and the widget draws it. `display.graph.setfill(g, 0)` does not affect it, so
+it is not a fill artifact, and an unconditional closure would draw it every frame rather than
+on alternate ones.
 
-    pass 1   flo -> fhi      ends at fhi
-    pass 2   fhi -> flo      begins at fhi, so the join is a repeated point
-    pass 3   flo -> fhi      begins at flo, so the join is a repeated point
+So each pass has to end where the next one begins. Two shapes do that, and only one of them
+works.
 
-A descending pass traverses the same curve backwards, so the picture and the trace extent are
-unchanged. Measured: no line, and 14 fps at 2048 against the fold's 9.5. One or two frames at
-launch glitch while the display ring fills, which the operator accepted.
+**The fold does, and it ships.** Up the band and back down, so a pass ends at `flo` where the
+next begins. 510 appends.
 
-`display.graph.setfill(g, 0)` does **not** affect it, so the join is not a fill artifact.
+**Alternating the direction of each pass is the same property at 255 appends, and it is
+unusable.** 8.50 shipped it and the glass showed a double curve on alternate frames at 2048,
+4096, 8192, 16384 and 32768 -- the correct curve, twice, two frames of it visible at once.
+
+> **THE INVARIANT THAT GOVERNS THE FILL: every slot must always hold the same frequency.**
+>
+> The display task paints during every append, so a paint lands part-way through a pass, some
+> slots holding this pass and the rest the previous one. That is invisible only while slot *i*
+> carries the same x in both -- then the two passes differ in dB alone and the picture is a
+> blend of two spectra at the same frequencies. A fold satisfies it: slot *i* is `hz[i]` going
+> up and `hz[cap+1-i]` coming back, every pass alike. Alternating does not: slot *i* is
+> `hz[i]` on one pass and `hz[room+1-i]` on the next, so a mid-pass paint holds two
+> frequencies per slot and the curve doubles back.
+
+This is also why the ring removed the `FILL_ONCE` flicker -- not because the buffer is never
+empty, but because a partial update is indistinguishable from a complete one. The alternating
+row stays in the table above because its frame rates are real and they bound what a 255-append
+pass could cost if some other shape ever satisfies the invariant.
 
 **Do not test any of this with a straight-line spectrum.** A ramp's pass-to-pass join is
 collinear with the ramp, so it is invisible and an always-ascending pass looks clean when it
@@ -492,6 +506,46 @@ Cross-checking against the cost model: 512 buffer reads at 22 µs is **11.3 ms**
 and 256 buffer writes at 65 µs is **16.6 ms** of the ~20 ms graph phase. So about **28 ms of the
 80 ms frame is marshalled API calls**, and it is a hard floor -- there is no bulk route into or out of
 a reading buffer from Lua (established three ways, see the dead ends).
+
+## The one route left past the appends: write the display task's own ring
+
+The 510 appends a folded pass makes are ~39 ms of a 105 ms frame at 2048, and they are a floor for
+the sanctioned path: `buffer.write.reading` is the only call the display task reads, it has no bulk
+form, and `dispatch`'s send is a synchronous vtable call so each append is a real round trip.
+
+What the widget draws is a ring of records the display task keeps for itself, one record per
+append. **Writing that ring directly is the only remaining way under the floor**, and at fixed
+slots it also satisfies the frequency invariant by construction -- so it needs 255 records, not
+510, and no fold.
+
+Measured on a DMM6500 1.7.17a: ring `0x03B53038..0x03B5CDF0`, span 40,376 = **721 records of 56
+bytes**; header 40,904 bytes below the ring with `lo`, `hi`, `oldest` and `write` at `+0x00`,
+`+0x04`, `+0x08`, `+0x0C` and the count at `+0x14`, capped at `0x2D0`; within a record, the value
+as float32 **twice** at `+0x20`/`+0x24`, flags at `+0x28`, the x as float32 twice at
+`+0x2C`/`+0x30`, and `2.0f` at `+0x34`. Record 128 read `-115.786` and `254.2428` against
+`readings[128] = -115.78624725` and `extravalues[128] = 254.24284363`.
+
+**None of that is compiled in or assumed.** `fftsa.nl.find_ring` appends four sentinel readings
+whose dB and Hz are exactly representable in float32, searches for a sentinel's dB packed as
+float32 twice, takes the **stride** from the distance between two sentinels' hits and the
+**value-to-x distance** from a search of one record's worth of bytes, confirms the whole run, and
+then finds the header by its own consistency -- an adjacent `(lo, hi)` pair a whole number of
+records apart with the confirmed record inside it and both cursors on the record grid. The test
+suite builds the fixture at a stride and a field order **nobody has measured** and requires the
+finder to recover those too, so it measures the instrument rather than recognising a 6500.
+
+The one decoy that matters is the buffer-side staging ring: 28-byte records holding the same two
+float32 pairs, written by the same append, and not what the widget draws. It confirms at a stride
+just as convincingly. What separates them is the header — the staging ring keeps its bounds at
+`+0x8C` and `+0x94`, which are not adjacent, so there is no pair to find — and `find_ring` walks
+every record candidate until one has a header.
+
+**Open, and it is the question the design rests on:** does the widget draw from those records, or
+are they a cache it refills from somewhere else? `tools/probe_ringfind.py --write` answers it in
+one run — it saves a run of records, writes an unmistakable dB into their value fields only, fires
+one append to provoke a repaint, and compares a checksum of the plot interior. Only the two
+float32 fields are touched, so the flags, the `2.0f` and the scratch extent bytes stay exactly as
+the firmware left them, and everything is restored first in the finally block.
 
 ## What is left to win
 
