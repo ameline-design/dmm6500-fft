@@ -71,6 +71,41 @@ def ask(d, cmd, tag, tries=8, timeout=120):
     raise SystemExit('DESYNC(%s) last=%r' % (tag, r))
 
 
+def park(d):
+    """Park the frame loop, confirming by state rather than by reply.
+
+    A running frame loop holds the interpreter, so the park statement's own reply is usually
+    swallowed even though the statement runs -- measured at 1.9 fps, where one frame occupies
+    most of a 525 ms period, and five consecutive queries came back empty before anything
+    answered. So this sends it without expecting a reply and polls until the state says it
+    took."""
+    stmt = ("do if fftsa.saved_frame == nil then fftsa.saved_frame = fftsa.frame "
+            "fftsa.frame = function() end end end")
+    for _ in range(30):
+        d.drain()
+        d.send(stmt)
+        time.sleep(0.4)
+        r = d.q("print('K|' .. tostring(fftsa.saved_frame ~= nil))", timeout=20)
+        if r is not None and str(r).startswith('K|true'):
+            return True
+        time.sleep(1)
+    raise SystemExit('could not park the frame loop; the app may not be running')
+
+
+def unpark(d):
+    stmt = ("do if fftsa.saved_frame ~= nil then fftsa.frame = fftsa.saved_frame "
+            "fftsa.saved_frame = nil end end")
+    for _ in range(30):
+        d.drain()
+        d.send(stmt)
+        time.sleep(0.4)
+        r = d.q("print('K|' .. tostring(fftsa.saved_frame == nil))", timeout=20)
+        if r is not None and str(r).startswith('K|true'):
+            return True
+        time.sleep(1)
+    return False
+
+
 def one(*parts):
     return ' '.join(p.strip() for p in parts)
 

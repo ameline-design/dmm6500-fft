@@ -772,6 +772,36 @@ do
         and w[1][2] == fftsa.nl.BACKSTOP_HI,
         'n=' .. table.getn(w))
 
+  -- The chunk payload is derived, not asserted. The old pair of tests demanded exactly
+  -- 32768, which refused a valid DMM7510 descriptor outright.
+  check('a 6500 record: 32 bytes x 1024 fills a 32 KB payload',
+        fftsa.nl._chunk_span(32, 1024) == 32768,
+        'got=' .. tostring(fftsa.nl._chunk_span(32, 1024)))
+  -- STYLE_STANDARD is 24 bytes and does not divide the payload: 1365 fill 32,760 and leave
+  -- 8 spare, so the fit has to be a fit and not an exact product.
+  check('a 24-byte element still pins the same payload',
+        fftsa.nl._chunk_span(24, 1365) == 32768,
+        'got=' .. tostring(fftsa.nl._chunk_span(24, 1365)))
+  -- A model with a bigger allocator block is recognised rather than refused.
+  check('a 64 KB payload is recognised, which the old tests refused',
+        fftsa.nl._chunk_span(32, 2048) == 65536,
+        'got=' .. tostring(fftsa.nl._chunk_span(32, 2048)))
+  check('and a 4 KB one at the bottom of the range',
+        fftsa.nl._chunk_span(32, 128) == 4096,
+        'got=' .. tostring(fftsa.nl._chunk_span(32, 128)))
+  -- Several payload sizes are valid now, which is the cost of not assuming one: 512 elements
+  -- of 32 bytes exactly fill 16 KB, so that is a real geometry and is accepted. What is still
+  -- refused is a count that fills no power of two at all -- 1000 elements of 32 bytes span
+  -- 32,000 and one more reaches 32,032, so no payload size has them as its maximum.
+  check('a geometry that fills no power of two is refused',
+        fftsa.nl._chunk_span(32, 512) == 16384 and fftsa.nl._chunk_span(32, 1000) == nil,
+        '512->' .. tostring(fftsa.nl._chunk_span(32, 512))
+        .. ' 1000->' .. tostring(fftsa.nl._chunk_span(32, 1000)))
+  check('nonsense geometry is refused',
+        fftsa.nl._chunk_span(0, 1024) == nil and fftsa.nl._chunk_span(32, 0) == nil
+        and fftsa.nl._chunk_span(32, 1048576) == nil,
+        'zero and oversize both refused')
+
   tostring = SAVED
   -- Every refusal in init names itself now, so the panel never reports a bare nil again.
   check('a refusal records why',

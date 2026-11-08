@@ -665,7 +665,11 @@ function fftsa.nl.diag()
   o = o .. ' | backstop=' .. hx(nl.BACKSTOP_LO or 0) .. '..' .. hx(nl.BACKSTOP_HI or 0)
   o = o .. ' anchor=' .. hx(nl.heap_anchor() or 0) .. ' ' .. nl.windows_str()
   o = o .. ' | glue=' .. tostring(nl.nglue) .. '/' .. tostring(nl.GLUE_MIN)
-  o = o .. ' mathpos=' .. tostring(nl.math_pos) .. ' odd=' .. tostring(nl.math_odd)
+  local np, k = 0, nil
+  if nl.math_pos ~= nil then for k in pairs(nl.math_pos) do np = np + 1 end end
+  o = o .. ' mathpos=' .. tostring(np) .. ' odd=' .. tostring(nl.math_odd)
+  o = o .. ' | chunk=' .. tostring(nl.chunk_span) .. '/' .. tostring(nl.CHUNK_BYTES)
+  o = o .. ' hits=' .. tostring(nl._hit_n) .. ' first[' .. tostring(nl._hit_why) .. ']'
   o = o .. ' | plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params=' .. tostring(nl.SIZEOF_PARAMS)
   o = o .. ' real=' .. tostring(nl.SIZEOF_REAL) .. ' align=' .. tostring(nl.DSP_ALIGN)
   -- Which of the six resolved, by name: one missing entry is enough to stop the install, and
@@ -855,6 +859,26 @@ end
 -- below. Confirmed by the two self-pointers and the chunk geometry, so a base that no
 -- longer describes this buffer is refused here and the caller sweeps again. Returns the
 -- base, elemsize, perchunk, the chunk vector and the chunk count.
+-- The chunk payload size is the allocator's figure, not ours. A DMM6500 uses 32,768 bytes;
+-- another model need not, and a DMM7510 1.7.16 rejected a perfectly good descriptor because
+-- the two tests below demanded that exact number.
+--
+-- perchunk is how many elements fit one payload, so the payload is the power of two perchunk
+-- exactly fills: elemsize * perchunk fits it, and one more element does not. That still pins
+-- perchunk as tightly as the old pair did -- it just does not assume which payload size it is
+-- pinning against. Identification does not rest on this anyway: +0x48 holding elem0 and the
+-- two self-pointers at +0x54 and +0x64 both equalling base are three independent checks.
+function fftsa.nl._chunk_span(elemsize, perchunk)
+  if elemsize == nil or perchunk == nil then return nil end
+  if elemsize < 8 or perchunk < 1 then return nil end
+  local p = 4096
+  while p <= 1048576 do
+    if elemsize * perchunk <= p and elemsize * (perchunk + 1) > p then return p end
+    p = p * 2
+  end
+  return nil
+end
+
 function fftsa.nl._read_desc(base, elem0)
   if base == nil then return nil end
   if W(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
@@ -864,8 +888,9 @@ function fftsa.nl._read_desc(base, elem0)
   local nchunks  = W(base + 16)
   if elemsize == nil or perchunk == nil or nchunks == nil then return nil end
   if nchunks < 1 or nchunks >= 4096 or elemsize < 8 or perchunk < 1 then return nil end
-  if elemsize * perchunk > fftsa.nl.CHUNK_BYTES then return nil end
-  if elemsize * (perchunk + 1) <= fftsa.nl.CHUNK_BYTES then return nil end
+  local span = fftsa.nl._chunk_span(elemsize, perchunk)
+  if span == nil then return nil end
+  fftsa.nl.chunk_span = span
   return base, elemsize, perchunk, W(base + 68), nchunks
 end
 
@@ -881,6 +906,7 @@ function fftsa.nl._find_desc(elem0)
     nl._desc_of, nl._desc_at = nil, nil
   end
   local needle = u32_pack(elem0)
+  nl._hit_n, nl._hit_why = 0, nil
   local windows = fftsa.nl.sweep_windows()
   local wi
   for wi = 1, table.getn(windows) do
@@ -894,15 +920,19 @@ function fftsa.nl._find_desc(elem0)
         local elemsize = W(base + 8)
         local perchunk = W(base + 12)
         local nchunks  = W(base + 16)   -- 0x10, chunk count
-        -- perchunk is how many elements fit in a chunk, which is not CHUNK_BYTES / 32: the
-        -- payload is a fixed 32,768 bytes but the element size is a runtime field, and a
-        -- STYLE_STANDARD element of 24 does not divide it -- 1365 elements fill 32,760 and
-        -- leave 8 spare. So the test is a fit and not an exact product, and it still pins
-        -- perchunk exactly, one more element not fitting.
+        -- The element size is a runtime field and need not divide the payload: a
+        -- STYLE_STANDARD element of 24 bytes puts 1365 in a 32,768-byte payload, filling
+        -- 32,760 and leaving 8 spare. So the test is a fit rather than an exact product, and
+        -- _chunk_span finds which payload size it is a fit for instead of assuming.
+        local span = fftsa.nl._chunk_span(elemsize, perchunk)
+        nl._hit_n = (nl._hit_n or 0) + 1
+        if nl._hit_why == nil then
+          nl._hit_why = 'es=' .. tostring(elemsize) .. ' pc=' .. tostring(perchunk)
+                        .. ' nc=' .. tostring(nchunks) .. ' span=' .. tostring(span)
+        end
         if elemsize ~= nil and perchunk ~= nil and nchunks ~= nil and
-           nchunks > 0 and nchunks < 4096 and elemsize >= 8 and perchunk > 0 and
-           elemsize * perchunk <= fftsa.nl.CHUNK_BYTES and
-           elemsize * (perchunk + 1) > fftsa.nl.CHUNK_BYTES then
+           nchunks > 0 and nchunks < 4096 and span ~= nil then
+          nl.chunk_span = span
           -- 0x44 is the chunk vector. The count comes back with it because a caller
           -- indexing the vector has no other way to know where it ends, and an entry too
           -- far returns whatever follows in the heap -- which could pass the backstop and
@@ -1411,7 +1441,9 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local pdesc = nl.describe(pb, true)
   if pdesc == nil or pdesc.vec == nil then
     return fftsa.nl._abort(cb, pb, 'plan buffer: no descriptor found by sweep -- '
-                           .. tostring(nl._stor_why) .. ' anchor=' .. hx(nl.heap_anchor() or 0)
+                           .. tostring(nl._stor_why) .. ' hits=' .. tostring(nl._hit_n)
+                           .. ' first[' .. tostring(nl._hit_why) .. ']'
+                           .. ' anchor=' .. hx(nl.heap_anchor() or 0)
                            .. ' ' .. fftsa.nl.windows_str())
   end
   trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
@@ -1420,6 +1452,16 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- descriptor's own field at +0x10, so this is the allocator's answer and not an inference
   -- from the capacity asked for: one entry past the end returns whatever follows in the
   -- heap, and anything that looks like a heap address passes the native backstop.
+  -- Everything below lays the plan out against nl.CHUNK_BYTES, and the compiled image
+  -- bounds a strided walk with DSPN_CHUNK_BYTES, so a payload of some other size cannot be
+  -- used even though the descriptor is now recognised. Reported with the real figure, which
+  -- is what parameterising both sides would need.
+  if nl.chunk_span ~= nil and nl.chunk_span ~= nl.CHUNK_BYTES then
+    return fftsa.nl._abort(cb, pb, 'this model has a ' .. tostring(nl.chunk_span)
+                           .. '-byte chunk payload, not ' .. tostring(nl.CHUNK_BYTES)
+                           .. ' -- elemsize=' .. tostring(pdesc.elemsize)
+                           .. ' perchunk=' .. tostring(pdesc.perchunk))
+  end
   if pdesc.nchunks == nil or pdesc.nchunks < chunks_wanted then
     return fftsa.nl._abort(cb, pb, 'plan buffer has ' .. tostring(pdesc.nchunks)
                            .. ' chunks, needs ' .. tostring(chunks_wanted))
