@@ -4580,6 +4580,31 @@ check('without either implementation, start refuses and says so', (function()
   return ok == false and string.find(why, 'no interpreted fallback', 1, true) ~= nil,
          'start=' .. tostring(ok) .. ' lasterr=' .. why
 end)())
+-- A DEFECT IN nl.init MUST REACH THE ERROR PAGE, NOT KILL THE APP. init is several hundred
+-- lines of our own arithmetic over tables, byte offsets and strings, and one defect in it was
+-- real -- a negative byte reaching string.char in the ring finder, which raises. Unprotected
+-- that raise escapes start() and leaves the app on screen and dead, with nothing to
+-- photograph on a model nobody here can run. The boundary turns it into a named refusal.
+check('a raise inside nl.init becomes a named refusal, not a dead app', (function()
+  local keepi, keepnl = fftsa.fft_init, fftsa.nl
+  fftsa.fft_init = nil
+  fftsa.nl = {ready = false, entry = nil, why = nil,
+              init = function() error('boom in init', 0) end,
+              diag = function() return 'why=' .. tostring(fftsa.nl.why) end,
+              win_to_native = function() return 0 end,
+              FFT_FOURSTEP = 1}
+  local ok = fftsa.start()
+  local why = tostring(fftsa.lasterr)
+  local recorded = tostring(fftsa.nl.why)
+  fftsa.fft_init, fftsa.nl = keepi, keepnl
+  fftsa.start()
+  fftsa.frame()
+  -- start() has to RETURN, the reason has to name the raise, and it has to be on the page.
+  return ok == false and string.find(recorded, 'init raised', 1, true) ~= nil
+         and string.find(why, 'boom in init', 1, true) ~= nil,
+         'start=' .. tostring(ok) .. ' why=' .. recorded
+end)())
+
 -- The other side of that refusal, and the one it got wrong. An installed, planned compiled
 -- path must start even when the per-frame descriptor cache is cold: nl_bind() rebuilds
 -- fftsa.nl_cap on every Apply, so a nil one is recoverable and not an absent implementation.

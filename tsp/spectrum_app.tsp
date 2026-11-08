@@ -1925,11 +1925,28 @@ function fftsa.start()
   -- nil for the barrier buffer: nl.init barriers on a buffer it fills itself, and fftsa.cap
   -- holds no readings until the first capture, where buffer.getstats need not make the
   -- service-task call the barrier depends on -- which bluescreens from this call site.
+  --
+  -- Inside the same boundary as apply() above, for the same reason and not as a new habit:
+  -- init is several hundred lines of our own arithmetic over tables, byte offsets and
+  -- strings, so a defect in it raises rather than returning. Outside a boundary that raise
+  -- leaves the app dead with nothing on the glass; inside one the error page names it, and on
+  -- a model nobody here can run that is the difference between a report and a shrug. One such
+  -- defect was real -- a negative byte reaching string.char in the ring finder -- and it was
+  -- found by reading the code rather than by a photograph of a blank screen.
   if fftsa.nl ~= nil and type(fftsa.nl.init) == 'function' then
-    fftsa.nl.init(nil, fftsa.nl_nmax, fftsa.nl.win_to_native(fftsa.win_i),
-                  fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP,
-                  fftsa.sg_maxpts)
-    fftsa.nl_replan()
+    local iok, ierr = pcall(function()
+      fftsa.nl.init(nil, fftsa.nl_nmax, fftsa.nl.win_to_native(fftsa.win_i),
+                    fftsa.kbeta(fftsa.kbeta_i), 1, fftsa.nl.FFT_FOURSTEP,
+                    fftsa.sg_maxpts)
+      fftsa.nl_replan()
+    end)
+    -- Refused rather than run: a raise part-way through the plan leaves the arena in a state
+    -- nothing has checked, and a wrong plan is a wrong spectrum drawn confidently. NLBOOT is
+    -- already claimed by then, so there is no install to protect either.
+    if not iok then
+      fftsa.nl.ready = false
+      fftsa.nl.why = 'init raised: ' .. tostring(ierr)
+    end
   end
   -- No implementation at all is a refusal, not twenty error frames a second: the archive
   -- ships no interpreted transform, so without the compiled path every frame would post
