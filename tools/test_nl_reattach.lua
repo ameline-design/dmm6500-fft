@@ -522,6 +522,209 @@ check('resolves at every count the app offers, with no content scan available',
       allok, string.format('counts=%d firstbad=%s',
                            table.getn(counts), tostring(firstbad)))
 
+-- ========================================================================================
+-- The descriptor outside every anchored window: the DMM7510 1.7.16 failure.
+--
+-- Reported from the glass at 8.47: element 0 confirmed at 0x0158D7C0 at stride 32, and no
+-- descriptor anywhere, with windows 0x3000..0x27BF520 and 0x3000..0x8FBF520. The layout is not
+-- the difference -- the function that initialises +0x44/+0x48/+0x54/+0x64/+0x74 and the four
+-- copies of n is 1044 bytes byte-identical in the 6500 1.7.17a and 7510 1.7.16 images -- so the
+-- descriptor was outside what tostring({}) can reach. The anchored pair covers 143 MB of a heap
+-- that runs to 248 MB.
+--
+-- These use the reported numbers. FINDS is modelled on the needle's meaning: a hit comes back
+-- only when the address it sits at is inside the window asked for, which is the whole of what
+-- went wrong.
+-- ========================================================================================
+
+print('\nnl.scan_windows, the descriptor beyond the anchored windows')
+
+do
+  local SAVED = tostring
+  fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 12288, 268435456
+
+  local ANCHOR = 17179000        -- 0x1062178, the anchor that DMM7510 reported
+  local ELEM0  = 22599616        -- 0x158D7C0, the element 0 it confirmed
+  local INST   = 209715200       -- 0xC800000, a C++ instance 200 MB up
+  local HDESC  = INST + 65536    -- the descriptor, in the instance's own arena
+  local COLPTR = INST - 131072   -- a column pointer, as the chain lists them
+  local REF    = {cclassref = true}
+
+  -- tostring has to answer two different objects: a fresh table for the anchor, and the
+  -- CClassRef userdata for the instance. Both print an address on the instrument.
+  local setpair = function(anchor, refaddr)
+    tostring = function(v)
+      if v == REF and refaddr ~= nil then
+        return 'userdata: ' .. string.format('%x', refaddr)
+      end
+      if type(v) == 'table' and next(v) == nil then
+        return 'table: ' .. string.format('%x', anchor)
+      end
+      return SAVED(v)
+    end
+  end
+
+  -- The buffer as the firmware presents it: a table with no own keys whose metatable carries
+  -- CClassRef. The Udata payload holds one pointer, which is the instance.
+  local REFAT = 55000000
+  local function hbuf()
+    return setmetatable({n = 2048, capacity = 263168}, {CClassRef = REF})
+  end
+
+  setpair(ANCHOR, REFAT)
+  reset_heap()
+  WORDS[REFAT] = INST
+
+  check('the instance comes off the buffer metatable, with no searching',
+        fftsa.nl.cclass(hbuf()) == INST,
+        'inst=' .. tostring(fftsa.nl.cclass(hbuf())))
+
+  check('a buffer with no metatable answers nil rather than guessing',
+        fftsa.nl.cclass({n = 1}) == nil and fftsa.nl.cclass(nil) == nil,
+        'both nil')
+
+  -- The chain is (previous id, this id, two pointers) per 16 bytes, NUL-terminated. A reader
+  -- that misses the terminator walks into unreclaimed heap and hands back pointers to nothing.
+  WORDS[INST + 16 + 4] = 9
+  WORDS[INST + 16 + 8] = COLPTR
+  WORDS[INST + 16 + 12] = COLPTR + 4096
+  WORDS[INST + 32 + 4] = 0
+  local cp = fftsa.nl.col_ptrs(INST)
+  check('the column chain stops at its terminator',
+        table.getn(cp) == 2 and cp[1] == COLPTR and cp[2] == COLPTR + 4096,
+        'n=' .. table.getn(cp))
+
+  -- The ladder itself. Stage 1 has to be tight and first, or a model that works today pays
+  -- minutes for what it used to find in a second.
+  local w = fftsa.nl.scan_windows(hbuf(), ELEM0)
+  local nw = table.getn(w)
+  check('the first window is tight and centred on the instance',
+        w[1][1] == INST - fftsa.nl.TIGHT and w[1][2] == INST + fftsa.nl.TIGHT,
+        string.format('%X..%X over %d windows', w[1][1], w[1][2], nw))
+  check('the last window is everything the backstop allows, so nothing in DRAM is unreachable',
+        w[nw][1] == fftsa.nl.BACKSTOP_LO and w[nw][2] == fftsa.nl.BACKSTOP_HI,
+        string.format('%X..%X', w[nw][1], w[nw][2]))
+  -- The anchored pair is still in there. It is what works on a 6500 today and the ladder adds
+  -- to it rather than replacing it.
+  local kept = false
+  local sw = fftsa.nl.sweep_windows()
+  local wi, si
+  for wi = 1, nw do
+    for si = 1, table.getn(sw) do
+      if w[wi][1] == sw[si][1] and w[wi][2] == sw[si][2] then kept = true end
+    end
+  end
+  check('the anchored windows 8.46 swept are still swept', kept, 'n=' .. nw)
+  -- And no window appears twice: elem0 and the instance can be in the same arena, and a
+  -- duplicate of the wide stage would double the worst case.
+  local dup = false
+  for wi = 1, nw do
+    for si = wi + 1, nw do
+      if w[wi][1] == w[si][1] and w[wi][2] == w[si][2] then dup = true end
+    end
+  end
+  check('no window is swept twice', not dup, 'n=' .. nw)
+
+  -- A hit only where the needle really is. This is the model the 7510 defeated.
+  local PLACES
+  fftsa.nl.FINDS = function(lo, hi, pat)
+    local out, n, i = {}, 0, nil
+    for i = 1, table.getn(PLACES) do
+      if PLACES[i][2] == pat and PLACES[i][1] >= lo and PLACES[i][1] <= hi then
+        n = n + 1; out[n] = PLACES[i][1]
+      end
+    end
+    return out
+  end
+  local E0PAT = string.char(1, 88, 215, 192)       -- 0x0158D7C0 big-endian
+
+  reset_heap()
+  WORDS[REFAT] = INST
+  WORDS[INST + 16 + 4] = 9
+  WORDS[INST + 16 + 8] = COLPTR
+  WORDS[INST + 32 + 4] = 0
+  place_desc(HDESC, ELEM0, 32, 1024, 2, 263168, 2048)
+  PLACES = {{HDESC + 72, E0PAT}}
+  fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil
+
+  -- First the failure as it stands, so the fixture is known to reproduce it: the anchored pair
+  -- alone cannot see a descriptor 200 MB up, and that is hits=0 with nothing to act on.
+  local osw = fftsa.nl.scan_windows
+  fftsa.nl.scan_windows = function() return fftsa.nl.sweep_windows() end
+  local b0 = fftsa.nl._find_desc(ELEM0, hbuf())
+  check('the anchored windows alone still miss it, which is what was reported',
+        b0 == nil and fftsa.nl._raw_n == 0,
+        'base=' .. tostring(b0) .. ' raw=' .. tostring(fftsa.nl._raw_n))
+  fftsa.nl.scan_windows = osw
+
+  fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil
+  local b, es, pc, vec, nc = fftsa.nl._find_desc(ELEM0, hbuf())
+  check('and the instance window finds it, in stage 1',
+        b == HDESC and es == 32 and pc == 1024 and nc == 2 and fftsa.nl._win_hit == 1,
+        string.format('base=%s win=%s raw=%s', tostring(b), tostring(fftsa.nl._win_hit),
+                      tostring(fftsa.nl._raw_n)))
+
+  -- A column pointer that is the descriptor needs no sweep at all. FINDS is replaced with one
+  -- that fails the test if it is called, because "cheapest first" is the claim being made.
+  reset_heap()
+  WORDS[REFAT] = INST
+  WORDS[INST + 16 + 4] = 9
+  WORDS[INST + 16 + 8] = HDESC
+  WORDS[INST + 32 + 4] = 0
+  place_desc(HDESC, ELEM0, 32, 1024, 2, 263168, 2048)
+  local swept = 0
+  local KEEP = fftsa.nl.FINDS
+  fftsa.nl.FINDS = function() swept = swept + 1; return {} end
+  fftsa.nl._desc_of, fftsa.nl._desc_at, fftsa.nl.arena = nil, nil, nil
+  local bd = fftsa.nl._find_desc(ELEM0, hbuf())
+  fftsa.nl.FINDS = KEEP
+  check('a chain pointer that is the descriptor is recognised without sweeping',
+        bd == HDESC and fftsa.nl._win_hit == 0 and swept == 0,
+        'base=' .. tostring(bd) .. ' win=' .. tostring(fftsa.nl._win_hit)
+        .. ' sweeps=' .. swept)
+
+  reset_heap()
+  WORDS[REFAT] = INST
+  WORDS[INST + 16 + 4] = 9
+  WORDS[INST + 16 + 8] = COLPTR
+  WORDS[INST + 32 + 4] = 0
+  place_desc(HDESC, ELEM0, 32, 1024, 2, 263168, 2048)
+  PLACES = {{HDESC + 72, E0PAT}}
+
+  -- With no instance to be had -- a build whose metatable is shaped differently -- the wide
+  -- stage is the one that answers. Slower, and the point is that it still answers.
+  setpair(ANCHOR, nil)
+  fftsa.nl._desc_of, fftsa.nl._desc_at, fftsa.nl.arena = nil, nil, nil
+  local bw = fftsa.nl._find_desc(ELEM0, hbuf())
+  check('with no instance the wide stage still reaches it rather than refusing',
+        bw == HDESC and fftsa.nl._win_hit ~= nil and fftsa.nl._win_hit > 1,
+        'base=' .. tostring(bw) .. ' win=' .. tostring(fftsa.nl._win_hit))
+
+  -- raw against confirmed. A raw hit with nothing confirmed means the layout moved; no raw hit
+  -- at all means the window never covered it. The 7510 report could not tell them apart.
+  setpair(ANCHOR, REFAT)
+  reset_heap()
+  WORDS[REFAT] = INST
+  place_desc(HDESC, ELEM0, 32, 1024, 2, 263168, 2048)
+  WORDS[HDESC + 84] = HDESC + 4         -- an owner pointer that is not the base
+  PLACES = {{HDESC + 72, E0PAT}}
+  fftsa.nl._desc_of, fftsa.nl._desc_at, fftsa.nl.arena = nil, nil, nil
+  local bl = fftsa.nl._find_desc(ELEM0, hbuf())
+  check('a found-but-unconfirmed descriptor reports raw hits with none confirmed',
+        bl == nil and fftsa.nl._raw_n > 0 and fftsa.nl._hit_n == 0,
+        'raw=' .. tostring(fftsa.nl._raw_n) .. ' hits=' .. tostring(fftsa.nl._hit_n))
+
+  -- The guarded read. Everything above starts from a pointer the firmware gave us rather than
+  -- from a window we chose, so an address outside DRAM has to come back nil and not as an lwz.
+  check('the guarded word refuses what peek32 would have faulted on',
+        fftsa.nl._wg(2147483648) == nil and fftsa.nl._wg(INST + 1) == nil
+        and fftsa.nl._wg(0) == nil and fftsa.nl._wg('x') == nil,
+        'MMIO, unaligned, zero and non-numeric all refused')
+
+  tostring = SAVED
+  fftsa.nl._desc_of, fftsa.nl._desc_at, fftsa.nl.arena = nil, nil, nil
+end
+
 fftsa.nl.FINDS = FINDS_REAL
 
 -- ========================================================================================

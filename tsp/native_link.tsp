@@ -606,14 +606,82 @@ fftsa.nl.ANCHOR_FAR  = 134217728        -- 128 MB either side
 -- sweeping wide.
 fftsa.nl.DRAM_END = 268435456
 
-function fftsa.nl.heap_anchor()
-  local t = tostring({})
+-- The address inside what tostring() prints for a collectable Lua value: 'table: 3550a18',
+-- 'userdata: 353b010', either with or without an 0x. Nil for anything that prints no address,
+-- which is every value with a __tostring and every number and string.
+function fftsa.nl.obj_addr(o)
+  local t = tostring(o)
   if type(t) ~= 'string' then return nil end
   local h = string.gsub(t, '^.*:%s*', '')
   h = string.gsub(h, '^0[xX]', '')
   local a = tonumber(h, 16)
   if a == nil or a <= 0 then return nil end
   return a
+end
+
+function fftsa.nl.heap_anchor()
+  return fftsa.nl.obj_addr({})
+end
+
+-- One word, refused rather than faulted for an address that is not a 4-aligned DRAM one.
+-- ki.peek32 is an lwz with no validation, so a bad address is a precise data storage
+-- interrupt and a bluescreen -- and unlike the sweep, whose addresses all come out of a
+-- window it chose, the routes below start from a pointer the firmware gave us and follow it.
+function fftsa.nl._wg(addr)
+  if type(addr) ~= 'number' then return nil end
+  if addr <= 0 or math.mod(addr, 4) ~= 0 then return nil end
+  local lo, hi = fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI
+  if lo == nil or hi == nil or lo >= hi then lo, hi = 0, fftsa.nl.DRAM_END end
+  if addr < lo or addr + 4 > hi then return nil end
+  return tonumber(ki.peek32(hx(addr)), 16)
+end
+
+-- A buffer's native instance, from the buffer itself rather than from a search.
+--
+-- A reading buffer is a Lua table with no own keys whose metatable carries CClassRef, a
+-- userdata of one pointer: the C++ instance. getmetatable is unprotected on this firmware, so
+-- the whole walk is two steps and no sweeping. This matters because the instance comes from
+-- the C++ allocator, which is the allocator that places the column descriptors -- measured
+-- 19 KB apart -- while tostring({}) anchors on the Lua allocator, which on a DMM7510 put
+-- every window it chose in the wrong part of a 251 MB heap.
+--
+-- The pointer is read through _wg, so a metatable shaped differently on some other build
+-- answers nil and the caller falls back to the sweep.
+function fftsa.nl.cclass(buf)
+  if type(buf) ~= 'table' and type(buf) ~= 'userdata' then return nil end
+  local mt = getmetatable(buf)
+  if type(mt) ~= 'table' then return nil end
+  local ref = mt.CClassRef
+  if ref == nil then return nil end
+  local p = fftsa.nl.obj_addr(ref)
+  if p == nil then return nil end
+  -- The Udata holds one pointer and tostring already gave the payload, so the instance is at
+  -- payload+0. Adding 16 here lands in the next object and dereferencing that faults.
+  return fftsa.nl._wg(p)
+end
+
+-- The per-column pointers the instance lists. Its header is a NUL-terminated list of 16-byte
+-- records (previous id, this id, two pointers), ids 9 and 14 being the reading and extra-value
+-- columns of a STYLE_WRITABLE_FULL buffer. Every capture so far put the column descriptor
+-- within a couple of hundred KB of these, so they are the cheapest window there is.
+fftsa.nl.INST_CHAIN = 16
+fftsa.nl.CHAIN_MAX = 8
+
+function fftsa.nl.col_ptrs(inst)
+  local out, n = {}, 0
+  if inst == nil then return out end
+  local k
+  for k = 0, fftsa.nl.CHAIN_MAX - 1 do
+    local rec = inst + fftsa.nl.INST_CHAIN + k * 16
+    local id = fftsa.nl._wg(rec + 4)
+    if id == nil or id == 0 then return out end
+    local i
+    for i = 8, 12, 4 do
+      local p = fftsa.nl._wg(rec + i)
+      if p ~= nil and p > 0 then n = n + 1; out[n] = p end
+    end
+  end
+  return out
 end
 
 function fftsa.nl.sweep_windows()
@@ -642,11 +710,93 @@ function fftsa.nl.sweep_windows()
   return out
 end
 
+-- Windows for a buffer's own storage and descriptor, cheapest first and covering everything.
+--
+-- A DMM7510 1.7.16 reported a confirmed element 0 at 0x0158D7C0 with no descriptor anywhere in
+-- the two anchored windows. The descriptor layout is not the difference: the function that
+-- initialises +0x44, +0x48, +0x54, +0x64, +0x74 and the four copies of n is byte-identical in
+-- the 6500 1.7.17a and 7510 1.7.16 images, 1044 bytes of it. So the descriptor was simply
+-- outside what tostring({}) could reach -- the anchored pair covers 143 MB of a heap that runs
+-- to 248 MB -- and the fix is which windows get swept, in which order.
+--
+-- Four stages. The first three are each a fraction of a second and are where both models are
+-- expected to answer; the last is minutes and is there so that nothing in DRAM is unreachable,
+-- because a slow start beats a refusal.
+fftsa.nl.TIGHT = 262144                 -- 256 KB either side, the measured arena distance
+fftsa.nl.MID   = 4194304                -- 4 MB either side
+
+function fftsa.nl._clamp_win(x, y, lo, hi)
+  if x < lo then x = lo end
+  if y > hi then y = hi end
+  if x >= y then return nil end
+  return { x, y }
+end
+
+function fftsa.nl.scan_windows(buf, elem0)
+  local nl = fftsa.nl
+  local lo, hi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if lo == nil or hi == nil or lo >= hi then lo, hi = 0, nl.DRAM_END end
+  local out, n = {}, 0
+  local add = function(x, y)
+    local w = nl._clamp_win(x, y, lo, hi)
+    if w == nil then return end
+    local i
+    for i = 1, n do
+      if out[i][1] == w[1] and out[i][2] == w[2] then return end
+    end
+    n = n + 1
+    out[n] = w
+  end
+
+  -- Stage 1: the buffer's own C++ instance, its column pointers, the storage address if the
+  -- caller has one, and whichever arena a descriptor was last found in.
+  local inst = nl.cclass(buf)
+  nl.inst = inst
+  local centres, cn = {}, 0
+  local push = function(c)
+    if c ~= nil and c > 0 then cn = cn + 1; centres[cn] = c end
+  end
+  push(inst)
+  local cp = nl.col_ptrs(inst)
+  local i
+  for i = 1, table.getn(cp) do push(cp[i]) end
+  push(elem0)
+  push(nl.arena)
+  for i = 1, cn do add(centres[i] - nl.TIGHT, centres[i] + nl.TIGHT) end
+
+  -- Stage 2: the same two strongest centres, widened. Two bands rather than one window, so
+  -- this never re-reads what stage 1 covered.
+  for i = 1, 2 do
+    local c = centres[i]
+    if c ~= nil then
+      add(c - nl.MID, c - nl.TIGHT)
+      add(c + nl.TIGHT, c + nl.MID)
+    end
+  end
+
+  -- Stage 3: the anchored pair, unchanged. This is the whole of what 8.46 swept, so a model
+  -- that works today keeps working even if every route above answers nothing.
+  local sw = nl.sweep_windows()
+  for i = 1, table.getn(sw) do add(sw[i][1], sw[i][2]) end
+
+  -- Stage 4: everything the backstop allows. Minutes, and only reached when the app was
+  -- otherwise going to refuse to start.
+  add(lo, hi)
+  nl.last_windows = out
+  return out
+end
+
 function fftsa.nl.windows_str()
   local w = fftsa.nl.last_windows
   if w == nil then return 'windows=none' end
   local o, i = 'windows=', nil
+  -- Two, then a count: this goes on the error page for an operator to photograph, and a
+  -- four-stage ladder is a dozen ranges that would push everything after it off the glass.
   for i = 1, table.getn(w) do
+    if i > 2 then
+      o = o .. ',+' .. tostring(table.getn(w) - 2)
+      return o
+    end
     if i > 1 then o = o .. ',' end
     o = o .. hx(w[i][1]) .. '..' .. hx(w[i][2])
   end
@@ -668,8 +818,10 @@ function fftsa.nl.diag()
   local np, k = 0, nil
   if nl.math_pos ~= nil then for k in pairs(nl.math_pos) do np = np + 1 end end
   o = o .. ' mathpos=' .. tostring(np) .. ' odd=' .. tostring(nl.math_odd)
+  o = o .. ' inst=' .. hx(nl.inst or 0) .. ' arena=' .. hx(nl.arena or 0)
   o = o .. ' | chunk=' .. tostring(nl.chunk_span) .. '/' .. tostring(nl.CHUNK_BYTES)
-  o = o .. ' hits=' .. tostring(nl._hit_n) .. ' first[' .. tostring(nl._hit_why) .. ']'
+  o = o .. ' raw=' .. tostring(nl._raw_n) .. ' hits=' .. tostring(nl._hit_n)
+  o = o .. ' win=' .. tostring(nl._win_hit) .. ' first[' .. tostring(nl._hit_why) .. ']'
   o = o .. ' | plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params=' .. tostring(nl.SIZEOF_PARAMS)
   o = o .. ' real=' .. tostring(nl.SIZEOF_REAL) .. ' align=' .. tostring(nl.DSP_ALIGN)
   -- Which of the six resolved, by name: one missing entry is enough to stop the install, and
@@ -790,7 +942,7 @@ function fftsa.nl._find_storage(buf, has_extras)
     end
   end
   local needle = f64_pack(rd[1])
-  local windows = fftsa.nl.sweep_windows()
+  local windows = fftsa.nl.scan_windows(buf, nil)
   local wi
   local nhits = 0
   for wi = 1, table.getn(windows) do
@@ -879,26 +1031,31 @@ function fftsa.nl._chunk_span(elemsize, perchunk)
   return nil
 end
 
+-- Every read here is guarded, not raw. A base reaching this is a word the firmware handed us
+-- -- a cached one, a sweep hit, or a pointer out of the instance's column chain -- and only the
+-- sweep hit is known to be in DRAM at all. An unguarded peek32 on the other two is an lwz on an
+-- arbitrary address, which is a precise data storage interrupt and a bluescreen.
 function fftsa.nl._read_desc(base, elem0)
   if base == nil then return nil end
-  if W(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
-  if W(base + 84) ~= base or W(base + 100) ~= base then return nil end
-  local elemsize = W(base + 8)
-  local perchunk = W(base + 12)
-  local nchunks  = W(base + 16)
+  local g = fftsa.nl._wg
+  if g(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
+  if g(base + 84) ~= base or g(base + 100) ~= base then return nil end
+  local elemsize = g(base + 8)
+  local perchunk = g(base + 12)
+  local nchunks  = g(base + 16)
   if elemsize == nil or perchunk == nil or nchunks == nil then return nil end
   if nchunks < 1 or nchunks >= 4096 or elemsize < 8 or perchunk < 1 then return nil end
   local span = fftsa.nl._chunk_span(elemsize, perchunk)
   if span == nil then return nil end
   fftsa.nl.chunk_span = span
-  return base, elemsize, perchunk, W(base + 68), nchunks
+  return base, elemsize, perchunk, g(base + 68), nchunks
 end
 
-function fftsa.nl._find_desc(elem0)
-  -- The cached base first, re-validated rather than trusted. This is the expensive half of
-  -- describe(): the sweep below walks 33 MB as 32 kB reads on its first window and 133 MB on
-  -- its second, about a minute. Keyed on the storage address, so a buffer whose storage
-  -- moved misses, and _read_desc refuses a stale base even if the key matched.
+function fftsa.nl._find_desc(elem0, buf)
+  -- The cached base first, re-validated rather than trusted. Keyed on the storage address, so
+  -- a buffer whose storage moved misses, and _read_desc refuses a stale base even if the key
+  -- matched. This is the expensive half of describe() when the ladder has to escalate, so the
+  -- cache is what keeps a second describe() of the same buffer free.
   local nl = fftsa.nl
   if nl._desc_of == elem0 then
     local b, es, pc, v, nc = nl._read_desc(nl._desc_at, elem0)
@@ -906,20 +1063,42 @@ function fftsa.nl._find_desc(elem0)
     nl._desc_of, nl._desc_at = nil, nil
   end
   local needle = u32_pack(elem0)
-  nl._hit_n, nl._hit_why = 0, nil
-  local windows = fftsa.nl.sweep_windows()
+  -- Two counts, because they fail differently and the panel has to tell them apart. _raw_n is
+  -- how many times the storage address appears at all: zero means the descriptor is outside
+  -- every window swept. _hit_n is how many of those passed the two owner self-pointers: raw
+  -- hits with no confirmed one would mean the layout moved, which the image comparison says it
+  -- has not. The DMM7510 report had only the one count and it could not separate the two.
+  nl._hit_n, nl._hit_why, nl._raw_n, nl._win_hit = 0, nil, 0, nil
+  local windows = fftsa.nl.scan_windows(buf, elem0)
+  -- The chain pointers as the descriptor itself, before any sweeping. On a DMM6500 this does
+  -- not answer: a sweep for the descriptor's own address found four references and all four
+  -- were inside the descriptor or in allocator bookkeeping, so nothing outside it points at
+  -- it. It is here because it costs three guarded reads a pointer against _read_desc's own
+  -- validation, scan_windows has already walked the chain, and a model where one of those
+  -- pointers is the descriptor gets it for nothing.
+  local cand = fftsa.nl.col_ptrs(nl.inst)
+  local ci
+  for ci = 1, table.getn(cand) do
+    local b, es, pc, v, nc = nl._read_desc(cand[ci], elem0)
+    if b ~= nil then
+      nl._desc_of, nl._desc_at = elem0, b
+      nl._win_hit, nl.arena = 0, b
+      return b, es, pc, v, nc
+    end
+  end
   local wi
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    nl._raw_n = nl._raw_n + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
       local base = hits[k] - 72       -- 0x48
-      local s1 = W(base + 84)         -- 0x54, owner self-pointer
-      local s2 = W(base + 100)        -- 0x64, second self-pointer
+      local s1 = fftsa.nl._wg(base + 84)    -- 0x54, owner self-pointer
+      local s2 = fftsa.nl._wg(base + 100)   -- 0x64, second self-pointer
       if s1 == base and s2 == base then
-        local elemsize = W(base + 8)
-        local perchunk = W(base + 12)
-        local nchunks  = W(base + 16)   -- 0x10, chunk count
+        local elemsize = fftsa.nl._wg(base + 8)
+        local perchunk = fftsa.nl._wg(base + 12)
+        local nchunks  = fftsa.nl._wg(base + 16)   -- 0x10, chunk count
         -- The element size is a runtime field and need not divide the payload: a
         -- STYLE_STANDARD element of 24 bytes puts 1365 in a 32,768-byte payload, filling
         -- 32,760 and leaving 8 spare. So the test is a fit rather than an exact product, and
@@ -938,7 +1117,10 @@ function fftsa.nl._find_desc(elem0)
           -- far returns whatever follows in the heap -- which could pass the backstop and
           -- be written to.
           nl._desc_of, nl._desc_at = elem0, base
-          return base, elemsize, perchunk, W(base + 68), nchunks
+          -- Which stage answered, and where: the next buffer gets a tight window around this
+          -- arena, so at most one call ever pays for the wide stages.
+          nl._win_hit, nl.arena = wi, base
+          return base, elemsize, perchunk, fftsa.nl._wg(base + 68), nchunks
         end
       end
     end
@@ -965,18 +1147,19 @@ function fftsa.nl._find_desc_by_sig(buf)
   local cap, n = buf.capacity, buf.n
   if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then return nil end
   local needle = u32_pack(cap) .. u32_pack(n)
-  local windows = fftsa.nl.sweep_windows()
+  local windows = fftsa.nl.scan_windows(buf, nil)
   local wi
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
     local k
     for k = 1, table.getn(hits) do
       local base = hits[k] - 116          -- 0x74, the capacity field
-      local elem0 = W(base + 72)          -- 0x48, the storage pointer
+      local elem0 = fftsa.nl._wg(base + 72)   -- 0x48, the storage pointer
       if elem0 ~= nil and elem0 ~= 0 then
         local b, es, pc, v, nc = nl._read_desc(base, elem0)
         if b ~= nil then
           nl._desc_of, nl._desc_at = elem0, base
+          nl._win_hit, nl.arena = wi, base
           return base, elem0, es, pc, v, nc
         end
       end
@@ -1441,8 +1624,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local pdesc = nl.describe(pb, true)
   if pdesc == nil or pdesc.vec == nil then
     return fftsa.nl._abort(cb, pb, 'plan buffer: no descriptor found by sweep -- '
-                           .. tostring(nl._stor_why) .. ' hits=' .. tostring(nl._hit_n)
+                           .. tostring(nl._stor_why) .. ' raw=' .. tostring(nl._raw_n)
+                           .. ' hits=' .. tostring(nl._hit_n)
                            .. ' first[' .. tostring(nl._hit_why) .. ']'
+                           .. ' inst=' .. hx(nl.inst or 0)
                            .. ' anchor=' .. hx(nl.heap_anchor() or 0)
                            .. ' ' .. fftsa.nl.windows_str())
   end
@@ -1996,7 +2181,7 @@ function fftsa.nl.describe(buf, has_extras)
   if not elem0 then return nil end
   local desc, elemsize, perchunk, vec, nchunks = sdesc, selemsize, sperchunk, svec, snchunks
   if desc == nil then
-    desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0)
+    desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0, buf)
   end
   -- Each of the two halves names itself: _find_storage sets _stor_why on its own failures
   -- and clears it on the way in, so without these the caller reports "nil" for a refusal
