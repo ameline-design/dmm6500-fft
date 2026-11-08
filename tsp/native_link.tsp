@@ -789,21 +789,27 @@ function fftsa.nl.scan_windows(buf, elem0)
   -- Stage 1: the buffer's own C++ instance, its column pointers, the storage address if the
   -- caller has one, and whichever arena a descriptor was last found in.
   local inst = nl.cclass(buf)
-  nl.inst = inst
+  -- Only when there is a buffer to ask. A ring search passes none, and blanking this would
+  -- both empty the error page's inst= and point the next descriptor call's chain walk at
+  -- nothing.
+  if buf ~= nil then nl.inst = inst end
   local centres, cn = {}, 0
   local push = function(c)
     if c ~= nil and c > 0 then cn = cn + 1; centres[cn] = c end
   end
+  -- The instance and the storage first, because those are the two the widening stage uses:
+  -- they are what the descriptor is known to sit near. The column pointers and the cached
+  -- arena follow, tight only.
   push(inst)
+  push(elem0)
   local cp = nl.col_ptrs(inst)
   local i
   for i = 1, table.getn(cp) do push(cp[i]) end
-  push(elem0)
   push(nl.arena)
   for i = 1, cn do add(centres[i] - nl.TIGHT, centres[i] + nl.TIGHT) end
 
-  -- Stage 2: the same two strongest centres, widened. Two bands rather than one window, so
-  -- this never re-reads what stage 1 covered.
+  -- Stage 2: the two strongest centres, widened. Two bands rather than one window, so this
+  -- never re-reads what stage 1 covered.
   for i = 1, 2 do
     local c = centres[i]
     if c ~= nil then
@@ -1395,6 +1401,9 @@ function fftsa.nl.find_ring_header(g)
   local pre, np = {}, 0
   local t = math.floor(v / 65536)
   local lot = math.floor((v - maxspan) / 65536)
+  -- Clamped, because a record below maxspan from zero makes this negative and math.mod keeps
+  -- the sign -- string.char would then be handed a negative byte and RAISE, inside bind.
+  if lot < 0 then lot = 0 end
   local k
   for k = lot, t do
     np = np + 1

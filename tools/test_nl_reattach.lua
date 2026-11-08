@@ -615,6 +615,17 @@ do
     end
   end
   check('the anchored windows 8.46 swept are still swept', kept, 'n=' .. nw)
+  -- The widening stage has to widen around the two centres the descriptor is known to sit
+  -- near: the instance and the storage. An earlier ordering widened around a column pointer
+  -- instead and left the storage with only its tight window.
+  local wide = false
+  for wi = 1, nw do
+    if w[wi][1] == ELEM0 + fftsa.nl.TIGHT and w[wi][2] == ELEM0 + fftsa.nl.MID then
+      wide = true
+    end
+  end
+  check('the widening stage covers the storage address, not just a column pointer', wide,
+        'n=' .. nw)
   -- And no window appears twice: elem0 and the instance can be in the same arena, and a
   -- duplicate of the wide stage would double the worst case.
   local dup = false
@@ -1201,6 +1212,16 @@ do
   check('a count larger than the ring is not a header either',
         g4 ~= nil and fftsa.nl.find_ring_header(g4) == nil,
         'why=' .. tostring(fftsa.nl.ring_why))
+
+  -- A record near the bottom of memory. The candidate bounds are derived from the record
+  -- address less a whole ring, which goes negative there, and math.mod keeps the sign -- so
+  -- string.char would be handed a negative byte and RAISE, inside bind, where nothing catches
+  -- it. pcall is the assertion here: the answer has to be a refusal and not an error.
+  local lowok, lowres = pcall(fftsa.nl.find_ring_header,
+                              {val0 = 20000, stride = 56, dx = 12})
+  check('a record below one ring from zero is refused, not raised',
+        lowok and lowres == nil,
+        'ok=' .. tostring(lowok) .. ' res=' .. tostring(lowres))
 
   fftsa.nl.arena = nil
   tostring = SAVEDT

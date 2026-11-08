@@ -177,7 +177,8 @@ def main():
             print('adjacent, so a candidate with no header is very likely that one.')
         else:
             hdr, lo, hi, nrec, ov, ox, val0, stride, dx = (int(x) for x in h[5:].split(','))
-            ring = dict(val0=val0, stride=stride, dx=dx, hdr=hdr, lo=lo, hi=hi, nrec=nrec)
+            ring = dict(val0=val0, stride=stride, dx=dx, hdr=hdr, lo=lo, hi=hi, nrec=nrec,
+                        ov=ov, ox=ox)
             print('records: val0 0x%08X  stride %d  value->x %+d' % (val0, stride, dx))
             print('header : 0x%08X  ring 0x%08X..0x%08X  %d records  value at +0x%X  x at +0x%X'
                   % (hdr, lo, hi, nrec, ov, ox))
@@ -205,6 +206,45 @@ def main():
                 print('        THE CURSOR FIELD IS NOT CONFIRMED -- do not write the header')
             if c1 == c0 and c0 == nrec:
                 print('        the count is already at the ring size, so it has stopped moving')
+
+        # THE WHOLE RECORD, both of the first two, as bytes and as decoded float32. The
+        # question the write experiment cannot settle on its own is what the bytes outside the
+        # two fields are for: if +0x00..0x1F holds pixel coordinates the widget computed at
+        # append time, then writing the value and the x changes a cache nobody reads back, and
+        # the bypass needs those recomputed too. Printing them is what makes that judgeable
+        # instead of guessed.
+        if 'lo' in ring:
+            v0, s, dxv = ring['val0'], ring['stride'], ring['dx']
+            base = v0 - ring['ov']
+            print()
+            print('the first two SENTINEL records in full, of %d in the ring. These are the'
+                  % ring['nrec'])
+            print('ones whose contents are known, which is what makes the other bytes readable.')
+            for k in range(2):
+                a = base + k * s
+                r = ask(d, one("do local s = ki.memread('%X', '%X')" % (a, s),
+                               "if s == nil then print('D|nil') return end",
+                               "local o, i = '', nil",
+                               "for i = 1, string.len(s) do",
+                               "o = o .. string.format('%02X', string.byte(s, i)) end",
+                               "print('D|' .. o) end"), 'D|', timeout=120)
+                if r[2:].strip() == 'nil':
+                    print('  rec %d  unreadable' % k)
+                    continue
+                b = bytes.fromhex(r[2:].strip())
+                print('  rec %d  0x%08X' % (k, a))
+                for off in range(0, len(b), 16):
+                    print('    +0x%02X  %s' % (off, ' '.join('%02X' % x for x in b[off:off + 16])))
+                for off in range(0, len(b) - 3, 4):
+                    f = struct.unpack('>f', b[off:off + 4])[0]
+                    tag = ''
+                    if off == ring['ov'] or off == ring['ov'] + 4:
+                        tag = '  <- value'
+                    elif off == ring['ox'] or off == ring['ox'] + 4:
+                        tag = '  <- x'
+                    if tag or (1e-6 < abs(f) < 1e9):
+                        print('    +0x%02X  %-16.6g %08X%s'
+                              % (off, f, struct.unpack('>I', b[off:off + 4])[0], tag))
 
         if not DO_WRITE:
             print()
