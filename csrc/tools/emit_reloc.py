@@ -265,15 +265,15 @@ def main():
     raw = elf.read_at(sizes_addr, 36)
     if raw is None or len(raw) != 36:
         sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
-    (plan_sz, params_sz, real_sz, align, heap_lo, heap_hi,
+    (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
      res_peaks, res_doubles, status_off) = struct.unpack(">IIIIIIIII", raw)
-    if 0 in (plan_sz, params_sz, real_sz, align, heap_lo, heap_hi,
+    if 0 in (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
              res_peaks, res_doubles, status_off):
         sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
                  "rather than an initialised one in .rodata")
-    if heap_lo >= heap_hi:
-        sys.exit("dsp_native_sizes heap bounds are inverted: 0x%08X >= 0x%08X"
-                 % (heap_lo, heap_hi))
+    if bs_lo >= bs_hi:
+        sys.exit("dsp_native_sizes backstop bounds are inverted: 0x%08X >= 0x%08X"
+                 % (bs_lo, bs_hi))
     if status_off + 4 > params_sz:
         sys.exit("the status word at %d does not fit a %d-byte params struct"
                  % (status_off, params_sz))
@@ -299,9 +299,9 @@ def main():
         fh.write("fftsa.nl.SIZEOF_PARAMS = %d\n" % params_sz)
         fh.write("fftsa.nl.SIZEOF_REAL = %d\n" % real_sz)
         fh.write("fftsa.nl.DSP_ALIGN = %d\n" % align)
-        fh.write("-- heap bounds from dsp_native_bounds.h, so Lua holds no second copy\n")
-        fh.write("fftsa.nl.HEAP_LO = %d\n" % heap_lo)
-        fh.write("fftsa.nl.HEAP_HI = %d\n" % heap_hi)
+        fh.write("-- backstop bounds from dsp_native_bounds.h, so Lua holds no second copy\n")
+        fh.write("fftsa.nl.BACKSTOP_LO = %d\n" % bs_lo)
+        fh.write("fftsa.nl.BACKSTOP_HI = %d\n" % bs_hi)
         fh.write("-- results block: Lua reserves the memory and decodes what lands in it\n")
         fh.write("fftsa.nl.RES_PEAKS = %d\n" % res_peaks)
         fh.write("fftsa.nl.RES_DOUBLES = %d\n" % res_doubles)

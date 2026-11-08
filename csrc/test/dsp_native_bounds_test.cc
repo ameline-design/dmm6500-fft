@@ -157,10 +157,39 @@ TEST(WriteGate, UnmappedRefused) {
 TEST(WriteGate, BothSidesMustAgree) {
   // Inside the heap but outside the declared window: refused by the window.
   EXPECT_FALSE(dspn_write_ok(kHeapMid, 4, kHeapLo, kHeapLo + 0x1000U));
-  // Inside a declared window that reaches past the heap: refused by the backstop, so a
-  // params struct cannot widen the gate by declaring a bigger window.
-  EXPECT_FALSE(dspn_write_ok(kStack, 4, kHeapLo, 0x0FFFFFFFU));
+  // The data sections and the call stacks are the window's job alone -- those addresses
+  // differ per model, so the backstop names none of them.
+  EXPECT_FALSE(dspn_write_ok(kBss, 4, kHeapLo, kHeapHi));
+  EXPECT_FALSE(dspn_write_ok(kStack, 4, kHeapLo, kHeapHi));
+  EXPECT_TRUE(dspn_write_ok(kBss, 4, kBss, kBss + 0x1000U));
+  EXPECT_TRUE(dspn_write_ok(kStack, 4, kStack, kStack + 0x1000U));
+}
+
+TEST(WriteGate, BackstopHoldsAgainstAnyDeclaredWindow) {
+  // What the backstop refuses however wide the window: .text, the exception vectors,
+  // MMIO, flash and the unmapped gap above DRAM. A params struct cannot reach any of
+  // them by declaring a bigger window, and nor can a window drawn tightly around one.
+  EXPECT_FALSE(dspn_write_ok(kText, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kText, 4, kText, kText + 0x1000U));
+  EXPECT_FALSE(dspn_write_ok(kTextEnd - 4, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(DSPN_TEXT_HI - 1, 1, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(DSPN_TEXT_LO - 2, 8, 0U, 0xFFFFFFFFU));  // straddling
+  EXPECT_FALSE(dspn_write_ok(DSPN_TEXT_HI - 2, 8, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kVectors, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(DSPN_DRAM_LO - 4U, 8, 0U, 0xFFFFFFFFU));
   EXPECT_FALSE(dspn_write_ok(kMmio1, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kMmio2, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kMmio3, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kFlash, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(kUnmapped, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(DSPN_DRAM_END, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_FALSE(dspn_write_ok(DSPN_DRAM_END - 2U, 8, 0U, 0xFFFFFFFFU));
+  // The gap between the vectors and .text, the word above .text, and the top of DRAM,
+  // which it permits: on every measured build the heap floor is above TEXT_HI.
+  EXPECT_TRUE(dspn_write_ok(DSPN_DRAM_LO, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_TRUE(dspn_write_ok(DSPN_TEXT_HI, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_TRUE(dspn_write_ok(DSPN_DRAM_END - 4U, 4, 0U, 0xFFFFFFFFU));
+  EXPECT_TRUE(dspn_write_ok(kHeapLo, 4, 0U, 0xFFFFFFFFU));
 }
 
 // ---------------------------------------------------------------------------
@@ -246,10 +275,16 @@ TEST(StrideOk, ZeroStrideRefused) {
 }
 
 TEST(StrideOk, ReadSideUsesTheReadGate) {
-  // Capture storage is read, so DRAM outside the heap is fine for it.
+  // Capture storage is read, so all of DRAM is fine for it -- including the exception
+  // vectors, where a load is inert and a store is not.
   EXPECT_TRUE(dspn_stride_ok(kText, 4, 32, 0U, DSPN_DRAM_END, 0));
+  EXPECT_TRUE(dspn_stride_ok(kVectors, 4, 32, 0U, DSPN_DRAM_END, 0));
   // But not for the write side.
   EXPECT_FALSE(dspn_stride_ok(kText, 4, 32, 0U, DSPN_DRAM_END, 1));
+  EXPECT_FALSE(dspn_stride_ok(kVectors, 4, 32, 0U, DSPN_DRAM_END, 1));
+  // Past DRAM, neither side goes.
+  EXPECT_FALSE(dspn_stride_ok(kMmio1, 4, 32, 0U, 0xFFFFFFFFU, 0));
+  EXPECT_FALSE(dspn_stride_ok(kMmio1, 4, 32, 0U, 0xFFFFFFFFU, 1));
 }
 
 // ---------------------------------------------------------------------------
@@ -313,13 +348,24 @@ TEST(ChunkStride, AbsentSecondChunkIsZeroCountNotZeroBase) {
   EXPECT_FALSE(dspn_chunk_stride_ok(0, 1, 32, kSpanLo, kSpanHi, 1));
 }
 
-TEST(ChunkStride, StillRefusesEverythingTheWindowRefuses) {
-  // The per-chunk bound is an addition, never a replacement: a chunk-shaped access at a
-  // forbidden address stays refused even though it is internally self-consistent.
-  EXPECT_FALSE(dspn_chunk_stride_ok(kBss, 1024, 32, kBss, kBss + 32768, 1));
+TEST(ChunkStride, StillRefusesEverythingTheBackstopRefuses) {
+  // The per-chunk bound is an addition, never a replacement: a chunk-shaped access at an
+  // address the backstop forbids stays refused even though it is internally
+  // self-consistent, and even though the window here is drawn around it.
+  //
+  // What that covers is .text, the vectors, and everything outside DRAM. It does NOT
+  // cover .data, .bss, the I/O buffers or the call stacks: those addresses differ per
+  // model, so no figure compiled in here can name them without refusing good heap on a
+  // model it was not measured on. A window drawn around one of them is accepted, and
+  // what keeps a window from being drawn there is on the Lua side -- the descriptor is
+  // authenticated by signature before its chunk vector is read, and the window is
+  // derived from that vector rather than declared.
+  EXPECT_FALSE(dspn_chunk_stride_ok(kText, 1024, 32, kText, kText + 32768, 1));
   EXPECT_FALSE(dspn_chunk_stride_ok(kRodata, 1024, 32, kRodata, kRodata + 32768, 1));
+  EXPECT_FALSE(dspn_chunk_stride_ok(kVectors, 16, 32, kVectors, kVectors + 32768, 1));
   EXPECT_FALSE(dspn_chunk_stride_ok(kMmio1, 1024, 32, kMmio1, kMmio1 + 32768, 0));
-  EXPECT_FALSE(dspn_chunk_stride_ok(kStack, 1024, 32, kStack, kStack + 32768, 1));
+  EXPECT_TRUE(dspn_chunk_stride_ok(kBss, 1024, 32, kBss, kBss + 32768, 1));
+  EXPECT_TRUE(dspn_chunk_stride_ok(kStack, 1024, 32, kStack, kStack + 32768, 1));
 }
 
 TEST(ChunkStride, BaseNearTheTopOfTheAddressSpaceRefused) {

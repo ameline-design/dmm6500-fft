@@ -82,10 +82,10 @@ fftsa.nl.SIZEOF_PLAN   = 0
 fftsa.nl.SIZEOF_PARAMS = 0
 fftsa.nl.SIZEOF_REAL   = 0
 
--- Heap bounds, also overwritten from the image. Zero here so an un-generated module
--- refuses every address rather than accepting every address.
-fftsa.nl.HEAP_LO = 0
-fftsa.nl.HEAP_HI = 0
+-- The native side's compiled backstop, also overwritten from the image. Zero here so an
+-- un-generated module refuses every address rather than accepting every address.
+fftsa.nl.BACKSTOP_LO = 0
+fftsa.nl.BACKSTOP_HI = 0
 
 -- Shape of the results block, also from the image: the peak slots it holds and the total
 -- doubles Lua reads back out of it. Zero until the generated module loads, which makes
@@ -1303,8 +1303,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
 
   -- Chunk payload addresses from the vector. They are neither in address order nor
   -- adjacent, which dsp_plan_init_segs does not care about and nothing here may assume.
-  -- Each is checked against the heap here as well as by the native entry point, so a bad
-  -- vector is a refusal from Lua rather than a status code from a call already handed it.
+  -- Each is checked against the backstop here as well as by the native entry point, so a
+  -- bad vector is a refusal from Lua rather than a status code from a call already handed
+  -- it. These addresses are the allocator's own answer, read from the descriptor's chunk
+  -- vector, and they are what the writable window below is derived from -- so this is a
+  -- sanity check on the descriptor, not the bound that keeps a write off firmware.
   local payload = {}
   local i
   for i = 1, chunks_wanted do
@@ -1312,7 +1315,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     if a == nil or a == 0 then
       return fftsa.nl._abort(cb, pb)
     end
-    if a < nl.HEAP_LO or a + nl.CHUNK_BYTES > nl.HEAP_HI then
+    if a < nl.BACKSTOP_LO or a + nl.CHUNK_BYTES > nl.BACKSTOP_HI then
       return fftsa.nl._abort(cb, pb)
     end
     payload[i] = a

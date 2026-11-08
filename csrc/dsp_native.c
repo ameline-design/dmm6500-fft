@@ -72,9 +72,9 @@ volatile uint32_t dspn_params_addr;
  * test/dsp_native_bounds_test.cc, which covers every forbidden region by name. */
 #include "dsp_native_bounds.h"
 
-#define HEAP_LO   DSPN_HEAP_LO
-#define HEAP_HI   DSPN_HEAP_HI
-#define DRAM_END  DSPN_DRAM_END
+#define BACKSTOP_LO  DSPN_DRAM_LO
+#define BACKSTOP_HI  DSPN_DRAM_END
+#define DRAM_END     DSPN_DRAM_END
 
 /* Status pushed back to Lua.  Non-negative is a bin count; negative is a refusal. */
 #define DSPN_OK            0
@@ -251,16 +251,16 @@ typedef struct {
  *   [1] sizeof(dsp_native_params)
  *   [2] sizeof(dsp_real)
  *   [3] DSP_ALIGN
- *   [4] DSPN_HEAP_LO
- *   [5] DSPN_HEAP_HI
+ *   [4] DSPN_DRAM_LO
+ *   [5] DSPN_DRAM_END
  *   [6] DSPN_RES_PEAKS
  *   [7] DSPN_RES_DOUBLES
  *   [8] offsetof(dsp_native_params, status)
  *
- * The heap bounds are here so the Lua side can sanity-check an address before passing it
- * in, without a second copy of the numbers to drift: a Lua literal and this header would
- * diverge silently the first time a firmware build moved the heap, and both sides would
- * still look self-consistent. The results-block shape is here for the same reason: Lua
+ * The backstop bounds are here so the Lua side can sanity-check an address before passing
+ * it in, without a second copy of the numbers to drift: a Lua literal and this header
+ * would diverge silently the first time one of them changed, and both sides would still
+ * look self-consistent. The results-block shape is here for the same reason: Lua
  * reserves the memory and decodes what lands in it, so it needs both figures and must not
  * hold a second copy. And the status offset, because the word Lua reads back after a call
  * has to be the word this file writes, which means not counting the fields twice.
@@ -273,8 +273,8 @@ const uint32_t dsp_native_sizes[9] = {
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
     (uint32_t)DSP_ALIGN,
-    (uint32_t)DSPN_HEAP_LO,
-    (uint32_t)DSPN_HEAP_HI,
+    (uint32_t)DSPN_DRAM_LO,
+    (uint32_t)DSPN_DRAM_END,
     (uint32_t)DSPN_RES_PEAKS,
     (uint32_t)DSPN_RES_DOUBLES,
     (uint32_t)offsetof(dsp_native_params, status)
@@ -439,7 +439,7 @@ static double pw_double(uint32_t hi, uint32_t lo)
     return u.d;
 }
 
-/* Byte ranges.  Both callers have already bounded each range inside the heap, so neither
+/* Byte ranges.  Both callers have already bounded each range inside the backstop, so neither
  * sum can wrap.  A zero-length range touches nothing and so overlaps nothing. */
 static int overlaps(uint32_t a, uint32_t an, uint32_t b, uint32_t bn)
 {
@@ -520,20 +520,20 @@ int dsp_native_run(void *L)
 
     paddr = dspn_params_addr;
 
-    /* The params struct itself must be in the heap before it is dereferenced. */
-    if (!range_ok(paddr, (uint32_t)sizeof(dsp_native_params), HEAP_LO, HEAP_HI)) {
+    /* The params struct itself must be in writable DRAM before it is dereferenced. */
+    if (!range_ok(paddr, (uint32_t)sizeof(dsp_native_params), BACKSTOP_LO, BACKSTOP_HI)) {
         return 0;
     }
     p = (const dsp_native_params *)(uintptr_t)paddr;
 
     /* The one word written through a pointer the caller did not supply.  It is inside the
-     * struct the test above proved to be in the heap, so it needs no window of its own. */
+     * struct the test above proved to be in DRAM, so it needs no window of its own. */
     st = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, status));
 
     if (p->magic != DSP_NATIVE_MAGIC) { RET(DSPN_EMAGIC); }
 
     /* Arena sizing, answered before any bound is examined because it dereferences
-     * nothing beyond the struct already proved to be in the heap: it is how Lua learns
+     * nothing beyond the struct already proved to be in DRAM: it is how Lua learns
      * how much storage to find in the first place, so requiring a valid arena to ask
      * would be circular. Both are pure arithmetic. */
     if (p->mode == DSPN_MODE_BYTES) {
@@ -547,14 +547,14 @@ int dsp_native_run(void *L)
 
     /* The declared windows have to be sane in themselves, and inside the backstop,
      * before they are trusted to validate anything else. */
-    if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < HEAP_LO || p->wr_hi  > HEAP_HI ||
+    if (p->wr_lo  >= p->wr_hi  || p->wr_lo  < BACKSTOP_LO || p->wr_hi  > BACKSTOP_HI ||
         p->rd_lo  >= p->rd_hi  || p->rd_hi > DRAM_END) {
         RET(DSPN_EBOUNDS);
     }
     /* The output window only has to be anything when a reading buffer is being written,
      * which out_desc is what says.  A caller writing the trace itself declares none. */
     if (p->out_desc != 0U &&
-        (p->out_lo >= p->out_hi || p->out_lo < HEAP_LO || p->out_hi > HEAP_HI)) {
+        (p->out_lo >= p->out_hi || p->out_lo < BACKSTOP_LO || p->out_hi > BACKSTOP_HI)) {
         RET(DSPN_EBOUNDS);
     }
 
@@ -566,7 +566,7 @@ int dsp_native_run(void *L)
         p->seg_bytes == 0U || (p->seg_bytes & (DSP_ALIGN - 1U)) != 0U) {
         RET(DSPN_EBOUNDS);
     }
-    if (!range_ok(p->segs_addr, p->nsegs * 4U, HEAP_LO, HEAP_HI)) {
+    if (!range_ok(p->segs_addr, p->nsegs * 4U, BACKSTOP_LO, BACKSTOP_HI)) {
         RET(DSPN_EBOUNDS);
     }
     nsegs = (int)p->nsegs;
@@ -662,7 +662,7 @@ int dsp_native_run(void *L)
         want = ((uint32_t)n + p->cap_perchunk - 1U) / p->cap_perchunk;
         if (nch == 0U || want > nch || want > (uint32_t)DSP_MAX_SRC_BLOCKS ||
             (p->cap_vec & 3U) != 0U ||
-            !range_ok(p->cap_vec, nch * 4U, HEAP_LO, HEAP_HI)) {
+            !range_ok(p->cap_vec, nch * 4U, BACKSTOP_LO, BACKSTOP_HI)) {
             RET(DSPN_ECAPTURE);
         }
         for (i = 0; i < (uint32_t)DSP_MAX_SRC_BLOCKS; i++) {
@@ -735,7 +735,7 @@ int dsp_native_run(void *L)
      * never drawn.  Asking for the write as well costs a content scan at startup to find
      * that storage, and the write is then overwritten.
      *
-     * Output storage, when it is asked for: written, so the output window and the heap
+     * Output storage, when it is asked for: written, so the output window and the
      * backstop.  The trace is nseg points and not m bins -- the reduction is what the graph
      * reads -- and one element beyond it has to exist too, because the cursor rewind stores
      * the address of the slot after the last one written. */
@@ -749,11 +749,11 @@ int dsp_native_run(void *L)
             RET(DSPN_EOUTPUT);
         }
         /* The descriptor is a separate allocation from the chunk storage, so it is checked
-         * against the heap backstop rather than the bulk window, and only its base is
+         * against the backstop rather than the bulk window, and only its base is
          * trusted: the field offsets are compiled in.  4-aligned because the rewind writes
          * it as words, and clear of the arena, which it would otherwise be free to
          * overwrite. */
-        if (!range_ok(p->out_desc, DESC_SPAN, HEAP_LO, HEAP_HI) ||
+        if (!range_ok(p->out_desc, DESC_SPAN, BACKSTOP_LO, BACKSTOP_HI) ||
             (p->out_desc & 3U) != 0U ||
             hits_arena(p->out_desc, DESC_SPAN, segs, nsegs, seg_bytes)) {
             RET(DSPN_EDESC);

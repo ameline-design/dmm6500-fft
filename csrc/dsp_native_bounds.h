@@ -7,34 +7,37 @@
  * test: asking the DMM whether a write to a device register is refused is itself the
  * dangerous operation. test/dsp_native_bounds_test.cc exercises them on the host.
  *
- * The constants come from the 1.7.17a section table, documented in fwmem-SAFETY.md:
+ * What is compiled in here is the address map the processor and the board give us, not
+ * the one a firmware build gives us:
  *
- *   .vectors  0x00000000              exception vectors
- *   .text     0x00004000-0x0052567C   running instruction stream
- *   .rodata   0x005256C0-0x006E4F6C
- *   .data     0x006E4F70-0x009C6A3C
- *   .bss      0x009C6A40-0x00FE5548
- *   buffers   adjacent to .bss        splash, flash, ethernet, debug: live I/O
- *   .heap     0x01036000-0x0D836000   the only writable region
- *   stacks    0x0D836000-0x0D84A000   .stack .kstack .cstack .mcstack
- *   above     0x0D84A000-0x0FFFFFFF   page table and unmapped gaps
+ *   .vectors  0x00000000-0x00003000   exception vectors, never ours to write
+ *   .text     0x00004000-TEXT_HI      running instruction stream, never written; the one
+ *                                     section span that holds across models, and below
+ *                                     every measured build's heap floor
  *   DRAM end  0x10000000
  *   MMIO      0x80000000, 0x90000000, 0xA0000000, 1 MB each: never touched, not even
  *                                     read, because a load from a device register has
  *                                     side effects
  *   flash     0xFE000000-0xFFFFFFFF   never written
  *
- * They shift between firmware builds and are a backstop only: the primary bound is the
- * window Lua declares in the params struct, re-derived from the section table each run.
- * A write must pass both.
+ * Section addresses are deliberately not here. They differ per model -- a DMM7510's heap
+ * runs 7.6 MB below and 32.4 MB above a DMM6500's, 17% of it -- so a compiled section
+ * bound refuses good addresses on a model it was not measured on, and the app then works
+ * or fails by where the allocator happened to land a buffer. The bound that does the
+ * work is the window Lua declares in the params struct, derived each run from the chunk
+ * vector of the buffer being written, which is the allocator's own answer and so is tight
+ * on any model. A write must pass that, this, and the per-chunk containment test below.
+ *
+ * .text is the exception: it is a call target rather than a destination, the span is a
+ * property of the image the app is running against, and TEXT_HI holds with 6 KB to spare
+ * across every 6500 and 7510 build measured.
  */
 #ifndef DSP_NATIVE_BOUNDS_H
 #define DSP_NATIVE_BOUNDS_H
 
 #include <stdint.h>
 
-#define DSPN_HEAP_LO   0x01036000U
-#define DSPN_HEAP_HI   0x0D836000U
+#define DSPN_DRAM_LO   0x00003000U
 #define DSPN_DRAM_END  0x10000000U
 #define DSPN_TEXT_LO   0x00004000U
 #define DSPN_TEXT_HI   0x00527000U
@@ -57,11 +60,23 @@ static int dspn_range_ok(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi)
     return 1;
 }
 
-/* Writable at all: the documented heap, which excludes .text, .rodata, .data, .bss, the
- * I/O buffers below the heap, the four call stacks above it, MMIO and flash. */
-static int dspn_heap_ok(uint32_t a, uint32_t n)
+/* Writable at all: DRAM, less the exception vectors and less the running instruction
+ * stream.  That excludes MMIO, flash and the unmapped gap above DRAM by being outside
+ * DRAM, and .text by name.
+ *
+ * .text is in here and the data sections are not, because the span of .text is the one
+ * section figure that holds across models: every 6500 and 7510 build measured starts it
+ * at 0x00004000 and ends it below TEXT_HI, and every one of them puts the heap floor
+ * ABOVE TEXT_HI -- 0x008A2000 on a 7510, 0x01034000 on the oldest 6500 -- so refusing
+ * this span costs no legitimate address anywhere.  A .data or .bss bound has no such
+ * margin: those addresses differ per model, and compiling one in would refuse good heap
+ * on a model it was not measured on.  Keeping those off is the declared window's job. */
+static int dspn_backstop_ok(uint32_t a, uint32_t n)
 {
-    return dspn_range_ok(a, n, DSPN_HEAP_LO, DSPN_HEAP_HI);
+    if (dspn_range_ok(a, n, DSPN_DRAM_LO, DSPN_DRAM_END) == 0) { return 0; }
+    /* The wrap case is already refused above, so a + n cannot have wrapped here. */
+    if (a < DSPN_TEXT_HI && a + n > DSPN_TEXT_LO) { return 0; }
+    return 1;
 }
 
 /* Readable at all: DRAM. Everything at or above 0x10000000 is refused, which covers the
@@ -81,7 +96,7 @@ static int dspn_text_ok(uint32_t a)
  * inside the backstop. */
 static int dspn_write_ok(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi)
 {
-    return (dspn_range_ok(a, n, lo, hi) != 0 && dspn_heap_ok(a, n) != 0) ? 1 : 0;
+    return (dspn_range_ok(a, n, lo, hi) != 0 && dspn_backstop_ok(a, n) != 0) ? 1 : 0;
 }
 
 /* The read equivalent, for capture storage. */
