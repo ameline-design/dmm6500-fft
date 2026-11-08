@@ -49,6 +49,20 @@ ki.memread = function(addrhex, lenhex)
   if s == nil then return string.rep('\0', n) end
   return string.sub(s, 1, n)
 end
+-- The sweep anchors on what tostring() gives a fresh table, which on the instrument is a
+-- heap address from the same allocator that placed the buffers. Under the host interpreter it
+-- is a host address nowhere near the fixtures below, so the harness supplies one: without it
+-- every storage and descriptor case sweeps a window that cannot contain its own fixture and
+-- answers nil, which is the same symptom a DMM7510 showed for the same reason.
+local HOST_TOSTR = tostring
+local MOCK_ANCHOR = 55890248          -- TRUE_E0, so the near window brackets every fixture
+tostring = function(v)
+  if type(v) == 'table' and next(v) == nil then
+    return 'table: ' .. string.format('%x', MOCK_ANCHOR)
+  end
+  return HOST_TOSTR(v)
+end
+
 ki.peek32 = function(addrhex)
   local w = WORDS[tonumber(addrhex, 16)]
   return string.format('%X', w or 0)
@@ -668,6 +682,101 @@ do
   math.abs, math.deg, math.rad = sa, sd, sr
   check('no glue sample: refused rather than guessed', got == 0,
         'found=' .. got .. ' nglue=' .. tostring(fftsa.nl.nglue))
+end
+
+-- ---------------------------------------------------------------------------
+-- The heap sweep windows. These were two constants measured inside a DMM6500's heap, which
+-- left about 45% of a DMM7510 1.7.16's heap unswept: describe() answered nil for a buffer
+-- the allocator placed outside them, and nl.init then aborted with no reason recorded. They
+-- are now derived from a heap address Lua hands over for free. Decimal throughout, because
+-- Lua 5.0.2 rejects a hex literal at parse time.
+-- ---------------------------------------------------------------------------
+do
+  local SAVED = tostring
+  fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 12288, 268435456
+
+  -- Measured on a DMM6500 1.7.17a: the four addresses the native path must find, and the
+  -- anchor sampled over six calls.
+  local D6500 = { 51587624, 56345968, 57110112, 57144480 }
+  local A6500 = { 59283568, 59425080, 51858960, 45103512, 51513064, 51938648 }
+
+  local setanchor = function(a)
+    tostring = function(v)
+      if type(v) == 'table' and next(v) == nil then
+        return 'table: ' .. string.format('%x', a)
+      end
+      return SAVED(v)
+    end
+  end
+
+  setanchor(59546064)
+  check('the anchor is read out of what tostring gives a fresh table',
+        fftsa.nl.heap_anchor() == 59546064,
+        'got=' .. SAVED(fftsa.nl.heap_anchor()))
+
+  -- Some builds print 0x and some do not. Both have to parse, or the sweep loses its anchor
+  -- and falls back to the whole backstop, which takes minutes.
+  tostring = function(v)
+    if type(v) == 'table' and next(v) == nil then return 'table: 0x38c99d0' end
+    return SAVED(v)
+  end
+  check('an 0x-prefixed address parses too', fftsa.nl.heap_anchor() == 59546064,
+        'got=' .. SAVED(fftsa.nl.heap_anchor()))
+
+  -- Every address the native path has to find, against every anchor sample. The near window
+  -- has to contain all of them, because reaching the far one costs minutes.
+  local worst, allin = 0, true
+  local ai, di
+  for ai = 1, table.getn(A6500) do
+    setanchor(A6500[ai])
+    local w = fftsa.nl.sweep_windows()
+    if table.getn(w) ~= 2 then allin = false end
+    for di = 1, table.getn(D6500) do
+      local t = D6500[di]
+      if not (t >= w[1][1] and t <= w[1][2]) then allin = false end
+      local dist = t - A6500[ai]
+      if dist < 0 then dist = -dist end
+      if dist > worst then worst = dist end
+    end
+  end
+  check('the near window holds every measured DMM6500 address, for every anchor', allin,
+        'worst distance ' .. string.format('%.2f', worst / 1048576) .. ' MB of '
+        .. string.format('%.0f', fftsa.nl.ANCHOR_NEAR / 1048576) .. ' MB')
+
+  -- A DMM7510 1.7.16 heap runs 0x008A2000..0x0F8A2000. The old constants started at
+  -- 0x01100000 and stopped at 0x09000000, so a buffer at either end of that heap was
+  -- invisible. Whatever the anchor, a window must contain it and must stay inside the
+  -- backstop.
+  local reach = true
+  local probes = { 9056256, 16777216, 159383552, 260644864 }
+  for ai = 1, table.getn(probes) do
+    setanchor(probes[ai])
+    local w = fftsa.nl.sweep_windows()
+    local far = w[table.getn(w)]
+    if not (probes[ai] >= far[1] and probes[ai] <= far[2]) then reach = false end
+    if far[1] < fftsa.nl.BACKSTOP_LO or far[2] > fftsa.nl.BACKSTOP_HI then reach = false end
+  end
+  check('windows stay inside the backstop and contain their anchor across a 7510 heap', reach,
+        'backstop ' .. string.format('%X', fftsa.nl.BACKSTOP_LO) .. '..'
+        .. string.format('%X', fftsa.nl.BACKSTOP_HI))
+
+  -- No address from tostring means no anchor, and the only thing left that can still succeed
+  -- is sweeping everything the backstop allows.
+  tostring = function(v)
+    if type(v) == 'table' and next(v) == nil then return 'table: (no address)' end
+    return SAVED(v)
+  end
+  local w = fftsa.nl.sweep_windows()
+  check('no anchor falls back to the whole backstop rather than refusing',
+        table.getn(w) == 1 and w[1][1] == fftsa.nl.BACKSTOP_LO
+        and w[1][2] == fftsa.nl.BACKSTOP_HI,
+        'n=' .. table.getn(w))
+
+  tostring = SAVED
+  -- Every refusal in init names itself now, so the panel never reports a bare nil again.
+  check('a refusal records why',
+        fftsa.nl._no('because') == false and fftsa.nl.why == 'because',
+        'why=' .. tostring(fftsa.nl.why))
 end
 
 ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR

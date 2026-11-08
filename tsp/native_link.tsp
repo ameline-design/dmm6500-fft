@@ -585,6 +585,110 @@ end
 -- Content scan over a heap range. A normal function rather than a loadstring, so the
 -- packager's luac gate checks it like any other code.
 -- ---------------------------------------------------------------------------
+-- Where the heap is cannot be compiled in. A DMM6500 1.7.16-1.7.18 puts .heap at
+-- 0x01036000..0x0D836000 and a DMM7510 1.7.16 at 0x008A2000..0x0F8A2000, so a window pair
+-- measured on one model leaves about 45% of the other's heap unswept, and describe() answers
+-- nil for a buffer the allocator placed there.
+--
+-- Lua's own objects come from the same allocator as reading-buffer storage, so tostring({})
+-- is a heap address for free, on any model, with no section table and no scan. Measured on a
+-- DMM6500 1.7.17a: a fresh table at 0x0387F730, fftsa.sg_buf's object at 0x03132A28 and
+-- fftsa.cap's at 0x0328EFB8, against descriptors at 0x035BC570 and 0x0367F4A0 and a chunk
+-- vector at 0x03676E60 -- the whole working set inside 7.6 MB. The first window is that
+-- spread with threefold room, so the common case costs what a 32 MB window costs; the second
+-- is everything the compiled backstop permits, for a heap that scatters further than measured.
+fftsa.nl.ANCHOR_NEAR = 25165824         -- 24 MB either side
+fftsa.nl.ANCHOR_FAR  = 134217728        -- 128 MB either side
+-- The top of DRAM, which is the board and not a firmware build -- the same figure
+-- dsp_native_bounds.h compiles in. Used only when the generated module has not loaded and
+-- the backstop is still zero: clamping to a zero range would answer with no windows at all,
+-- and describe() is also called at runtime by nl_bind, where refusing to sweep is worse than
+-- sweeping wide.
+fftsa.nl.DRAM_END = 268435456
+
+function fftsa.nl.heap_anchor()
+  local t = tostring({})
+  if type(t) ~= 'string' then return nil end
+  local h = string.gsub(t, '^.*:%s*', '')
+  h = string.gsub(h, '^0[xX]', '')
+  local a = tonumber(h, 16)
+  if a == nil or a <= 0 then return nil end
+  return a
+end
+
+function fftsa.nl.sweep_windows()
+  local nl = fftsa.nl
+  local lo, hi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if lo == nil or hi == nil or lo >= hi then lo, hi = 0, nl.DRAM_END end
+  local a = nl.heap_anchor()
+  local out = {}
+  local n = 0
+  if a ~= nil and a > lo and a < hi then
+    local clamp = function(x, y)
+      if x < lo then x = lo end
+      if y > hi then y = hi end
+      if x >= y then return nil end
+      return { x, y }
+    end
+    local w1 = clamp(a - nl.ANCHOR_NEAR, a + nl.ANCHOR_NEAR)
+    local w2 = clamp(a - nl.ANCHOR_FAR, a + nl.ANCHOR_FAR)
+    if w1 ~= nil then n = n + 1 out[n] = w1 end
+    if w2 ~= nil then n = n + 1 out[n] = w2 end
+  end
+  -- No anchor means tostring() did not give an address. Sweeping everything the backstop
+  -- allows is slow, and it is the only thing left that can still succeed.
+  if n == 0 then out[1] = { lo, hi } end
+  nl.last_windows = out
+  return out
+end
+
+function fftsa.nl.windows_str()
+  local w = fftsa.nl.last_windows
+  if w == nil then return 'windows=none' end
+  local o, i = 'windows=', nil
+  for i = 1, table.getn(w) do
+    if i > 1 then o = o .. ',' end
+    o = o .. hx(w[i][1]) .. '..' .. hx(w[i][2])
+  end
+  return o
+end
+
+-- Everything about the native path a failure report needs, in one string the panel can hold.
+-- An operator on a model we have never run on can only send back what is on the glass, so
+-- the screen has to carry the state rather than name a log to go and read.
+function fftsa.nl.diag()
+  local nl = fftsa.nl
+  local o = 'model=' .. tostring(localnode.model) .. ' fw=' .. tostring(localnode.version)
+  o = o .. ' why=' .. tostring(nl.why)
+  o = o .. ' | ready=' .. tostring(nl.ready) .. ' entry=' .. tostring(nl.entry)
+  o = o .. ' rc=' .. tostring(nl.last_rc) .. ' spent=' .. tostring(nl.boot_spent)
+  o = o .. ' | backstop=' .. hx(nl.BACKSTOP_LO or 0) .. '..' .. hx(nl.BACKSTOP_HI or 0)
+  o = o .. ' anchor=' .. hx(nl.heap_anchor() or 0) .. ' ' .. nl.windows_str()
+  o = o .. ' | glue=' .. tostring(nl.nglue) .. '/' .. tostring(nl.GLUE_MIN)
+  o = o .. ' mathpos=' .. tostring(nl.math_pos) .. ' odd=' .. tostring(nl.math_odd)
+  o = o .. ' | plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params=' .. tostring(nl.SIZEOF_PARAMS)
+  o = o .. ' real=' .. tostring(nl.SIZEOF_REAL) .. ' align=' .. tostring(nl.DSP_ALIGN)
+  -- Which of the six resolved, by name: one missing entry is enough to stop the install, and
+  -- the census is the part that differs between models.
+  local i
+  o = o .. ' | libm '
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local nm = nl.MATH_NAMES[i]
+    local a = nl.fn ~= nil and nl.fn[nm] or nil
+    o = o .. nm .. '=' .. (a ~= nil and hx(a) or 'NIL')
+    if i < table.getn(nl.MATH_NAMES) then o = o .. ' ' end
+  end
+  return o
+end
+
+-- A refusal that names itself. init has a dozen ways to give up before the native call is
+-- ever made, and without a reason the panel reports the same "ready=false entry=nil rc=nil"
+-- for every one of them -- which is what a DMM7510 1.7.16 reported, with nothing to act on.
+function fftsa.nl._no(why)
+  fftsa.nl.why = why
+  return false
+end
+
 function fftsa.nl.FINDS(lo, hi, pat)
   local a   = lo
   local out = {}
@@ -682,10 +786,7 @@ function fftsa.nl._find_storage(buf, has_extras)
     end
   end
   local needle = f64_pack(rd[1])
-  local windows = {
-    { 50331648, 83886080 },     -- 0x03000000 - 0x05000000
-    { 17825792, 150994944 },    -- 0x01100000 - 0x09000000, both inside .heap
-  }
+  local windows = fftsa.nl.sweep_windows()
   local wi
   local nhits = 0
   for wi = 1, table.getn(windows) do
@@ -780,10 +881,7 @@ function fftsa.nl._find_desc(elem0)
     nl._desc_of, nl._desc_at = nil, nil
   end
   local needle = u32_pack(elem0)
-  local windows = {
-    { 50331648, 83886080 },
-    { 17825792, 150994944 },
-  }
+  local windows = fftsa.nl.sweep_windows()
   local wi
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
@@ -837,10 +935,7 @@ function fftsa.nl._find_desc_by_sig(buf)
   local cap, n = buf.capacity, buf.n
   if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then return nil end
   local needle = u32_pack(cap) .. u32_pack(n)
-  local windows = {
-    { 50331648, 83886080 },
-    { 17825792, 150994944 },
-  }
+  local windows = fftsa.nl.sweep_windows()
   local wi
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
@@ -1005,8 +1100,11 @@ end
 -- later via_peek8 through a stale nl.entry would branch into whatever the allocator hands
 -- out next. peek8_cls and peek8_f are kept, restore_peek8 needing them, and they are
 -- firmware addresses rather than heap.
-function fftsa.nl._abort(cb, pb)
+function fftsa.nl._abort(cb, pb, why)
   local nl = fftsa.nl
+  -- Every caller names its own refusal. Without this the panel reports "rc=nil nil" and the
+  -- nine ways init can give up before the native call are indistinguishable from each other.
+  nl.why = why or 'unspecified'
   if pb ~= nil then pcall(function() buffer.delete(pb) end) end
   if cb ~= nil then pcall(function() buffer.delete(cb) end) end
   nl.ready     = false
@@ -1054,7 +1152,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     -- made, which is what lets a relaunch run compiled at all. It validates before it
     -- believes and answers false on any doubt.
     if nl.reattach(want_n, kind, beta, decim, method) then return true end
-    return false
+    return nl._no('one install per boot is spent and reattach refused: the earlier '
+                  .. 'install is gone or no longer validates')
   end
   nl.boot_spent = false
 
@@ -1073,8 +1172,12 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
     nl._DSP_RELOC = b64decode(nl._DSP_RELOC_B64, nl._DSP_RELOC_B64_LEN)
     trace('b64.ok', nl._DSP_CODE ~= nil and string.len(nl._DSP_CODE) or 'nil')
   end
-  if nl._DSP_CODE == nil or string.len(nl._DSP_CODE) == 0 then return false end
-  if nl._DSP_RELOC == nil then return false end
+  if nl._DSP_CODE == nil or string.len(nl._DSP_CODE) == 0 then
+    return nl._no('native_code.tsp did not load: no image')
+  end
+  if nl._DSP_RELOC == nil then
+    return nl._no('native_code.tsp did not load: no relocation table')
+  end
   -- Zero or nil means the generated module never loaded, and every size below would then be
   -- wrong in a way that still produces addresses. PARAMS_SLOT and STATUS_OFF are in the list
   -- because without them the image gets no params address and reports nothing, which is a
@@ -1083,7 +1186,10 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
      nl.RES_DOUBLES == 0 or nl.RES_PEAKS == 0 or
      nl.PARAMS_SLOT == nil or nl.PARAMS_SLOT == 0 or
      nl.STATUS_OFF == nil or nl.STATUS_OFF == 0 then
-    return false
+    return nl._no('generated sizes are zero or nil: real=' .. tostring(nl.SIZEOF_REAL)
+                  .. ' plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params='
+                  .. tostring(nl.SIZEOF_PARAMS) .. ' slot=' .. tostring(nl.PARAMS_SLOT)
+                  .. ' status=' .. tostring(nl.STATUS_OFF))
   end
 
   -- No array has to fit a chunk whole: dsp_plan_init_segs cuts one too long for a segment
@@ -1095,7 +1201,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- The plan struct has a chunk to itself, which is the one size still checked here.
   if align8(nl.SIZEOF_PLAN) + 32 > nl.CHUNK_BYTES then
     trace('size.plan', nl.SIZEOF_PLAN)
-    return false
+    return nl._no('plan struct of ' .. tostring(nl.SIZEOF_PLAN)
+                  .. ' bytes does not leave a chunk room for alignment')
   end
   -- Two arrays of want_nseg dsp_real share the reduction chunk with the results block,
   -- whose size is fixed by the image. DSPN_RES_BYTES in dsp_native.c, computed from the
@@ -1105,28 +1212,41 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.nseg_ceil = math.floor((nl.CHUNK_BYTES - 32 - res_bytes) / (2 * nl.SIZEOF_REAL))
   if want_n > nmax or want_nseg < 2 or want_nseg > nl.nseg_ceil then
     trace('size.refused', want_n, want_nseg)
-    return false
+    return nl._no('size refused: n=' .. tostring(want_n) .. ' max=' .. tostring(nmax)
+                  .. ' nseg=' .. tostring(want_nseg) .. ' ceil=' .. tostring(nl.nseg_ceil))
   end
 
   -- 1. Firmware math addresses. All six are needed; dsp.c calls every one.
   trace('math')
-  if nl.resolve_math() < 6 then return false end
+  local nmath = nl.resolve_math()
+  if nmath < 6 then
+    return nl._no('resolve_math found ' .. tostring(nmath) .. ' of 6 libm entries: glue='
+                  .. tostring(nl.nglue) .. ' need>=' .. tostring(nl.GLUE_MIN)
+                  .. ' mathpos=' .. tostring(nl.math_pos) .. ' odd=' .. tostring(nl.math_odd))
+  end
   trace('math.ok')
 
   -- 2. The ki.peek8 closure, and its original f pointer.
   local s = tostring(ki.peek8)
   local _, e = string.find(s, ': ')
-  if not e then return false end
+  if not e then return nl._no('ki.peek8 does not tostring to an address: ' .. tostring(s)) end
   local cls = tonumber(string.sub(s, e + 1), 16)
-  if not cls then return false end
+  if not cls then return nl._no('ki.peek8 address will not parse as hex: ' .. tostring(s)) end
   -- This value is written back into a live lua_CFunction pointer by every redirect, so it
   -- is validated before it is kept, and one transport read is not enough: a desynchronised
   -- socket can return a heap address here, which the restore then writes into the dispatch
   -- path. Two agreeing reads, both inside firmware .text, or refuse.
   local orig_f = W(cls + 12)
-  if orig_f == nil then return false end
-  if not fftsa.nl._text_ok(orig_f) then return false end
-  if W(cls + 12) ~= orig_f then return false end
+  if orig_f == nil then
+    return nl._no('cannot read the ki.peek8 f pointer at ' .. hx(cls + 12))
+  end
+  if not fftsa.nl._text_ok(orig_f) then
+    return nl._no('ki.peek8 f pointer ' .. hx(orig_f) .. ' is outside .text '
+                  .. hx(nl.TEXT_LO) .. '..' .. hx(nl.TEXT_HI))
+  end
+  if W(cls + 12) ~= orig_f then
+    return nl._no('the ki.peek8 f pointer read back differently: transport is unreliable')
+  end
   nl.peek8_cls = cls
   nl.peek8_f   = orig_f
 
@@ -1289,7 +1409,11 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('scan.plan')
   -- STYLE_WRITABLE_FULL, so it does store extra values and asking for them is safe.
   local pdesc = nl.describe(pb, true)
-  if pdesc == nil or pdesc.vec == nil then return fftsa.nl._abort(cb, pb) end
+  if pdesc == nil or pdesc.vec == nil then
+    return fftsa.nl._abort(cb, pb, 'plan buffer: no descriptor found by sweep -- '
+                           .. tostring(nl._stor_why) .. ' anchor=' .. hx(nl.heap_anchor() or 0)
+                           .. ' ' .. fftsa.nl.windows_str())
+  end
   trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
 
   -- The vector has to hold the entries about to be read out of it. The chunk count is the
@@ -1297,7 +1421,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- from the capacity asked for: one entry past the end returns whatever follows in the
   -- heap, and anything that looks like a heap address passes the native backstop.
   if pdesc.nchunks == nil or pdesc.nchunks < chunks_wanted then
-    return fftsa.nl._abort(cb, pb)
+    return fftsa.nl._abort(cb, pb, 'plan buffer has ' .. tostring(pdesc.nchunks)
+                           .. ' chunks, needs ' .. tostring(chunks_wanted))
   end
   nl.plan_buf = pb
 
@@ -1313,10 +1438,13 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   for i = 1, chunks_wanted do
     local a = W(pdesc.vec + (i - 1) * 4)
     if a == nil or a == 0 then
-      return fftsa.nl._abort(cb, pb)
+      return fftsa.nl._abort(cb, pb, 'chunk ' .. tostring(i) .. ' of '
+                             .. tostring(chunks_wanted) .. ' is a null payload')
     end
     if a < nl.BACKSTOP_LO or a + nl.CHUNK_BYTES > nl.BACKSTOP_HI then
-      return fftsa.nl._abort(cb, pb)
+      return fftsa.nl._abort(cb, pb, 'chunk ' .. tostring(i) .. ' at ' .. hx(a)
+                             .. ' is outside the backstop ' .. hx(nl.BACKSTOP_LO)
+                             .. '..' .. hx(nl.BACKSTOP_HI))
     end
     payload[i] = a
   end
@@ -1328,7 +1456,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   for i = 1, nseg do
     segbase[i] = align32(payload[i])
     if (segbase[i] - payload[i]) + nl.SEG_BYTES > nl.CHUNK_BYTES then
-      return fftsa.nl._abort(cb, pb)
+      return fftsa.nl._abort(cb, pb, 'segment ' .. tostring(i) .. ': ' .. tostring(nl.SEG_BYTES)
+                             .. ' bytes will not fit a chunk after 32-byte alignment')
     end
   end
 
@@ -1338,7 +1467,8 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   local host      = align32(payload[nseg + 1])
   local plan_addr = host
   if (host - payload[nseg + 1]) + align8(nl.SIZEOF_PLAN) > nl.CHUNK_BYTES then
-    return fftsa.nl._abort(cb, pb)
+    return fftsa.nl._abort(cb, pb, 'plan struct of ' .. tostring(nl.SIZEOF_PLAN)
+                           .. ' bytes will not fit a chunk')
   end
 
   -- dsp_reduce writes nseg entries into each of db and hz, and the trace count is a
@@ -1352,13 +1482,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- a whole number of dsp_real, so the sum is.
   local res_addr = red_hz + want_nseg * nl.SIZEOF_REAL
   if (res_addr - payload[nseg + 2]) + res_bytes > nl.CHUNK_BYTES then
-    return fftsa.nl._abort(cb, pb)
+    return fftsa.nl._abort(cb, pb, 'reduction arrays plus a ' .. tostring(res_bytes)
+                           .. '-byte results block will not fit a chunk')
   end
 
   -- The segment vector itself, in the code buffer above the params struct.
   local segs_addr = nl.params + align8(nl.PARAM_WORDS * 4)
   if (segs_addr - code_base) + nseg * 4 > nl.CHUNK_BYTES then
-    return fftsa.nl._abort(cb, pb)
+    return fftsa.nl._abort(cb, pb, 'the ' .. tostring(nseg)
+                           .. '-entry segment vector will not fit above the params struct')
   end
   local sv = {}
   for i = 1, nseg do sv[i] = u32_pack(segbase[i]) end
@@ -1392,7 +1524,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('call.init.ret', tostring(rc))
   nl.last_rc = rc
   if rc ~= 0 then
-    return fftsa.nl._abort(cb, pb)
+    return fftsa.nl._abort(cb, pb, 'MODE_INIT refused with rc=' .. tostring(rc))
   end
 
   nl.plan_addr = plan_addr

@@ -1926,8 +1926,12 @@ function fftsa.start()
     local nl = fftsa.nl
     local why = "nl absent"
     if nl ~= nil then
-      why = "ready=" .. tostring(nl.ready) .. " entry=" .. tostring(nl.entry)
-            .. " rc=" .. tostring(nl.last_rc) .. " " .. tostring(fftsa.nl_lasterr)
+      -- nl.diag() carries the whole native-path state: model, firmware, which refusal fired,
+      -- the heap anchor and swept windows, the glue census and all six libm entries by name.
+      -- A model we cannot test on reports by photographing this screen, so everything needed
+      -- to place the failure has to be on it.
+      why = nl.diag()
+      if fftsa.nl_lasterr ~= nil then why = why .. " | bind=" .. tostring(fftsa.nl_lasterr) end
     end
     return fftsa.start_failed("the compiled DSP did not start and this archive has no "
                               .. "interpreted fallback -- " .. why
@@ -2025,13 +2029,31 @@ function fftsa.show_error(msg)
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
                    "The analyser could not start.", 16736352,   -- red FF6060
                    display.FONT_MEDIUM, display.JUST_LEFT)
+    -- Wrapped on spaces, not cut every 80 characters: the diagnostic is mostly addresses
+    -- and key=value pairs read off the glass by whoever is standing in front of it, and a
+    -- hex address split across two lines is the one that gets transcribed wrong.
     local m = tostring(msg)
     local y = 140
     local i = 1
-    while i <= string.len(m) and y <= 400 do
-      display.create(fftsa.errscr, display.OBJ_TEXT, 20, y, string.sub(m, i, i + 79),
+    local len = string.len(m)
+    while i <= len and y <= 400 do
+      local stop = i + 79
+      if stop < len then
+        -- Back up to the last space in the window. No space means a single long run, which
+        -- has to be cut somewhere, so it is cut at the full width.
+        local cut = nil
+        local k = stop
+        while k > i do
+          if string.sub(m, k, k) == ' ' then cut = k break end
+          k = k - 1
+        end
+        if cut ~= nil then stop = cut - 1 end
+      else
+        stop = len
+      end
+      display.create(fftsa.errscr, display.OBJ_TEXT, 20, y, string.sub(m, i, stop),
                      14737632, display.FONT_SMALL, display.JUST_LEFT)   -- light grey E0E0E0
-      i = i + 80
+      i = stop + 2
       y = y + 22
     end
     display.create(fftsa.errscr, display.OBJ_TEXT, 20, 420,
