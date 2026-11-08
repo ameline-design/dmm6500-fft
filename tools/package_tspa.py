@@ -99,7 +99,7 @@ MANIFEST = [
     # tree or an install cannot be told from the one it replaced. The minor part stays two
     # digits: the field may be compared as a string, where "8.9" sorts above "8.10", so a
     # one-digit minor would read as newer than this.
-    ('Version', '8.56'),
+    ('Version', '8.57'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was

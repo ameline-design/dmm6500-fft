@@ -6741,6 +6741,23 @@ end)())
 --
 -- Both paths are driven. A stash on the failure path would carry a descriptor the app has
 -- just rejected, which is the opposite defect and passes an assertion that counts only up.
+-- A DIAGNOSTIC MUST NOT BECOME THE FAULT. nl is a separately loaded module and a relaunch
+-- reloads them in an order this code has no business depending on, so nl_bind's failure
+-- message reaches for members that may not be back. It used to call nl.windows_str()
+-- unconditionally, which raised inside the string being built to explain a failed bind -- the
+-- stub below is exactly the nl that catches it, carrying only what the bind path needs.
+check('a failed bind explains itself against an nl missing every optional member', (function()
+  local keepnl, keepcap, keepof = fftsa.nl, fftsa.nl_cap, fftsa.nl_cap_of
+  fftsa.nl = {ready = true, entry = 1, describe = function() return nil end}
+  local ok, err = pcall(fftsa.nl_bind)
+  local why = tostring(fftsa.nl_lasterr)
+  fftsa.nl, fftsa.nl_cap, fftsa.nl_cap_of = keepnl, keepcap, keepof
+  -- It has to RETURN false and say which term, not raise while saying it.
+  return ok == true and string.find(why, 'no descriptor', 1, true) ~= nil
+         and string.find(why, 'windows=?', 1, true) ~= nil,
+         'ok=' .. tostring(ok) .. ' err=' .. tostring(err) .. ' why=' .. why
+end)())
+
 check('a successful bind re-stashes, a failed one does not', (function()
   local keepnl, keepcap, keepof = fftsa.nl, fftsa.nl_cap, fftsa.nl_cap_of
   local stashed, desc = 0, nil

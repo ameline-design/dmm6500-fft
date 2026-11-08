@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.56
+-- $Version: 8.57
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -1609,6 +1609,19 @@ fftsa.nl.RC = {
   EOUTPUT = -6, EDESC = -7, EARENA = -8, ESCRATCH = -9, ERUN = -10, EMATH = -11,
   EREDUCE = -12, ERESULT = -13,
 }
+
+-- A return code as its name, for anything an operator reads. "rc=-11" needs this file open
+-- beside it; "rc=-11 EMATH" says a libm entry was refused, which is actionable from the
+-- glass. The table is written name-to-number because that is how the code uses it, so this
+-- walks it rather than keeping a second copy that could disagree.
+function fftsa.nl.rc_name(rc)
+  if type(rc) ~= 'number' then return tostring(rc) end
+  local k, v
+  for k, v in pairs(fftsa.nl.RC) do
+    if v == rc then return tostring(rc) .. ' ' .. k end
+  end
+  return tostring(rc)
+end
 
 -- DSP_THD_MAINS_* from csrc/dsp.h. Hum at a multiple of the selected mains frequency is
 -- passed over when the fundamental is sought; BOTH discounts 50 and 60.
@@ -3681,7 +3694,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('call.init.ret', tostring(rc))
   nl.last_rc = rc
   if rc ~= 0 then
-    return fftsa.nl._abort(cb, pb, 'MODE_INIT refused with rc=' .. tostring(rc))
+    return fftsa.nl._abort(cb, pb, 'MODE_INIT refused with rc=' .. nl.rc_name(rc))
   end
 
   nl.plan_addr = plan_addr
@@ -4915,6 +4928,19 @@ end
 -- answer rather than something describe() may discover: the capture is STYLE_STANDARD, and
 -- reading .extravalues on one posts event 4927, which the firmware shows as a modal dialog
 -- over the running app. pcall is no defence where it posts rather than raises.
+-- A member of nl, called only if it is there. nl is a separately loaded module and a relaunch
+-- reloads them in an order this code has no business depending on, so reaching for a function
+-- that may not be back yet turns a diagnostic into the fault it was meant to describe. The
+-- offline suite caught exactly that: a stub nl with no windows_str raised inside the message
+-- being built to explain a failed bind.
+function fftsa.nl_call(name, arg, dflt)
+  local nl = fftsa.nl
+  if nl == nil or type(nl[name]) ~= 'function' then return dflt end
+  local v = nl[name](arg)
+  if v == nil then return dflt end
+  return v
+end
+
 function fftsa.nl_bind()
   local nl = fftsa.nl
   -- Each failure says which term, or this reads as "the compiled DSP did not start" with no
@@ -4932,7 +4958,10 @@ function fftsa.nl_bind()
     -- The sweep's own reason when it has one, or a short record, an unconfirmed stride and
     -- a missed descriptor all read alike.
     fftsa.nl_lasterr = 'bind: describe found no descriptor for the capture buffer -- '
-                       .. tostring(nl._stor_why)
+                       .. tostring(nl._stor_why) .. ' raw=' .. tostring(nl._raw_n)
+                       .. ' hits=' .. tostring(nl._hit_n)
+                       .. ' inst=' .. string.format('%X', nl.inst or 0)
+                       .. ' ' .. fftsa.nl_call('windows_str', nil, 'windows=?')
     return false
   end
   fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
@@ -5120,7 +5149,9 @@ function fftsa.nl_replan()
   local ok = nl.reinit(fftsa.n, nl.win_to_native(fftsa.win_i),
                        fftsa.kbeta(fftsa.kbeta_i), 1, nl.FFT_FOURSTEP)
   if not ok then
-    fftsa.nl_lasterr = 'reinit ' .. tostring(nl.last_rc)
+    fftsa.nl_lasterr = 'reinit refused rc='
+                       .. fftsa.nl_call('rc_name', nl.last_rc, tostring(nl.last_rc))
+                       .. ' at n=' .. tostring(fftsa.n)
     return false
   end
   return fftsa.nl_bind()
@@ -5244,7 +5275,9 @@ function fftsa.frame_body()
       -- Demoted for the rest of the session rather than raising once a frame. last_rc
       -- carries the reason; fftsa.nl.RC names it.
       fftsa.nl.ready = false
-      fftsa.nl_lasterr = tostring(fftsa.nl.last_rc)
+      fftsa.nl_lasterr = 'call_dsp rc='
+                         .. fftsa.nl_call('rc_name', fftsa.nl.last_rc,
+                                          tostring(fftsa.nl.last_rc))
       nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
     else
       -- The trace reaches the graph through buffer.write.reading, from the values the same
@@ -5254,7 +5287,7 @@ function fftsa.frame_body()
       local rd = fftsa.nl.reduce(nseg)
       if rd == nil then
         fftsa.nl.ready = false
-        fftsa.nl_lasterr = 'reduce'
+        fftsa.nl_lasterr = 'reduce returned nil for nseg=' .. tostring(nseg)
         nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
       else
         fftsa.binhz = binhz

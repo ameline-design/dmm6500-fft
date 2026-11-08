@@ -404,6 +404,19 @@ end
 -- answer rather than something describe() may discover: the capture is STYLE_STANDARD, and
 -- reading .extravalues on one posts event 4927, which the firmware shows as a modal dialog
 -- over the running app. pcall is no defence where it posts rather than raises.
+-- A member of nl, called only if it is there. nl is a separately loaded module and a relaunch
+-- reloads them in an order this code has no business depending on, so reaching for a function
+-- that may not be back yet turns a diagnostic into the fault it was meant to describe. The
+-- offline suite caught exactly that: a stub nl with no windows_str raised inside the message
+-- being built to explain a failed bind.
+function fftsa.nl_call(name, arg, dflt)
+  local nl = fftsa.nl
+  if nl == nil or type(nl[name]) ~= 'function' then return dflt end
+  local v = nl[name](arg)
+  if v == nil then return dflt end
+  return v
+end
+
 function fftsa.nl_bind()
   local nl = fftsa.nl
   -- Each failure says which term, or this reads as "the compiled DSP did not start" with no
@@ -421,7 +434,10 @@ function fftsa.nl_bind()
     -- The sweep's own reason when it has one, or a short record, an unconfirmed stride and
     -- a missed descriptor all read alike.
     fftsa.nl_lasterr = 'bind: describe found no descriptor for the capture buffer -- '
-                       .. tostring(nl._stor_why)
+                       .. tostring(nl._stor_why) .. ' raw=' .. tostring(nl._raw_n)
+                       .. ' hits=' .. tostring(nl._hit_n)
+                       .. ' inst=' .. string.format('%X', nl.inst or 0)
+                       .. ' ' .. fftsa.nl_call('windows_str', nil, 'windows=?')
     return false
   end
   fftsa.nl_cap, fftsa.nl_cap_of = c, fftsa.cap
@@ -609,7 +625,9 @@ function fftsa.nl_replan()
   local ok = nl.reinit(fftsa.n, nl.win_to_native(fftsa.win_i),
                        fftsa.kbeta(fftsa.kbeta_i), 1, nl.FFT_FOURSTEP)
   if not ok then
-    fftsa.nl_lasterr = 'reinit ' .. tostring(nl.last_rc)
+    fftsa.nl_lasterr = 'reinit refused rc='
+                       .. fftsa.nl_call('rc_name', nl.last_rc, tostring(nl.last_rc))
+                       .. ' at n=' .. tostring(fftsa.n)
     return false
   end
   return fftsa.nl_bind()
@@ -733,7 +751,9 @@ function fftsa.frame_body()
       -- Demoted for the rest of the session rather than raising once a frame. last_rc
       -- carries the reason; fftsa.nl.RC names it.
       fftsa.nl.ready = false
-      fftsa.nl_lasterr = tostring(fftsa.nl.last_rc)
+      fftsa.nl_lasterr = 'call_dsp rc='
+                         .. fftsa.nl_call('rc_name', fftsa.nl.last_rc,
+                                          tostring(fftsa.nl.last_rc))
       nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
     else
       -- The trace reaches the graph through buffer.write.reading, from the values the same
@@ -743,7 +763,7 @@ function fftsa.frame_body()
       local rd = fftsa.nl.reduce(nseg)
       if rd == nil then
         fftsa.nl.ready = false
-        fftsa.nl_lasterr = 'reduce'
+        fftsa.nl_lasterr = 'reduce returned nil for nseg=' .. tostring(nseg)
         nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
       else
         fftsa.binhz = binhz

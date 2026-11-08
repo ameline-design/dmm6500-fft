@@ -40,6 +40,19 @@ fftsa.nl.RC = {
   EREDUCE = -12, ERESULT = -13,
 }
 
+-- A return code as its name, for anything an operator reads. "rc=-11" needs this file open
+-- beside it; "rc=-11 EMATH" says a libm entry was refused, which is actionable from the
+-- glass. The table is written name-to-number because that is how the code uses it, so this
+-- walks it rather than keeping a second copy that could disagree.
+function fftsa.nl.rc_name(rc)
+  if type(rc) ~= 'number' then return tostring(rc) end
+  local k, v
+  for k, v in pairs(fftsa.nl.RC) do
+    if v == rc then return tostring(rc) .. ' ' .. k end
+  end
+  return tostring(rc)
+end
+
 -- DSP_THD_MAINS_* from csrc/dsp.h. Hum at a multiple of the selected mains frequency is
 -- passed over when the fundamental is sought; BOTH discounts 50 and 60.
 fftsa.nl.MAINS_BOTH = -1
@@ -2111,7 +2124,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   trace('call.init.ret', tostring(rc))
   nl.last_rc = rc
   if rc ~= 0 then
-    return fftsa.nl._abort(cb, pb, 'MODE_INIT refused with rc=' .. tostring(rc))
+    return fftsa.nl._abort(cb, pb, 'MODE_INIT refused with rc=' .. nl.rc_name(rc))
   end
 
   nl.plan_addr = plan_addr
