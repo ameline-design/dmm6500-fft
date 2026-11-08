@@ -140,8 +140,8 @@ immediately and without opening Options.
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So every gesture is settled after the
 fact. The check runs every 0.15 s, floored by the frame period because it is driven from the frame:
-about 0.07 s at 1024 samples and 0.3 s at 2048, so the settle follows the finger by roughly twice
-that. A check that has had no gesture reported costs one clock read and no graph call.
+about 0.10 s at 1024 and 2048 samples and 0.53 s at 32768, so the settle follows the finger by
+roughly twice that. A check that has had no gesture reported costs one clock read and no graph call.
 
 **A frequency gesture is adopted only once the axis stops moving.** A finger still on the glass is
 reported on every check, and retuning to each reading would mean several captures during one drag,
@@ -249,7 +249,7 @@ works either way.
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
-| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At the small counts the frame rate is set by per-frame overhead rather than by the count, so a step up costs less than doubling suggests; 1024 is measured at 13 to 15 frames a second. |
+| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At the small counts the frame rate is set by per-frame overhead rather than by the count, so a step up costs less than doubling suggests; 1024 and 2048 are both measured at 10 frames a second. |
 
 Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
 open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
@@ -573,22 +573,27 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
   tone the instrument can show.
-- **13 to 15 frames a second at 1024 samples, falling as the count rises.** The firmware's shortest
-  timer period is 0.05 s and a tick arriving mid-frame is dropped. The period itself is **not
-  restricted to multiples of 0.05**: asking for one off that grid posts event 1727 in the log and the
-  period is honoured anyway, measured as an armed 0.07 s delivering 13 to 15 fps, which is neither
-  0.05 (20 fps) nor 0.10 (10 fps). So the rate is `1 / period` on a 10 ms grid, with 0.05 s a hard
+- **10 frames a second at 1024 and 2048 samples, falling as the count rises.** The firmware's
+  shortest timer period is 0.05 s and a tick arriving mid-frame is dropped. The period itself is
+  **not restricted to multiples of 0.05**: asking for one off that grid posts event 1727 in the log
+  and the period is honoured anyway. So the rate is `1 / period` on a 10 ms grid, with 0.05 s a hard
   floor -- `0.045` is refused outright. The app times its own frames and picks the smallest period
   that still leaves 20 ms free:
 
   | FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
   |---|---|---|---|---|---|---|
-  | period | **0.07 s** | | | | | |
-  | displayed | **13-15 fps** | | | | | |
+  | displayed | **10 fps** | **10** | **8.2** | **6.0** | **3.6** | **1.9** |
+  | period, derived | 0.10 s | 0.10 | 0.12 | 0.17 | 0.28 | 0.53 |
 
-  Only 1024 has been measured on the compiled path, and it is faster than the whole of the earlier
-  interpreted table it replaces -- which read 0.10 s and 10 fps here. The remaining counts are blank
-  rather than carried over, because a figure from the interpreted path is not a figure for this one.
+  **The displayed row is measured, every count, on a DMM6500 1.7.17a.** The period row is `1 / rate`
+  rounded to the 10 ms grid, which is derived and not read back -- the app chooses the period and
+  the displayed rate is what comes of it.
+
+  An earlier build read 13 to 15 fps at 1024 and that figure is gone rather than kept: the trace is
+  now written as a folded pass, up the band and back down, which is twice the appends and is what
+  removes the dropout the earlier build had. Over 500 appends at about 76 us each is roughly 39 ms
+  of every frame. A single ascending lap costs half that and runs 17 fps at 1024, and it cannot be
+  used -- it draws the spectrum twice on alternate frames.
 
   At the small counts the frame is dominated by work that does not depend on the sample count, which
   is why 2048 is the default: it is twice the frequency resolution of 1024 for little. From 8192 up
