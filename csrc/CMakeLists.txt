@@ -341,6 +341,17 @@ if(Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE} -I
                      ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_f32.py)
 
+    # A probe is untested code until it has run, and the run is the expensive part: the
+    # window is scarce and a defect at the far end has already spent it. This drives
+    # probe_ringfind against a stub instrument and asserts the two rules a TSP statement has
+    # to satisfy -- one line, and under 1000 bytes -- plus that the restore happens even when
+    # the body raises. Two tag collisions were caught this way, and a collision is not
+    # cosmetic: ask() matches a reply on its prefix, so a stale reply of a different shape
+    # gets parsed as the wrong one.
+    add_test(NAME probe_ringfind
+             COMMAND ${Python3_EXECUTABLE} -I tools/test_probe_ringfind.py
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
     # The archive carries the image as base64, so there is a decoder between the compiler
     # and the CPU. A wrong byte there is not a failure to load: it is one instruction or
     # one float constant quietly different, which relocation then places perfectly.

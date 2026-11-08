@@ -7,7 +7,7 @@ buffer-side staging ring's pending count cannot be pre-loaded because the push S
 in-place buffer write draws nothing because the display task works from its own copy. That copy
 is a ring of records, and nothing has ever written it.
 
-Two phases, deliberately separated.
+Three phases, deliberately separated, each answering one thing.
 
 READ ONLY, the default. Appends four sentinel readings through the sanctioned path, then calls
 fftsa.nl.find_ring_records and find_ring_header on the instrument and prints what they found.
@@ -24,9 +24,23 @@ redraw from something else and leave them as a cache nobody reads.
     python3 -u -I tools/probe_ringfind.py --write
     python3 -u -I tools/probe_ringfind.py --write --nrec 64 --db -20
 
+Only the two float32 fields of a record are touched: no pointer, no cursor, no count, so the
+worst case is a wrong value drawn rather than a freed-widget fault.
+
+THE WHOLE PASS, --pass. The per-frame path, prototyped here rather than in the app. It writes
+every record of one pass from the app's own trace shifted in dB, sets the count and both
+cursors so the geometry is the same every pass, fires one append, times the write on the
+instrument's clock and compares the plot. One run then answers all three questions the app
+cannot be written without: do the records draw, is the cursor convention right, and what does a
+pass cost -- which is what decides whether the Lua form is worth shipping or whether the write
+has to be native.
+
+    python3 -u -I tools/probe_ringfind.py --pass
+    python3 -u -I tools/probe_ringfind.py --pass --shift 20 --hold 8
+
 Everything written is restored first in the finally block, before anything else that can fail
--- the 2350 lesson. Only the two float32 fields of a record are touched: no pointer, no cursor,
-no count, so the worst case is a wrong value drawn rather than a freed-widget fault.
+-- the 2350 lesson -- and the header goes back before the records, because an inconsistent
+cursor is the part that cannot be left behind.
 
 NO PARKING IS NEEDED AND NONE IS ATTEMPTED. A socket session suppresses display event dispatch,
 so the app's frame timer stops firing the moment this connects, the spectrum screen stays on the
@@ -58,8 +72,11 @@ def opt(flag, default, cast=int):
 
 
 DO_WRITE = '--write' in sys.argv
+DO_PASS = '--pass' in sys.argv
 NREC = opt('--nrec', 32)
 WDB = opt('--db', -20.0, float)
+SHIFT = opt('--shift', 20.0, float)
+HOLD = opt('--hold', 0.0, float)
 
 
 def ask(d, cmd, tag, tries=14, timeout=600):
@@ -114,6 +131,126 @@ def append_sentinels(d):
                    "fftsa.sg_stamp = (fftsa.sg_stamp or 0) + 1",
                    "buffer.write.reading(b, %.1f, %.1f, fftsa.sg_stamp, 0)" % (db, hz),
                    "print('W|%d') end" % (i + 1)), 'W|%d' % (i + 1), timeout=120)
+
+
+def whole_pass(d, ring):
+    """One pass written the way a frame would write it, timed and then undone.
+
+    This is the prototype for the app's per-frame path, and it is here rather than in the app
+    because three things have to be true before that code is worth writing and none of them is
+    knowable offline: that the records are what the widget draws, that resetting the count and
+    both cursors every pass keeps the geometry fixed, and that the write is cheap enough to be
+    worth doing in Lua at all.
+
+    The values come off the app's own trace shifted in dB, so the picture should be the same
+    curve lifted bodily. A synthetic shape would also answer "did anything change", but not
+    "did the RIGHT thing change", and a shift is the one change that is unmistakable at a
+    glance and impossible to produce by accident.
+    """
+    lo, hi, s, hdr = ring['lo'], ring['hi'], ring['stride'], ring['hdr']
+    ov, ox, nrec = ring['ov'], ring['ox'], ring['nrec']
+    # One pass is what the app plots, bounded by the ring and leaving the slot the triggering
+    # append will take.
+    r = ask(d, one("do print('N|' .. tostring(fftsa.sg_ncol) .. ',' .. tostring(fftsa.sg_buf.n)",
+                   ".. ',' .. tostring(fftsa.sg_buf.capacity)) end"), 'N|')
+    ncol, bn, bcap = (int(x) for x in r[2:].split(','))
+    n = min(ncol, nrec - 1, bn)
+    if n < 8:
+        print('pass   : only %d points available, not enough to judge' % n)
+        return
+    # Fused or split. On a 6500 the value pair, the flags and the x pair are 20 contiguous
+    # bytes, so one write a record does it; anywhere else it is two. Halving the call count
+    # matters because the calls are the cost.
+    fuse = (ox == ov + 12)
+    print('pass   : %d records, %s write a record, span 0x%X..0x%X'
+          % (n, 'one fused 20-byte' if fuse else 'two 8-byte', lo, hi))
+
+    # THE CURSOR CONVENTION, DERIVED. The measured header had write = lo + 254*stride with
+    # count = 255, so the cursor points at the LAST written record and not one past it -- but
+    # that is one observation on one build. Taking the offset between the live cursor and the
+    # live count and preserving it means the convention never has to be assumed.
+    lv = ask(d, one("do local v = fftsa.nl.ring_header(RG)",
+                    "print('L|' .. tostring(v.count) .. ',' .. tostring(v.write)) end"), 'L|')
+    c0, w0 = (int(x) for x in lv[2:].split(','))
+    coff = (w0 - lo) // s - c0
+    print('cursor : live count %d, write at record %d, so the cursor sits %+d from the count'
+          % (c0, (w0 - lo) // s, coff))
+
+    ask(d, "print('O|' .. tostring(KG.own(%d,%d)))" % (hdr, hi - hdr), 'O|')
+    # SAVED ON THE INSTRUMENT, not over the wire: the records are 14 kB and the socket moves
+    # 110 kB/s, so a host-side copy would cost a second each way and a restore that slow is a
+    # restore that might not happen.
+    # The addresses are formatted HERE, not on the instrument: a string.format('%X', ...)
+    # inside a Python %-formatted fragment has its escape eaten before Lua sees it, which
+    # audit_probe.py exists to catch and did.
+    ask(d, one("do ZS = ki.memread('%X', '%X')" % (lo, hi - lo),
+               "ZH = {KG.w(%d), KG.w(%d), KG.w(%d), KG.w(%d), KG.w(%d)}"
+               % (hdr, hdr + 4, hdr + 8, hdr + 12, hdr + 20),
+               "print('S|' .. tostring(string.len(ZS)) .. ',' .. tostring(ZH[5])) end"), 'S|')
+    print('saved  : the whole ring and five header words, on the instrument')
+
+    # The writer, defined once so the timing is of the loop and not of the definition.
+    if fuse:
+        body = ("local fl = string.sub(ki.memread(string.format('%X', lo + ov + 8), '4'), 1, 4) "
+                "for i = 1, n do local a = lo + (i - 1) * s "
+                "local v = P(b.readings[i] + dsh) local x = P(b.extravalues[i]) "
+                "KG.write(a + ov, v .. v .. fl .. x .. x) end")
+    else:
+        body = ("for i = 1, n do local a = lo + (i - 1) * s "
+                "local v = P(b.readings[i] + dsh) local x = P(b.extravalues[i]) "
+                "KG.write(a + ov, v .. v) KG.write(a + ox, x .. x) end")
+    ask(d, one("do function ZW(lo, s, ov, ox, n, dsh)",
+               "local b, P, i = fftsa.sg_buf, fftsa.nl._f32_pack, nil",
+               body,
+               "end print('F|1') end"), 'F|1')
+
+    before = sumplot(d)
+    ask(d, "do KG.armed = true print('M|' .. tostring(KG.armed)) end", 'M|')
+    t = ask(d, one("do local c = os.clock local t0 = c()",
+                   "ZW(%d, %d, %d, %d, %d, %.1f)" % (lo, s, ov, ox, n, SHIFT),
+                   "local t1 = c()",
+                   "KG.p32(%d, %d) KG.p32(%d, %d) KG.p32(%d, %d)"
+                   % (hdr + 20, n, hdr + 8, lo, hdr + 12, lo + (n + coff) * s),
+                   "local t2 = c()",
+                   "print(string.format('T|%.2f|%.2f', (t1-t0)*1000, (t2-t1)*1000)) end"),
+            'T|', timeout=300)
+    wms, hms = (float(x) for x in t[2:].split('|'))
+    print('timing : %d records in %.2f ms, header in %.2f ms -- %.1f us a record'
+          % (n, wms, hms, wms * 1000.0 / n))
+
+    ask(d, one("do fftsa.sg_stamp = (fftsa.sg_stamp or 0) + 1",
+               "buffer.write.reading(fftsa.sg_buf, -105.0, 32768.0, fftsa.sg_stamp, 0)",
+               "delay(0.4) print('P|3') end"), 'P|3', timeout=120)
+    after = sumplot(d)
+    print('plot   : before %s  after %s  -> %s'
+          % (before, after, 'CHANGED' if after != before else 'same'))
+    hv = ask(d, one("do local v = fftsa.nl.ring_header(RG)",
+                    "print('A2|' .. tostring(v.count) .. ',' .. tostring(v.write)",
+                    ".. ',' .. tostring(v.oldest)) end"), 'A2|')
+    print('header : after the triggering append, count,write,oldest = %s'
+          % hv.split('|', 1)[1])
+    if after != before:
+        print()
+        print('THE PER-FRAME PATH WORKS. %.2f ms a pass against about 39 ms for 510 appends.'
+              % (wms + hms))
+        print('Look at the glass: the curve should be the same shape lifted %.0f dB.' % SHIFT)
+    else:
+        print()
+        print('The plot did not change. Before concluding the records are not what is drawn,')
+        print('check that one ordinary append alone changes this checksum at all.')
+    if HOLD > 0:
+        print('hold   : %.0f s on the glass before the restore' % HOLD)
+        ask(d, "do delay(%.1f) print('Y|1') end" % HOLD, 'Y|1', timeout=int(HOLD) + 60)
+
+    # RESTORE: the header first, because an inconsistent cursor is the part that must not be
+    # left behind, then the records. Each in its own statement so one failing does not skip
+    # the other.
+    d.q(one("do KG.p32(%d, ZH[1]) KG.p32(%d, ZH[2]) KG.p32(%d, ZH[3])" % (hdr, hdr + 4, hdr + 8),
+            "KG.p32(%d, ZH[4]) KG.p32(%d, ZH[5])" % (hdr + 12, hdr + 20),
+            "print('Z2|1') end"), timeout=60)
+    d.q("print('Z3|' .. tostring(KG.write(%d, ZS)))" % lo, timeout=120)
+    d.q('do KG.armed = false KG.wb = nil ZS, ZH, ZW = nil, nil, nil end', timeout=60)
+    print('restore: header and all %d bytes of records put back' % (hi - lo))
 
 
 def main():
@@ -246,20 +383,25 @@ def main():
                         print('    +0x%02X  %-16.6g %08X%s'
                               % (off, f, struct.unpack('>I', b[off:off + 4])[0], tag))
 
-        if not DO_WRITE:
+        if not (DO_WRITE or DO_PASS):
             print()
-            print('Read only. Rerun with --write to answer whether the widget draws from these')
-            print('records. That writes two float32 fields per record and restores them.')
+            print('Read only. --write answers whether the widget draws from these records.')
+            print('--pass prototypes the whole per-frame path and times it.')
             return
 
-        # ---- the experiment ----------------------------------------------------------
+        # ---- the experiments ---------------------------------------------------------
         if 'lo' not in ring:
             print()
-            print('No header, so the run to write cannot be bounded inside the ring. Refusing.')
+            print('No header, so nothing can be bounded inside the ring. Refusing to write.')
             return
         for i, stmt in enumerate(g.tsp()):
             ask(d, stmt.replace('\n', ' '), 'KG|%d' % (i + 1), timeout=60)
         print('guard  : installed')
+
+        if DO_PASS:
+            whole_pass(d, ring)
+            if not DO_WRITE:
+                return
 
         v0, s, dxv = ring['val0'], ring['stride'], ring['dx']
         # How many records fit between val0 and the end of the ring, so no write leaves it.
@@ -315,7 +457,8 @@ def main():
         # RESTORE FIRST, before the guard is disarmed and before anything else can fail.
         if saved:
             for a, b in saved:
-                d.q("print('R|' .. tostring(KG.write(%d, %s)))" % (a, luachars(b)), timeout=60)
+                d.q("print('Z1|' .. tostring(KG.write(%d, %s)))" % (a, luachars(b)),
+                    timeout=60)
             print('restore: %d records put back' % len(saved))
         d.q('do KG.armed = false KG.wb = nil end', timeout=30)
         d.q('RS, RG = nil, nil', timeout=30)
