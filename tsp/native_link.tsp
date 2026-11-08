@@ -3,8 +3,9 @@
 -- Called once at startup; sets fftsa.nl.ready when the native path is available. Every
 -- failure is recorded and swallowed, and the app reports it from the frame that needs it.
 --
--- No firmware address is written down here. The six libm entries come from FNF, which finds
--- them in the code of Lua's own math wrappers; the ki.peek8 closure and its f pointer come
+-- No firmware address is written down here, and none is compared against either. The six
+-- libm entries come from FNT and resolve_math, which find them in the code of Lua's own
+-- math wrappers by the company each call keeps; the ki.peek8 closure and its f pointer come
 -- from tostring and a read; the trampoline is self-contained PowerPC that flushes the cache
 -- itself. Neither it nor the image reads the Lua stack, and what the call reports comes back
 -- through a word of the params struct.
@@ -19,7 +20,7 @@
 fftsa = fftsa or {}
 fftsa.nl = {
   ready     = false,  -- true once the binary is loaded, relocated and the plan is built
-  fn        = {},     -- firmware math addresses resolved by FNF
+  fn        = {},     -- firmware math addresses resolved by resolve_math
   tramp     = 0,      -- heap address of the cache-flush trampoline
   entry     = 0,      -- heap address of dsp_native_run, which is image offset 0
   code_base = 0,      -- heap address the image is loaded at
@@ -333,12 +334,31 @@ end
 fftsa.nl._f32_unpack = f32_unpack
 
 -- ---------------------------------------------------------------------------
--- FNF: find the firmware function behind a Lua math wrapper, by scanning a Form E closure's
--- .text handler for the first bl targeting >= 0x00400000. That is the GHS C function,
--- double in f1 to double in f1, and it works across builds as long as the wrapper's shape
--- is preserved.
+-- Find the firmware math entries behind the Lua math wrappers.
+--
+-- The entries move between models as well as between builds, so nothing here is compared
+-- against an address. What identifies the library call is the company it keeps.
+--
+-- Every math wrapper is the same shape: ten calls into the Lua VM, the library function if
+-- it has one, then lua_pushnumber. math.abs, math.deg and math.rad have no library function
+-- -- abs on a double is a sign-bit clear and the other two are one multiply, all three
+-- inlined -- so every target they reach is VM glue by construction, and that is a property
+-- of the Lua source rather than of the link map. Take their targets as the glue set, and a
+-- one-argument wrapper's library entry is its one target outside it.
+--
+-- Measured on three images: DMM6500 1.7.17a and 1.7.18a, where the block sits at 0x002026F8
+-- and 0x002026E0, and the DMM7510 1.7.16 function list, where it sits at 0x000CDD34. All
+-- three are 13,228 bytes, function for function, in the same order. On both 6500 builds the
+-- glue set is nine targets, every one-argument wrapper contains all nine, and the one target
+-- outside it is the eleventh bl of twelve.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.FNF(fn)
+
+-- The ceiling on one wrapper, not its length: the scan stops at the wrapper's blr, and the
+-- longest of these is 0x16C bytes, 91 words. One memread rather than a peek a word at a
+-- time, the scan needing the whole body and a round trip costing what a few peeks do.
+fftsa.nl.SCAN_WORDS = 256
+
+function fftsa.nl.FNT(fn)
   local s = tostring(fn)
   local _, e = string.find(s, ': ')
   if not e then return nil end
@@ -346,45 +366,140 @@ function fftsa.nl.FNF(fn)
   if not c then return nil end
   local w = W(c + 12)
   if not w then return nil end
-  local i
-  for i = 0, 255 do
-    local pc = w + i * 4
-    local n = W(pc)
-    if n == nil then return nil end
-    if math.floor(n / 67108864) == 18 and math.mod(n, 2) == 1 then
+  local nw = fftsa.nl.SCAN_WORDS
+  local body = ki.memread(hx(w), hx(nw * 4))
+  if body == nil or string.len(body) < nw * 4 then return nil end
+  local out, i = {}, nil
+  for i = 0, nw - 1 do
+    local n = u32_at(body, i * 4 + 1)
+    -- bl: primary opcode 18 with LK set and AA clear. Testing both low bits refuses bla,
+    -- whose field is an absolute address and not the displacement this reads it as.
+    if math.floor(n / 67108864) == 18 and math.mod(n, 4) == 1 then
       local r = math.mod(math.floor(n / 4), 16777216)
       if r >= 8388608 then r = r - 16777216 end
-      local t = math.mod(pc + r * 4, 4294967296)
-      if t >= 4194304 then return t end   -- 0x00400000
+      table.insert(out, math.mod(w + i * 4 + r * 4, 4294967296))
     end
+    if n == 1317011488 then break end   -- blr: the wrapper's one exit
   end
-  return nil
+  return out
 end
 
--- Resolve the six functions dsp.c calls. Returns the count found.
-fftsa.nl.MATH_NAMES = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+-- The six dsp.c calls, the wrappers that reach no library function at all, and the wider set
+-- the cross-check needs. MATH_GLUE is what makes this work; MATH_CENSUS only confirms it.
+fftsa.nl.MATH_NAMES  = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+fftsa.nl.MATH_GLUE   = { 'abs', 'deg', 'rad' }
+fftsa.nl.MATH_CENSUS = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil',
+                         'tan', 'log', 'exp', 'asin', 'acos', 'atan' }
+
+-- The smallest glue set worth believing. Nine on both measured builds; a sample that yields
+-- a handful has not found the wrappers, and treating it as complete would leave most of a
+-- wrapper's VM calls looking like library entries.
+fftsa.nl.GLUE_MIN = 6
 
 function fftsa.nl.resolve_math()
-  local fn = fftsa.nl.fn
-  -- Recorded and not tested against anything: every address below is found by reading this
-  -- build's own code, so an unseen build either yields six or loses the native path.
+  local nl = fftsa.nl
+  local fn = nl.fn
   local v = nil
   if localnode ~= nil then v = localnode.version end
-  fftsa.nl.fw_seen = tostring(v)
-  local names = fftsa.nl.MATH_NAMES
+  nl.fw_seen = tostring(v)
+
+  local i, k = nil, nil
+  for i = 1, table.getn(nl.MATH_NAMES) do fn[nl.MATH_NAMES[i]] = nil end
+  nl.math_pos, nl.math_odd = {}, nil
+
+  -- 1. The glue set, off the wrappers that call no library function.
+  local glue, nglue = {}, 0
+  for i = 1, table.getn(nl.MATH_GLUE) do
+    local f = math[nl.MATH_GLUE[i]]
+    if f ~= nil then
+      local ts = nl.FNT(f)
+      if ts ~= nil then
+        for k = 1, table.getn(ts) do
+          if not glue[ts[k]] then
+            glue[ts[k]] = true
+            nglue = nglue + 1
+          end
+        end
+      end
+    end
+  end
+  nl.glue, nl.nglue = glue, nglue
+  if nglue < nl.GLUE_MIN then return 0 end
+
+  -- 2. Each census wrapper's targets, and the ones not in the glue set. Every wrapper has
+  --    to contain the whole glue set: a sample that is not the shared part is not glue, and
+  --    the difference below would then be most of the wrapper.
+  local tg, out = {}, {}
+  for i = 1, table.getn(nl.MATH_CENSUS) do
+    local nm = nl.MATH_CENSUS[i]
+    if math[nm] ~= nil then
+      local ts = nl.FNT(math[nm])
+      if ts ~= nil then
+        local have, left, pos = {}, {}, {}
+        for k = 1, table.getn(ts) do
+          have[ts[k]] = true
+          if not glue[ts[k]] and not pos[ts[k]] then
+            pos[ts[k]] = k
+            table.insert(left, ts[k])
+          end
+        end
+        local whole, g = true, nil
+        for g in pairs(glue) do
+          if not have[g] then whole = false end
+        end
+        if whole and table.getn(left) > 0 then
+          tg[nm] = ts
+          out[nm] = left
+          nl.math_pos[nm] = pos[left[1]]
+        end
+      end
+    end
+  end
+
+  -- 3. Exactly one target outside the glue set, or the name goes unresolved: a wrapper whose
+  --    shape has changed has to lose the native path rather than hand out an address nothing
+  --    has checked. In .text as well, which is what dspn_text_ok in the image tests the same
+  --    six against -- refused here the launch says so, where the image answering EMATH is an
+  --    app already on the glass and a frame that never arrives.
   local found = 0
-  local k
-  for k = 1, table.getn(names) do
-    local nm = names[k]
-    fn[nm] = fftsa.nl.FNF(math[nm])
-    if fn[nm] then found = found + 1 end
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local nm = nl.MATH_NAMES[i]
+    local left = out[nm]
+    if left ~= nil and table.getn(left) == 1 and nl._text_ok(left[1]) then
+      fn[nm] = left[1]
+      found = found + 1
+      -- Recorded, not required: on both measured builds the pick is the eleventh bl of
+      -- twelve, the last being lua_pushnumber, and a build where it is not has changed shape
+      -- in a way worth seeing in fw_probe. Not a gate, because a build that inlined the push
+      -- would put the library call last and be refused for no reason.
+      if nl.math_pos[nm] ~= table.getn(tg[nm]) - 1 then nl.math_odd = true end
+    end
+  end
+
+  -- 4. Two names answering one address is the failure fw_probe was written to show. Checked
+  --    rather than reported: if it appears, the six are not six functions. Both copies go,
+  --    not the second one -- a shared address says neither name was identified, so keeping
+  --    whichever came first would be a guess with a count that looked like progress.
+  local seen = {}
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local a = fn[nl.MATH_NAMES[i]]
+    if a ~= nil then seen[a] = (seen[a] or 0) + 1 end
+  end
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local nm = nl.MATH_NAMES[i]
+    local a = fn[nm]
+    if a ~= nil and seen[a] > 1 then
+      fn[nm] = nil
+      found = found - 1
+    end
   end
   return found
 end
 
 -- The resolved math addresses and the first words at each, as hex, for a probe to report.
--- Reading the entry back is the only check available on an address FNF derived: two of them
--- answering alike, or one landing somewhere that is not a prologue, shows up only here.
+-- resolve_math now refuses two names answering alike, so this is for reading the entries
+-- back: one landing somewhere that is not a prologue shows up only here, and nl.math_odd
+-- records a build whose library call is not where both measured ones put it.
 function fftsa.nl.fw_probe(words)
   local fn = fftsa.nl.fn
   local names = fftsa.nl.MATH_NAMES

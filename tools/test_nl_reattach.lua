@@ -510,6 +510,168 @@ check('resolves at every count the app offers, with no content scan available',
 
 fftsa.nl.FINDS = FINDS_REAL
 
+-- ========================================================================================
+-- resolve_math: finding the libm entries without comparing anything to an address.
+--
+-- The entries move between models as well as between builds. A DMM7510 on 1.7.16 carries the
+-- same Lua math block as a DMM6500 -- 13,228 bytes, function for function, same order -- at
+-- 0x000CDD34 against the 6500's 0x002026F8, so its library sits BELOW the 0x00400000 that
+-- used to pick it out, six names come back nil, and the app cannot start. Position cannot
+-- separate the library call from the VM glue either: the VM calls are outside the wrapper's
+-- body, outside the math block, and forward of the wrapper, exactly as the library call is.
+--
+-- What separates them is that math.abs, math.deg and math.rad call no library function at
+-- all, so every target they reach is glue by construction -- a property of the Lua source,
+-- not of the link map. These cases drive the real resolve_math from the target lists measured
+-- off two 6500 images and from the 7510's wrapper addresses.
+--
+-- The mocks here are word-based, where the suite's own are string-based, so they are saved
+-- and restored around the section.
+-- ========================================================================================
+
+local SAVED_PEEK, SAVED_READ, SAVED_TOSTR = ki.peek32, ki.memread, tostring
+
+do
+  local MEM, CLS = {}, {}
+  ki.peek32 = function(ah) return string.format('%X', MEM[tonumber(ah, 16)] or 0) end
+  ki.memread = function(ah, lh)
+    local a, n = tonumber(ah, 16), tonumber(lh, 16)
+    local acc, i = {}, nil
+    for i = 0, n / 4 - 1 do
+      local w = MEM[a + i * 4] or 0
+      table.insert(acc, string.char(math.floor(w / 16777216),
+                                    math.mod(math.floor(w / 65536), 256),
+                                    math.mod(math.floor(w / 256), 256), math.mod(w, 256)))
+    end
+    return table.concat(acc)
+  end
+  -- FNT reads the closure address out of tostring, so the synthetic wrappers need one.
+  tostring = function(v)
+    if CLS[v] then return 'function: ' .. string.format('%X', CLS[v]) end
+    return SAVED_TOSTR(v)
+  end
+
+  -- A wrapper body: mflr at word 0, the bls at words 1..n, the blr at word 89, which is
+  -- where every measured wrapper puts its one exit.
+  local function body(entry, targets)
+    local i
+    for i = 0, 90 do MEM[entry + i * 4] = 1610612736 end
+    for i = 1, table.getn(targets) do
+      local d = math.floor((targets[i] - (entry + i * 4)) / 4)
+      if d < 0 then d = d + 16777216 end
+      MEM[entry + i * 4] = 1207959552 + d * 4 + 1
+    end
+    MEM[entry + 89 * 4] = 1317011488
+  end
+
+  -- Ten VM calls, the library entry, then lua_pushnumber. abs/deg/rad are the same list with
+  -- the library entry left out, which is what makes them the glue sample.
+  local function layout(blockbase, glue, libbase, libstep)
+    MEM, CLS = {}, {}
+    local order = { 'abs', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'ceil', 'floor',
+                    'sqrt', 'log', 'log10', 'exp', 'deg', 'rad' }
+    local want, cls, i = {}, 44040192, nil
+    for i = 1, table.getn(order) do
+      local nm = order[i]
+      local w = blockbase + (i - 1) * 364
+      local c = cls + (i - 1) * 64
+      local ts, k = {}, nil
+      for k = 1, 10 do table.insert(ts, glue[k]) end
+      if nm ~= 'abs' and nm ~= 'deg' and nm ~= 'rad' then
+        local lib = libbase + (i - 1) * libstep
+        table.insert(ts, lib)
+        want[nm] = lib
+      end
+      table.insert(ts, glue[11])
+      MEM[c + 12] = w
+      body(w, ts)
+      CLS[math[nm]] = c
+    end
+    return want
+  end
+
+  local function six(want)
+    local i, ok = nil, true
+    for i = 1, 6 do
+      local nm = fftsa.nl.MATH_NAMES[i]
+      if fftsa.nl.fn[nm] ~= want[nm] then ok = false end
+    end
+    return ok
+  end
+
+  local function hex(v) return string.format('%X', v or 0) end
+
+  -- The measured glue lists: 1.7.17a, 1.7.18a, and the 7510's with the VM moved down
+  -- alongside its math block.
+  local G17 = {2222840, 2221992, 2221808, 2221700, 2221808, 2225156, 2217264, 2217800,
+               2163164, 2163164, 2224932}
+  local G18 = {2222816, 2221968, 2221784, 2221676, 2221784, 2225132, 2217240, 2217776,
+               2163140, 2163140, 2224908}
+  local G75 = {860000, 859000, 858000, 857000, 858000, 861000, 855000, 856000,
+               845000, 845000, 862000}
+
+  -- 1.7.17a: block 0x002026F8, library from 0x0046F83C.
+  local want = layout(2103032, G17, 4651068, 256)
+  local got = fftsa.nl.resolve_math()
+  check('1.7.17a: all six resolve', got == 6,
+        'found=' .. got .. ' glue=' .. tostring(fftsa.nl.nglue))
+  check('1.7.17a: each is the measured entry', six(want), 'sin=' .. hex(fftsa.nl.fn.sin))
+  check('1.7.17a: the glue set is the nine measured', fftsa.nl.nglue == 9,
+        'nglue=' .. tostring(fftsa.nl.nglue))
+  check('1.7.17a: the pick sits where the measured one does', fftsa.nl.math_odd == nil,
+        'math_odd=' .. tostring(fftsa.nl.math_odd))
+
+  -- 1.7.18a: different addresses, same shape. The VM moved -0x18 and the library +0x154
+  -- between these two builds, which is why nothing may key on position.
+  want = layout(2103008, G18, 4651408, 256)
+  got = fftsa.nl.resolve_math()
+  check('1.7.18a: six resolve, and each is right', got == 6 and six(want),
+        'found=' .. got .. ' sin=' .. hex(fftsa.nl.fn.sin))
+
+  -- DMM7510 1.7.16: block 0x000CDD34, library below 0x400000. This is the case that fails
+  -- against the old scan floor, and the reason the floor is gone.
+  want = layout(843060, G75, 3407872, 256)
+  got = fftsa.nl.resolve_math()
+  check('7510 shape, library below 0x400000: six resolve', got == 6,
+        'found=' .. got .. ' sin=' .. hex(fftsa.nl.fn.sin))
+  check('7510 shape: each is the right entry', six(want),
+        'sin=' .. hex(fftsa.nl.fn.sin) .. ' want ' .. hex(want.sin))
+
+  -- Above TEXT_HI: refused here, at the launch, rather than by the image's own bounds check
+  -- at the first frame -- which is an app already on the glass and a spectrum that never
+  -- arrives.
+  want = layout(2103032, G17, 6000000, 256)
+  got = fftsa.nl.resolve_math()
+  check('library above TEXT_HI: none resolve, so nl.init refuses', got == 0, 'found=' .. got)
+
+  -- Every wrapper reaching one address: both copies go, not the second. A shared address
+  -- says neither name was identified, so keeping the first would be a guess with a count
+  -- that looked like progress -- which is exactly how the broken change read as six.
+  want = layout(2103032, G17, 4651068, 0)
+  got = fftsa.nl.resolve_math()
+  check('every wrapper reaching one entry: all refused', got == 0,
+        'found=' .. got .. ' sin=' .. tostring(fftsa.nl.fn.sin))
+
+  -- A glue sample that is not glue: abs reaches something the others do not, so the
+  -- whole-set test fails for every census wrapper and the lot is refused.
+  want = layout(2103032, G17, 4651068, 256)
+  body(2103032, {G17[1], G17[2], 4800000, G17[4], G17[5], G17[6], G17[7], G17[8],
+                 G17[9], G17[10], G17[11]})
+  got = fftsa.nl.resolve_math()
+  check('a glue sample reaching what the others do not: refused', got == 0, 'found=' .. got)
+
+  -- No glue sample at all: nothing to subtract, so nothing is claimed.
+  want = layout(2103032, G17, 4651068, 256)
+  local sa, sd, sr = math.abs, math.deg, math.rad
+  math.abs, math.deg, math.rad = nil, nil, nil
+  got = fftsa.nl.resolve_math()
+  math.abs, math.deg, math.rad = sa, sd, sr
+  check('no glue sample: refused rather than guessed', got == 0,
+        'found=' .. got .. ' nglue=' .. tostring(fftsa.nl.nglue))
+end
+
+ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

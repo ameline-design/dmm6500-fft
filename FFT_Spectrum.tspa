@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.39
+-- $Version: 8.44
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -382,7 +382,7 @@ end
 -- and re-reads only when handed a buffer, so overwriting one in place changes nothing.
 function fftsa.sg_make_buffer(nbins, npoints)
   fftsa.sg_nbins = nbins
-  local want = npoints or fftsa.sg_maxpts
+  local want = npoints or fftsa.sg_capacity()
   -- Already built at the right size: keep it, and write nothing but sg_nbins. This is the
   -- one place the no-reallocation rule is stated in code rather than left to the call graph.
   if fftsa.sg_buf ~= nil and fftsa.sg_mk ~= nil and fftsa.sg_buf.capacity == want then
@@ -493,8 +493,10 @@ end
 -- all, and sg_build() binds this before the first frame has run.
 function fftsa.sg_fmt_seed(b, want)
   if b == nil then return nil end
-  -- FILL_ONCE: FILL_CONTINUOUS works as documented and still draws a line from the newest
-  -- point to the oldest.
+  -- FILL_ONCE unless fftsa.sg_ring is on, where the wrap line is accepted and parked under
+  -- the plot by the two sentinels sg_fill writes. Set before the seed so the seed itself
+  -- lays down one full lap and leaves the cursor back at slot 1.
+  if fftsa.sg_ring then b.fillmode = buffer.FILL_CONTINUOUS end
   --
   -- A custom unit is how the axis gets to say decibels; without it the labels read "+020.0V"
   -- on numbers that are not volts. Not buffer.UNIT_DECIBEL, which panics the instrument
@@ -522,10 +524,14 @@ function fftsa.sg_fmt_seed(b, want)
   if flo == nil or fhi == nil or not (fhi > flo) then
     flo, fhi = fftsa.flomin, fftsa.fhi_min
   end
+  -- No sentinels here, however the ring is set: the seed is the geometry the widget draws
+  -- at the first paint of a launch, before sg_bind pins anything, and a point 1000 dB
+  -- under the floor makes that first box 1002 dB tall. The first pass writes the real
+  -- sentinels a frame later, by which time both axes are pinned.
   for k = 1, want do
     local t = (k - 1) / span
-    fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t, flo + (fhi - flo) * t,
-                         k)
+    fftsa.sg_write_point(b, fftsa.sg_dbmin + fftsa.sg_seed_spread * t,
+                         flo + (fhi - flo) * t, k)
   end
   return b
 end
@@ -538,6 +544,124 @@ end
 function fftsa.sg_write_point(buf, db, f, slot)
   if slot == nil then slot = 1 end
   buffer.write.reading(buf, db, f, slot, 0)
+end
+
+
+-- The fill window, and the ring that removes it.
+--
+-- FILL_ONCE must be cleared before it is refilled, so the bound buffer holds fewer than
+-- sg_ncol points for the length of the fill: 20.75 ms of a 105 ms frame at 255 points. An
+-- append blocks Lua for ~80 us and that is the only time the display task runs, so the task
+-- gets sg_ncol chances to paint inside the window, and a paint landing there draws a
+-- truncated trace. That is the flicker, at about fps * window / period.
+--
+-- The ring is never partially populated, so a mid-pass paint draws this frame mixed with
+-- the last -- a tear, not a dropout. Capacity equals the points a pass writes, so the
+-- cursor returns to slot 1 every pass and startindex/endindex are stationary. That is the
+-- difference from the ring that was tried and abandoned, which wrote 255 to 340 points into
+-- a 680 ring and moved the extent every frame.
+--
+-- The cost would be the wrap seam: the widget joins newest to oldest, which in frequency
+-- order is the two ends of the axis -- a line across the whole plot, drawn whenever the
+-- cursor is mid-pass, so it flickers at exactly the rate the dropout used to. 8.40 tried
+-- parking it below the axis floor and the widget CLAMPS rather than clips: it came out as a
+-- green line along the bottom rule, measured on the glass.
+--
+-- So the pass folds back on itself instead. Ascending flo..fhi, then descending fhi..flo:
+-- the join at the fold is the same point twice and so is the wrap, both zero length, and
+-- every edge is drawn twice in opposite directions. There is no seam at any cursor
+-- position, and the picture is exactly the spectrum. It costs twice the appends.
+-- Every count, and a sample count threshold was tried and removed. The arithmetic said the
+-- dropout should fade at the long counts, the fill window being 20 ms of a 420 ms frame at
+-- 32768 against 20 of 105 at 2048 -- so 8.42 used the ring below 4096 only. On the glass
+-- 8192, 16384 and 32768 all still flickered plainly. The rate argument counts dropouts and
+-- ignores how long each one is on the glass: a truncated paint stays up until the next
+-- paint, which at 1.8 fps is about half a second rather than 70 ms, so a low frame rate
+-- makes a dropout more visible and not less. The ring costs 1.8 fps against 2.4 at 32768
+-- and that is the price of no flicker anywhere.
+--
+-- The switch stays because it is the revert: FILL_ONCE is still the shipped behaviour of
+-- every build before 8.41, the suite covers both branches, and no other instrument has run
+-- the ring yet.
+fftsa.sg_ring  = true
+fftsa.sg_stamp = 0       -- ring timestamps, monotonic across passes
+
+-- Capacity a ring needs: the spectrum plus one sentinel at each end. Capacity must equal
+-- the writes a pass makes or the cursor walks, so this is the one place that decides it and
+-- sg_make_buffer asks here rather than using sg_maxpts.
+function fftsa.sg_ring_cap(ncol)
+  return 2 * (ncol or fftsa.sg_ncol)
+end
+
+-- The trace buffer's capacity, and the one thing the ring costs. FILL_ONCE takes the
+-- sg_maxpts ceiling, which is what lets sg_ncol be raised and lowered while frames run
+-- without reallocating. A ring cannot: capacity has to equal the points a pass writes, so
+-- under the ring a changed sg_ncol needs a reallocation, and the only safe place for one
+-- is Apply -- replacing the trace buffers on a live graph freezes the trace.
+-- The same capacity in both modes. The ring needs capacity to equal the points a pass
+-- writes; FILL_ONCE does not care that capacity exceeds what it writes. Keeping them equal
+-- is what lets fftsa.sg_ring be flipped without a new buffer -- a reallocation on a live
+-- graph freezes the trace at the frame it fires, which is the one thing neither mode may do.
+function fftsa.sg_capacity()
+  return fftsa.sg_ring_cap()
+end
+
+
+
+-- The most points a frame may plot, which is half the capacity under the ring: the pass
+-- writes each point twice. fftsa.dsp_live() clamps to this, so the primitive is asked for a
+-- count the fill can write without clamping it again -- a second clamp is how the trace and
+-- the primitive come to disagree.
+function fftsa.sg_points_max(buf)
+  local b = buf or fftsa.sg_buf
+  if b == nil then return fftsa.sg_maxpts end
+  if fftsa.sg_ring then return math.floor(b.capacity / 2) end
+  return b.capacity
+end
+
+-- The frame's trace write, both modes. Returns the points written, sentinels excluded.
+--
+-- THE RING NEEDS THE COMPILED PATH. fftsa.spectrum_interp writes the trace through
+-- dsp.spectrum, which clears sg_buf itself before filling it, and a clear resets the ring
+-- cursor -- leaving the buffer part full and the seam sweeping. That path cannot produce a
+-- spectrum in this archive anyway (no dsp.spectrum, so the frame halts and says so), which
+-- is what makes the ring safe here rather than a second thing to get right.
+function fftsa.sg_fill(db, hz, nseg)
+  local wr = buffer.write.reading
+  local tb = fftsa.sg_buf
+  local i
+  if tb == nil or nseg == nil or nseg < 1 then return 0 end
+  if not fftsa.sg_ring then
+    tb.clear()
+    for i = 1, nseg do
+      wr(tb, db[i], hz[i], i, 0)
+    end
+    return nseg
+  end
+  -- Timestamps keep climbing across passes, because the slot being overwritten holds an
+  -- older one and buffer.write.reading documents chronological order. Integers, so they
+  -- cannot reach the 0.9999999 fractional refusal.
+  -- Exactly capacity points, always, or the cursor walks and the fold stops landing on
+  -- itself. Up the band then back down it, so both joins are a point repeated. A short
+  -- spectrum repeats its last point to fill the lap -- duplicates are zero-length edges and
+  -- draw nothing -- and a long one is clamped.
+  local cap = tb.capacity
+  local room = math.floor(cap / 2)
+  if nseg > room then nseg = room end
+  local t = fftsa.sg_stamp
+  local last = nseg
+  for i = 1, room do
+    local j = i
+    if j > last then j = last end
+    wr(tb, db[j], hz[j], t + i, 0)
+  end
+  for i = 1, room do
+    local j = room + 1 - i
+    if j > last then j = last end
+    wr(tb, db[j], hz[j], t + room + i, 0)
+  end
+  fftsa.sg_stamp = t + 2 * room
+  return nseg
 end
 
 
@@ -1389,8 +1513,9 @@ end
 -- Called once at startup; sets fftsa.nl.ready when the native path is available. Every
 -- failure is recorded and swallowed, and the app reports it from the frame that needs it.
 --
--- No firmware address is written down here. The six libm entries come from FNF, which finds
--- them in the code of Lua's own math wrappers; the ki.peek8 closure and its f pointer come
+-- No firmware address is written down here, and none is compared against either. The six
+-- libm entries come from FNT and resolve_math, which find them in the code of Lua's own
+-- math wrappers by the company each call keeps; the ki.peek8 closure and its f pointer come
 -- from tostring and a read; the trampoline is self-contained PowerPC that flushes the cache
 -- itself. Neither it nor the image reads the Lua stack, and what the call reports comes back
 -- through a word of the params struct.
@@ -1405,7 +1530,7 @@ end
 fftsa = fftsa or {}
 fftsa.nl = {
   ready     = false,  -- true once the binary is loaded, relocated and the plan is built
-  fn        = {},     -- firmware math addresses resolved by FNF
+  fn        = {},     -- firmware math addresses resolved by resolve_math
   tramp     = 0,      -- heap address of the cache-flush trampoline
   entry     = 0,      -- heap address of dsp_native_run, which is image offset 0
   code_base = 0,      -- heap address the image is loaded at
@@ -1719,12 +1844,31 @@ end
 fftsa.nl._f32_unpack = f32_unpack
 
 -- ---------------------------------------------------------------------------
--- FNF: find the firmware function behind a Lua math wrapper, by scanning a Form E closure's
--- .text handler for the first bl targeting >= 0x00400000. That is the GHS C function,
--- double in f1 to double in f1, and it works across builds as long as the wrapper's shape
--- is preserved.
+-- Find the firmware math entries behind the Lua math wrappers.
+--
+-- The entries move between models as well as between builds, so nothing here is compared
+-- against an address. What identifies the library call is the company it keeps.
+--
+-- Every math wrapper is the same shape: ten calls into the Lua VM, the library function if
+-- it has one, then lua_pushnumber. math.abs, math.deg and math.rad have no library function
+-- -- abs on a double is a sign-bit clear and the other two are one multiply, all three
+-- inlined -- so every target they reach is VM glue by construction, and that is a property
+-- of the Lua source rather than of the link map. Take their targets as the glue set, and a
+-- one-argument wrapper's library entry is its one target outside it.
+--
+-- Measured on three images: DMM6500 1.7.17a and 1.7.18a, where the block sits at 0x002026F8
+-- and 0x002026E0, and the DMM7510 1.7.16 function list, where it sits at 0x000CDD34. All
+-- three are 13,228 bytes, function for function, in the same order. On both 6500 builds the
+-- glue set is nine targets, every one-argument wrapper contains all nine, and the one target
+-- outside it is the eleventh bl of twelve.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.FNF(fn)
+
+-- The ceiling on one wrapper, not its length: the scan stops at the wrapper's blr, and the
+-- longest of these is 0x16C bytes, 91 words. One memread rather than a peek a word at a
+-- time, the scan needing the whole body and a round trip costing what a few peeks do.
+fftsa.nl.SCAN_WORDS = 256
+
+function fftsa.nl.FNT(fn)
   local s = tostring(fn)
   local _, e = string.find(s, ': ')
   if not e then return nil end
@@ -1732,45 +1876,140 @@ function fftsa.nl.FNF(fn)
   if not c then return nil end
   local w = W(c + 12)
   if not w then return nil end
-  local i
-  for i = 0, 255 do
-    local pc = w + i * 4
-    local n = W(pc)
-    if n == nil then return nil end
-    if math.floor(n / 67108864) == 18 and math.mod(n, 2) == 1 then
+  local nw = fftsa.nl.SCAN_WORDS
+  local body = ki.memread(hx(w), hx(nw * 4))
+  if body == nil or string.len(body) < nw * 4 then return nil end
+  local out, i = {}, nil
+  for i = 0, nw - 1 do
+    local n = u32_at(body, i * 4 + 1)
+    -- bl: primary opcode 18 with LK set and AA clear. Testing both low bits refuses bla,
+    -- whose field is an absolute address and not the displacement this reads it as.
+    if math.floor(n / 67108864) == 18 and math.mod(n, 4) == 1 then
       local r = math.mod(math.floor(n / 4), 16777216)
       if r >= 8388608 then r = r - 16777216 end
-      local t = math.mod(pc + r * 4, 4294967296)
-      if t >= 4194304 then return t end   -- 0x00400000
+      table.insert(out, math.mod(w + i * 4 + r * 4, 4294967296))
     end
+    if n == 1317011488 then break end   -- blr: the wrapper's one exit
   end
-  return nil
+  return out
 end
 
--- Resolve the six functions dsp.c calls. Returns the count found.
-fftsa.nl.MATH_NAMES = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+-- The six dsp.c calls, the wrappers that reach no library function at all, and the wider set
+-- the cross-check needs. MATH_GLUE is what makes this work; MATH_CENSUS only confirms it.
+fftsa.nl.MATH_NAMES  = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil' }
+fftsa.nl.MATH_GLUE   = { 'abs', 'deg', 'rad' }
+fftsa.nl.MATH_CENSUS = { 'sin', 'cos', 'sqrt', 'log10', 'floor', 'ceil',
+                         'tan', 'log', 'exp', 'asin', 'acos', 'atan' }
+
+-- The smallest glue set worth believing. Nine on both measured builds; a sample that yields
+-- a handful has not found the wrappers, and treating it as complete would leave most of a
+-- wrapper's VM calls looking like library entries.
+fftsa.nl.GLUE_MIN = 6
 
 function fftsa.nl.resolve_math()
-  local fn = fftsa.nl.fn
-  -- Recorded and not tested against anything: every address below is found by reading this
-  -- build's own code, so an unseen build either yields six or loses the native path.
+  local nl = fftsa.nl
+  local fn = nl.fn
   local v = nil
   if localnode ~= nil then v = localnode.version end
-  fftsa.nl.fw_seen = tostring(v)
-  local names = fftsa.nl.MATH_NAMES
+  nl.fw_seen = tostring(v)
+
+  local i, k = nil, nil
+  for i = 1, table.getn(nl.MATH_NAMES) do fn[nl.MATH_NAMES[i]] = nil end
+  nl.math_pos, nl.math_odd = {}, nil
+
+  -- 1. The glue set, off the wrappers that call no library function.
+  local glue, nglue = {}, 0
+  for i = 1, table.getn(nl.MATH_GLUE) do
+    local f = math[nl.MATH_GLUE[i]]
+    if f ~= nil then
+      local ts = nl.FNT(f)
+      if ts ~= nil then
+        for k = 1, table.getn(ts) do
+          if not glue[ts[k]] then
+            glue[ts[k]] = true
+            nglue = nglue + 1
+          end
+        end
+      end
+    end
+  end
+  nl.glue, nl.nglue = glue, nglue
+  if nglue < nl.GLUE_MIN then return 0 end
+
+  -- 2. Each census wrapper's targets, and the ones not in the glue set. Every wrapper has
+  --    to contain the whole glue set: a sample that is not the shared part is not glue, and
+  --    the difference below would then be most of the wrapper.
+  local tg, out = {}, {}
+  for i = 1, table.getn(nl.MATH_CENSUS) do
+    local nm = nl.MATH_CENSUS[i]
+    if math[nm] ~= nil then
+      local ts = nl.FNT(math[nm])
+      if ts ~= nil then
+        local have, left, pos = {}, {}, {}
+        for k = 1, table.getn(ts) do
+          have[ts[k]] = true
+          if not glue[ts[k]] and not pos[ts[k]] then
+            pos[ts[k]] = k
+            table.insert(left, ts[k])
+          end
+        end
+        local whole, g = true, nil
+        for g in pairs(glue) do
+          if not have[g] then whole = false end
+        end
+        if whole and table.getn(left) > 0 then
+          tg[nm] = ts
+          out[nm] = left
+          nl.math_pos[nm] = pos[left[1]]
+        end
+      end
+    end
+  end
+
+  -- 3. Exactly one target outside the glue set, or the name goes unresolved: a wrapper whose
+  --    shape has changed has to lose the native path rather than hand out an address nothing
+  --    has checked. In .text as well, which is what dspn_text_ok in the image tests the same
+  --    six against -- refused here the launch says so, where the image answering EMATH is an
+  --    app already on the glass and a frame that never arrives.
   local found = 0
-  local k
-  for k = 1, table.getn(names) do
-    local nm = names[k]
-    fn[nm] = fftsa.nl.FNF(math[nm])
-    if fn[nm] then found = found + 1 end
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local nm = nl.MATH_NAMES[i]
+    local left = out[nm]
+    if left ~= nil and table.getn(left) == 1 and nl._text_ok(left[1]) then
+      fn[nm] = left[1]
+      found = found + 1
+      -- Recorded, not required: on both measured builds the pick is the eleventh bl of
+      -- twelve, the last being lua_pushnumber, and a build where it is not has changed shape
+      -- in a way worth seeing in fw_probe. Not a gate, because a build that inlined the push
+      -- would put the library call last and be refused for no reason.
+      if nl.math_pos[nm] ~= table.getn(tg[nm]) - 1 then nl.math_odd = true end
+    end
+  end
+
+  -- 4. Two names answering one address is the failure fw_probe was written to show. Checked
+  --    rather than reported: if it appears, the six are not six functions. Both copies go,
+  --    not the second one -- a shared address says neither name was identified, so keeping
+  --    whichever came first would be a guess with a count that looked like progress.
+  local seen = {}
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local a = fn[nl.MATH_NAMES[i]]
+    if a ~= nil then seen[a] = (seen[a] or 0) + 1 end
+  end
+  for i = 1, table.getn(nl.MATH_NAMES) do
+    local nm = nl.MATH_NAMES[i]
+    local a = fn[nm]
+    if a ~= nil and seen[a] > 1 then
+      fn[nm] = nil
+      found = found - 1
+    end
   end
   return found
 end
 
 -- The resolved math addresses and the first words at each, as hex, for a probe to report.
--- Reading the entry back is the only check available on an address FNF derived: two of them
--- answering alike, or one landing somewhere that is not a prologue, shows up only here.
+-- resolve_math now refuses two names answering alike, so this is for reading the entries
+-- back: one landing somewhere that is not a prologue shows up only here, and nl.math_odd
+-- records a build whose library call is not where both measured ones put it.
 function fftsa.nl.fw_probe(words)
   local fn = fftsa.nl.fn
   local names = fftsa.nl.MATH_NAMES
@@ -3781,7 +4020,7 @@ end
 function fftsa.dsp_live()
   local ncol = fftsa.sg_ncol
   local cap = nil
-  if fftsa.sg_buf ~= nil then cap = fftsa.sg_buf.capacity end
+  if fftsa.sg_buf ~= nil then cap = fftsa.sg_points_max() end
   if cap ~= nil and ncol ~= nil and ncol > cap then ncol = cap end
   if ncol == nil or ncol < 2 then ncol = 2 end
   -- Kept for the native path, which has no dsp.out to read back. A second clamp elsewhere
@@ -4239,18 +4478,21 @@ function fftsa.frame_body()
         fftsa.binhz = binhz
         fftsa.nl_frame = true
         fftsa.nl_res = fftsa.nl.results()
-        -- Cleared and refilled, so the window between the clear and the last append is
-        -- where the trace drops out for a frame. Hiding the graph across it does not help,
-        -- setstate posting without waiting; writing the elements in place and re-subscribing
-        -- repaints the whole widget, axes included, once a frame; and clearing only every
-        -- other frame halves the dropouts by drawing two spectra overlaid, which is refused.
-        local wr = buffer.write.reading
-        local tb, db, hz = fftsa.sg_buf, rd.db, rd.hz
-        local i
-        tb.clear()
-        for i = 1, nseg do
-          wr(tb, db[i], hz[i], i, 0)
-        end
+        -- buffer.write.reading is the only way points reach the glass. The display task
+        -- paints from its own copy and that copy is fed one point per call: measured by
+        -- replacing all 255 elements in place with the descriptor untouched, which the
+        -- buffer read back correctly and the trace ignored, then appending once, which drew
+        -- that one point and nothing else. So the cost is nseg appends at ~80 us, and the
+        -- argument count does not change it -- five args 19.7 ms against two args 25.0 ms
+        -- for 255 points, because the cost is the IPC round trip.
+        --
+        -- Under FILL_ONCE that means a clear first, and the buffer then holds fewer than
+        -- nseg points for the length of the fill: 20.75 ms of a 105 ms frame at 255 points.
+        -- A paint landing in there draws a truncated trace, which is the flicker, at a rate
+        -- of about fps * window / period.
+        --
+        -- fftsa.sg_ring is the way out that does not shrink the window but removes it.
+        fftsa.sg_fill(rd.db, rd.hz, nseg)
       end
     end
   else
@@ -5206,7 +5448,8 @@ function fftsa.build()
   fftsa.loading_front()
   -- The trace buffer at sg_maxpts and not at sg_ncol, so the point count stays adjustable
   -- upwards while running without anything being resized or reallocated.
-  local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2, fftsa.sg_maxpts)
+  local scr, why = fftsa.sg_build("FFT SPECTRUM ANALYSER", fftsa.n / 2,
+                                  fftsa.sg_capacity())
   if scr == nil then return false, why end
   -- The buttons died with the screen fftsa.sg_build() just destroyed: clear the stale
   -- handles rather than deleting them.
