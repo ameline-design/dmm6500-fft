@@ -1465,7 +1465,14 @@ function fftsa.settxt(h, t)
   return true
 end
 
-function fftsa.options_preview()
+-- wi and bi are optional, and passing them is what keeps the Options button quick.
+--
+-- A display.getvalue WAITS for the display task to answer, and that task is busy painting the
+-- trace, so each read-back costs whatever is left of the current paint and gives up after two
+-- seconds. opt_fill has just written both fields, so it knows them and reads back nothing: on
+-- the press path that removes the two most expensive calls of the eight. A field edit still
+-- calls this with no arguments, where reading back is the whole point.
+function fftsa.options_preview(wi, bi)
   local lo, hi = fftsa.options_span()
   local n = fftsa.options_samples()
   local fs = fftsa.pick_fs(hi)
@@ -1474,9 +1481,13 @@ function fftsa.options_preview()
   local acq = fs
   -- The window comes from the fields too, or three quarters of the line would track
   -- the edit and the fourth would silently show the applied window.
-  local wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
-  local bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
-                             fftsa.kbeta_i)
+  if wi == nil then
+    wi = fftsa.opt_index(fftsa.getval(fftsa.opt_win), fftsa.win_names, fftsa.win_i)
+  end
+  if bi == nil then
+    bi = fftsa.opt_index(fftsa.getval(fftsa.opt_beta), fftsa.kbeta_labels,
+                         fftsa.kbeta_i)
+  end
   local text = fftsa.opt_info_text(fs, n, wi, bi, acq)
   if text ~= fftsa.opt_info_last then
     fftsa.settxt(fftsa.opt_info, text)
@@ -1528,15 +1539,25 @@ function fftsa.opt_fill(flo, fhi, range, win_i, kbeta_i, n)
   fftsa.setval(fftsa.opt_win, win_i)
   fftsa.setval(fftsa.opt_beta, kbeta_i)
   fftsa.setval(fftsa.opt_n, fftsa.sample_to_idx(n))
-  fftsa.options_preview()
+  fftsa.options_preview(win_i, kbeta_i)
 end
 
 -- A press only switches. Everything is built in fftsa.start(), so a nil handle
 -- means the object pool refused and building it now would fail the same way.
 function fftsa.options()
   if fftsa.optscr == nil then return false end
-  fftsa.opt_fill(fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i, fftsa.kbeta_i, fftsa.n)
+  -- SWITCH FIRST, then fill. The frame timer is parented to the spectrum screen, so changing
+  -- screen is what stops frames -- and filling the form before that means six setvalue calls
+  -- queued behind a display task painting the trace. Measured from the glass: 7 to 8 seconds
+  -- on the first press and 1 to 2 after, which reads as a broken button. Switching first
+  -- leaves the task idle for the writes.
+  --
+  -- The form holds the previous open's values for the moment before the fill lands, which is
+  -- a flicker of stale text against seconds of apparent hang. The yield is what lets the
+  -- switch take effect before the writes, as for every other screen in this app.
   display.changescreen(fftsa.optscr)
+  delay(fftsa.sg_yield)
+  fftsa.opt_fill(fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i, fftsa.kbeta_i, fftsa.n)
   return true
 end
 

@@ -140,6 +140,7 @@ def main():
 
     g = Guard(IMAGE)
     d = DMM(recover=False, timeout=240)
+    base, R = None, None
     try:
         d.drain()
         print('park  : %s' % ask(d, one("do if fftsa.saved_frame == nil then",
@@ -229,6 +230,19 @@ def main():
         if 'false' in cu[2:]:
             raise SystemExit('cursor update refused')
 
+        # Did the writes stick at all? The drain consuming one record and leaving pending at
+        # zero is consistent with two different things -- the cursor write never landing, or
+        # the push path overwriting pending rather than incrementing it -- and they are told
+        # apart by reading the fields back before anything appends.
+        wv = words(hexs(d, base, 0xA4))
+        print('verify: write 0x%08X pending %d   (wanted 0x%08X and %d)'
+              % (wv[0x90 // 4], wv[0xA0 // 4], W + need, a.k))
+        if wv[0xA0 // 4] != a.k:
+            print('        the pending write did not stick, so nothing below is about the hook')
+        stg = hexs(d, W, RECSIZE)
+        print('rec[0]: %s   %s' % (stg.hex(), 'as staged' if stg == blob[:RECSIZE]
+                                   else 'NOT WHAT WAS STAGED'))
+
         # The one append. It stages record K+1 and fires the drain for all K+1.
         ap2 = ask(d, one("do local ok, e = pcall(buffer.write.reading, fftsa.sg_buf,",
                          "%f, %f, fftsa.sg_stamp + 1, 0)" % (a.db, fhi),
@@ -260,6 +274,26 @@ def main():
                                     if after != before else
                                     'identical -- cursors moved but nothing repainted'))
     finally:
+        # RESTORE THE RING CURSORS FIRST, before anything else can fail.
+        #
+        # Staging moves sub+0x90 and sub+0xA0, and the firmware's push carries on from
+        # whatever it finds in them. Leaving them advanced puts the read and write cursors
+        # permanently out of step: the subscription's accounting stops adding up, and the
+        # service task reports 2350 "SPLT command message lost" as a modal dialog that
+        # reappears on OK, blocks the socket AND the web panel, and clears only on a power
+        # cycle. Measured the hard way on 2026-11-08.
+        if base is not None and R is not None:
+            try:
+                rr = ask(d, one("do local ok1 = KG.own(%d, 4)" % (base + 0x90),
+                                "local okA = KG.p32(%d, %d)" % (base + 0x90, R),
+                                "local ok2 = KG.own(%d, 4)" % (base + 0xA0),
+                                "local okB = KG.p32(%d, 0)" % (base + 0xA0),
+                                "print('X|' .. tostring(okA) .. ',' .. tostring(okB)) end"),
+                         'X|', tries=20)
+                print('restore: write=0x%08X pending=0  (%s)' % (R, rr[2:]))
+            except SystemExit as e:
+                print('restore: FAILED (%s)' % e)
+                print('         THE RING IS LEFT ADVANCED -- power cycle before using the app')
         ask(d, one("do ZB, H2B = nil, nil if fftsa.saved_frame ~= nil then",
                    "fftsa.frame = fftsa.saved_frame fftsa.saved_frame = nil end",
                    "print('UP|running') end"), 'UP|', tries=25)

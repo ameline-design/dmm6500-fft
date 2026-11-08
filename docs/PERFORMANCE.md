@@ -305,11 +305,40 @@ short spectrum repeats its last point to fill the lap, so the pass is still exac
 The cost is twice the appends and twice the points the widget draws, and it is paid in full.
 Measured on the glass, all three on a DMM6500 at a 50 kHz span:
 
-| | 2048 | 4096 | 8192 | 16384 | 32768 |
-|---|---|---|---|---|---|
-| `FILL_ONCE`, 255 appends | 9.5 | — | — | — | 2.4 |
-| ring, 257 appends, seam visible | **14** | — | — | 3.8 | 2.4 |
-| **folded ring, 510 appends** | 9.5 | 8.3 | 5.9 | 3.6 | 1.9 |
+| | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
+|---|---|---|---|---|---|---|
+| `FILL_ONCE`, 255 appends | — | 9.5 | — | — | — | 2.4 |
+| one-lap ring, always ascending, **line visible** | 17 | 14 | — | — | 3.8 | 2.4 |
+| folded ring, 510 appends | 11 | 9.5 | 8.3 | 5.9 | 3.6 | 1.9 |
+| **one lap, alternating direction, 255 appends** | **17** | **14** | — | — | — | **2.4** |
+
+### What draws the line, and why alternating removes it
+
+**The display task accumulates into its own ring across frames.** The trace object holds 720
+records and the appender wraps when it fills, so the plot shows roughly the last 720 points
+however they arrived -- about 2.8 passes at 255 points each. The line is therefore the join
+**between consecutive passes**, not the trace closing on itself: a pass that always runs
+`flo -> fhi` leaves a `fhi -> flo` step at every frame boundary inside that ring, and the
+widget draws it. Confirmed on the glass, appearing on alternate frames as the wrap moves.
+
+That is also why the fold works. A fold ends at `flo`, where the next fold begins, so its
+frame-to-frame join is a repeated point -- but it pays 510 appends for the property.
+**Alternating the direction of each pass buys the same property at 255:**
+
+    pass 1   flo -> fhi      ends at fhi
+    pass 2   fhi -> flo      begins at fhi, so the join is a repeated point
+    pass 3   flo -> fhi      begins at flo, so the join is a repeated point
+
+A descending pass traverses the same curve backwards, so the picture and the trace extent are
+unchanged. Measured: no line, and 14 fps at 2048 against the fold's 9.5. One or two frames at
+launch glitch while the display ring fills, which the operator accepted.
+
+`display.graph.setfill(g, 0)` does **not** affect it, so the join is not a fill artifact.
+
+**Do not test any of this with a straight-line spectrum.** A ramp's pass-to-pass join is
+collinear with the ramp, so it is invisible and an always-ascending pass looks clean when it
+is not -- 8.48 and 8.49 both shipped on the strength of exactly that mistake, two identical
+ascending ramps drawing one clean line. Use a shape whose two ends sit at different values.
 
 The one-lap ring is half again faster than `FILL_ONCE` at 2048 despite doing the same number of
 appends, so the limit there was the display task's work and not the fill -- emptying the buffer

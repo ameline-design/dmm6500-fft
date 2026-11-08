@@ -5188,9 +5188,10 @@ check('the shipped fill mode is the ring', (function()
   return fftsa.sg_ring == true, string.format('sg_ring=%s', tostring(fftsa.sg_ring))
 end)())
 
--- Capacity has to equal the writes a pass makes, or the ring's cursor walks and the wrap
--- seam sweeps across the plot instead of staying parked under it. That is the whole
--- difference from the ring that was tried and abandoned, so it gets its own case.
+-- Capacity has to equal the writes a pass makes, or the ring's cursor walks and the window
+-- the widget draws sweeps instead of staying parked. That is the whole difference from the
+-- ring that was tried and abandoned, so it gets its own case -- expressed against
+-- sg_ring_cap rather than a literal, so it holds whichever way sg_fold is set.
 check('a ring pass writes exactly its capacity', (function()
   local cap = fftsa.sg_ring_cap(200)
   local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
@@ -5205,52 +5206,113 @@ check('a ring pass writes exactly its capacity', (function()
   local n2, s2, e2 = b.n, b.startindex, b.endindex
   fftsa.sg_ring, fftsa.sg_buf = keep, kb
   fftsa.del_buf(b)
-  return cap == 400 and wrote == 200 and n1 == cap and n2 == cap
+  local want_cap = 200
+  if fftsa.sg_fold then want_cap = 400 end
+  return cap == want_cap and wrote == 200 and n1 == cap and n2 == cap
          and s1 == s2 and e1 == e2,
          string.format('cap=%d wrote=%s pass1=%d/%s..%s pass2=%d/%s..%s',
                        cap, tostring(wrote), n1, tostring(s1), tostring(e1),
                        n2, tostring(s2), tostring(e2))
 end)())
 
--- The sentinels are what park the seam: first and last in the pass, at the band edges and
--- far below the axis floor, so the newest-to-oldest join runs under the plot rather than
--- from one end of the frequency axis to the other.
-check('a ring pass folds back on itself, so both joins are a repeated point', (function()
-  -- The seam is why. A closed ring over a curve that rises monotonically in x has one long
-  -- return edge somewhere, and parking it below the axis floor does not work: the widget
-  -- CLAMPS to the floor rather than clipping, measured on the glass as a green line along the
-  -- bottom rule. Folding the pass -- up the band, then back down it -- makes the fold join and
-  -- the wrap join the same point twice, so both have zero length and draw nothing.
-  local n = 8
+-- What a pass looks like in each mode, and which one ships.
+--
+-- The widget CLOSES the trace -- it draws an edge from the last point back to the first, and
+-- over points that rise monotonically in frequency that edge crosses the whole band.
+-- Confirmed on the glass: a one-lap pass drew a line from the start of the trace to the end
+-- of it. The fold removes it by making both joins a repeated point.
+--
+-- A straight-line spectrum cannot test this. A ramp's return edge is collinear with the ramp,
+-- so the seam is invisible and one lap looks clean when it is not -- which is how the fold
+-- came to be removed for one build. Use a shape with different values at the two ends.
+--
+-- Both modes stay exercised, because sg_fold switches the pass from one place.
+check('a pass is a fold as shipped, and one lap when sg_fold is cleared', (function()
+  local keepf, keep, kb = fftsa.sg_fold, fftsa.sg_ring, fftsa.sg_buf
+  local n = 16
+  local run = function(fold)
+    fftsa.sg_fold = fold
+    local cap = fftsa.sg_ring_cap(n)
+    local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
+    b.fillmode = buffer.FILL_CONTINUOUS
+    fftsa.sg_ring, fftsa.sg_buf = true, b
+    fftsa.sg_up = true
+    local db, hz, i = {}, {}, nil
+    for i = 1, n do db[i], hz[i] = -100 + i, 100 * i end
+    local wrote = fftsa.sg_fill(db, hz, n)
+    local s1, e1 = b.startindex, b.endindex
+    -- Checked on the FIRST pass: with alternation the second one writes the band backwards,
+    -- which is the point of it, so reading slot order after two passes proves nothing.
+    local asc = true
+    for i = 1, n do
+      if b.readings[i] ~= db[i] or b.extravalues[i] ~= hz[i] then asc = false end
+    end
+    fftsa.sg_fill(db, hz, n)
+    local s2, e2 = b.startindex, b.endindex
+    -- A fold mirrors it into the second half; one lap has no second half to check.
+    local mirrored = true
+    if fold then
+      for i = 1, n do
+        if b.readings[cap + 1 - i] ~= db[i] or b.extravalues[cap + 1 - i] ~= hz[i] then
+          mirrored = false
+        end
+      end
+    end
+    local r = { cap = cap, wrote = wrote, nn = b.n, asc = asc, mirrored = mirrored,
+                parked = (s1 == s2 and e1 == e2) }
+    fftsa.del_buf(b)
+    return r
+  end
+  local one = run(false)
+  local two = run(true)
+  fftsa.sg_fold, fftsa.sg_ring, fftsa.sg_buf = keepf, keep, kb
+  return one.cap == n and one.wrote == n and one.nn == n and one.asc and one.parked
+         and two.cap == 2 * n and two.wrote == n and two.nn == 2 * n and two.asc
+         and two.mirrored and two.parked and fftsa.sg_fold == true,
+         string.format('one lap cap=%d n=%d asc=%s parked=%s | fold cap=%d n=%d '
+                       .. 'mirrored=%s parked=%s | shipped fold=%s',
+                       one.cap, one.nn, tostring(one.asc), tostring(one.parked),
+                       two.cap, two.nn, tostring(two.mirrored), tostring(two.parked),
+                       tostring(fftsa.sg_fold))
+end)())
+
+-- The property the one-lap pass rests on: the display task accumulates points into its own
+-- 720-record ring across frames, so where one pass ENDS and the next BEGINS is an edge it
+-- draws. Alternating direction makes every such join a repeated point. Checked on the real
+-- buffer contents, pass after pass, because this is the thing that was wrong in 8.48 and 8.49.
+check('consecutive one-lap passes join at a repeated point', (function()
+  local keepf, keep, kb, keepu = fftsa.sg_fold, fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_up
+  local n = 16
+  fftsa.sg_fold, fftsa.sg_up = false, true
   local cap = fftsa.sg_ring_cap(n)
   local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
   b.fillmode = buffer.FILL_CONTINUOUS
-  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
   fftsa.sg_ring, fftsa.sg_buf = true, b
   local db, hz, i = {}, {}, nil
   for i = 1, n do db[i], hz[i] = -100 + i, 100 * i end
-  local t0 = fftsa.sg_stamp
-  fftsa.sg_fill(db, hz, n)
-  -- The fold: slot n and slot n+1 are the same point, and so are slot cap and slot 1.
-  local fold = b.readings[n] == b.readings[n + 1]
-               and b.extravalues[n] == b.extravalues[n + 1]
-  local wrap = b.readings[cap] == b.readings[1]
-               and b.extravalues[cap] == b.extravalues[1]
-  -- And it really is the spectrum twice, not the spectrum and something else.
-  local same = true
-  for i = 1, n do
-    if b.readings[i] ~= db[i] or b.extravalues[i] ~= hz[i] then same = false end
-    if b.readings[cap + 1 - i] ~= db[i] or b.extravalues[cap + 1 - i] ~= hz[i] then
-      same = false
+  -- Four passes, recording the first and last point each one wrote.
+  local firsts, lasts, k = {}, {}, nil
+  for k = 1, 4 do
+    fftsa.sg_fill(db, hz, n)
+    firsts[k] = { b.readings[1], b.extravalues[1] }
+    lasts[k]  = { b.readings[cap], b.extravalues[cap] }
+  end
+  -- Pass k ends where pass k+1 begins, for every join.
+  local joined = true
+  for k = 1, 3 do
+    if lasts[k][1] ~= firsts[k + 1][1] or lasts[k][2] ~= firsts[k + 1][2] then
+      joined = false
     end
   end
-  local rose = fftsa.sg_stamp > t0
-  fftsa.sg_ring, fftsa.sg_buf = keep, kb
+  -- And the direction really does alternate, or the joins above would be a coincidence.
+  local flipped = (firsts[1][2] ~= firsts[2][2]) and (firsts[1][2] == firsts[3][2])
+  fftsa.sg_fold, fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_up = keepf, keep, kb, keepu
   fftsa.del_buf(b)
-  return cap == 2 * n and fold and wrap and same and rose and b.n == cap,
-         string.format('cap=%d of 2x%d fold=%s wrap=%s mirrored=%s stamp rose=%s n=%s',
-                       cap, n, tostring(fold), tostring(wrap), tostring(same),
-                       tostring(rose), tostring(b.n))
+  return joined and flipped and cap == n,
+         string.format('cap=%d joins=%s alternating=%s (pass starts at hz %s %s %s %s)',
+                       cap, tostring(joined), tostring(flipped),
+                       tostring(firsts[1][2]), tostring(firsts[2][2]),
+                       tostring(firsts[3][2]), tostring(firsts[4][2]))
 end)())
 
 -- A short spectrum repeats its last point to fill the lap, so the pass is still exactly
@@ -5259,15 +5321,19 @@ check('a short ring pass is padded, not left short', (function()
   local cap = fftsa.sg_ring_cap(10)
   local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
   b.fillmode = buffer.FILL_CONTINUOUS
-  local keep, kb = fftsa.sg_ring, fftsa.sg_buf
+  local keep, kb, keepu = fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_up
   fftsa.sg_ring, fftsa.sg_buf = true, b
+  fftsa.sg_up = true
   local db, hz, i = {}, {}, nil
   for i = 1, 4 do db[i], hz[i] = -70 - i, 250 * i end
   local wrote = fftsa.sg_fill(db, hz, 4)
   local n1, s1, e1 = b.n, b.startindex, b.endindex
+  -- The ascending pass pads its tail with the last real point; read it before the next pass
+  -- runs the other way.
+  local tail = b.readings[10] == db[4] and b.extravalues[10] == hz[4]
   fftsa.sg_fill(db, hz, 4)
   local s2, e2 = b.startindex, b.endindex
-  local tail = b.readings[10] == db[4] and b.extravalues[10] == hz[4]
+  fftsa.sg_up = keepu
   fftsa.sg_ring, fftsa.sg_buf = keep, kb
   fftsa.del_buf(b)
   return wrote == 4 and n1 == cap and s1 == s2 and e1 == e2 and tail,

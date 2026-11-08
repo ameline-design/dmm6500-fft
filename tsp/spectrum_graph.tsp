@@ -466,8 +466,45 @@ fftsa.sg_stamp = 0       -- ring timestamps, monotonic across passes
 -- Capacity a ring needs: the spectrum plus one sentinel at each end. Capacity must equal
 -- the writes a pass makes or the cursor walks, so this is the one place that decides it and
 -- sg_make_buffer asks here rather than using sg_maxpts.
+-- One pass writes exactly capacity, so capacity is the points a pass writes.
+--
+-- WHAT DRAWS A LINE IS THE JOIN BETWEEN CONSECUTIVE PASSES, not the trace closing on itself.
+-- The display task keeps its own ring of 720 records and accumulates into it across frames,
+-- so a pass that always runs flo -> fhi leaves a fhi -> flo step at every frame boundary
+-- inside that ring and the widget draws it. setfill(g, 0) does not affect it, and an
+-- unconditional closure would draw every frame rather than alternate ones.
+--
+-- So each pass has to END where the next one BEGINS. A fold does that by running up the band
+-- and back down, at twice the appends; ALTERNATING THE DIRECTION of each pass does it at one
+-- lap. A descending pass traverses the same curve backwards, so the picture and the trace
+-- extent are unchanged.
+--
+-- ALTERNATING DIRECTION CANNOT BE USED, and the reason is the one that matters for every
+-- future change here: EVERY SLOT MUST ALWAYS HOLD THE SAME FREQUENCY.
+--
+-- The display task paints during every append, so a paint lands part-way through a pass with
+-- some slots holding this pass and the rest the previous one. That is invisible only while
+-- slot i carries the same x value in both -- then the two passes differ in dB alone and the
+-- picture is a blend of two spectra at the same frequencies. A fold satisfies it: slot i is
+-- hz[i] going up and hz[cap+1-i] coming back, every pass alike. Alternating the direction
+-- does not: slot i is hz[i] on one pass and hz[room+1-i] on the next, so a mid-pass paint
+-- holds two different frequencies per slot and the curve doubles back. Measured on the glass
+-- as a double curve on alternate frames, at every sample count.
+--
+-- This is also why the ring removed the flicker that FILL_ONCE had: not because the buffer is
+-- never empty, but because a partial update is indistinguishable from a complete one.
+--
+-- Do not test any of this with a straight-line spectrum: a ramp's join is collinear with the
+-- ramp, so it is invisible and an always-ascending pass looks clean when it is not.
+fftsa.sg_fold = true
+
+-- Which way the next one-lap pass runs. Flipped by sg_fill and read nowhere else.
+fftsa.sg_up = true
+
 function fftsa.sg_ring_cap(ncol)
-  return 2 * (ncol or fftsa.sg_ncol)
+  local n = ncol or fftsa.sg_ncol
+  if fftsa.sg_fold then return 2 * n end
+  return n
 end
 
 -- The trace buffer's capacity, and the one thing the ring costs. FILL_ONCE takes the
@@ -492,7 +529,8 @@ end
 function fftsa.sg_points_max(buf)
   local b = buf or fftsa.sg_buf
   if b == nil then return fftsa.sg_maxpts end
-  if fftsa.sg_ring then return math.floor(b.capacity / 2) end
+  -- A folded pass spends half its capacity on the return lap; a one-lap pass spends none.
+  if fftsa.sg_ring and fftsa.sg_fold then return math.floor(b.capacity / 2) end
   return b.capacity
 end
 
@@ -523,10 +561,32 @@ function fftsa.sg_fill(db, hz, nseg)
   -- spectrum repeats its last point to fill the lap -- duplicates are zero-length edges and
   -- draw nothing -- and a long one is clamped.
   local cap = tb.capacity
-  local room = math.floor(cap / 2)
+  local room = cap
+  if fftsa.sg_fold then room = math.floor(cap / 2) end
   if nseg > room then nseg = room end
   local t = fftsa.sg_stamp
   local last = nseg
+  -- One lap, alternating direction, so this pass ends where the next one begins and the join
+  -- between them is a repeated point rather than a step across the whole band.
+  if not fftsa.sg_fold then
+    local i
+    if fftsa.sg_up then
+      for i = 1, room do
+        local j = i
+        if j > last then j = last end
+        wr(tb, db[j], hz[j], t + i, 0)
+      end
+    else
+      for i = 1, room do
+        local j = room + 1 - i
+        if j > last then j = last end
+        wr(tb, db[j], hz[j], t + i, 0)
+      end
+    end
+    fftsa.sg_up = not fftsa.sg_up
+    fftsa.sg_stamp = t + room
+    return nseg
+  end
   for i = 1, room do
     local j = i
     if j > last then j = last end
