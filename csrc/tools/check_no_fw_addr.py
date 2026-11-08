@@ -27,6 +27,19 @@ this checks the three places an address could hide and fails the build if one ap
      was: a build not in the table lost the native path, and a build wrongly in it
      bluescreened.
 
+  5. EVERY integer literal in the native path that falls inside DRAM, against a list that
+     states why each one is not an address. Checks 1 to 4 only look in firmware .text, and
+     that is how this gate passed a build whose write backstop and heap sweep windows were
+     both the DMM6500's heap measured in hex -- 0x01036000..0x0D836000, which is in DRAM,
+     is 1024-aligned so the round-number exclusion waved it through, and which left 45% of
+     a DMM7510's heap unswept. The app would not start and the gate said nothing.
+
+     csrc/dsp_native_bounds.h was not read at all, which is where the backstop lives.
+
+     The list is small on purpose. A new DRAM-range constant fails until someone writes
+     down what it is, and the one model-dependent figure left in the tree -- TEXT_HI -- is
+     named as such rather than hidden among the arithmetic.
+
     python3 -I csrc/tools/check_no_fw_addr.py
     python3 -I csrc/tools/check_no_fw_addr.py --self-test
 """
@@ -37,6 +50,39 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODULE = os.path.join(ROOT, 'tsp', 'native_link.tsp')
 CSRC = os.path.join(ROOT, 'csrc', 'dsp_native.c')
+BOUNDS = os.path.join(ROOT, 'csrc', 'dsp_native_bounds.h')
+
+# DRAM, as the backstop declares it. Anything in here could be an address.
+DRAM_LO, DRAM_END = 0x00003000, 0x10000000
+# Below this a literal is a field width, an enum or a small count, not an address worth
+# checking: the lowest thing the native path addresses is the vector area top at 0x3000.
+DRAM_FLOOR = 0x3000
+
+# Every DRAM-range literal the native path is allowed to hold, and why it is not an address.
+# A value missing from here fails the gate, which is the whole point: the 6500 heap bounds
+# that broke the DMM7510 were 1024-aligned and sailed through a round-number exclusion.
+DRAM_ALLOW = {
+    12288: 'DSPN_DRAM_LO, 0x3000: the top of the vector area. A board figure, not a build one',
+    16384: 'TEXT_LO, 0x4000: where firmware .text starts, the same on both models',
+    32768: 'CHUNK_BYTES, the reading-buffer chunk payload, and the sweep slice size',
+    65536: 'the 16-bit split in the float packers and in hex formatting',
+    262144: 'TIGHT, 256 KB: the tight descriptor window, a distance and not a place',
+    1000000: 'a seed reading written into a buffer this module creates',
+    1048576: 'the chunk payload ceiling, and MB arithmetic in a report',
+    2000000: 'a seed reading',
+    3000000: 'a seed reading',
+    4000000: 'a seed reading',
+    4194304: 'MID, 4 MB: the second descriptor window, a distance',
+    5402624: 'TEXT_HI, 0x527000. THE ONE MODEL-DEPENDENT FIRMWARE FIGURE LEFT IN THE TREE. '
+             'It is a ceiling the backstop and the lua_CFunction check rest on, and every '
+             'image measured so far puts its heap floor above it -- check_fw_strategy.py '
+             'asserts that per image. A model that does not would need this derived',
+    8388608: '2^23, the float32 significand',
+    16777216: '2^24, byte arithmetic in the branch decoder and the packers',
+    25165824: 'ANCHOR_NEAR, 24 MB: a sweep radius',
+    67108864: '2^26, the primary opcode field in the branch decoder',
+    134217728: 'ANCHOR_FAR, 128 MB: a sweep radius',
+}
 
 # Firmware .text, the same extent TEXT_LO and TEXT_HI declare. A call target has to be in
 # here to be a call target, which is what makes this the range to scan.
@@ -108,14 +154,53 @@ def strip_c_comments(s):
     return re.sub(r'//[^\n]*', ' ', s)
 
 
-def check_c(src):
+def check_c(src, name='csrc/dsp_native.c'):
     """A literal inside firmware .text, in code or in a comment that names one."""
     bad = []
     for m in re.finditer(r'\b0[xX]([0-9A-Fa-f]+)[uU]?\b', strip_c_comments(src)):
         v = int(m.group(1), 16)
         if TEXT_LO <= v < TEXT_HI:
-            bad.append('csrc/dsp_native.c has 0x%08X, inside firmware .text' % v)
+            bad.append('%s has 0x%08X, inside firmware .text' % (name, v))
     return bad
+
+
+def c_literals(src):
+    """Every integer literal in C, hex or decimal, comments stripped."""
+    code = strip_c_comments(src)
+    out = set()
+    for m in re.finditer(r'\b0[xX]([0-9A-Fa-f]+)[uU]?\b', code):
+        out.add(int(m.group(1), 16))
+    for m in re.finditer(r'\b(\d+)[uU]?[lL]*\b', code):
+        out.add(int(m.group(1)))
+    return out
+
+
+def lua_literals(src):
+    """Every decimal literal in Lua, comments stripped. Lua 5.0.2 has no hex at all."""
+    code = re.sub(r'--[^\n]*', ' ', src)
+    return set(int(m.group(1)) for m in re.finditer(r'\b(\d+)\b', code))
+
+
+def check_dram(files):
+    """Every DRAM-range literal in the native path, against the stated list.
+
+    This is the check the .text scan could not be: a heap bound is in DRAM, is page-aligned
+    and so looks round, and nothing about it reads as an entry point. The only test that
+    works is an explicit list with a reason beside each value.
+    """
+    bad, seen = [], {}
+    for name, src, kind in files:
+        lits = c_literals(src) if kind == 'c' else lua_literals(src)
+        for v in sorted(lits):
+            if not DRAM_FLOOR <= v < DRAM_END:
+                continue
+            if v in DRAM_ALLOW:
+                seen.setdefault(v, []).append(name)
+                continue
+            bad.append('%s has %d (0x%08X), inside DRAM and not in DRAM_ALLOW. If it is not '
+                       'an address, say what it is there; if it is one, derive it at runtime'
+                       % (name, v, v))
+    return bad, seen
 
 
 def _round(v):
@@ -153,20 +238,29 @@ def check_no_fw_table(src):
     return []
 
 
-def run(module_src, c_src):
+def run(module_src, c_src, bounds_src=''):
     bad = []
     bad += check_tramp(module_src)
     bad += check_c(c_src)
+    # NOT the .text scan on the bounds header: declaring the .text window is what that file is
+    # for, so TEXT_LO and TEXT_HI are in it by necessity. The DRAM list below covers it
+    # instead, and covers it more strictly -- it has no round-number escape, so an arbitrary
+    # .text address there fails just the same.
     mbad, allowed = check_module(module_src)
     bad += mbad
     bad += check_no_fw_table(module_src)
-    return bad, allowed
+    dbad, seen = check_dram([('tsp/native_link.tsp', module_src, 'lua'),
+                             ('csrc/dsp_native.c', c_src, 'c'),
+                             ('csrc/dsp_native_bounds.h', bounds_src, 'c')])
+    bad += dbad
+    return bad, allowed, seen
 
 
 def main():
     self_test = '--self-test' in sys.argv
     module_src = open(MODULE).read()
     c_src = open(CSRC).read()
+    bounds_src = open(BOUNDS).read()
 
     if self_test:
         # Each mutation is one way an address comes back. A gate that cannot see them is
@@ -187,17 +281,28 @@ def main():
              lambda m, c: (m + '\nfftsa.nl.PN = 2223908\n', c)),
             ('an nl.FW table', 'nl.FW table',
              lambda m, c: (m + "\nfftsa.nl.FW = { ['1.7.17az'] = 1 }\n", c)),
+            # THE CASE THIS GATE USED TO MISS, both halves of it. A 6500 heap bound is in
+            # DRAM, is 1024-aligned so it reads as round, and is nowhere near .text.
+            ('a 6500 heap bound in the module', '16998400',
+             lambda m, c: (m + '\nfftsa.nl.HEAP_LO = 16998400\n', c)),
+            ('a 6500 heap bound in the backstop header', '226713600',
+             lambda m, c: (m, c), '#define DSPN_HEAP_HI 0x0D836000U\n'),
+            # And one that is not page-aligned either, so neither exclusion could hide it.
+            ('an arbitrary DRAM address in dsp_native.c', '0x03B53038',
+             lambda m, c: (m, c + '\nstatic const unsigned r = 0x03B53038u;\n')),
         ]
         ok = True
         # The mutations have to be the only finding, so a case cannot pass on a failure
         # that was already there.
-        found, _ = run(module_src, c_src)
+        found, _, _ = run(module_src, c_src, bounds_src)
         if found:
             print('FAIL the tree itself does not pass: %s' % found[0])
             return 1
-        for name, want, mutate in cases:
+        for case in cases:
+            name, want, mutate = case[0], case[1], case[2]
+            extra = case[3] if len(case) > 3 else ''
             mm, cc = mutate(module_src, c_src)
-            found, _ = run(mm, cc)
+            found, _, _ = run(mm, cc, bounds_src + extra)
             hit = [f for f in found if want in f]
             if hit:
                 print('ok   caught %s: %s' % (name, hit[0]))
@@ -206,18 +311,23 @@ def main():
                 ok = False
         return 0 if ok else 1
 
-    bad, allowed = run(module_src, c_src)
+    bad, allowed, seen = run(module_src, c_src, bounds_src)
     data = tramp_bytes(module_src)
     for line in bad:
         print('FAIL ' + line)
     if bad:
         return 1
-    print('no firmware addresses: %d trampoline instructions form none, dsp_native.c has '
-          'no .text literal, and the module has no version table'
+    print('no firmware addresses: %d trampoline instructions form none, neither C file has '
+          'a .text literal, and the module has no version table'
           % ((len(data) - 8) // 4))
     if allowed:
         print('  in-range round numbers passed over: %s'
               % ', '.join('%d (0x%X)' % (v, v) for v in allowed))
+    # Printed rather than counted, because the point of the list is that a reader can see
+    # what the native path is allowed to know about memory and judge it.
+    print('  %d DRAM-range literals, each stated:' % len(seen))
+    for v in sorted(seen):
+        print('    %-11d 0x%08X  %s' % (v, v, DRAM_ALLOW[v]))
     return 0
 
 
