@@ -4795,13 +4795,14 @@ TEST(Segments, TheInstrumentsGeometryServesEveryCountTheApplicationOffers) {
     }
 }
 
-TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
-    // The instrument's capture: 24-byte elements with the reading at offset zero, packed into
-    // chunks. per is deliberately ODD, so an even/odd sample pair straddles a block boundary
-    // and the packing loop has to address the two halves independently.
-    const int n = 1024;
-    const int stride = 24;
-    const int per = 65;
+// A strided record over separate blocks against the same samples held as a flat array, bin
+// for bin. base_off shifts every block base, which is how the alignment of the elements is
+// chosen: a 20-byte stride off an 8-aligned base leaves the odd elements 4-aligned, and off a
+// 4-aligned base leaves the even ones.
+//
+// Void, because ASSERT_ inside it has to be able to return.
+void ExpectStridedRecordMatchesArray(const int n, const int stride, const int per,
+                                     const size_t base_off) {
     const int nblk = (n + per - 1) / per;
     ASSERT_LE(nblk, DSP_MAX_SRC_BLOCKS);
 
@@ -4814,18 +4815,19 @@ TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
     // Each block its own allocation, so they are genuinely not contiguous.
     std::vector<std::vector<unsigned char>> blocks;
     for (int b = 0; b < nblk; b++) {
-        blocks.push_back(std::vector<unsigned char>(static_cast<size_t>(per) *
-                                                    static_cast<size_t>(stride), 0));
+        blocks.push_back(std::vector<unsigned char>(base_off + static_cast<size_t>(per) *
+                                                                   static_cast<size_t>(stride),
+                                                    0));
     }
     dsp_src src{};
     for (int b = 0; b < nblk; b++)
-        src.blk[b] = blocks[static_cast<size_t>(b)].data();
+        src.blk[b] = blocks[static_cast<size_t>(b)].data() + base_off;
     src.nblock = nblk;
     src.per = per;
     src.stride = stride;
     src.len = n;
     for (int i = 0; i < n; i++) {
-        unsigned char *q = blocks[static_cast<size_t>(i / per)].data() +
+        unsigned char *q = blocks[static_cast<size_t>(i / per)].data() + base_off +
                            static_cast<size_t>(i % per) * static_cast<size_t>(stride);
         std::memcpy(q, &x[static_cast<size_t>(i)], sizeof(double));
     }
@@ -4842,21 +4844,113 @@ TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
         ASSERT_EQ(flat->pwr[k], strided->pwr[k]) << "bin " << k;
 }
 
-TEST(Source, AStrideThatWouldMisalignADoubleIsRefused) {
-    // A double load off a 4-aligned element traps on the target, so the stride has to be a
-    // multiple of eight whatever the block bases are.
+TEST(Source, AStridedMultiBlockRecordMatchesTheSameSamplesAsAnArray) {
+    // A DMM6500's capture: 24-byte elements with the reading at offset zero, packed into
+    // chunks. per is deliberately ODD at every call below, so an even/odd sample pair
+    // straddles a block boundary and the packing loop has to address the two halves
+    // independently.
+    ExpectStridedRecordMatchesArray(1024, 24, 65, 0u);
+}
+
+TEST(Source, AFourAlignedElementIsReadAsTwoWordsAndStillMatches) {
+    // A DMM7510's STYLE_STANDARD element is 20 bytes, so half of the readings in a record
+    // land 4-aligned and their double has to be assembled from two word loads. Bin-for-bin
+    // equality is the check that wants making: two words put back in the wrong order is not
+    // a small error, it is a different number, which no tolerance would catch.
+    //
+    // Both base alignments, because which half of the elements is the 4-aligned half depends
+    // on the base and only one of the two is exercised by either on its own.
+    ExpectStridedRecordMatchesArray(1024, 20, 65, 0u);
+    ExpectStridedRecordMatchesArray(1024, 20, 65, 4u);
+    // The other 4-aligned element sizes a model could use, 12 among them: the test that used
+    // to stand here asserted 12 was refused.
+    ExpectStridedRecordMatchesArray(512, 12, 33, 0u);
+    ExpectStridedRecordMatchesArray(512, 28, 33, 4u);
+}
+
+TEST(Source, AStrideShorterThanADoubleIsRefused) {
+    // EIGHT BYTES ARE READ AT EVERY ELEMENT, so a stride under eight overruns the last one.
+    // The allocation is EXACTLY len*stride with no slack, which is the whole point: a pad of
+    // 8 makes a four-byte over-read land inside the allocation and the sanitizer stay quiet,
+    // and the test then passes whether or not the bound is there. Measured: with the bound
+    // removed this is a heap-buffer-overflow at the second word load, "0 bytes after a
+    // 4096-byte region".
+    //
+    // 4 is the one this has to cover. Testing the stride for `& 7` excluded it incidentally;
+    // relaxing to `& 3` for the 20-byte element admitted it, and nothing else noticed.
+    const int n = 512;
+    const unsigned short_strides[] = {4u};
+    for (size_t s = 0; s < sizeof(short_strides) / sizeof(short_strides[0]); s++) {
+        std::vector<unsigned char> raw(static_cast<size_t>(n) * short_strides[s], 0);
+        dsp_src src{};
+        src.blk[0] = raw.data();
+        src.nblock = 1;
+        src.per = n;
+        src.stride = static_cast<int>(short_strides[s]);
+        src.len = n;
+        Plan p(n, DSP_WINDOW_HANN);
+        ASSERT_EQ(DSP_OK, p.rc());
+        double mean = 0.0;
+        EXPECT_EQ(DSP_EARG, dsp_spectrum_run_src(&p.get(), &src, n, &mean))
+            << "stride " << short_strides[s];
+    }
+}
+
+TEST(Source, ANegativeStrideIsRefused) {
+    // (-4) & 3 is 0, so the alignment test alone admits it and the pointer arithmetic wraps.
+    // The `< sizeof(double)` bound is what excludes the whole negative range.
     const int n = 64;
-    std::vector<unsigned char> raw(static_cast<size_t>(n) * 12u, 0);
+    std::vector<unsigned char> raw(static_cast<size_t>(n) * 8u, 0);
     dsp_src src{};
     src.blk[0] = raw.data();
     src.nblock = 1;
     src.per = n;
-    src.stride = 12;
+    src.stride = -4;
     src.len = n;
     Plan p(n, DSP_WINDOW_HANN);
     ASSERT_EQ(DSP_OK, p.rc());
     double mean = 0.0;
     EXPECT_EQ(DSP_EARG, dsp_spectrum_run_src(&p.get(), &src, n, &mean));
+}
+
+TEST(Source, BlocksThatDoNotReachTheRecordLengthAreRefused) {
+    // nblock * per has to cover len, or an index inside len addresses a block past the end of
+    // blk[]: len 1024 over 2 blocks of 10 indexes blk[102] of 32 and dereferences whatever
+    // follows the caller's struct. ASan reports a SEGV there.
+    const int n = 1024;
+    std::vector<unsigned char> raw(4096u, 0);
+    dsp_src src{};
+    src.blk[0] = raw.data();
+    src.blk[1] = raw.data();
+    src.nblock = 2;
+    src.per = 10;
+    src.stride = 8;
+    src.len = n;
+    Plan p(n, DSP_WINDOW_HANN);
+    ASSERT_EQ(DSP_OK, p.rc());
+    double mean = 0.0;
+    EXPECT_EQ(DSP_EARG, dsp_spectrum_run_src(&p.get(), &src, n, &mean));
+}
+
+TEST(Source, AStrideFinerThanAWordIsRefused) {
+    // Four-aligned is as fine as this goes. dsp_src_at builds the double from a pair of word
+    // loads, and a 1- or 2-aligned element has no pair of loads to build one from.
+    const int n = 64;
+    const unsigned strides[] = {9u, 10u, 14u};
+    for (size_t s = 0; s < sizeof(strides) / sizeof(strides[0]); s++) {
+        std::vector<unsigned char> raw(static_cast<size_t>(n) * strides[s] + 8u, 0);
+        dsp_src src{};
+        src.blk[0] = raw.data();
+        src.nblock = 1;
+        src.per = n;
+        src.stride = static_cast<int>(strides[s]);
+        src.len = n;
+        Plan p(n, DSP_WINDOW_HANN);
+        ASSERT_EQ(DSP_OK, p.rc());
+        double mean = 0.0;
+        EXPECT_EQ(DSP_EARG, dsp_spectrum_run_src(&p.get(), &src, n, &mean))
+            << "stride " << strides[s];
+    }
 }
 
 TEST(Segments, AnArrayLongerThanASegmentIsSplitRatherThanRefused) {

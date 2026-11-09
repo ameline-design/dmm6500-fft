@@ -147,15 +147,26 @@ typedef struct {
  * doubles, 131 kB at 16,384 samples and longer than any segment -- from the frame entirely.
  *
  * @c nblock 1 with @c stride `sizeof(double)` is a plain array, which is what the entry
- * points taking one build. @c stride must be a multiple of 8: the elements are then as
- * aligned as the block base and a `double` load is safe, which a 4-aligned stride would not
- * make it.
+ * points taking one build.
+ *
+ * @c stride must be at least `sizeof(double)` and a multiple of 4. At least a double because
+ * eight bytes are read at every element, so a shorter stride overruns the last one. A
+ * multiple of 4 rather than of 8 because a 4-aligned element is read as a pair of words: a
+ * DMM7510's `STYLE_STANDARD` reading element is 20 bytes, which leaves half the elements of
+ * a record 4-aligned, and refusing those refused that model's capture outright.
+ *
+ * @c nblock times @c per must reach @c len, or an index inside @c len addresses a block past
+ * the end of @c blk.
+ *
+ * The alignment of each @c blk entry is the caller's and is not examined here. A base finer
+ * than 4-aligned puts the word loads themselves off a word boundary; dsp_native.c, whose
+ * addresses come from an instrument rather than from a caller, refuses that at its entry.
  */
 typedef struct {
     const unsigned char *blk[DSP_MAX_SRC_BLOCKS];
     int nblock;
     int per;    /**< Elements in each block; only the last may hold fewer. */
-    int stride; /**< Bytes between elements, a multiple of 8. */
+    int stride; /**< Bytes between elements, >= sizeof(double) and a multiple of 4. */
     int len;    /**< Elements in the record. */
 } dsp_src;
 

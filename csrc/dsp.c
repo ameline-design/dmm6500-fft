@@ -565,13 +565,36 @@ static int dsp_log2_of(const int v) {
 }
 
 /* Element i of a strided record. One block is the array case and takes a branch rather than
- * a divide, which is what every caller holding a plain array gets. */
+ * a divide, which is what every caller holding a plain array gets.
+ *
+ * An element only 4-aligned has its double assembled from two word loads, and the reason is
+ * narrower than "a misaligned lfd traps". The e300 core reference (docs/e300coreRM.txt
+ * 5.5.6.1, Table 5-18) takes an alignment interrupt on a double-word operand only when its
+ * effective address ends in 0xFF9-0xFFF -- when the eight bytes straddle a page -- and fixes
+ * up every other misaligned access in hardware, at a cost in cache cycles. A 20-byte element
+ * walks every 4-aligned residue of a 4 KB page, so 4 in 4096 of them land there: two a frame
+ * at n = 2048, which is rare, certain, and would read as intermittent. A 4-aligned lwz cannot
+ * straddle a page at all, 4 dividing 4096, and the stack slot the pair is reassembled in is
+ * 8-aligned, so neither load here can reach the interrupt. An 8-aligned stride never could,
+ * which is why 24 and 32 have never needed it.
+ *
+ * The test is on the address and not on the stride: a 20-byte element leaves half of them
+ * 8-aligned and those keep the single load. The two words are copied in the order they sit
+ * in memory, so the byte image reaches the union unchanged and the endianness does not
+ * enter. */
 static double dsp_src_at(const dsp_src *s, const int i) {
     const unsigned char *q;
     if (s->nblock == 1)
         q = s->blk[0] + (size_t)i * (size_t)s->stride;
     else
         q = s->blk[i / s->per] + (size_t)(i % s->per) * (size_t)s->stride;
+    if (((uintptr_t)q & 7U) != 0U) {
+        union { double d; uint32_t w[2]; } u;
+        const uint32_t *p = (const uint32_t *)(const void *)q;
+        u.w[0] = p[0];
+        u.w[1] = p[1];
+        return u.d;
+    }
     return *(const double *)(const void *)q;
 }
 
@@ -1151,9 +1174,25 @@ static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
         return DSP_EARG;
     if (x->nblock < 1 || x->nblock > DSP_MAX_SRC_BLOCKS || x->per < 1 || x->len < n)
         return DSP_EARG;
-    /* A double load off a 4-aligned element traps on this core, and the record's elements
-     * are only as aligned as the stride makes them. */
-    if ((x->stride & 7) != 0)
+    /* per blocks of nblock have to reach len, or an index inside len addresses a block past
+     * the end of the array: len = 1024 over nblock = 2 of per = 10 reads blk[102] of 32 and
+     * then dereferences whatever is after the caller's struct. */
+    if ((long)x->nblock * (long)x->per < (long)x->len)
+        return DSP_EARG;
+    /* A stride of at least a double, and 4-aligned.
+     *
+     * BOTH terms. dsp_src_at reads eight bytes an element, so a stride under eight makes the
+     * last element of a record overrun it -- the `& 7` test this replaced excluded 4 only
+     * incidentally, and dropping to `& 3` without the lower bound admitted stride 4 and
+     * over-read by four bytes, which ASan caught and the suite did not. `< sizeof(double)`
+     * also excludes every negative stride, which would otherwise wrap the pointer arithmetic.
+     *
+     * 4-aligned is the finest spacing dsp_src_at can assemble a double from. It does not
+     * follow that the elements are word-aligned: the BASE is the caller's to get right and is
+     * not examined here, so a 2-aligned base with an 8-byte stride reaches a half-word-aligned
+     * lwz. dsp_native.c refuses that at its own entry with `base & 3U`, which is where the
+     * addresses come from an instrument rather than from this library's callers. */
+    if (x->stride < (int)sizeof(double) || (x->stride & 3) != 0)
         return DSP_EARG;
     if (w->nslice < 1 || re->nslice < 1 || im->nslice < 1)
         return DSP_EARG;

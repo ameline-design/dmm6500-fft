@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.66'
+fftsa.VERSION = '8.69'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is

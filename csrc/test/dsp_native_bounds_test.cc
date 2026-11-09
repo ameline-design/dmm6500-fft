@@ -12,6 +12,8 @@
 
 extern "C" {
 #include "dsp_native_bounds.h"
+// For DSP_MAX_SRC_BLOCKS: the record's bound, against the vector's one here.
+#include "dsp.h"
 }
 
 namespace {
@@ -392,4 +394,59 @@ TEST(ChunkStride, InvertedWindowRefusesEverything) {
   static_assert(bad_hi < bad_lo, "the measured pair must invert, or this tests nothing");
   EXPECT_FALSE(dspn_chunk_stride_ok(kChunk1, 1024, 32, bad_lo, bad_hi, 1));
   EXPECT_FALSE(dspn_chunk_stride_ok(kChunk2, 1024, 32, bad_lo, bad_hi, 1));
+}
+
+// A buffer's chunk VECTOR and the part of it a record SPANS are two different lengths, and
+// they do not share a bound. Bounding the vector at DSP_MAX_SRC_BLOCKS refused a DMM6500's
+// own capture outright -- 49 entries against 32 -- which reached the instrument as
+// DSPN_ECAPTURE on every frame, with the app halting because this archive carries no
+// interpreted transform to fall back to. DSPN_MAX_NCHUNKS is the vector's bound and exists
+// only to stop `nchunks * 4` wrapping; DSP_MAX_SRC_BLOCKS is the record's and bounds
+// dsp_src::blk.
+TEST(ChunkVector, TheVectorIsLongerThanTheRecordSpansAtEveryCountTheAppOffers) {
+  struct Geom { const char *model; int elemsize; };
+  // Both measured: 24 on a DMM6500 1.7.17a, 20 on a DMM7510 1.7.16a. The element size is a
+  // runtime sum of column widths, so it is per model and neither figure is compiled in.
+  const Geom geoms[] = {{"DMM6500", 24}, {"DMM7510", 20}};
+  const uint32_t capacity = 65536U;           // what the app asks buffer.make for
+  const int counts[] = {512, 1024, 2048, 4096, 8192, 16384, 32768};
+
+  for (const Geom &g : geoms) {
+    const uint32_t perchunk = DSPN_CHUNK_BYTES / static_cast<uint32_t>(g.elemsize);
+    // perchunk is how many elements fill one payload, and one more must not.
+    EXPECT_LE(perchunk * static_cast<uint32_t>(g.elemsize), DSPN_CHUNK_BYTES) << g.model;
+    EXPECT_GT((perchunk + 1U) * static_cast<uint32_t>(g.elemsize), DSPN_CHUNK_BYTES)
+        << g.model;
+
+    const uint32_t nchunks = (capacity + perchunk - 1U) / perchunk;
+    EXPECT_LT(nchunks, DSPN_MAX_NCHUNKS) << g.model << " vector length must be admissible";
+    // THE POINT: the vector is legitimately longer than a record can span, so the two
+    // bounds cannot be the same number.
+    EXPECT_GT(nchunks, static_cast<uint32_t>(DSP_MAX_SRC_BLOCKS))
+        << g.model << " vector of " << nchunks
+        << " entries must NOT be judged against DSP_MAX_SRC_BLOCKS";
+
+    for (size_t i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
+      const uint32_t want =
+          (static_cast<uint32_t>(counts[i]) + perchunk - 1U) / perchunk;
+      EXPECT_LE(want, static_cast<uint32_t>(DSP_MAX_SRC_BLOCKS))
+          << g.model << " n=" << counts[i] << " spans " << want << " blocks";
+      EXPECT_LE(want, nchunks) << g.model << " n=" << counts[i];
+      // Every element the record has must be addressable: blk[j / per] for j < n.
+      EXPECT_GE(want * perchunk, static_cast<uint32_t>(counts[i]))
+          << g.model << " n=" << counts[i];
+    }
+  }
+}
+
+// And the wrap the vector bound is actually for: a length that is a multiple of 2^30 makes
+// `nchunks * 4` exactly zero, and a zero-length range is permitted at any address -- the
+// device registers included. The bound is what keeps that unreachable.
+TEST(ChunkVector, AVectorLengthThatWrapsItsByteCountIsOutsideTheBound) {
+  for (uint32_t nch : {0x40000000U, 0x80000000U, 0xC0000000U}) {
+    EXPECT_EQ(0U, nch * 4U) << "this nchunks must wrap to a zero byte length";
+    EXPECT_GE(nch, DSPN_MAX_NCHUNKS) << "and must therefore be refused";
+    // Proof the wrap would otherwise pass: a zero-length range is admitted at MMIO.
+    EXPECT_TRUE(dspn_range_ok(0x80000000U, nch * 4U, 0U, DSPN_DRAM_END));
+  }
 }

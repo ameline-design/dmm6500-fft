@@ -98,7 +98,8 @@ volatile uint32_t dspn_params_addr;
 
 /* Report and return.  Zero Lua results, because the status does not travel on the Lua
  * stack: pushing one would mean calling lua_pushnumber, a firmware address. */
-#define RET(v)  do { *st = (uint32_t)(int32_t)(v); return 0; } while (0)
+#define RET(v)  do { *fl = (uint32_t)__LINE__; *st = (uint32_t)(int32_t)(v); return 0; } \
+                while (0)
 
 #define DSP_NATIVE_MAGIC  0x44535031U   /* 'DSP1' */
 
@@ -198,6 +199,17 @@ typedef struct {
     uint32_t res_addr;     /* DSPN_RES_BYTES of scratch, 8-aligned                      */
     uint32_t res_npk;      /* peaks to rank, 0..DSPN_RES_PEAKS                          */
     uint32_t res_mains;    /* DSP_THD_MAINS_*, as an int32; -1 is BOTH                  */
+
+    /* WHICH refusal, not just which code.  The line in this file that returned, written by
+     * RET at every exit.  There are 26 of them against a dozen status codes -- DSPN_ECAPTURE
+     * alone has three sites and ten conditions among them -- so a code names the stage and
+     * not the test, and the test is what a fix needs.  A DMM7510 reported rc=-5 ECAPTURE and
+     * placing it took a hand-decoded hex dump of the descriptor.
+     *
+     * Last in the struct deliberately: appended, so no field Lua already packs moves, and
+     * the PARAM_WORDS check catches the two sides disagreeing about the size.  Lua writes 0
+     * here before every call, so a stale line cannot be read as this call's. */
+    uint32_t fail_at;
 } dsp_native_params;
 
 #define DSPN_MODE_INIT   1U
@@ -209,6 +221,7 @@ typedef struct {
 /* Chunks the arena may span. At the largest n a single chunk can hold an array for, the
  * layout needs six, so this is generous; it bounds a stack array in dsp_native_run. */
 #define DSPN_MAX_SEGS    32U
+
 
 /* The results block.  The peaks and the distortion measurement, as plain doubles that Lua
  * reads with one ki.memread and decodes with math.ldexp.
@@ -256,6 +269,7 @@ typedef struct {
  *   [6] DSPN_RES_PEAKS
  *   [7] DSPN_RES_DOUBLES
  *   [8] offsetof(dsp_native_params, status)
+ *   [9] offsetof(dsp_native_params, fail_at)
  *
  * The backstop bounds are here so the Lua side can sanity-check an address before passing
  * it in, without a second copy of the numbers to drift: a Lua literal and this header
@@ -268,7 +282,7 @@ typedef struct {
  * Initialised, not tentative: without the initialiser this is a common definition that
  * lands in .bss as zeros and reports nothing.
  */
-const uint32_t dsp_native_sizes[9] = {
+const uint32_t dsp_native_sizes[10] = {
     (uint32_t)sizeof(dsp_plan),
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
@@ -277,11 +291,12 @@ const uint32_t dsp_native_sizes[9] = {
     (uint32_t)DSPN_DRAM_END,
     (uint32_t)DSPN_RES_PEAKS,
     (uint32_t)DSPN_RES_DOUBLES,
-    (uint32_t)offsetof(dsp_native_params, status)
+    (uint32_t)offsetof(dsp_native_params, status),
+    (uint32_t)offsetof(dsp_native_params, fail_at)
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  54
+#define DSP_NATIVE_PARAM_WORDS  55
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -505,6 +520,7 @@ int dsp_native_run(void *L)
 {
     const dsp_native_params *p;
     volatile uint32_t *st;
+    volatile uint32_t *fl;
     const dsp_plan *plan;
     dsp_plan *plan_w;
     dsp_src cap_src;
@@ -529,6 +545,9 @@ int dsp_native_run(void *L)
     /* The one word written through a pointer the caller did not supply.  It is inside the
      * struct the test above proved to be in DRAM, so it needs no window of its own. */
     st = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, status));
+    /* The second reported word, in the same proven-writable struct and for the same reason:
+     * RET writes both, so it has to be set before the first RET below can fire. */
+    fl = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, fail_at));
 
     if (p->magic != DSP_NATIVE_MAGIC) { RET(DSPN_EMAGIC); }
 
@@ -646,13 +665,15 @@ int dsp_native_run(void *L)
      *
      * The stride is the capture's own element size, not 32: a STYLE_STANDARD buffer stores
      * no extra value and is smaller.  It has to tile the chunk exactly, which is the
-     * descriptor's own invariant, so a stride that fails it is not this buffer's.  And it
-     * has to be a multiple of eight, as does every payload base: the elements are then as
-     * aligned as the base and the double load inside dsp.c is legal.  A 4-aligned stride
-     * is refused here rather than read as a pair of words, which is what the copy did. */
+     * descriptor's own invariant, so a stride that fails it is not this buffer's.  It has to
+     * be at least eight, to hold the double it is read for, and 4-aligned, which is the
+     * finest spacing dsp_src_at can assemble a double from -- a DMM7510's STYLE_STANDARD
+     * element is 20 bytes and leaves half the readings in a record 4-aligned.  Why a pair of
+     * word loads rather than one lfd is in dsp_src_at: it is the page-straddling case, not
+     * misalignment as such. */
     {
         uint32_t nch = p->cap_nchunks, want, i, left = (uint32_t)n;
-        if (p->cap_perchunk == 0U || p->cap_stride < 8U || (p->cap_stride & 7U) != 0U ||
+        if (p->cap_perchunk == 0U || p->cap_stride < 8U || (p->cap_stride & 3U) != 0U ||
             p->cap_stride * p->cap_perchunk > DSPN_CHUNK_BYTES ||
             p->cap_stride * (p->cap_perchunk + 1U) <= DSPN_CHUNK_BYTES) {
             RET(DSPN_ECAPTURE);
@@ -660,7 +681,20 @@ int dsp_native_run(void *L)
         /* Blocks the record actually occupies, which is what dsp_src addresses; nch is the
          * vector's length and only has to be at least that. */
         want = ((uint32_t)n + p->cap_perchunk - 1U) / p->cap_perchunk;
-        if (nch == 0U || want > nch || want > (uint32_t)DSP_MAX_SRC_BLOCKS ||
+        /* nch is bounded ABOVE as well, because `nch * 4U` is the length the vector's own
+         * range test is given and that multiply is a uint32: any nch that is a multiple of
+         * 2^30 makes the length exactly 0, range_ok permits a zero-length range anywhere,
+         * and cap_vec would then be dereferenced for up to 31 words behind nothing but its
+         * alignment -- MMIO, flash and the vector page among the addresses that pass.
+         *
+         * AT DSPN_MAX_NCHUNKS AND NOT AT DSP_MAX_SRC_BLOCKS, which is the distinction the
+         * paragraph above this one draws: nch is the length of the whole chunk vector the
+         * buffer owns, and `want` is the part of it the record occupies.  A DMM6500's
+         * capture is 65,536 readings of 24 bytes, so its vector is 49 entries long while a
+         * 2048-sample record spans 2 of them -- bounding nch at 32 refused that outright,
+         * measured as ECAPTURE on the instrument.  Only `want` has to fit cap_src.blk. */
+        if (nch == 0U || nch >= DSPN_MAX_NCHUNKS ||
+            want > nch || want > (uint32_t)DSP_MAX_SRC_BLOCKS ||
             (p->cap_vec & 3U) != 0U ||
             !range_ok(p->cap_vec, nch * 4U, BACKSTOP_LO, BACKSTOP_HI)) {
             RET(DSPN_ECAPTURE);
@@ -672,15 +706,17 @@ int dsp_native_run(void *L)
             const uint32_t *cvec = (const uint32_t *)(uintptr_t)p->cap_vec;
             for (i = 0; i < want; i++) {
                 /* Element 0 is where the content scan found it, not where the first chunk's
-                 * payload begins: it is measured 8-aligned against a 16-aligned payload, so
-                 * the record does not start at the base of its chunk.  Later chunks hold
-                 * elements from their payload base.  That is the mapping the two-chunk form
-                 * used and had verified on the instrument, generalised to a long record;
-                 * taking the first block from the vector as well would read a fixed offset
-                 * early and be a wrong spectrum rather than a refusal. */
+                 * payload begins: the record does not start at the base of its chunk.  Later
+                 * chunks hold elements from their payload base.  That is the mapping the
+                 * two-chunk form used and had verified on the instrument, generalised to a
+                 * long record; taking the first block from the vector as well would read a
+                 * fixed offset early and be a wrong spectrum rather than a refusal.
+                 *
+                 * 4-aligned and not 8, for the same reason the stride is: a 20-byte element
+                 * puts the record's own start on either, and dsp_src_at reads both. */
                 const uint32_t base = (i == 0U) ? p->cap_chunk1 : cvec[i];
                 const uint32_t take = (left < p->cap_perchunk) ? left : p->cap_perchunk;
-                if ((base & 7U) != 0U || !stride_ok_rd(p, base, take, p->cap_stride)) {
+                if ((base & 3U) != 0U || !stride_ok_rd(p, base, take, p->cap_stride)) {
                     RET(DSPN_ECAPTURE);
                 }
                 cap_src.blk[i] = (const unsigned char *)(uintptr_t)base;

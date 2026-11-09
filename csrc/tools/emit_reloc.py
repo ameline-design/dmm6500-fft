@@ -262,11 +262,13 @@ def main():
     sizes_addr = elf.symbol_named("dsp_native_sizes")
     if sizes_addr is None:
         sys.exit("dsp_native_sizes not found: the Lua side needs the target's struct sizes")
-    raw = elf.read_at(sizes_addr, 36)
-    if raw is None or len(raw) != 36:
+    raw = elf.read_at(sizes_addr, 40)
+    if raw is None or len(raw) != 40:
         sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
     (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
-     res_peaks, res_doubles, status_off) = struct.unpack(">IIIIIIIII", raw)
+     res_peaks, res_doubles, status_off, fail_off) = struct.unpack(">IIIIIIIIII", raw)
+    # fail_off is excluded from the zero test: it is an offset and a zero one would mean the
+    # field had moved to the front of the struct, which the fit test below catches anyway.
     if 0 in (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
              res_peaks, res_doubles, status_off):
         sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
@@ -277,6 +279,9 @@ def main():
     if status_off + 4 > params_sz:
         sys.exit("the status word at %d does not fit a %d-byte params struct"
                  % (status_off, params_sz))
+    if fail_off + 4 > params_sz or fail_off == status_off:
+        sys.exit("the refusal-line word at %d does not fit a %d-byte params struct, or "
+                 "collides with the status word at %d" % (fail_off, params_sz, status_off))
 
     # Where the loader writes the params address. The image reads it instead of taking an
     # argument, so without this offset there is no way to hand it over and the entry would
@@ -309,6 +314,8 @@ def main():
         fh.write("-- of the params struct the call reports through\n")
         fh.write("fftsa.nl.PARAMS_SLOT = %d\n" % params_slot)
         fh.write("fftsa.nl.STATUS_OFF = %d\n" % status_off)
+        fh.write("-- the line of dsp_native.c that refused, so a status code names the test\n")
+        fh.write("fftsa.nl.FAIL_OFF = %d\n" % fail_off)
 
     print("image      %s  %d bytes" % (bin_path, len(image)))
     print("relocs     %s  %d entries, %d bytes"

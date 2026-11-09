@@ -44,13 +44,22 @@ fftsa.nl.RC = {
 -- beside it; "rc=-11 EMATH" says a libm entry was refused, which is actionable from the
 -- glass. The table is written name-to-number because that is how the code uses it, so this
 -- walks it rather than keeping a second copy that could disagree.
+-- The line of dsp_native.c that returned goes on the end as @NNN, and it is the half that
+-- places a fault: there are 26 refusal sites against a dozen codes, and DSPN_ECAPTURE alone
+-- has three sites with ten conditions among them. So the code names the stage and the line
+-- names the test. Four characters on a settings line that holds 70, and placing one rc=-5
+-- cost a hand-decoded hex dump of a descriptor without it.
 function fftsa.nl.rc_name(rc)
   if type(rc) ~= 'number' then return tostring(rc) end
+  local at = ''
+  if rc ~= 0 and type(fftsa.nl.fail_at) == 'number' and fftsa.nl.fail_at ~= 0 then
+    at = '@' .. tostring(fftsa.nl.fail_at)
+  end
   local k, v
   for k, v in pairs(fftsa.nl.RC) do
-    if v == rc then return tostring(rc) .. ' ' .. k end
+    if v == rc then return tostring(rc) .. ' ' .. k .. at end
   end
-  return tostring(rc)
+  return tostring(rc) .. at
 end
 
 -- DSP_THD_MAINS_* from csrc/dsp.h. Hum at a multiple of the selected mains frequency is
@@ -86,7 +95,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 54
+fftsa.nl.PARAM_WORDS = 55
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -302,9 +311,21 @@ end
 
 -- Is the double at addr this value? Both halves, so a shared exponent is not a match.
 -- addr need only be 4-aligned, which is what the extra value at element+20 is.
+--
+-- THROUGH THE GUARD, not through W. The content scan confirms a candidate at its far
+-- indices, which is the hit plus 255 strides -- 8160 bytes at a 32-byte element -- and a hit
+-- can sit anywhere in the swept window including its last word. Measured from a hit at
+-- BACKSTOP_HI - 32: the confirmation reached 8128 bytes PAST the top of DRAM, which is an
+-- unguarded lwz and a bluescreen. W's own contract says every address it is handed comes
+-- from inside the window, and this is the one caller for which that was never true.
+--
+-- nil reads as not-equal, which is the right answer and not a compromise: a record whose
+-- tail is outside the backstop is one the native side could not read either, so refusing it
+-- here is the same refusal one step earlier.
 local function eq64(addr, v)
   local hi, lo = f64_words(v)
-  return W(addr) == hi and W(addr + 4) == lo
+  local g = fftsa.nl._wg
+  return g(addr) == hi and g(addr + 4) == lo
 end
 
 -- The inverse of f64_words, out of eight big-endian bytes at p in s. ldexp rather than a
@@ -887,6 +908,26 @@ function fftsa.nl.diag()
   o = o .. ' ' .. nl.desc_off_str() .. ' der[' .. tostring(nl._der_why) .. ']'
   o = o .. ' sig[' .. tostring(nl._sig_why) .. ']'
   o = o .. ' buf=' .. tostring(nl._desc_buf) .. ' cp=' .. tostring(nl._ncol)
+  -- The element stride the content scan measured, and element 0. This is the figure that
+  -- decides whether the native read is possible at all, it is per model -- a DMM7510's
+  -- STYLE_STANDARD element is 20 bytes where a DMM6500's is 24 -- and it survives a failed
+  -- descriptor walk, which is when it is most wanted. Without it on the page it has to be
+  -- decoded out of the hit dump a word at a time.
+  o = o .. ' str=' .. tostring(nl._stor_stride)
+  o = o .. ' e0=' .. (nl._stor_elem0 ~= nil and hx(nl._stor_elem0) or 'nil')
+  -- THE GEOMETRY THE NATIVE CALL WAS ACTUALLY HANDED, which is what every capture-side
+  -- refusal is a judgement on. Without it a refusal names a test whose inputs are not on the
+  -- page, and each one costs a round trip to another continent to ask for one more figure.
+  local c = fftsa.nl_cap
+  if c == nil then
+    o = o .. ' cap[none]'
+  else
+    o = o .. ' cap[es=' .. tostring(c.elemsize) .. ' pc=' .. tostring(c.perchunk)
+             .. ' nc=' .. tostring(c.nchunks) .. ' c1=' .. hx(c.chunk1 or 0)
+             .. ' vec=' .. hx(c.vec or 0) .. ' ' .. hx(c.lo or 0) .. '..' .. hx(c.hi or 0)
+             .. ']'
+  end
+  o = o .. ' geom[' .. tostring(nl._geom_why) .. ']'
   o = o .. ' | ' .. nl.hit_dump_str()
   o = o .. ' | plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params=' .. tostring(nl.SIZEOF_PARAMS)
   o = o .. ' real=' .. tostring(nl.SIZEOF_REAL) .. ' align=' .. tostring(nl.DSP_ALIGN)
@@ -1062,24 +1103,27 @@ function fftsa.nl._find_storage(buf, has_extras)
     local k
     for k = 1, table.getn(hits) do
       local h = hits[k]
-      -- 8 and not 16: the reading at +0 is a double the firmware itself loads, so element 0
-      -- is 8-aligned and nothing more. It is not the chunk payload, so the allocator's
-      -- guarantee does not reach it, and a 16-byte filter rejects real storage -- the trace
-      -- buffer's element 0 is measurable at 0x037C71C8. The discrimination is the extras and
-      -- the far readings below.
-      if math.mod(h, 8) == 0 then
-        -- Candidate strides 32 and 24, both unconditionally: they are the two element sizes
-        -- this firmware uses, WRITABLE_FULL and STANDARD, and 32 is the only one that can
-        -- hold the extra value at +20. The discovered offsets after them cover an element
-        -- neither size matches, and they can only be measured where readings 1 and 2 differ
-        -- -- with every reading equal each offset matches and the list fills with noise,
-        -- which is a quiet capture at 4.5 digits. Each candidate still gets the full
-        -- confirmation, and describe() checks the winner against the descriptor's elemsize.
-        local cands, cn = { 32, 24 }, 2
+      -- 4 and not 16: element 0 is not the chunk payload, so the allocator's guarantee does
+      -- not reach it, and a 16-byte filter rejects real storage -- the trace buffer's element
+      -- 0 is measurable at 0x037C71C8. Not 8 either: a 20-byte element puts half the readings
+      -- in a record on a 4-aligned address, so the firmware is not loading them 8-aligned and
+      -- element 0 need not be. The discrimination is the extras and the far readings below.
+      if math.mod(h, 4) == 0 then
+        -- Candidate strides 32, 24 and 20, all three unconditionally: they are the element
+        -- sizes this firmware uses -- WRITABLE_FULL 32 on both models, STANDARD 24 on a
+        -- DMM6500 and 20 on a DMM7510 -- and 32 is the only one that can hold the extra
+        -- value at +20. The discovered offsets after them cover an element none of the three
+        -- matches, and they can only be measured where readings 1 and 2 differ -- with every
+        -- reading equal each offset matches and the list fills with noise, which is a quiet
+        -- capture at 4.5 digits. 20 is in the list for exactly that case: a DMM7510 reported
+        -- "no stride confirmed ... eq12=true", a quiet capture whose stride the discovery
+        -- loop never ran to find. Each candidate still gets the full confirmation, and
+        -- describe() checks the winner against the descriptor's elemsize.
+        local cands, cn = { 32, 24, 20 }, 3
         if rd[2] ~= rd[1] then
           local off
           for off = 8, 64, 4 do
-            if off ~= 32 and off ~= 24 and eq64(h + off, rd[2]) then
+            if off ~= 32 and off ~= 24 and off ~= 20 and eq64(h + off, rd[2]) then
               cn = cn + 1; cands[cn] = off
             end
           end
@@ -1143,31 +1187,159 @@ function fftsa.nl._chunk_span(elemsize, perchunk)
   return nil
 end
 
--- The descriptor field offsets measured on a DMM6500, named rather than spelled out at each
--- use so the derived route below has something to compare what it found against, and so the
--- one place that matters -- the native cursor rewind, which writes at compiled offsets -- can
--- refuse a layout that is not this one.
-fftsa.nl.DOFF = { es = 8, pc = 12, nc = 16, vec = 68, stor = 72, s1 = 84, s2 = 100 }
+-- The descriptor field offsets, named rather than spelled out at each use so the derived
+-- route below has something to compare what it found against, and so the one place that
+-- matters -- the native cursor rewind, which writes at compiled offsets -- can refuse a
+-- layout that is not the one the image was built for.
+--
+-- DOFF is the DMM6500's and the only one anything may be written at. DOFF_7510 is where the
+-- same fields were found on a DMM7510 1.7.16a: vec, stor, s1, s2 and cap all 8 lower, es, pc
+-- and nc unmoved. Read off three error pages, from two different buffers in two different
+-- boots, after the derived route had already answered with them -- so it is that route's
+-- finding written down, which is what lets the signature route below answer on that model
+-- without the readings having to differ.
+--
+-- WHAT THE IMAGES DO AND DO NOT SETTLE. notes/firmware/structmatch.py finds the initialiser
+-- 1044 bytes byte-identical at 6500 1.7.18 file offset 0x3F2AFC and 7510 1.7.16a 0x221DE4,
+-- which was once read as proving the layout identical on both. It does not: that function
+-- stores to EVERY 4-byte displacement from 0x04 to 0x94, as an unrolled init of a 16-byte
+-- strided array -- r11 to 0x2C,0x3C,..,0x9C and r12 to 0x30,0x40,..,0x90 -- and a function
+-- that writes every slot in a range cannot say which slot is which field. The 16-byte period
+-- is visible in the records themselves: on the 7510 the words at +0x4C..+0x58 and +0x5C..+0x68
+-- repeat the same (owner, ptr, ptr, count) shape, so the pair this module calls two owner
+-- self-pointers is the owner field of two CONSECUTIVE array entries, and the 8 between the
+-- models is where the array starts.
+--
+-- So these are two measured offset sets and not a derivation. Nothing rests on them being
+-- right: every candidate is confirmed by content -- the storage pointer has to equal the
+-- element 0 the scan measured, two words have to equal the base, and the geometry has to tile
+-- a power-of-two payload -- so a wrong set fails to find rather than finding something wrong.
+-- The route that needs no table at all is _derive_desc, and making the signature route derive
+-- its base the same way would retire both of these.
+fftsa.nl.DOFF = { es = 8, pc = 12, nc = 16, vec = 68, stor = 72, s1 = 84, s2 = 100,
+                  cap = 116 }
+fftsa.nl.DOFF_7510 = { es = 8, pc = 12, nc = 16, vec = 60, stor = 64, s1 = 76, s2 = 92,
+                       cap = 108 }
 
+-- Every layout to try, the compiled one first.
+--
+-- WHY A SECOND SET COSTS NO FALSE POSITIVE, stated correctly: it is not that the two sets
+-- space those three words differently -- they do not, s1 and s2 are stor+12 and stor+28 in
+-- both, and cap-32 and cap-16 in both. It is the VALUE the self-pointers have to hold. From
+-- a sweep hit h the base is h-72 at one set and h-64 at the other, and the word at h+12 has
+-- to equal whichever one is being tried, so at most one set can confirm. That is a stronger
+-- property than the spacing claim and it is the one that holds.
+--
+-- It holds only for the two routes that anchor on a hit. _read_desc takes a base the caller
+-- already has and tries each set at it, and a single base CAN satisfy both -- so the order
+-- here is what decides, and the compiled set being first is what makes that safe. The order
+-- is also per hit and not global: the layout loop is inside the hit loop, so a second-set
+-- match on an earlier hit beats a first-set match on a later one.
+--
+-- And on the signature route there is one fewer check than it looks. elem0 is read FROM
+-- base+stor there, so _read_desc_1's storage-pointer test is an identity on that path, which
+-- also makes describe's "elemsize must equal the measured stride" cross-check compare the
+-- descriptor's figure with itself. geom_ok is what closes that: it asks the firmware for the
+-- readings at a chunk boundary, which no descriptor field can satisfy by agreeing with
+-- itself.
+fftsa.nl.DOFF_SETS = { fftsa.nl.DOFF, fftsa.nl.DOFF_7510 }
+
+-- Which set last answered, so desc_off_ok() can refuse a write at offsets the image does not
+-- use. nil until a descriptor has been read.
+fftsa.nl.doff_used = nil
+
+-- One candidate layout, read at D's offsets.
+--
 -- Every read here is guarded, not raw. A base reaching this is a word the firmware handed us
 -- -- a cached one, a sweep hit, or a pointer out of the instance's column chain -- and only the
 -- sweep hit is known to be in DRAM at all. An unguarded peek32 on the other two is an lwz on an
 -- arbitrary address, which is a precise data storage interrupt and a bluescreen.
-function fftsa.nl._read_desc(base, elem0)
+--
+-- note belongs to the sweep's hit loop and to nothing else. It counts a candidate that got
+-- past the two owner self-pointers and names the first one's geometry, which is what tells
+-- "the sweep found the storage address but the record is shaped differently" from "the sweep
+-- never covered it" -- the distinction a DMM7510 report could not make. The other callers
+-- search on a different needle, so counting their candidates in the same two fields would
+-- make the figure on the error page mean two things.
+function fftsa.nl._read_desc_1(base, elem0, D, note)
   if base == nil then return nil end
-  local g = fftsa.nl._wg
-  local D = fftsa.nl.DOFF
+  local nl = fftsa.nl
+  local g = nl._wg
   if g(base + D.stor) ~= elem0 then return nil end     -- 0x48, the storage pointer
   if g(base + D.s1) ~= base or g(base + D.s2) ~= base then return nil end
   local elemsize = g(base + D.es)
   local perchunk = g(base + D.pc)
   local nchunks  = g(base + D.nc)
+  -- The element size is a runtime field and need not divide the payload: a STYLE_STANDARD
+  -- element of 24 bytes puts 1365 in a 32,768-byte payload, filling 32,760 and leaving 8
+  -- spare, and one of 20 puts 1638 there for the same 8. So the test is a fit rather than an
+  -- exact product, and _chunk_span finds which payload size it is a fit for.
+  local span = nl._chunk_span(elemsize, perchunk)
+  if note then
+    nl._hit_n = (nl._hit_n or 0) + 1
+    if nl._hit_why == nil then
+      nl._hit_why = 'es=' .. tostring(elemsize) .. ' pc=' .. tostring(perchunk)
+                    .. ' nc=' .. tostring(nchunks) .. ' span=' .. tostring(span)
+    end
+  end
   if elemsize == nil or perchunk == nil or nchunks == nil then return nil end
   if nchunks < 1 or nchunks >= 4096 or elemsize < 8 or perchunk < 1 then return nil end
-  local span = fftsa.nl._chunk_span(elemsize, perchunk)
   if span == nil then return nil end
-  fftsa.nl.chunk_span = span
+  nl.chunk_span = span
+  nl.doff_used = D
+  -- The chunk count comes back with the vector because a caller indexing it has no other way
+  -- to know where it ends, and an entry too far returns whatever follows in the heap -- which
+  -- could pass the backstop and be written to.
   return base, elemsize, perchunk, g(base + D.vec), nchunks
+end
+
+-- Every candidate layout, from a base the caller already believes is a descriptor base --
+-- a cached one, or a pointer out of the instance's column chain.
+function fftsa.nl._read_desc(base, elem0)
+  if base == nil then return nil end
+  local si
+  for si = 1, table.getn(fftsa.nl.DOFF_SETS) do
+    local b, es, pc, v, nc = fftsa.nl._read_desc_1(base, elem0, fftsa.nl.DOFF_SETS[si])
+    if b ~= nil then return b, es, pc, v, nc end
+  end
+  return nil
+end
+
+-- Every candidate layout, from a word that holds the storage pointer. The base follows from
+-- each layout's own stor offset, so the hit is tried at each distance rather than at one --
+-- which is what a sweep hit needs, because the hit is the only address it knows.
+function fftsa.nl._read_desc_from_stor(h, elem0, note)
+  if h == nil then return nil end
+  local si
+  for si = 1, table.getn(fftsa.nl.DOFF_SETS) do
+    local D = fftsa.nl.DOFF_SETS[si]
+    local b, es, pc, v, nc = fftsa.nl._read_desc_1(h - D.stor, elem0, D, note)
+    if b ~= nil then return b, es, pc, v, nc end
+  end
+  return nil
+end
+
+-- The descriptor half of the report, cleared. Both halves of describe() sweep, and the
+-- descriptor half does not run at all when the storage half fails -- so without this the
+-- error page carries the PREVIOUS buffer's hits, dump and derived offsets beside this
+-- buffer's storage failure. A DMM7510 grab read that way names the wrong buffer and the
+-- wrong element size.
+function fftsa.nl.desc_report_reset(buf)
+  local nl = fftsa.nl
+  nl._hit_n, nl._hit_why, nl._raw_n, nl._win_hit = 0, nil, 0, nil
+  nl._raw_at, nl._der_why, nl.desc_off = {}, nil, nil
+  nl._der_best, nl._der_best_n = nil, -1
+  nl._ncol = nil
+  -- The layout attribution goes with the rest of it. Leaving it attached to a buffer whose
+  -- descriptor was never read is the same staleness, and it is the one field desc_off_ok()
+  -- decides a write on.
+  nl.doff_used = nil
+  -- Which buffer this was, and how far the instance's column chain got. Both are invisible in
+  -- the report otherwise: a chain that walked nothing and one that walked eight records give
+  -- the same window count once the ladder's later stages are added, and the capacity says
+  -- whether the buffer the allocator built is the one that was asked for.
+  nl._desc_buf = 'cap' .. tostring(buf ~= nil and buf.capacity or nil)
+                 .. '/n' .. tostring(buf ~= nil and buf.n or nil)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1208,12 +1380,16 @@ fftsa.nl.DERIVE_SELF_MIN = 2
 -- about a third of a second rather than leaving it to a field that could be any word.
 fftsa.nl.DERIVE_NC_MAX = 1024
 
--- Is a word a plausible chunk payload address? In the backstop, 8-aligned because a payload
--- holds doubles the firmware loads directly, and readable. Nothing here authenticates it --
--- that is what entry 0 matching elem0 does -- it only bounds how far a vector walk may go.
+-- Is a word a plausible chunk payload address? In the backstop, 4-aligned, and readable.
+-- Nothing here authenticates it -- that is what entry 0 matching elem0 does -- it only
+-- bounds how far a vector walk may go.
 function fftsa.nl._payload_ok(a)
   if type(a) ~= 'number' or a == 0 then return false end
-  if math.mod(a, 8) ~= 0 then return false end
+  -- 4 and not 8. This asked for 8 because a payload holds doubles the firmware loads
+  -- directly, and that premise is gone: a 20-byte element leaves half of them 4-aligned,
+  -- which is why dsp_native.c admits a 4-aligned payload base. An 8-byte test here would
+  -- end the vector walk early on such a model and refuse a descriptor that is good.
+  if math.mod(a, 4) ~= 0 then return false end
   return fftsa.nl._wg(a) ~= nil
 end
 
@@ -1255,10 +1431,11 @@ function fftsa.nl._derive_desc(h, elem0, stride)
     return nil
   end
 
-  -- Which two words those were. Without them the cache cannot re-validate a base found this
-  -- way: _read_desc would test the measured offsets, fail, and every describe() of the buffer
-  -- would sweep the whole backstop again -- which on a model that needs this route is a
-  -- minute of the glass frozen on every Apply.
+  -- Which two words those were, for the report and for the rewind gate. They are not a cache
+  -- re-validation: the cached-base path goes through _read_desc, which tries DOFF_SETS and
+  -- not these, so a model reached only by this route does re-sweep on a later describe()
+  -- whose storage cache has missed. DOFF_7510 is why the DMM7510 no longer needs this route;
+  -- the next model that does will need the cache path taught to carry derived offsets.
   local s1off, s2off = nil, nil
   for k = -back, fwd, 4 do
     if v[k] == base then
@@ -1342,6 +1519,9 @@ function fftsa.nl._derive_desc(h, elem0, stride)
   nl.chunk_span = span
   nl.desc_off = { es = off_es, pc = off_es + 4, nc = off_nc, vec = off_vec,
                   stor = h - base, s1 = s1off, s2 = s2off, self_n = nself }
+  -- Cleared, because this route did not read a candidate layout and a value left here would
+  -- be the one some earlier buffer matched.
+  nl.doff_used = nil
   nl._der_why = nil
   return base, stride, perchunk, vec, nchunks
 end
@@ -1350,17 +1530,40 @@ end
 -- in dsp_native.c stores at compiled displacements from the descriptor base, so a model whose
 -- descriptor is shaped differently must not be handed one -- the fields it would overwrite
 -- belong to whatever is really there.
-function fftsa.nl.desc_off_ok()
-  local o = fftsa.nl.desc_off
-  if o == nil then return true end        -- never derived, so the measured layout answered
-  local D = fftsa.nl.DOFF
-  return o.es == D.es and o.pc == D.pc and o.nc == D.nc
-         and o.vec == D.vec and o.stor == D.stor
+-- THE DESCRIPTOR IS THE ARGUMENT, and an absent answer refuses.
+--
+-- This decides a write at displacements compiled into the image, and it used to decide it
+-- from module state: which layout any buffer was read at most recently, with nil -- the state
+-- every _find_desc entry resets to -- meaning permit. The caller holds a descriptor; that is
+-- what has to be judged. With two layouts in the search the stale case stopped being
+-- harmless: DOFF_7510's two self-pointers are at 76 and 92, which are exactly the
+-- DESC_IT1_PTR and DESC_IT2_PTR the rewind in dsp_native.c stores at, so a write permitted
+-- against the wrong layout would overwrite both owner pointers of a live column descriptor.
+function fftsa.nl.desc_off_ok(d)
+  local nl = fftsa.nl
+  local D = nl.DOFF
+  if d == nil then return false end
+  local o = d.dderived
+  if o ~= nil then                        -- the derived route answered, with its own offsets
+    return o.es == D.es and o.pc == D.pc and o.nc == D.nc
+           and o.vec == D.vec and o.stor == D.stor
+  end
+  -- Otherwise a candidate layout answered and it has to be the compiled one. A descriptor
+  -- carrying neither is one this cannot place, which is a refusal and not a default.
+  return d.doff ~= nil and d.doff == D
 end
 
 function fftsa.nl.desc_off_str()
-  local o = fftsa.nl.desc_off
-  if o == nil then return 'doff=measured' end
+  local nl = fftsa.nl
+  local o = nl.desc_off
+  if o == nil then
+    -- Which candidate layout answered. 'measured' could not say, and the two sets differ by
+    -- 8 in four fields -- so which of them a model matched is the layout finding itself.
+    local u = nl.doff_used
+    if u == nil then return 'doff=none' end
+    if u == nl.DOFF then return 'doff=compiled' end
+    return 'doff=stor' .. hx(u.stor) .. ',vec' .. hx(u.vec) .. ',cap' .. hx(u.cap)
+  end
   return 'doff=stor' .. hx(o.stor) .. ',es' .. hx(o.es) .. ',nc' .. hx(o.nc)
          .. ',vec' .. hx(o.vec) .. ',s' .. hx(o.s1 or 0) .. '/' .. hx(o.s2 or 0)
          .. ',n' .. tostring(o.self_n)
@@ -1429,15 +1632,7 @@ function fftsa.nl._find_desc(elem0, buf, stride)
   -- every window swept. _hit_n is how many of those passed the two owner self-pointers: raw
   -- hits with no confirmed one means the layout is not the one measured, which is what the
   -- derived pass below then answers. The DMM7510 report had only the one count.
-  nl._hit_n, nl._hit_why, nl._raw_n, nl._win_hit = 0, nil, 0, nil
-  nl._raw_at, nl._der_why, nl.desc_off = {}, nil, nil
-  nl._der_best, nl._der_best_n = nil, -1
-  -- Which buffer this was, and how far the instance's column chain got. Both are invisible in
-  -- the report otherwise: a chain that walked nothing and one that walked eight records give
-  -- the same window count once the ladder's later stages are added, and the capacity says
-  -- whether the buffer the allocator built is the one that was asked for.
-  nl._desc_buf = 'cap' .. tostring(buf ~= nil and buf.capacity or nil)
-                 .. '/n' .. tostring(buf ~= nil and buf.n or nil)
+  nl.desc_report_reset(buf)
   nl.sweep_reset()
   local seen, nseen = {}, 0
   local windows = fftsa.nl.scan_windows(buf, elem0)
@@ -1471,37 +1666,16 @@ function fftsa.nl._find_desc(elem0, buf, stride)
         seen[hits[k]] = true
         nl._raw_at[nseen] = hits[k]
       end
-      local D = fftsa.nl.DOFF
-      local base = hits[k] - D.stor
-      local s1 = fftsa.nl._wg(base + D.s1)
-      local s2 = fftsa.nl._wg(base + D.s2)
-      if s1 == base and s2 == base then
-        local elemsize = fftsa.nl._wg(base + D.es)
-        local perchunk = fftsa.nl._wg(base + D.pc)
-        local nchunks  = fftsa.nl._wg(base + D.nc)
-        -- The element size is a runtime field and need not divide the payload: a
-        -- STYLE_STANDARD element of 24 bytes puts 1365 in a 32,768-byte payload, filling
-        -- 32,760 and leaving 8 spare. So the test is a fit rather than an exact product, and
-        -- _chunk_span finds which payload size it is a fit for instead of assuming.
-        local span = fftsa.nl._chunk_span(elemsize, perchunk)
-        nl._hit_n = (nl._hit_n or 0) + 1
-        if nl._hit_why == nil then
-          nl._hit_why = 'es=' .. tostring(elemsize) .. ' pc=' .. tostring(perchunk)
-                        .. ' nc=' .. tostring(nchunks) .. ' span=' .. tostring(span)
-        end
-        if elemsize ~= nil and perchunk ~= nil and nchunks ~= nil and
-           nchunks > 0 and nchunks < 4096 and span ~= nil then
-          nl.chunk_span = span
-          -- 0x44 is the chunk vector. The count comes back with it because a caller
-          -- indexing the vector has no other way to know where it ends, and an entry too
-          -- far returns whatever follows in the heap -- which could pass the backstop and
-          -- be written to.
-          nl._desc_of, nl._desc_at = elem0, base
-          -- Which stage answered, and where: the next buffer gets a tight window around this
-          -- arena, so at most one call ever pays for the wide stages.
-          nl._win_hit, nl.arena = wi, base
-          return base, elemsize, perchunk, fftsa.nl._wg(base + D.vec), nchunks
-        end
+      -- Every candidate layout, each from the base its own stor offset puts the record at.
+      -- A DMM7510's record is a DMM6500's with eight bytes gone ahead of the chunk vector, so
+      -- its descriptor sits 8 lower than one offset alone looks and matched nothing there.
+      local b, es, pc, v, nc = fftsa.nl._read_desc_from_stor(hits[k], elem0, true)
+      if b ~= nil then
+        nl._desc_of, nl._desc_at = elem0, b
+        -- Which stage answered, and where: the next buffer gets a tight window around this
+        -- arena, so at most one call ever pays for the wide stages.
+        nl._win_hit, nl.arena = wi, b
+        return b, es, pc, v, nc
       end
     end
   end
@@ -1535,13 +1709,22 @@ end
 -- the bind failed one step later with the storage half reporting success. A quiet or shorted
 -- input is ordinary, so the capture buffer needs a route that ignores the signal.
 --
--- Two adjacent big-endian words make a specific needle, and _read_desc applies the same
+-- Two adjacent big-endian words make a specific needle, and _read_desc_1 applies the same
 -- validation as the other route. 878 hits on the instrument, exactly one a descriptor.
-fftsa.nl.DOFF_CAP = 116                   -- 0x74, the capacity field, n in the word above it
-
+--
+-- The capacity's offset is a field of each candidate layout, because this route is the one a
+-- quiet capture depends on and it answers nothing when the offset is wrong. A DMM7510 found
+-- 58 hits of the pair and no descriptor at 0x74, where its own capacity is at 0x6C.
 function fftsa.nl._find_desc_by_sig(buf)
   local nl = fftsa.nl
   nl._sig_why = nil
+  -- The descriptor half of the report belongs to the buffer being described, and this is one
+  -- of the three paths that can resolve one. When this route answers, _find_desc is never
+  -- called and so never resets it -- and this is the CAPTURE's primary route, so the page
+  -- would carry the previous buffer's identity, hit list, dump and element size beside a
+  -- successful bind. Measured: buffer B resolving at a 20-byte element while the page read
+  -- cap4096/n1024 and es=32.
+  nl.desc_report_reset(buf)
   local cap, n = buf.capacity, buf.n
   if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then
     nl._sig_why = 'cap=' .. tostring(cap) .. ' n=' .. tostring(n)
@@ -1557,14 +1740,21 @@ function fftsa.nl._find_desc_by_sig(buf)
     nhits = nhits + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
-      local base = hits[k] - nl.DOFF_CAP
-      local elem0 = fftsa.nl._wg(base + nl.DOFF.stor)
-      if elem0 ~= nil and elem0 ~= 0 then
-        local b, es, pc, v, nc = nl._read_desc(base, elem0)
-        if b ~= nil then
-          nl._desc_of, nl._desc_at = elem0, base
-          nl._win_hit, nl.arena = wi, base
-          return base, elem0, es, pc, v, nc
+      local si
+      for si = 1, table.getn(nl.DOFF_SETS) do
+        local D = nl.DOFF_SETS[si]
+        local base = hits[k] - D.cap
+        -- The storage pointer this layout would put in that record, taken as the content the
+        -- rest of the validation is against: elem0 is not known here, which is the whole
+        -- point of the route -- a quiet capture cannot be identified by its readings.
+        local elem0 = fftsa.nl._wg(base + D.stor)
+        if elem0 ~= nil and elem0 ~= 0 then
+          local b, es, pc, v, nc = nl._read_desc_1(base, elem0, D)
+          if b ~= nil then
+            nl._desc_of, nl._desc_at = elem0, base
+            nl._win_hit, nl.arena = wi, base
+            return base, elem0, es, pc, v, nc
+          end
         end
       end
     end
@@ -3010,6 +3200,10 @@ function fftsa.nl.write_params(t)
     t.red_db or 0, t.red_hz or 0, t.red_sense or 1,
     f0h, f0l, bwh, bwl, dnh, dnl, dxh, dxl, vfh, vfl,
     t.res_addr or 0, t.res_npk or 0, t.res_mains or 0,
+    -- The image writes the line of dsp_native.c that refused into fail_at. Written here as
+    -- well, and zero, because that is what keeps a line from the PREVIOUS call being read as
+    -- this one's; a caller has no reason to set it.
+    t.fail_at or 0,
   }
   if table.getn(w) ~= fftsa.nl.PARAM_WORDS then return false end
   local parts = {}
@@ -3091,6 +3285,16 @@ local function call_native(addr)
   if not ok then return nil, err end
   local s = ki.memread(hx(nl.params + nl.STATUS_OFF), hx(4))
   if s == nil or string.len(s) < 4 then return refuse('status unreadable') end
+  -- WHICH test refused, read before the code is interpreted so it is kept even on the
+  -- paths that return early below. A status code names the stage; the line names the test.
+  nl.fail_at = nil
+  if nl.FAIL_OFF ~= nil and nl.FAIL_OFF ~= 0 then
+    local f = ki.memread(hx(nl.params + nl.FAIL_OFF), hx(4))
+    if f ~= nil and string.len(f) >= 4 then
+      local fv = u32_at(f, 1)
+      if fv ~= 0 then nl.fail_at = fv end
+    end
+  end
   local v = u32_at(s, 1)
   if v == nl.STATUS_UNSET then return refuse('no status') end
   if v >= 2147483648 then v = v - 4294967296 end
@@ -3815,7 +4019,7 @@ function fftsa.nl.call_dsp(cap, out, red)
     -- the fields it would write belong to something else -- which is how a freed-widget
     -- bluescreen is reached. The app passes out = nil and asks for the reduction only, so
     -- this refuses a call no caller makes today rather than permitting one.
-    if not nl.desc_off_ok() then return nil end
+    if not nl.desc_off_ok(out) then return nil end
   end
 
   local ok = nl.write_params({
@@ -3979,6 +4183,133 @@ function fftsa.nl.reduce(nseg)
   return r
 end
 
+-- ---------------------------------------------------------------------------
+-- Does the derived geometry actually address the firmware's own readings?
+--
+-- Everything above identifies the record from two or three agreeing figures, and that is
+-- enough to be confident and not enough to be sure. The element size is a RUNTIME field --
+-- a sum of the widths of whatever columns a style enables, which no constant in the firmware
+-- image records -- so it is per model and cannot be looked up. A DMM6500's is 24 and a
+-- DMM7510 1.7.16a reads 20, and the second figure rests on a descriptor whose three geometry
+-- words agree with each other. A wrong element size does not refuse: it reads the wrong bytes
+-- as samples and draws a plausible, wrong spectrum.
+--
+-- So this asks the firmware. Element j of the record is at blk[j / perchunk] + (j % perchunk)
+-- * elemsize, which is exactly what dsp_src_at computes, so checking that address against
+-- buf.readings[j + 1] tests the mapping the native call will actually use:
+--
+--   * every chunk the record occupies, at its first element -- which pins PERCHUNK, because
+--     at perchunk 1638 chunk 1 begins at reading 1639 and at 1365 it begins at 1366
+--   * the last element of chunk 0 -- which pins ELEMSIZE across a whole chunk, where the
+--     content scan's far indices reach element 256 and no further
+--
+-- Two readings and a stride confirm on a periodic input at more than one spacing; a chunk
+-- boundary does not, because a wrong element size moves it by hundreds of elements.
+--
+-- About a dozen comparisons, at Apply and never in a frame. It costs the DMM6500 the same
+-- dozen and gains it the same guarantee: the one failure this module had no symptom for was
+-- a chunk mapping that reads the inter-chunk header back as samples.
+fftsa.nl.GEOM_CHUNKS_MAX = 32          -- DSP_MAX_SRC_BLOCKS; a record cannot span more
+
+-- Element sizes to try when the geometry does not fit, smallest first. Every multiple of 4
+-- from a bare double to 48: the figure is a runtime sum of the widths of whatever columns a
+-- style enables, so it is not drawn from a list the firmware holds and a model may use one
+-- nobody has seen.
+fftsa.nl.ES_CANDIDATES = { 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48 }
+
+-- Which element size WOULD put the right reading at the second chunk's base.
+--
+-- The refusal below says the geometry is wrong. This says what it probably is, which is the
+-- figure a fix needs rather than the figure that failed. A chunk boundary is what makes it
+-- answerable at all: perchunk is CHUNK_BYTES/elemsize, so each candidate predicts a
+-- DIFFERENT reading index at the same address -- 1366 at 24 bytes, 1639 at 20 -- and only the
+-- true one matches. Eleven candidates and two reads each, on the failing path only.
+--
+-- This is the figure that cost a session: a DMM7510 reported rc=-5 and settling the element
+-- size took a hand-decoded hex dump of the descriptor and an argument about design priors.
+function fftsa.nl._es_fit(buf, d)
+  local nl = fftsa.nl
+  if buf == nil or d == nil or d.vec == nil then return nil end
+  local n = buf.n
+  if type(n) ~= 'number' then return nil end
+  local c1 = nl._wg(d.vec + 4)
+  if c1 == nil or c1 == 0 then return nil end
+  local i
+  for i = 1, table.getn(nl.ES_CANDIDATES) do
+    local es = nl.ES_CANDIDATES[i]
+    -- Elements that fit one payload, which is what perchunk means.
+    local pc = math.floor(nl.CHUNK_BYTES / es)
+    if pc >= 1 and pc < n then
+      local v = buf.readings[pc + 1]
+      if v ~= nil and eq64(c1, v) then return es, pc end
+    end
+  end
+  return nil
+end
+
+function fftsa.nl.geom_ok(buf, d)
+  local nl = fftsa.nl
+  -- Both cleared on the way in: _geom_n is how many indices were confirmed, and a stale one
+  -- reads as this call having checked something when it returned before looking.
+  nl._geom_why, nl._geom_n = nil, nil
+  if buf == nil or d == nil then return true end
+  local n, pc, es = buf.n, d.perchunk, d.elemsize
+  if type(n) ~= 'number' or type(pc) ~= 'number' or type(es) ~= 'number' then return true end
+  if n < 1 or pc < 1 or es < 8 then return true end
+  -- Which address holds element j, by the native side's own arithmetic. blk[0] is the
+  -- record's first element and not the chunk payload, which is why it is carried separately.
+  local function at(j)
+    local k = math.floor(j / pc)
+    if k == 0 then return d.chunk1 + j * es end
+    if d.vec == nil or k >= nl.GEOM_CHUNKS_MAX then return nil end
+    local b = W(d.vec + k * 4)
+    if b == nil or b == 0 then return nil end
+    return b + math.mod(j, pc) * es
+  end
+  -- The indices to confirm: the first element of every chunk the record reaches, and the
+  -- last element of chunk 0. Zero-based j, so reading index is j + 1.
+  local want, nw = {}, 0
+  local j = 0
+  while j < n and nw < nl.GEOM_CHUNKS_MAX do
+    nw = nw + 1; want[nw] = j
+    j = j + pc
+  end
+  local last0 = pc - 1
+  if last0 >= n then last0 = n - 1 end
+  if last0 > 0 then nw = nw + 1; want[nw] = last0 end
+  local i
+  for i = 1, nw do
+    j = want[i]
+    local v = buf.readings[j + 1]
+    local a = at(j)
+    if v == nil then
+      nl._geom_why = 'reading ' .. tostring(j + 1) .. ' of ' .. tostring(n) .. ' reads nil'
+      return false
+    end
+    if a == nil then
+      nl._geom_why = 'no chunk for element ' .. tostring(j) .. ' pc=' .. tostring(pc)
+      return false
+    end
+    if not eq64(a, v) then
+      -- Both figures and the index, because this is where a per-model element size is
+      -- settled: the reading the firmware reports at an index against what is at the address
+      -- es and pc put it at. es=20 and es=24 disagree first at the second chunk's base.
+      nl._geom_why = 'reading ' .. tostring(j + 1) .. ' is not at ' .. hx(a)
+                     .. ' for es=' .. tostring(es) .. ' pc=' .. tostring(pc)
+      -- And what would fit, when that is answerable. A refusal naming the right figure is
+      -- one grab; a refusal naming only the wrong one is a round trip for each guess.
+      local fes, fpc = nl._es_fit(buf, d)
+      if fes ~= nil then
+        nl._geom_why = nl._geom_why .. ' -- fits es=' .. tostring(fes)
+                       .. ' pc=' .. tostring(fpc)
+      end
+      return false
+    end
+  end
+  nl._geom_n = nw
+  return true
+end
+
 -- Describe a buffer's storage for call_dsp, from the content scan and descriptor walk.
 -- Returns nil if either step fails, so a caller cannot build a half-filled table.
 function fftsa.nl.describe(buf, has_extras)
@@ -4013,7 +4344,13 @@ function fftsa.nl.describe(buf, has_extras)
       nl._stor_elem0, nl._stor_stride = elem0, stride
     end
   end
-  if not elem0 then return nil end
+  if not elem0 then
+    -- Nothing was looked for, so nothing may be reported: _find_desc never ran, and without
+    -- this the error page shows the last buffer that DID reach it -- its hits, its dump, its
+    -- derived offsets -- beside this buffer's storage failure.
+    nl.desc_report_reset(buf)
+    return nil
+  end
   local desc, elemsize, perchunk, vec, nchunks = sdesc, selemsize, sperchunk, svec, snchunks
   if desc == nil then
     -- The stride goes with it: the derived route locks the element-size field against the
@@ -4061,7 +4398,18 @@ function fftsa.nl.describe(buf, has_extras)
       if i == 2 then ch2 = a end
     end
   end
-  return { chunk1 = elem0, chunk2 = ch2, perchunk = perchunk,
-           elemsize = elemsize, desc = desc, vec = vec, nchunks = nchunks,
-           lo = lo, hi = hi }
+  -- Which layout this was read at travels WITH the descriptor, so a caller asking whether
+  -- it may be written to is answered about the descriptor it holds rather than about
+  -- whichever buffer was described last.
+  local d = { chunk1 = elem0, chunk2 = ch2, perchunk = perchunk,
+              elemsize = elemsize, desc = desc, vec = vec, nchunks = nchunks,
+              lo = lo, hi = hi, doff = nl.doff_used, dderived = nl.desc_off }
+  -- The last gate, and the only one that asks the firmware rather than the record. Refused
+  -- here rather than left to the native call: a geometry that addresses the wrong bytes is
+  -- not refused there, it draws a wrong spectrum.
+  if not fftsa.nl.geom_ok(buf, d) then
+    nl._stor_why = 'geometry does not address the readings -- ' .. tostring(nl._geom_why)
+    return nil
+  end
+  return d
 end

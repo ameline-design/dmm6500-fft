@@ -327,6 +327,42 @@ local function readings(r1, r2)
   return v
 end
 
+-- geom_ok reads a CHUNK BOUNDARY -- element 1638 at perchunk 1638 -- so a six-entry table
+-- cannot answer it. A metatable supplies a deterministic value for every other index, and
+-- place_geom writes those same values at the addresses a stated geometry puts them at, so
+-- the fixture has one source of truth and the code under test has to agree with it.
+local function densify(v, n)
+  setmetatable(v, {__index = function(_, i)
+    if type(i) ~= 'number' or i < 1 or i > n then return nil end
+    return 0.00390625 * i          -- exact in binary, so the f64 round trip is bit-exact
+  end})
+  return v
+end
+
+-- Every index geom_ok will look at, written where es/pc/vec put it. Only those indices,
+-- because the WORDS model would otherwise need 130,000 entries for a 65,536-element record.
+-- The arithmetic is restated here rather than shared with the module: that is what makes the
+-- negative cases below able to place a record at one geometry and claim another.
+local function place_geom(elem0, es, pc, vecaddr, n, v)
+  local idx, ni, j = {}, 0, 0
+  while j < n do ni = ni + 1; idx[ni] = j; j = j + pc end
+  local l0 = pc - 1
+  if l0 >= n then l0 = n - 1 end
+  if l0 > 0 then ni = ni + 1; idx[ni] = l0 end
+  local i
+  for i = 1, ni do
+    j = idx[i]
+    local k = math.floor(j / pc)
+    local base = elem0
+    if k > 0 then base = WORDS[vecaddr + k * 4] end
+    if base ~= nil then
+      local hi, lo = fftsa.nl._f64_words(v[j + 1])
+      WORDS[base + math.mod(j, pc) * es] = hi
+      WORDS[base + math.mod(j, pc) * es + 4] = lo
+    end
+  end
+end
+
 local QUIET = readings(0.125, 0.125)
 place(24, QUIET)
 local e0, st = fftsa.nl._find_storage({n = 2048, readings = QUIET}, false)
@@ -372,17 +408,21 @@ local SAME = -1.0912892195e-06
 
 -- The descriptor as _read_desc validates it: storage pointer at +0x48, both owner
 -- self-pointers, and the geometry of a 24-byte element in a 32768-byte chunk payload.
+-- D is the layout to place it at, and defaults to the DMM6500's. A DMM7510's record is the
+-- same fields with eight bytes gone ahead of the chunk vector, so the cases below place one
+-- at either set rather than spelling two sets of numbers out.
 local VEC = 56000000
-local function place_desc(base, elem0, elemsize, perchunk, nchunks, cap, n)
-  WORDS[base + 72] = elem0
-  WORDS[base + 84] = base
-  WORDS[base + 100] = base
-  WORDS[base + 8] = elemsize
-  WORDS[base + 12] = perchunk
-  WORDS[base + 16] = nchunks
-  WORDS[base + 68] = VEC          -- 0x44, the chunk vector
-  WORDS[base + 116] = cap         -- +0x74
-  WORDS[base + 120] = n           -- +0x78
+local function place_desc(base, elem0, elemsize, perchunk, nchunks, cap, n, D)
+  D = D or fftsa.nl.DOFF
+  WORDS[base + D.stor] = elem0
+  WORDS[base + D.s1] = base
+  WORDS[base + D.s2] = base
+  WORDS[base + D.es] = elemsize
+  WORDS[base + D.pc] = perchunk
+  WORDS[base + D.nc] = nchunks
+  WORDS[base + D.vec] = VEC
+  WORDS[base + D.cap] = cap
+  WORDS[base + D.cap + 4] = n
   -- Real entries, because describe walks every one and refuses a zero.
   local i
   for i = 1, nchunks do
@@ -403,6 +443,8 @@ fftsa.nl.FINDS = function(lo, hi, pat)
 end
 local flat = {SAME, SAME, SAME, SAME, SAME, SAME}
 flat[64], flat[256] = SAME, SAME
+densify(flat, 65536)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, flat)
 local CAPBUF = {n = 2048, capacity = 65536, readings = flat}
 
 local d = fftsa.nl.describe(CAPBUF, false)
@@ -422,6 +464,7 @@ check('does not answer with the chunk the content scan would have found',
 fftsa.nl._stor_of = nil
 reset_heap()
 place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, flat)
 local probed = 0
 local REAL_FS = fftsa.nl._find_storage
 fftsa.nl._find_storage = function(b, x) probed = probed + 1; return REAL_FS(b, x) end
@@ -448,9 +491,26 @@ local function sigof(cap, n) return u32be(cap) .. u32be(n) end
 local DESCS, READHIT = {}, nil
 fftsa.nl.FINDS = function(lo, hi, pat)
   local out, m, i = {}, 0, nil
+  -- A four-byte needle is _find_desc looking for the storage address, so it is answered the
+  -- way the instrument answers it: every word in the heap that holds that value. That is
+  -- more than the descriptor -- entry 0 of the chunk vector holds it too -- which is why a
+  -- real sweep reports several raw hits and only one confirmed.
+  if string.len(pat) == 4 then
+    -- One call a byte: Lua 5.0.2's string.byte returns a single value, and the range form
+    -- that would give four is 5.1.
+    local want = string.byte(pat, 1) * 16777216 + string.byte(pat, 2) * 65536
+                 + string.byte(pat, 3) * 256 + string.byte(pat, 4)
+    local a, v
+    for a, v in pairs(WORDS) do
+      if v == want then m = m + 1; out[m] = a end
+    end
+    return out
+  end
   for i = 1, table.getn(DESCS) do
     local dd = DESCS[i]
-    if pat == sigof(dd.cap, dd.n) then m = m + 1; out[m] = dd.base + 116 end
+    -- capoff, because the hit lands on the capacity field and which offset that is is per
+    -- layout: a DMM7510 holds it at 0x6C.
+    if pat == sigof(dd.cap, dd.n) then m = m + 1; out[m] = dd.base + (dd.capoff or 116) end
   end
   if m > 0 then return out end
   if READHIT ~= nil then return {READHIT} end
@@ -469,8 +529,9 @@ end
 reset_heap()
 DESCS = {{base = DESC, cap = 65536, n = 2048}}
 place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
-local live = readings(0.125, 0.1875)
+local live = densify(readings(0.125, 0.1875), 65536)
 place_record(TRUE_E0, 24, live)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, live)
 READHIT = TRUE_E0
 local LIVEBUF = {n = 2048, capacity = 65536, readings = live}
 
@@ -491,6 +552,7 @@ DESCS = {{base = DECOY, cap = 65536, n = 4096}, {base = DESC, cap = 65536, n = 2
 place_desc(DECOY, DECOY_E0, 24, 1365, 49, 65536, 4096)
 place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
 place_record(TRUE_E0, 24, live)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, live)
 READHIT = TRUE_E0
 fftsa.nl._stor_of = nil
 local dd2 = fftsa.nl.describe(LIVEBUF, false)
@@ -510,6 +572,7 @@ for ci = 1, table.getn(counts) do
   DESCS = {{base = DESC, cap = 65536, n = cn}}
   place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, cn)
   place_record(TRUE_E0, 24, live)
+  place_geom(TRUE_E0, 24, 1365, VEC, cn, live)
   READHIT = nil
   fftsa.nl._stor_of = nil
   local dc = fftsa.nl.describe({n = cn, capacity = 65536, readings = live}, false)
@@ -521,6 +584,266 @@ end
 check('resolves at every count the app offers, with no content scan available',
       allok, string.format('counts=%d firstbad=%s',
                            table.getn(counts), tostring(firstbad)))
+
+-- The descriptor the question is about is the argument now, so the case has to hold one.
+reset_heap()
+DESCS = {{base = DESC, cap = 65536, n = 2048}}
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, flat)
+READHIT = nil
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local d65 = fftsa.nl.describe({n = 2048, capacity = 65536, readings = flat}, false)
+check('a DMM6500 layout names itself, and a write at those offsets is allowed',
+      d65 ~= nil and d65.doff == fftsa.nl.DOFF
+      and fftsa.nl.desc_off_ok(d65) == true,
+      string.format('%s doff=%s', fftsa.nl.desc_off_str(), tostring(d65 and d65.doff)))
+
+-- Default refuse, which is the half that was a default permit: a descriptor this cannot
+-- place, and no descriptor at all, are both writes it must not allow.
+check('a descriptor naming no layout, and no descriptor, both refuse the rewind',
+      fftsa.nl.desc_off_ok(nil) == false
+      and fftsa.nl.desc_off_ok({}) == false,
+      'nil and empty both refuse')
+
+-- ========================================================================================
+-- A DMM7510's own geometry, read off three 8.65 error pages.
+--
+-- Two things differ from a DMM6500 and each one stopped the app on its own:
+--
+--   * its STYLE_STANDARD reading element is 20 bytes, not 24. The content scan tried 32 and
+--     24 unconditionally and reached 20 only through the discovery loop, which runs only
+--     where readings 1 and 2 differ -- so a quiet capture reported "no stride confirmed
+--     ... eq12=true" and the app halted. 20 also leaves half the readings in a record
+--     4-aligned, which the native read refused outright as ECAPTURE.
+--   * its descriptor is the same fields with eight bytes gone ahead of the chunk vector:
+--     stor 0x40, s1 0x4C, s2 0x5C, vec 0x3C, cap 0x6C. The signature route looked for the
+--     capacity at 0x74, found 58 hits of the pair and no descriptor -- and that route is
+--     precisely the one a quiet capture depends on.
+--
+-- The figures are the ones on the glass, run 3 of three: the hit at 0x1321AF8, base
+-- 0x1321AB8, elemsize 0x14, perchunk 0x666, 0x29 chunks, capacity 0x10000 at base+0x6C with
+-- n 0x800 in the word above it. 20 * 1638 = 32,760 fills the payload with 8 to spare, and
+-- 65,536 readings at 1638 a chunk is the 41 the record states.
+-- ========================================================================================
+
+print('\nnl.describe on a DMM7510 geometry')
+
+local D75 = fftsa.nl.DOFF_7510
+local DESC75, E0_75 = 20060856, 20227184      -- 0x1321AB8, 0x134A470
+
+-- The quiet capture: identical readings, so no content scan can answer, and the signature
+-- route has to find the descriptor at this model's own capacity offset.
+reset_heap()
+DESCS = {{base = DESC75, cap = 65536, n = 2048, capoff = D75.cap}}
+place_desc(DESC75, E0_75, 20, 1638, 41, 65536, 2048, D75)
+place_geom(E0_75, 20, 1638, VEC, 2048, flat)
+READHIT = nil
+fftsa.nl._stor_of = nil
+local q75 = fftsa.nl.describe({n = 2048, capacity = 65536, readings = flat}, false)
+check('a quiet DMM7510 capture resolves from the signature at its own capacity offset',
+      q75 ~= nil and q75.chunk1 == E0_75 and q75.elemsize == 20 and q75.perchunk == 1638,
+      string.format('chunk1=%s es=%s pc=%s why=%s/%s',
+                    q75 and string.format('%X', q75.chunk1) or 'nil',
+                    q75 and tostring(q75.elemsize) or 'nil',
+                    q75 and tostring(q75.perchunk) or 'nil',
+                    tostring(fftsa.nl._sig_why), tostring(fftsa.nl._stor_why)))
+
+-- The one thing that must NOT follow from reading a second layout. The native cursor rewind
+-- stores at offsets compiled into the image, so a descriptor identified at any other set is
+-- readable and not writable -- the fields it would overwrite belong to whatever is there.
+check('the layout it matched is named, and a write at those offsets is refused',
+      q75 ~= nil and q75.doff == D75 and fftsa.nl.desc_off_ok(q75) == false,
+      string.format('%s doff=%s', fftsa.nl.desc_off_str(), tostring(q75 and q75.doff)))
+
+-- The element size the page could not state. It had to be decoded out of the hit dump a word
+-- at a time, and the page is the whole channel to an instrument on another continent.
+-- localnode only for this one check: diag() opens with the model and the firmware revision,
+-- which is the rest of what makes a grab readable.
+do
+  localnode = { model = 'DMM7510', version = '1.7.16a' }
+  local dg = fftsa.nl.diag()
+  localnode = nil
+  check('the diagnostic carries the measured stride and element 0',
+        string.find(dg, 'str=20 e0=134A470', 1, true) ~= nil, dg)
+end
+
+-- Readings 1 and 2 equal and the rest distinct: the discovery loop never runs, so only the
+-- unconditional candidates are tried. This is the "eq12=true" report exactly, and it passes
+-- only because 20 is one of them.
+local eqhead = {SAME, SAME, 0.25, 0.5, 0.75, 1.0}
+eqhead[64], eqhead[256] = 2.5, 3.75
+densify(eqhead, 65536)
+reset_heap()
+DESCS = {}
+place_desc(DESC75, E0_75, 20, 1638, 41, 65536, 2048, D75)
+place_record(E0_75, 20, eqhead)
+place_geom(E0_75, 20, 1638, VEC, 2048, eqhead)
+READHIT = E0_75
+-- The descriptor cache as well as the storage one: the case above resolved the same element
+-- 0, so a cache left in place would answer this one before it swept anything.
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local eh = fftsa.nl.describe({n = 2048, capacity = 65536, readings = eqhead}, false)
+check('stride 20 is an unconditional candidate, so equal first readings do not hide it',
+      eh ~= nil and eh.chunk1 == E0_75 and eh.elemsize == 20,
+      string.format('chunk1=%s es=%s why=%s',
+                    eh and string.format('%X', eh.chunk1) or 'nil',
+                    eh and tostring(eh.elemsize) or 'nil', tostring(fftsa.nl._stor_why)))
+
+check('and the sweep hit reached the descriptor at this layout, not the derived route',
+      fftsa.nl._hit_n == 1 and fftsa.nl.desc_off == nil and fftsa.nl.doff_used == D75,
+      string.format('hits=%s %s', tostring(fftsa.nl._hit_n), fftsa.nl.desc_off_str()))
+
+-- A record whose element 0 is only 4-aligned. A 20-byte element means the firmware is not
+-- loading these 8-aligned either, so an 8-byte filter on the scan's hits would reject real
+-- storage on this model half the time -- once per allocation, at random.
+reset_heap()
+DESCS = {}
+place_desc(DESC75, E0_75 + 4, 20, 1638, 41, 65536, 2048, D75)
+place_record(E0_75 + 4, 20, live)
+place_geom(E0_75 + 4, 20, 1638, VEC, 2048, live)
+READHIT = E0_75 + 4
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local a4 = fftsa.nl.describe({n = 2048, capacity = 65536, readings = live}, false)
+check('an element 0 only 4-aligned is found rather than filtered out',
+      a4 ~= nil and a4.chunk1 == E0_75 + 4 and a4.elemsize == 20,
+      string.format('chunk1=%s es=%s why=%s',
+                    a4 and string.format('%X', a4.chunk1) or 'nil',
+                    a4 and tostring(a4.elemsize) or 'nil', tostring(fftsa.nl._stor_why)))
+
+-- And the report must not carry the last buffer that DID resolve. A DMM7510 grab showed a
+-- 32-byte element and cap28672/n256 beside a capture buffer of cap65536/n2048 whose storage
+-- was never found: _find_desc never ran, so nothing cleared what the previous call left.
+reset_heap()
+DESCS = {}
+READHIT = nil
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local miss = fftsa.nl.describe({n = 2048, capacity = 65536, readings = flat}, false)
+check('a storage failure clears the descriptor half of the report',
+      miss == nil and fftsa.nl._raw_n == 0 and fftsa.nl._hit_n == 0
+      and fftsa.nl.hit_dump_str() == 'dump=none'
+      and fftsa.nl.hits_str() == 'at=none'
+      and fftsa.nl._desc_buf == 'cap65536/n2048',
+      string.format('raw=%s hits=%s buf=%s %s %s', tostring(fftsa.nl._raw_n),
+                    tostring(fftsa.nl._hit_n), tostring(fftsa.nl._desc_buf),
+                    fftsa.nl.hits_str(), fftsa.nl.hit_dump_str()))
+
+-- ========================================================================================
+-- geom_ok: the element size settled against the firmware's own readings.
+--
+-- This is the gate that rests on nothing read off a screen. The element size is a runtime sum
+-- of column widths -- no constant in either firmware image records it, confirmed by there
+-- being no `mulli` by any element size in the DMM7510 1.7.16a image -- so 20 cannot be looked
+-- up and has to be proved on the instrument. A wrong one does not refuse: it reads the wrong
+-- bytes as samples and draws a plausible, wrong spectrum.
+--
+-- Each case below leaves the content scan and the descriptor AGREEING, because describe
+-- already refuses them when they do not ("elemsize N disagrees with stride M") and that
+-- refusal would mask this one. Only the firmware's own readings disagree, which is exactly
+-- the shape a wrong per-model element size takes.
+-- ========================================================================================
+
+print('\ngeom_ok, the element size against the readings')
+
+-- Chunk 1 holding the reading a perchunk of 1365 would put there. Both the scan and the
+-- descriptor say 1638; a 24-byte element is what would put reading 1366 at that address.
+reset_heap()
+DESCS = {}
+place_desc(DESC75, E0_75, 20, 1638, 41, 65536, 2048, D75)
+place_record(E0_75, 20, live)
+place_geom(E0_75, 20, 1638, VEC, 2048, live)
+local c1 = WORDS[VEC + 4]
+local wh, wl = fftsa.nl._f64_words(live[1366])
+WORDS[c1], WORDS[c1 + 4] = wh, wl
+READHIT = E0_75
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local wrong = fftsa.nl.describe({n = 2048, capacity = 65536, readings = live}, false)
+check('a geometry that does not address the readings is refused, not believed',
+      wrong == nil and fftsa.nl._geom_why ~= nil
+      and string.find(tostring(fftsa.nl._stor_why), 'does not address the readings',
+                      1, true) ~= nil,
+      string.format('d=%s why=%s stor=%s', tostring(wrong), tostring(fftsa.nl._geom_why),
+                    tostring(fftsa.nl._stor_why)))
+
+-- The figure a fix needs: not that 20 was wrong, but that 24 fits. A chunk boundary is what
+-- makes this answerable -- each candidate element size predicts a different reading index at
+-- the same address, so only the true one matches.
+check('and it names the element size that WOULD fit, which is the actionable figure',
+      string.find(tostring(fftsa.nl._geom_why), 'fits es=24', 1, true) ~= nil
+      and string.find(tostring(fftsa.nl._geom_why), 'pc=1365', 1, true) ~= nil,
+      tostring(fftsa.nl._geom_why))
+
+check('and the refusal names the reading index and the geometry it was tried at',
+      string.find(tostring(fftsa.nl._geom_why), 'reading 1639', 1, true) ~= nil
+      and string.find(tostring(fftsa.nl._geom_why), 'es=20', 1, true) ~= nil
+      and string.find(tostring(fftsa.nl._geom_why), 'pc=1638', 1, true) ~= nil,
+      tostring(fftsa.nl._geom_why))
+
+-- The last element of chunk 0. Without this term the stride is confirmed only as far as the
+-- content scan's furthest index, 256, and a record of 1638 elements a chunk is unchecked over
+-- the remaining 1381.
+reset_heap()
+DESCS = {}
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+place_record(TRUE_E0, 24, live)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, live)
+local lastw = TRUE_E0 + 1364 * 24
+local lh, ll = fftsa.nl._f64_words(live[9999])
+WORDS[lastw], WORDS[lastw + 4] = lh, ll
+READHIT = TRUE_E0
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local lastbad = fftsa.nl.describe({n = 2048, capacity = 65536, readings = live}, false)
+check('the stride is checked at the last element of a chunk, not only as far as index 256',
+      lastbad == nil
+      and string.find(tostring(fftsa.nl._geom_why), 'reading 1365', 1, true) ~= nil,
+      tostring(fftsa.nl._geom_why))
+
+-- And a correct DMM6500 record passes, having actually looked at something: a check that
+-- confirms zero indices passes everything.
+reset_heap()
+DESCS = {}
+place_desc(DESC, TRUE_E0, 24, 1365, 49, 65536, 2048)
+place_record(TRUE_E0, 24, live)
+place_geom(TRUE_E0, 24, 1365, VEC, 2048, live)
+READHIT = TRUE_E0
+fftsa.nl._stor_of, fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil, nil
+local good = fftsa.nl.describe({n = 2048, capacity = 65536, readings = live}, false)
+check('a correct record passes, and the check looked at more than nothing',
+      good ~= nil and fftsa.nl._geom_why == nil
+      and type(fftsa.nl._geom_n) == 'number' and fftsa.nl._geom_n >= 3,
+      string.format('d=%s n=%s why=%s', tostring(good ~= nil),
+                    tostring(fftsa.nl._geom_n), tostring(fftsa.nl._geom_why)))
+
+-- A DMM6500 descriptor must still not be read as a DMM7510 one or the other way round. The
+-- two sets put the storage pointer and the two self-pointers at three different distances
+-- from each other, so a record placed at one set is refused at the other -- which is what
+-- lets both be tried without a false positive.
+reset_heap()
+DESCS = {}
+place_desc(DESC75, E0_75, 24, 1365, 49, 65536, 2048)     -- the DMM6500 offsets
+READHIT = E0_75
+fftsa.nl._stor_of = nil
+-- Named for what they hold: as_7510 is the record READ AT the 7510 offsets. Both directions,
+-- and both at a fixed base, which is the one route where a single base can satisfy either set
+-- -- so this is also the case that makes the order in DOFF_SETS load-bearing.
+local as_7510 = fftsa.nl._read_desc_1(DESC75, E0_75, D75)
+local as_6500 = fftsa.nl._read_desc_1(DESC75, E0_75, fftsa.nl.DOFF)
+check('a record at one layout is refused when read at the other',
+      as_7510 == nil and as_6500 == DESC75,
+      string.format('as7510=%s as6500=%s', tostring(as_7510), tostring(as_6500)))
+
+-- And the mirror, which the case above does not cover: a record placed at the 7510 offsets
+-- must be refused when read at the compiled ones.
+reset_heap()
+place_desc(DESC75, E0_75, 20, 1638, 41, 65536, 2048, D75)
+local m7510 = fftsa.nl._read_desc_1(DESC75, E0_75, D75)
+local m6500 = fftsa.nl._read_desc_1(DESC75, E0_75, fftsa.nl.DOFF)
+check('and the other way round, so neither layout can be read as the other',
+      m7510 == DESC75 and m6500 == nil,
+      string.format('as7510=%s as6500=%s', tostring(m7510), tostring(m6500)))
+
+-- _read_desc_1 sets doff_used and chunk_span as a side effect, and these calls are outside
+-- any describe(), so the module is left attributing a layout to a buffer nothing described.
+fftsa.nl.doff_used, fftsa.nl.chunk_span = nil, nil
 
 -- ========================================================================================
 -- The descriptor outside every anchored window: the DMM7510 1.7.16 failure.
@@ -1433,7 +1756,7 @@ do
   -- The one consequence that matters: the image's cursor rewind stores at displacements
   -- compiled into it, so a descriptor found this way must not be handed to it.
   check('a derived layout refuses the native cursor rewind',
-        fftsa.nl.desc_off_ok() == false, fftsa.nl.desc_off_str())
+        fftsa.nl.desc_off_ok(d) == false, fftsa.nl.desc_off_str())
 
   -- The chunk vector holds the storage address too, and its neighbourhood has no self-pointer
   -- pair. That hit has to be rejected on its own terms rather than by being second in the
@@ -1480,7 +1803,7 @@ do
   local d2 = fftsa.nl.describe(BUF, true)
   check('the measured layout is still found without deriving anything',
         d2 ~= nil and d2.desc == DESC and fftsa.nl.desc_off == nil
-        and fftsa.nl.desc_off_ok() == true,
+        and fftsa.nl.desc_off_ok(d2) == true,
         string.format('desc=%s doff=%s win=%s',
                       d2 and string.format('%X', d2.desc) or 'nil',
                       fftsa.nl.desc_off_str(), tostring(fftsa.nl._win_hit)))

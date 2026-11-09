@@ -48,6 +48,22 @@
  * window alone is not a tight enough bound for a chunk access. */
 #define DSPN_CHUNK_BYTES  32768U
 
+/* The longest chunk vector a capture buffer may own.
+ *
+ * NOT the number of blocks a record spans.  That is DSP_MAX_SRC_BLOCKS, and it bounds the
+ * pointer array dsp_src carries.  A buffer's vector is as long as its CAPACITY needs, and
+ * the record using it is usually a small part of that: 65,536 readings of 24 bytes is 49
+ * entries and of 20 bytes is 41, while a 2048-sample record out of either spans 2.  The two
+ * figures are a factor of twenty apart at the short counts, which is why they cannot share
+ * a bound -- capping the vector length at DSP_MAX_SRC_BLOCKS refused a DMM6500's own capture
+ * outright, measured on the instrument as DSPN_ECAPTURE.
+ *
+ * The bound exists so that `nchunks * 4`, the byte length the vector's range test is given,
+ * cannot wrap a uint32 and present as a zero-length range -- which dspn_range_ok permits at
+ * any address, the vector page and the device registers included.  4096 is the figure
+ * native_link.tsp's _read_desc_1 refuses a descriptor at, so the two sides agree on it. */
+#define DSPN_MAX_NCHUNKS  4096U
+
 /* Is [a, a+n) wholly inside [lo, hi)?  A zero-length range touches nothing and is
  * permitted anywhere; a range that wraps at 32 bits is not. */
 static int dspn_range_ok(uint32_t a, uint32_t n, uint32_t lo, uint32_t hi)
