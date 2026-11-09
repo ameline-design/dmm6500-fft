@@ -1687,10 +1687,13 @@ check('the licence on the about screen is LICENSE, verbatim', (function()
   end
   f:close()
   while n > 0 and want[n] == '' do want[n] = nil; n = n - 1 end
+  -- The licence is the rows BEFORE about_diag_at: the native-path state is appended after it
+  -- so a working instrument can report what it did, and that marker is where it starts.
   local got = fftsa.about_text
   local ng = table.getn(got)
+  if fftsa.about_diag_at ~= nil then ng = fftsa.about_diag_at - 1 end
   if ng ~= n then
-    return false, string.format('%d rows on the screen, %d lines in LICENSE', ng, n)
+    return false, string.format('%d licence rows on the screen, %d lines in LICENSE', ng, n)
   end
   local i
   for i = 1, n do
@@ -1721,10 +1724,10 @@ check('the author line is FONT_4 and every licence row FONT_1', (function()
 end)())
 -- One object a row, rewritten per page, so the count is the page size and not the licence
 -- length. The licence is longer than a page at FONT_1, which is what the paging is for.
-check('there is one object per row and more licence than fits a page', (function()
+check('there is one object per row and more text than fits a page', (function()
   local rows = table.getn(fftsa.about_lines)
   return rows == fftsa.about_rows and fftsa.about_pages() > 1,
-         string.format('%d row objects for %d a page, %d licence rows, %d pages',
+         string.format('%d row objects for %d a page, %d rows of text in all, %d pages',
                        rows, fftsa.about_rows, table.getn(fftsa.about_text),
                        fftsa.about_pages())
 end)())
@@ -4577,7 +4580,7 @@ check('without either implementation, start refuses and says so', (function()
   fftsa.fft_init, fftsa.nl = keepi, keepnl
   fftsa.start()
   fftsa.frame()
-  return ok == false and string.find(why, 'no interpreted fallback', 1, true) ~= nil,
+  return ok == false and string.find(why, 'NODSP nofallback', 1, true) ~= nil,
          'start=' .. tostring(ok) .. ' lasterr=' .. why
 end)())
 -- A DEFECT IN nl.init MUST REACH THE ERROR PAGE, NOT KILL THE APP. init is several hundred
@@ -5948,6 +5951,240 @@ check('and with a working pool it builds a screen and shows it', (function()
   return h ~= nil and on and txt, 'screen ' .. tostring(h) .. ', message shown: '
          .. tostring(txt)
 end)())
+-- The native-path state on the About pages is the only report a WORKING instrument can send
+-- back, and the channel is a screen grab. Three things have to hold: it is reachable by
+-- paging, it starts at the top of a page so one grab is the whole of it, and a second launch
+-- does not add a second copy -- fftsa.start() runs again per launch while the load-time
+-- licence table does not.
+print('\nthe native state on the About pages (real code)')
+check('the About pages carry the native state, on a page of their own', (function()
+  -- A diagnostic the size of a real one, so the padding and the wrap are both exercised:
+  -- this suite loads no nl module, and a two-line state would pass a layout that a ten-line
+  -- one breaks.
+  local keep = fftsa.nl
+  fftsa.nl = {diag = function()
+    return 'model=STUB fw=9.9 ' .. string.rep('k=0123456789ABCDEF ', 40) .. 'ENDOFSTATE'
+  end}
+  fftsa.about_add_diag()
+  fftsa.nl = keep
+  local at = fftsa.about_diag_at
+  if at == nil then return false, 'about_diag_at was never set' end
+  -- The padded start is where the state really begins, which is the next page boundary.
+  local first = at
+  while fftsa.about_text[first] == '' do first = first + 1 end
+  local body, i = '', nil
+  for i = first, table.getn(fftsa.about_text) do
+    body = body .. tostring(fftsa.about_text[i])
+    if string.len(fftsa.about_text[i]) > fftsa.about_cols then
+      return false, 'row ' .. i .. ' is ' .. string.len(fftsa.about_text[i]) .. ' chars'
+    end
+  end
+  local onpage = (math.mod(first - 1, fftsa.about_rows) == 0)
+  local pages = fftsa.about_pages()
+  local reach = fftsa.about_show_page(pages)
+  local ok = onpage and reach
+             and string.find(body, tostring(fftsa.VERSION), 1, true) ~= nil
+             and string.find(body, 'DMM6500', 1, true) ~= nil
+             and string.find(body, 'ENDOFSTATE', 1, true) ~= nil
+  fftsa.about_add_diag()
+  return ok, string.format('at=%d first=%d rows=%d pages=%d body=%d chars onpage=%s',
+                           at, first, fftsa.about_rows, pages, string.len(body),
+                           tostring(onpage))
+end)())
+
+check('a second launch does not append a second copy of it', (function()
+  local n1 = table.getn(fftsa.about_text)
+  fftsa.about_add_diag()
+  fftsa.about_add_diag()
+  local n2 = table.getn(fftsa.about_text)
+  return n1 == n2, string.format('%d rows, then %d after two more appends', n1, n2)
+end)())
+
+check('and with no native module it says so rather than leaving the page blank', (function()
+  local keep = fftsa.nl
+  fftsa.nl = nil
+  fftsa.about_add_diag()
+  fftsa.nl = keep
+  local body, i = '', nil
+  for i = fftsa.about_diag_at, table.getn(fftsa.about_text) do
+    body = body .. tostring(fftsa.about_text[i])
+  end
+  fftsa.about_add_diag()
+  return string.find(body, 'no native path', 1, true) ~= nil, 'body=' .. body
+end)())
+
+-- The rows are laid out from constants against an undocumented font, and the 7510 is the one
+-- instrument that cannot be looked at -- so the arithmetic is checked here. An OBJ_TEXT y is
+-- not its baseline: the ink starts about 37 px below for a 17 px font, and a button's face is
+-- 50 px below its y. Those two offsets are why a row block that looks clear of the button row
+-- by its y figures can overlap it on the glass.
+check('the error page rows clear the button face and the footer', (function()
+  local INK = 37                        -- measured: ink top below the stated y
+  local H = 17                          -- FONT_1 ink height
+  local BTN = 50                        -- button face top below its stated y
+  local lastink = fftsa.err_y0 + (fftsa.err_rows - 1) * fftsa.err_dy + INK + H
+  local btntop = fftsa.opt_btn_y + BTN
+  local footink = fftsa.err_foot_y + INK
+  local firstink = fftsa.err_y0 + INK
+  -- The footer shares the button's band vertically and clears it in x, so what matters is
+  -- that it is below the rows and its ink still lands on a 480 px panel.
+  return lastink <= btntop and footink > lastink and footink + H <= 480
+         and fftsa.err_dy >= H and firstink > 100,
+         string.format('rows ink %d..%d, button face from %d, footer ink %d..%d, pitch %d',
+                       firstink, lastink, btntop, footink, footink + H, fftsa.err_dy)
+end)())
+
+-- THE WRAP MUST NOT LOSE A CHARACTER. The page carries a native-path diagnostic that an
+-- operator on a model we cannot test on photographs and sends back, so a line break that
+-- eats a byte or splits a hex address is a wrong address in the report -- indistinguishable
+-- from a wrong address on the instrument.
+check('err_wrap keeps every character and breaks only on spaces', (function()
+  local msgs = {
+    'short',
+    'a b c d e f g h i j k l m n o p q r s t u v w x y z',
+    string.rep('why=0123456789ABCDEF ', 40),
+    string.rep('x', 400),                          -- one run, no space to break on
+    'tail ' .. string.rep('y', 200) .. ' head',
+    '',
+  }
+  local bad = nil
+  local i
+  for i = 1, table.getn(msgs) do
+    local lines = fftsa.err_wrap(msgs[i], 86)
+    local j, joined = nil, {}
+    for j = 1, table.getn(lines) do
+      if string.len(lines[j]) > 86 then
+        bad = 'case ' .. i .. ' line ' .. j .. ' is ' .. string.len(lines[j]) .. ' chars'
+      end
+      joined[j] = lines[j]
+    end
+    -- Spaces are what a break consumes, so the comparison is on everything else.
+    local flat = string.gsub(table.concat(joined, ' '), ' ', '')
+    local want = string.gsub(msgs[i], ' ', '')
+    if flat ~= want then
+      bad = bad or ('case ' .. i .. ' lost or gained text: ' .. string.len(flat)
+                    .. ' vs ' .. string.len(want))
+    end
+  end
+  return bad == nil, bad or (table.getn(msgs) .. ' messages, nothing lost')
+end)())
+
+-- A diagnostic longer than one page used to be cut at 13 lines with nothing to say so. The
+-- report that came back from a DMM7510 was exactly that: a wall of hex with the end missing.
+check('a long report is paged rather than silently cut', (function()
+  local long = 'LONGREPORT ' .. string.rep('k=0123456789ABCDEF ', 120) .. 'LASTTOKEN'
+  local h = fftsa.show_error(long)
+  local rows, more = 0, nil
+  local _, o
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h then
+      if o.type == display.OBJ_TEXT and o.y ~= nil and o.y >= fftsa.err_y0
+         and o.y < fftsa.err_y0 + fftsa.err_rows * fftsa.err_dy then
+        rows = rows + 1
+      end
+      if o.type == display.OBJ_BUTTON then more = o.label end
+    end
+  end
+  local npages = math.floor((table.getn(fftsa.err_text) + fftsa.err_rows - 1)
+                            / fftsa.err_rows)
+  -- The button has to reach the end: pressing it npages-1 times must land on the last page
+  -- with the last token on the glass, and once more must wrap to the first rather than show
+  -- a blank one.
+  local i
+  for i = 1, npages - 1 do fftsa.err_more() end
+  local last = (fftsa.err_page == npages)
+  local shown = false
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT and o.text ~= nil
+       and string.find(o.text, 'LASTTOKEN', 1, true) ~= nil then shown = true end
+  end
+  fftsa.err_more()
+  return rows == fftsa.err_rows and more == 'More' and npages > 1 and last and shown
+         and fftsa.err_page == 1,
+         string.format('rows=%d btn=%s pages=%d landed=%s lasttoken=%s wrapped=%s',
+                       rows, tostring(more), npages, tostring(last), tostring(shown),
+                       tostring(fftsa.err_page))
+end)())
+
+-- The build has to be on the page. A report that does not name its build cannot be matched
+-- to a fix, and every 7510 report so far has had to be placed by hand instead.
+check('the error page names the build', (function()
+  local h = fftsa.show_error('synthetic failure')
+  local seen = false
+  local _, o
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT and o.text ~= nil
+       and string.find(o.text, tostring(fftsa.VERSION), 1, true) ~= nil then seen = true end
+  end
+  return seen and fftsa.VERSION ~= nil, 'version=' .. tostring(fftsa.VERSION)
+         .. ' on the page: ' .. tostring(seen)
+end)())
+
+-- The report comes back as a grab of whatever was on the glass, so an operator who is not
+-- told there are more pages sends one of three. The hint has to appear only when there is
+-- something to page to, or it is an instruction that does nothing.
+check('a multi-page report tells the operator to grab every page', (function()
+  local long = 'LONGREPORT ' .. string.rep('k=0123456789ABCDEF ', 120) .. 'LASTTOKEN'
+  local h = fftsa.show_error(long)
+  local foot = nil
+  local _, o
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT and o.text ~= nil
+       and string.find(o.text, 'End App', 1, true) ~= nil then foot = o.text end
+  end
+  local many = foot ~= nil and string.find(foot, 'every page', 1, true) ~= nil
+  h = fftsa.show_error('short one')
+  local short = nil
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT and o.text ~= nil
+       and string.find(o.text, 'End App', 1, true) ~= nil then short = o.text end
+  end
+  return many and short ~= nil and string.find(short, 'every page', 1, true) == nil,
+         'long=' .. tostring(foot) .. ' | short=' .. tostring(short)
+end)())
+
+-- The three facts that place a report: the app build, the model and the firmware. They are on
+-- the headline rather than only inside the native diagnostic, because startup can fail where
+-- that diagnostic is never built.
+check('the headline carries the build, the model and the firmware', (function()
+  local keep = localnode
+  localnode = {model = 'DMM7510', version = '1.7.16a'}
+  local h = fftsa.show_error('synthetic failure')
+  localnode = keep
+  local head = nil
+  local _, o
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == h and o.type == display.OBJ_TEXT
+       and o.font == display.FONT_MEDIUM then head = o.text end
+  end
+  return head ~= nil
+         and string.find(head, tostring(fftsa.VERSION), 1, true) ~= nil
+         and string.find(head, 'DMM7510', 1, true) ~= nil
+         and string.find(head, '1.7.16a', 1, true) ~= nil,
+         'headline=' .. tostring(head)
+end)())
+
+-- And an instrument that will not answer either attribute still gets a page: the report is
+-- the point, and a nil reaching string concatenation would raise inside the pcall and blank
+-- the panel instead.
+check('a silent instrument still gets a page, with the gaps named', (function()
+  local keep = localnode
+  localnode = nil
+  local ok, h = pcall(fftsa.show_error, 'synthetic failure')
+  localnode = keep
+  local head = nil
+  if ok and h ~= nil then
+    local _, o
+    for _, o in pairs(OBJ) do
+      if o.alive and o.parent == h and o.type == display.OBJ_TEXT
+         and o.font == display.FONT_MEDIUM then head = o.text end
+    end
+  end
+  return ok and head ~= nil and string.find(head, '?model', 1, true) ~= nil
+         and string.find(head, '?fw', 1, true) ~= nil,
+         'raised=' .. tostring(not ok) .. ' headline=' .. tostring(head)
+end)())
+
 check('and stop() reclaims it', (function()
   fftsa.stop()
   return fftsa.errscr == nil and live() == 0, 'live=' .. live()
@@ -6073,7 +6310,7 @@ check('an exhausted object pool fails the start with a reason, and cleans up', (
   end
   local started = fftsa.start()
   display.create = realcreate
-  local said = string.find(tostring(fftsa.lasterr), 'pool exhausted', 1, true) ~= nil
+  local said = string.find(tostring(fftsa.lasterr), 'OBJPOOL', 1, true) ~= nil
   local cleaned = live('timer') == 0
   local ok = fftsa.start()                       -- and it recovers afterwards
   return started == false and said and cleaned and ok,

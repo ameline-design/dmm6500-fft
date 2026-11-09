@@ -1058,12 +1058,30 @@ do
       IMG[a + i * 4] = string.sub(s, i * 4 + 1, i * 4 + 4)
     end
   end
+  -- The ladder's last stage sweeps the whole backstop, which is 8192 blocks of 32 KB, and
+  -- assembling each one word by word made this suite take a minute -- long enough that it
+  -- would get skipped, which is how it came to be in no gate at all. The fixture is a few
+  -- dozen words, so a block holding none of them is a constant and is answered from a cache.
+  -- Same bytes either way: what is cached is the all-zero case, not a short cut around it.
+  local ZEROS = {}
+  local function zeros(n)
+    if ZEROS[n] == nil then ZEROS[n] = string.rep('\0', n) end
+    return ZEROS[n]
+  end
+  local function touches(w0, w1)
+    local p, _
+    for p, _ in pairs(IMG) do
+      if p >= w0 and p < w1 then return true end
+    end
+    return false
+  end
   ki.memread = function(ah, lh)
     local a, n = tonumber(ah, 16), tonumber(lh, 16)
     if a == nil or n == nil or n <= 0 then return nil end
     local w0 = a - math.mod(a, 4)
     local w1 = a + n + 3
     w1 = w1 - math.mod(w1, 4)
+    if not touches(w0, w1) then return zeros(n) end
     local acc, k, p = {}, 0, nil
     for p = w0, w1 - 4, 4 do
       k = k + 1
@@ -1279,6 +1297,237 @@ do
         'ok=' .. tostring(lowok) .. ' res=' .. tostring(lowres))
 
   fftsa.nl.arena = nil
+  tostring = SAVEDT
+end
+
+-- ========================================================================================
+-- A descriptor whose field offsets are not the ones measured on a DMM6500.
+--
+-- A DMM7510 1.7.16 confirmed element 0 against eleven readings, found 30 words holding that
+-- address with the sweep covering the whole backstop, and matched the descriptor signature at
+-- none of them. Two things explain that and they need opposite fixes: the words were never
+-- actually read, or the layout is not the assumed one. The first is now counted by
+-- nl.sweep_str; the second is what the derived pass answers, and a DMM6500 cannot exercise it
+-- because its layout is the one being assumed.
+--
+-- So the fixture here is a descriptor laid out DIFFERENTLY -- storage pointer at +0x60, self
+-- pointers at +0x6C and +0x7C, geometry at +0x18, count at +0x20, vector at +0x5C -- and
+-- every one of those has to be recovered from the data. None of them is an input. The second
+-- fixture puts the same descriptor back at the measured offsets, which must still be found by
+-- the cheap route with nothing derived at all.
+-- ========================================================================================
+
+print('\nnl._derive_desc: a layout that is not the measured one')
+
+do
+  local SAVEDT = tostring
+  -- A megabyte, so the ladder's last stage is 32 blocks rather than 8192. Which windows get
+  -- swept is settled by the scan_windows cases above; what is under test here is what happens
+  -- to a hit once the sweep returns it.
+  fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 3145728, 4194304     -- 0x300000..0x400000
+
+  local ELEM0  = 3211264     -- 0x310000, 8-aligned, as _find_storage requires
+  local PAY1   = 3244032     -- 0x318000
+  local PAY2   = 3276800     -- 0x320000
+  local VEC    = 3342336     -- 0x330000, below the descriptor so its hit is examined first
+  local DESC   = 3407872     -- 0x340000
+  local ANCHOR = 3473408     -- 0x350000
+
+  local IMG = {}
+  local function be32(v)
+    return string.char(math.floor(v / 16777216), math.mod(math.floor(v / 65536), 256),
+                       math.mod(math.floor(v / 256), 256), math.mod(v, 256))
+  end
+  local function wr32(a, v) IMG[a] = be32(v) end
+  local function wr64(a, x)
+    local hi, lo = fftsa.nl._f64_words(x)
+    IMG[a], IMG[a + 4] = be32(hi), be32(lo)
+  end
+  local SHORT = 0            -- when non-zero, every memread answers this many bytes at most
+  ki.memread = function(ah, lh)
+    local a, n = tonumber(ah, 16), tonumber(lh, 16)
+    if a == nil or n == nil or n <= 0 then return nil end
+    if SHORT > 0 and n > SHORT then n = SHORT end
+    local w0 = a - math.mod(a, 4)
+    local w1 = a + n + 3
+    w1 = w1 - math.mod(w1, 4)
+    local acc, k, p = {}, 0, nil
+    for p = w0, w1 - 4, 4 do
+      k = k + 1
+      acc[k] = IMG[p] or '\0\0\0\0'
+    end
+    return string.sub(table.concat(acc), a - w0 + 1, a - w0 + n)
+  end
+  ki.peek32 = function(ah)
+    local a = tonumber(ah, 16)
+    local s = IMG[a]
+    if s == nil then return '0' end
+    return string.format('%X', ((string.byte(s, 1) * 256 + string.byte(s, 2)) * 256
+                                + string.byte(s, 3)) * 256 + string.byte(s, 4))
+  end
+  tostring = function(v)
+    if type(v) == 'table' and next(v) == nil then
+      return 'table: ' .. string.format('%x', ANCHOR)
+    end
+    return SAVEDT(v)
+  end
+
+  -- Readings a content scan can confirm: six consecutive, index 64 and index 256, and three
+  -- extra values at +20 inside the element. Values with no 0x31 byte in them, so none of them
+  -- can be mistaken for the 0x00310000 the descriptor sweep is looking for.
+  local RV = {0.125, 0.1875, 0.25, 0.375, 0.5, 0.625}
+  RV[64], RV[256] = 1.5, 2.5
+  local EV = {4.0, 8.0, 16.0}
+  local BUF = {n = 256, capacity = 1024, readings = RV, extravalues = EV}
+
+  local function place_record()
+    local i, v
+    for i, v in pairs(RV) do
+      wr64(ELEM0 + (i - 1) * 32, v)
+    end
+    for i = 1, 3 do
+      wr64(ELEM0 + (i - 1) * 32 + 20, EV[i])
+    end
+  end
+
+  -- off is base-to-storage-pointer; the rest move with it so nothing in the fixture lines up
+  -- with the measured layout by accident.
+  local function place(o)
+    IMG = {}
+    place_record()
+    wr32(VEC, ELEM0)
+    wr32(VEC + 4, PAY1)
+    wr32(VEC + 8, PAY2)
+    wr32(DESC + o.stor, ELEM0)
+    wr32(DESC + o.s1, DESC)
+    wr32(DESC + o.s2, DESC)
+    wr32(DESC + o.es, 32)
+    wr32(DESC + o.pc, 1024)
+    wr32(DESC + o.nc, 3)
+    wr32(DESC + o.vec, VEC)
+    fftsa.nl._desc_of, fftsa.nl._desc_at, fftsa.nl.arena = nil, nil, nil
+    fftsa.nl._stor_of, fftsa.nl._stor_elem0 = nil, nil
+  end
+
+  local SHIFTED = {stor = 96, s1 = 108, s2 = 124, es = 24, pc = 28, nc = 32, vec = 92}
+  place(SHIFTED)
+
+  local d = fftsa.nl.describe(BUF, true)
+  local o = fftsa.nl.desc_off
+  check('finds a descriptor whose every offset differs from the measured one',
+        d ~= nil and d.desc == DESC and d.vec == VEC and d.nchunks == 3
+        and d.elemsize == 32 and d.perchunk == 1024,
+        string.format('desc=%s vec=%s nc=%s es=%s why=%s der=%s',
+                      d and string.format('%X', d.desc) or 'nil',
+                      d and string.format('%X', d.vec) or 'nil',
+                      d and tostring(d.nchunks) or 'nil',
+                      d and tostring(d.elemsize) or 'nil',
+                      tostring(fftsa.nl._stor_why), tostring(fftsa.nl._der_why)))
+
+  check('and reports the offsets it derived, every one of them the fixture\'s',
+        o ~= nil and o.stor == SHIFTED.stor and o.es == SHIFTED.es and o.pc == SHIFTED.pc
+        and o.nc == SHIFTED.nc and o.vec == SHIFTED.vec,
+        o and string.format('stor=%d es=%d pc=%d nc=%d vec=%d self=%d',
+                            o.stor, o.es, o.pc, o.nc, o.vec, o.self_n) or 'nil')
+
+  -- The one consequence that matters: the image's cursor rewind stores at displacements
+  -- compiled into it, so a descriptor found this way must not be handed to it.
+  check('a derived layout refuses the native cursor rewind',
+        fftsa.nl.desc_off_ok() == false, fftsa.nl.desc_off_str())
+
+  -- The chunk vector holds the storage address too, and its neighbourhood has no self-pointer
+  -- pair. That hit has to be rejected on its own terms rather than by being second in the
+  -- list, so it is asked directly.
+  local vb = fftsa.nl._derive_desc(VEC, ELEM0, 32)
+  check('the chunk vector\'s own copy of the address is refused, and says why',
+        vb == nil and fftsa.nl._der_why ~= nil
+        and string.find(fftsa.nl._der_why, 'self-pointer', 1, true) ~= nil,
+        'base=' .. tostring(vb) .. ' why=' .. tostring(fftsa.nl._der_why))
+
+  -- One self-pointer is not a descriptor. A single word equal to a nearby address turns up in
+  -- ordinary allocator bookkeeping, and the measured shape has two.
+  place(SHIFTED)
+  wr32(DESC + SHIFTED.s2, 0)
+  local one = fftsa.nl._derive_desc(DESC + SHIFTED.stor, ELEM0, 32)
+  check('one self-pointer is refused where two are confirmed',
+        one == nil, 'base=' .. tostring(one) .. ' why=' .. tostring(fftsa.nl._der_why))
+
+  -- The element size has to be the stride the content scan measured. A descriptor whose
+  -- geometry says something else is a different buffer's, and the pair it would answer with
+  -- would be checked against the stride one step later anyway.
+  place(SHIFTED)
+  wr32(DESC + SHIFTED.es, 24)
+  local wrongsz = fftsa.nl._derive_desc(DESC + SHIFTED.stor, ELEM0, 32)
+  check('a geometry that disagrees with the measured stride is refused',
+        wrongsz == nil and fftsa.nl._der_why ~= nil
+        and string.find(fftsa.nl._der_why, 'elemsize', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl._der_why))
+
+  -- The count must equal what the vector actually holds. A field that says four where three
+  -- entries are plausible would have the caller read a fourth from whatever follows.
+  place(SHIFTED)
+  wr32(DESC + SHIFTED.nc, 4)
+  local wrongnc = fftsa.nl._derive_desc(DESC + SHIFTED.stor, ELEM0, 32)
+  check('a chunk count the vector does not support is refused',
+        wrongnc == nil and fftsa.nl._der_why ~= nil
+        and string.find(fftsa.nl._der_why, 'plausible entries', 1, true) ~= nil,
+        'why=' .. tostring(fftsa.nl._der_why))
+
+  -- AND THE OTHER HALF: the measured layout must still be found by the cheap route, with
+  -- nothing derived. Otherwise a fix for the model that fails could have moved the model that
+  -- works onto a path with more freedom in it.
+  place(fftsa.nl.DOFF)
+  local d2 = fftsa.nl.describe(BUF, true)
+  check('the measured layout is still found without deriving anything',
+        d2 ~= nil and d2.desc == DESC and fftsa.nl.desc_off == nil
+        and fftsa.nl.desc_off_ok() == true,
+        string.format('desc=%s doff=%s win=%s',
+                      d2 and string.format('%X', d2.desc) or 'nil',
+                      fftsa.nl.desc_off_str(), tostring(fftsa.nl._win_hit)))
+
+  -- A short read is the other explanation for "swept everything and found nothing", and the
+  -- one that would make every count on the error page a lie.
+  --
+  -- The needle is planted in the part of the FIRST block that a short read did not return:
+  -- the block starts at lo and SHORT bytes came back, so lo + SHORT + 8 is inside the block
+  -- and past everything read. A sweep that advances by the length it ASKED for steps over
+  -- that address and reports the needle absent, having read an eighth of memory.
+  print('\nnl.FINDS with every read answering short')
+
+  place(fftsa.nl.DOFF)
+  SHORT = 4096
+  local MARK = 1515806629                -- 0x5A5AA5A5, nowhere else in the fixture
+  local LO = fftsa.nl.BACKSTOP_LO
+  local GAP = LO + SHORT + 8
+  wr32(GAP, MARK)
+  fftsa.nl.sweep_reset()
+  local h = fftsa.nl.FINDS(LO, LO + 131072, be32(MARK))
+  local found, i = false, nil
+  for i = 1, table.getn(h) do
+    if h[i] == GAP then found = true end
+  end
+  check('a needle in the part of a block a short read did not return is still found',
+        found, string.format('hits=%d at=%s %s', table.getn(h),
+                             h[1] and string.format('%X', h[1]) or 'none',
+                             fftsa.nl.sweep_str()))
+  check('and the short reads are counted rather than passed over in silence',
+        fftsa.nl._sw_short > 0 and fftsa.nl._sw_bytes > 0,
+        fftsa.nl.sweep_str())
+  SHORT = 0
+
+  -- A block that cannot be read at all must advance the sweep, not spin on it. An unbounded
+  -- loop in one TSP statement cannot be interrupted from the panel.
+  local READ_OK = ki.memread
+  ki.memread = function() return nil end
+  fftsa.nl.sweep_reset()
+  local none = fftsa.nl.FINDS(fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_LO + 131072,
+                              be32(ELEM0))
+  ki.memread = READ_OK
+  check('a sweep whose reads all fail terminates, and reports that it read nothing',
+        table.getn(none) == 0 and fftsa.nl._sw_nil == 4 and fftsa.nl._sw_bytes == 0,
+        fftsa.nl.sweep_str())
+
+  fftsa.nl.desc_off, fftsa.nl.arena = nil, nil
   tostring = SAVEDT
 end
 

@@ -440,8 +440,31 @@ to **0.02 dB** across the span and **61 dB** down above the Nyquist.
 
 ## About
 
-**About**, bottom left of the Options form, names the author and carries the MIT licence over two
-pages with **PgUp** and **PgDn**. **Back** returns to the form.
+**About**, bottom left of the Options form, names the author and carries the MIT licence with
+**PgUp** and **PgDn**. **Back** returns to the form.
+
+**The last pages are a diagnostic, not licence text.** They carry the build, the model, the
+firmware version and the state of the compiled path: which memory window found the reading
+buffer's descriptor, whether its field offsets had to be derived rather than assumed, how much
+of the sweep reached memory, and the six firmware maths entries by address. None of it means
+anything to a measurement. It is there so that an instrument on which the app *works* can still
+be reported on -- **page to the end and send a grab of that page** if you are asked how a
+particular model behaved.
+
+## If the app will not start
+
+A red **FFT &lt;version&gt; did not start** page replaces the analyser, with the model and the
+firmware version beside the build. Everything below it is a diagnostic dump: addresses, window
+ranges, counters and a dump of the memory words the bind was looking at.
+
+**It is written to be read by whoever fixes the app, not by you.** Two things are worth doing
+with it:
+
+* If a **More** button is present there is more than one page, and the counter by the headline
+  says how many. **Press More and capture every page** -- the fault is as likely to be on page
+  two as on page one.
+* Send the captures. There is nothing to act on at the instrument; the app has already cleaned
+  up after itself, and **End App** exits.
 
 ## How many points the trace carries
 
@@ -628,6 +651,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | About half the frame rate the table above gives | The compiled transform did not install, so the app is running the interpreted one. It installs once per power cycle, so a second launch without a power cycle always lands here: power cycle and launch once. A firmware upgrade is not the explanation -- the compiled path holds no address belonging to a firmware build and finds what it needs on the instrument it is running on. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
+| A red `FFT <version> did not start` page | The compiled path could not bind and this archive has no interpreted fallback. See "If the app will not start" above: capture every page. |
 | A help dialog sits over the app after pressing HELP | Expected. Press EXIT to dismiss it. The firmware offers the app no way to receive that key, so the only way to notice the dialog is to poll the glass for it, and that poll waits on the display task: it cost 44 ms of every frame, a sixth of the rate at 16384 samples. It ships off. `fftsa.help_enabled = true` turns the recogniser back on, where it runs once a second rather than once a frame. |
 | Peak width changes as you tune | Expected. See above. |
 | A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |

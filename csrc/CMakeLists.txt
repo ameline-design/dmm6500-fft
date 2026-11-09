@@ -297,8 +297,18 @@ if(LUA502)
   add_test(NAME app_tsp
            COMMAND ${LUA502} tools/test_tsp.lua
            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+  # The native link's own suite: the reattach proofs, the window ladder, the content scan,
+  # the descriptor finder with its offsets derived, and the trace-ring geometry. It was
+  # runnable by hand and in no gate, which is how a change to the one thing a DMM7510 fails
+  # at could pass every test this file ran. Same working directory: it loads the real
+  # tsp/native_link.tsp by relative path.
+  add_test(NAME nl_reattach
+           COMMAND ${LUA502} tools/test_nl_reattach.lua
+           WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 else()
-  message(STATUS "Lua 5.0.2 not found; the relocate_applier and app_tsp gates will not run")
+  message(STATUS "Lua 5.0.2 not found; the relocate_applier, app_tsp and nl_reattach gates "
+                 "will not run")
 endif()
 
 # The picker index and DSP_WINDOW_* are different numbers that currently coincide, and
@@ -395,6 +405,17 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME no_fw_addr_selftest
            COMMAND ${Python3_EXECUTABLE} -I
                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_fw_addr.py --self-test)
+
+  # The build is named in two places that cannot read each other -- the archive manifest and
+  # fftsa.VERSION -- and a failure report from a model we cannot test on is matched to a fix
+  # by that figure alone. A bump applied to one side only makes every report name the wrong
+  # build, which is worse than naming none.
+  add_test(NAME version_agrees
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_version.py)
+  add_test(NAME version_agrees_selftest
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_version.py --self-test)
 endif()
 
 # ---------------------------------------------------------------------------

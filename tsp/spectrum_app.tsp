@@ -12,6 +12,13 @@
 
 fftsa = fftsa or {}   -- the single global this app exposes
 
+-- The build, and the same figure the archive manifest carries. It heads the error page and the
+-- native state on the About pages, because a failure report from a model we cannot test on is
+-- worth nothing if it does not say which build produced it -- and the report arrives as a
+-- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
+-- this and tools/package_tspa.py disagree.
+fftsa.VERSION = '8.59'
+
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
 --      false here and the frame body starts on the slower path without waiting.
@@ -1185,8 +1192,7 @@ function fftsa.build_options()
   -- A screen title over 31 characters is truncated by the firmware (event 1707).
   fftsa.optscr = create(display.ROOT, display.OBJ_SCREEN, "FFT ANALYSER OPTIONS")
   if fftsa.optscr == nil then
-    fftsa.lasterr = "display object pool exhausted building the options screen -- "
-                    .. "power cycle the instrument."
+    fftsa.lasterr = "OBJPOOL exhausted building the options screen"
     return false, fftsa.lasterr
   end
   fftsa.loading_front()
@@ -1317,10 +1323,62 @@ fftsa.about_text = {
   "SOFTWARE.",
 }
 
+-- Columns an About row holds. x is 12 and FONT_1 runs about 7.8 px a character, so 96 fit
+-- across 800; 92 leaves the margin the error page leaves.
+fftsa.about_cols = 92
+
 function fftsa.destroy_about()
   fftsa.del_scr(fftsa.aboutscr, fftsa.sg_scr)
   fftsa.aboutscr, fftsa.about_name, fftsa.about_lines = nil, nil, nil
   fftsa.about_pageno, fftsa.about_page = nil, 1
+end
+
+-- The native path's state appended to the About pages.
+--
+-- The error page only exists when the app did NOT start. What a model we have never run on
+-- did in order to start -- which window answered, whether the descriptor offsets had to be
+-- derived from the data, how much of the sweep reached memory -- is exactly what the next fix
+-- needs, and on a working instrument there is nowhere else to read it. The channel is a
+-- screen grab from another continent, so it is on the glass or it does not exist.
+--
+-- Appended from a marker rather than pushed, because fftsa.start() runs again on every launch
+-- while the module's load-time table does not: without the marker a second launch would carry
+-- two copies of the state and a tenth would carry ten.
+function fftsa.about_add_diag()
+  if fftsa.about_text == nil then return false end
+  if fftsa.about_diag_at == nil then
+    fftsa.about_diag_at = table.getn(fftsa.about_text) + 1
+  end
+  local i
+  for i = table.getn(fftsa.about_text), fftsa.about_diag_at, -1 do
+    fftsa.about_text[i] = nil
+  end
+  local d = nil
+  if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
+    local ok, got = pcall(fftsa.nl.diag)
+    if ok then d = got end
+  end
+  if d == nil then d = 'no native path: nl=' .. tostring(fftsa.nl ~= nil) end
+  local body = fftsa.err_wrap('v' .. tostring(fftsa.VERSION) .. ' ' .. fftsa.node_str()
+                              .. ' ' .. tostring(d), fftsa.about_cols)
+  -- A page boundary first, so the state starts at the top of a page and the licence is never
+  -- half overwritten by it: a grab of that page is then the whole of what it reports.
+  local at = fftsa.about_diag_at
+  local pad = math.mod(at - 1, fftsa.about_rows)
+  if pad > 0 then
+    for i = 1, fftsa.about_rows - pad do
+      fftsa.about_text[at] = ''
+      at = at + 1
+    end
+  end
+  for i = 1, table.getn(body) do
+    fftsa.about_text[at] = body[i]
+    at = at + 1
+  end
+  -- The row objects already exist and about_pages() counts the table, so a page that was not
+  -- there when the screen was built is reachable the moment this returns.
+  if fftsa.about_pageno ~= nil then fftsa.about_show_page(fftsa.about_page or 1) end
+  return true
 end
 
 function fftsa.about_pages()
@@ -1371,8 +1429,7 @@ function fftsa.build_about()
   local create = display.create
   fftsa.aboutscr = create(display.ROOT, display.OBJ_SCREEN, "FFT Analyser - About")
   if fftsa.aboutscr == nil then
-    fftsa.lasterr = "display object pool exhausted building the about screen -- "
-                    .. "power cycle the instrument."
+    fftsa.lasterr = "OBJPOOL exhausted building the about screen"
     return false, fftsa.lasterr
   end
   fftsa.loading_front()
@@ -1997,9 +2054,10 @@ function fftsa.start()
       why = nl.diag()
       if fftsa.nl_lasterr ~= nil then why = why .. " | bind=" .. tostring(fftsa.nl_lasterr) end
     end
-    return fftsa.start_failed("the compiled DSP did not start and this archive has no "
-                              .. "interpreted fallback -- " .. why
-                              .. " -- power cycle the instrument and try again")
+    -- No prose and no instruction. The page is a diagnostic read by whoever fixes the app,
+    -- 119 characters of sentence here cost a line and a half of the figures that place the
+    -- fault, and "power cycle and try again" does not help a model the app has never run on.
+    return fftsa.start_failed("NODSP nofallback " .. why)
   end
   if not hooked then
     print("fftsa WARNING: End App cleanup not hooked -- " .. tostring(fftsa.lasterr))
@@ -2007,6 +2065,10 @@ function fftsa.start()
   end
   print("fftsa started fs=" .. fftsa.fs .. " bin=" .. fftsa.binhz ..
         " range=" .. fftsa.range .. " window=" .. fftsa.win_label())
+  -- Here and not earlier: the native path is settled by now, so what goes on the About pages
+  -- is the state the app is actually running with. Under pcall because this is reporting and
+  -- a failure in it must not fail a start that otherwise succeeded.
+  pcall(fftsa.about_add_diag)
   -- Switching away from the cover is what starts the frames: the timer only runs
   -- while the screen it is parented to is the one on show. The cover itself stays
   -- allocated until fftsa.stop(), since Apply raises it again.
@@ -2067,6 +2129,101 @@ function fftsa.stop()
   return true
 end
 
+-- The error page's text block.
+--
+-- A SCREEN GRAB IS THE ONLY CHANNEL. The operator reporting a DMM7510 failure is on another
+-- continent, so everything needed to place the fault has to be legible on the glass, and a
+-- round trip to ask for one more figure costs a day. That is what sets this layout.
+--
+-- Laid out against the panel geometry measured in notes/HANDOFF-2026-10-31.md, not against
+-- the display reference, which omits all of it:
+--
+--   an OBJ_TEXT y is NOT the baseline -- the ink starts 37 px BELOW it for a 17 px font
+--   a button's y is 50 px ABOVE its face, so opt_btn_y 360 renders at 410..469
+--   FONT_1 is 17 px ink at about 7.8 px a character, FONT_SMALL 17 px at about 9.4
+--
+-- So FONT_1 holds 92 columns where FONT_SMALL holds 80, at the same height. Thirteen rows
+-- from y=103 at a pitch of 20 put their ink in 140..397, which clears the More button's face
+-- below them and the headline above. 1196 characters a page against the 1040 the old single
+-- pass showed before dropping the rest in silence.
+fftsa.err_y0, fftsa.err_dy, fftsa.err_rows, fftsa.err_cols = 103, 20, 13, 92
+fftsa.err_foot_y = 420
+
+-- The instrument, for the error page's headline. Both attributes are read behind a guard and
+-- neither is allowed to stop the page being built: an instrument that will not say which
+-- model it is still has to be able to report why the app would not start.
+function fftsa.node_str()
+  local m, v = nil, nil
+  if localnode ~= nil then m, v = localnode.model, localnode.version end
+  if m == nil then m = '?model' end
+  if v == nil then v = '?fw' end
+  return tostring(m) .. ' ' .. tostring(v)
+end
+
+-- Wrap a diagnostic into lines of at most cols characters, broken only on spaces.
+--
+-- The message is mostly addresses and key=value pairs, and a value split across two lines is
+-- the one that gets transcribed wrong -- so a break lands on a space unless the window holds
+-- none, which is a single long run and has to be cut somewhere. Returns every line: what to
+-- do about a message longer than the glass is the caller's decision, and making it here is
+-- how the old version came to drop 11 lines of a 7510 report without saying so.
+function fftsa.err_wrap(msg, cols)
+  local m = tostring(msg)
+  if cols == nil or cols < 8 then cols = 8 end
+  local out, n = {}, 0
+  local i, len = 1, string.len(m)
+  while i <= len do
+    local stop = i + cols - 1
+    if stop < len then
+      -- The character past the window counts: a space there means the window is exactly a
+      -- whole number of words and the full width is usable.
+      local cut, k = nil, stop + 1
+      while k > i do
+        if string.sub(m, k, k) == ' ' then cut = k break end
+        k = k - 1
+      end
+      if cut ~= nil then stop = cut - 1 end
+    else
+      stop = len
+    end
+    n = n + 1
+    out[n] = string.sub(m, i, stop)
+    i = stop + 1
+    -- The run of spaces at the break is the break. Carrying one onto the next line would
+    -- shift the whole page right by a character.
+    while i <= len and string.sub(m, i, i) == ' ' do i = i + 1 end
+  end
+  return out
+end
+
+-- Show one page of the wrapped message. settext rather than create, because the objects were
+-- built with page 1's text while the screen was still being assembled: this only ever runs
+-- from the More button, long after the screen became current and painted.
+function fftsa.err_show_page(p)
+  local lines = fftsa.err_text
+  if lines == nil or fftsa.err_row == nil then return false end
+  local rows = fftsa.err_rows
+  local npg = math.floor((table.getn(lines) + rows - 1) / rows)
+  if npg < 1 then npg = 1 end
+  if p == nil or p < 1 or p > npg then p = 1 end
+  fftsa.err_page = p
+  local i
+  for i = 1, rows do
+    local t = lines[(p - 1) * rows + i]
+    display.settext(fftsa.err_row[i], t or '')
+  end
+  if fftsa.err_pageno ~= nil then
+    display.settext(fftsa.err_pageno, 'page ' .. tostring(p) .. ' of ' .. tostring(npg))
+  end
+  return true
+end
+
+-- One button, wrapping back to page 1 at the end, so the whole report is reachable without
+-- two more objects on a screen that exists because the pool may already be short.
+function fftsa.err_more()
+  return fftsa.err_show_page((fftsa.err_page or 1) + 1)
+end
+
 -- Startup failure on the panel. End App is hooked here too and the handle kept, so stop()
 -- can delete the screen.
 --
@@ -2078,6 +2235,11 @@ end
 -- These children are created on a visible screen, which nothing else in the app does: it
 -- runs once, after startup has failed, and the cover is gone by then.
 function fftsa.show_error(msg)
+  -- The build, then the diagnostic, and no prose in between. This page is read by whoever is
+  -- fixing the app and not by whoever is standing in front of the instrument, so a sentence
+  -- here costs characters that a hex word would have used -- and the version is the one thing
+  -- that cannot be recovered from the rest, a report being matched to a fix by it alone.
+  local full = 'v' .. tostring(fftsa.VERSION) .. ' ' .. tostring(msg)
   local shown = pcall(function()
     if fftsa.errscr ~= nil then
       fftsa.del_obj(fftsa.errscr)
@@ -2090,46 +2252,54 @@ function fftsa.show_error(msg)
       print("fftsa: object pool exhausted; no error screen")
       return false
     end
-    display.create(fftsa.errscr, display.OBJ_TEXT, 20, 80,
-                   "The analyser could not start.", 16736352,   -- red FF6060
+    -- The headline is three facts, not a sentence: the app build, the model and the firmware.
+    -- Those three place every report, and they go here rather than only inside the native
+    -- path's own diagnostic because startup can fail where that diagnostic is never built --
+    -- an exhausted object pool, a refused capture -- and a report with no firmware version on
+    -- it cannot be compared against the images on disk.
+    display.create(fftsa.errscr, display.OBJ_TEXT, 20, 68,
+                   "FFT " .. tostring(fftsa.VERSION) .. "  " .. fftsa.node_str(),
+                   16736352,                                    -- red FF6060
                    display.FONT_MEDIUM, display.JUST_LEFT)
-    -- Wrapped on spaces, not cut every 80 characters: the diagnostic is mostly addresses
-    -- and key=value pairs read off the glass by whoever is standing in front of it, and a
-    -- hex address split across two lines is the one that gets transcribed wrong.
-    local m = tostring(msg)
-    local y = 140
-    local i = 1
-    local len = string.len(m)
-    while i <= len and y <= 400 do
-      local stop = i + 79
-      if stop < len then
-        -- Back up to the last space in the window. No space means a single long run, which
-        -- has to be cut somewhere, so it is cut at the full width.
-        local cut = nil
-        local k = stop
-        while k > i do
-          if string.sub(m, k, k) == ' ' then cut = k break end
-          k = k - 1
-        end
-        if cut ~= nil then stop = cut - 1 end
-      else
-        stop = len
-      end
-      display.create(fftsa.errscr, display.OBJ_TEXT, 20, y, string.sub(m, i, stop),
-                     14737632, display.FONT_SMALL, display.JUST_LEFT)   -- light grey E0E0E0
-      i = stop + 2
-      y = y + 22
+    fftsa.err_text = fftsa.err_wrap(full, fftsa.err_cols)
+    fftsa.err_page = 1
+    fftsa.err_row = {}
+    local y, i = fftsa.err_y0, nil
+    for i = 1, fftsa.err_rows do
+      fftsa.err_row[i] = display.create(fftsa.errscr, display.OBJ_TEXT, 20, y,
+                                        fftsa.err_text[i] or '',
+                                        14737632,               -- light grey E0E0E0
+                                        display.FONT_1, display.JUST_LEFT)
+      y = y + fftsa.err_dy
     end
-    display.create(fftsa.errscr, display.OBJ_TEXT, 20, 420,
-                   "Press End App to exit.", 9474192,   -- grey 909090
-                   display.FONT_SMALL, display.JUST_LEFT)
+    -- What the old page did silently: a report longer than the glass left no sign that it
+    -- had been cut, so a 7510 screen grab was a diagnostic with the end missing and no way
+    -- to tell it was missing. Now the count is on the glass and the button reaches the rest.
+    local npg = math.floor((table.getn(fftsa.err_text) + fftsa.err_rows - 1)
+                           / fftsa.err_rows)
+    local foot = "End App exits"
+    if npg > 1 then
+      fftsa.err_pageno = display.create(fftsa.errscr, display.OBJ_TEXT, 470, 76,
+                                        'page 1/' .. tostring(npg), 9474192,
+                                        display.FONT_1, display.JUST_LEFT)
+      local b = display.create(fftsa.errscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y,
+                               "More", 140)
+      display.setevent(b, display.EVENT_PRESS,
+                       "if fftsa ~= nil then fftsa.err_more() end")
+      -- Said explicitly, because the report comes back as a grab of whatever was on the
+      -- glass: an operator who does not know there are more pages sends one of three.
+      foot = "More -> next page, and grab every page.  " .. foot
+    end
+    display.create(fftsa.errscr, display.OBJ_TEXT, 20, fftsa.err_foot_y, foot,
+                   9474192,                                        -- grey 909090
+                   display.FONT_1, display.JUST_LEFT)
     display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
     display.changescreen(fftsa.errscr)
   end)
   if not shown or fftsa.errscr == nil then
     fftsa.errscr = nil
     display.changescreen(display.SCREEN_HOME)
-    print("fftsa: could not build the error screen either -- " .. tostring(msg))
+    print("fftsa: could not build the error screen either -- " .. full)
   end
   return fftsa.errscr
 end

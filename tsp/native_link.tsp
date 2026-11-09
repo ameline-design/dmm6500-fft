@@ -879,6 +879,15 @@ function fftsa.nl.diag()
   o = o .. ' | chunk=' .. tostring(nl.chunk_span) .. '/' .. tostring(nl.CHUNK_BYTES)
   o = o .. ' raw=' .. tostring(nl._raw_n) .. ' hits=' .. tostring(nl._hit_n)
   o = o .. ' win=' .. tostring(nl._win_hit) .. ' first[' .. tostring(nl._hit_why) .. ']'
+  -- The four the DMM7510 report could not answer: how much of the sweep reached memory, where
+  -- the addresses it did find are, what the derived pass made of them, and the words
+  -- themselves -- which is what makes the layout settleable from one grab instead of a round
+  -- trip to another continent for each field.
+  o = o .. ' | ' .. nl.sweep_str() .. ' ' .. nl.hits_str()
+  o = o .. ' ' .. nl.desc_off_str() .. ' der[' .. tostring(nl._der_why) .. ']'
+  o = o .. ' sig[' .. tostring(nl._sig_why) .. ']'
+  o = o .. ' buf=' .. tostring(nl._desc_buf) .. ' cp=' .. tostring(nl._ncol)
+  o = o .. ' | ' .. nl.hit_dump_str()
   o = o .. ' | plan=' .. tostring(nl.SIZEOF_PLAN) .. ' params=' .. tostring(nl.SIZEOF_PARAMS)
   o = o .. ' real=' .. tostring(nl.SIZEOF_REAL) .. ' align=' .. tostring(nl.DSP_ALIGN)
   -- Which of the six resolved, by name: one missing entry is enough to stop the install, and
@@ -902,16 +911,47 @@ function fftsa.nl._no(why)
   return false
 end
 
+-- How much of a sweep reached memory. A window can run past the end of DRAM and a block can
+-- come back nil or short, neither of which is an error here -- but "swept everything and the
+-- needle is not there" and "swept almost nothing" are the same report without these counters,
+-- and they call for opposite fixes. A DMM7510 reported 30 raw hits and no descriptor, which
+-- either answer explains.
+fftsa.nl._sw_blocks, fftsa.nl._sw_nil, fftsa.nl._sw_short, fftsa.nl._sw_bytes = 0, 0, 0, 0
+
+function fftsa.nl.sweep_reset()
+  local nl = fftsa.nl
+  nl._sw_blocks, nl._sw_nil, nl._sw_short, nl._sw_bytes = 0, 0, 0, 0
+end
+
+-- Megabytes, because the figure an operator has to read off the glass and compare against a
+-- heap size is the order of magnitude, and a byte count of nine digits costs a line.
+function fftsa.nl.sweep_str()
+  local nl = fftsa.nl
+  return 'read=' .. tostring(math.floor((nl._sw_bytes or 0) / 1048576)) .. 'MB/'
+         .. tostring(nl._sw_blocks) .. 'blk nil=' .. tostring(nl._sw_nil)
+         .. ' short=' .. tostring(nl._sw_short)
+end
+
+fftsa.nl.SWEEP_BLOCK = 32768
+
 function fftsa.nl.FINDS(lo, hi, pat)
+  local nl  = fftsa.nl
   local a   = lo
   local out = {}
   local n   = 0
   local pl  = string.len(pat)
   while a < hi do
-    local step = 32768
-    if a + step > hi then step = hi - a end
-    local s = ki.memread(hx(a), hx(step))
-    if s ~= nil then
+    local want = fftsa.nl.SWEEP_BLOCK
+    if a + want > hi then want = hi - a end
+    local s = ki.memread(hx(a), hx(want))
+    local got = 0
+    nl._sw_blocks = nl._sw_blocks + 1
+    if s == nil then
+      nl._sw_nil = nl._sw_nil + 1
+    else
+      got = string.len(s)
+      nl._sw_bytes = nl._sw_bytes + got
+      if got < want then nl._sw_short = nl._sw_short + 1 end
       local i = 1
       while true do
         local j = string.find(s, pat, i, true)
@@ -920,10 +960,23 @@ function fftsa.nl.FINDS(lo, hi, pat)
         i = j + 1
       end
     end
-    -- Terminate on the tail rather than on the step, or the overlap subtraction
-    -- leaves the address unchanged and the loop never ends.
-    if a + step >= hi then break end
-    a = a + step - (pl - 1)
+    -- Advance by what came back, not by what was asked for. A block answering short with the
+    -- step taken from the request leaves everything between them unsearched -- on a 268 MB
+    -- sweep that is most of it -- and the sweep still reports the hits it did reach, so the
+    -- caller sees "swept and absent" for a needle it never looked at. _sw_short counts it.
+    local nexta
+    if got >= pl then
+      -- Terminate on the tail rather than on the step, or the overlap subtraction
+      -- leaves the address unchanged and the loop never ends.
+      if a + got >= hi then break end
+      nexta = a + got - (pl - 1)
+    else
+      -- Nothing usable came back: step over the block rather than re-reading it. want is at
+      -- least one byte while a < hi, so this always advances.
+      nexta = a + want
+    end
+    if nexta <= a then nexta = a + want end
+    a = nexta
   end
   return out
 end
@@ -1002,6 +1055,7 @@ function fftsa.nl._find_storage(buf, has_extras)
   local windows = fftsa.nl.scan_windows(buf, nil)
   local wi
   local nhits = 0
+  fftsa.nl.sweep_reset()
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
     nhits = nhits + table.getn(hits)
@@ -1060,6 +1114,7 @@ function fftsa.nl._find_storage(buf, has_extras)
   fftsa.nl._stor_why = 'no stride confirmed n=' .. tostring(n) .. ' hits=' .. tostring(nhits)
                        .. ' eq12=' .. tostring(rd[2] == rd[1])
                        .. ' x=' .. tostring(has_extras)
+                       .. ' ' .. fftsa.nl.sweep_str()
   return nil
 end
 
@@ -1088,6 +1143,12 @@ function fftsa.nl._chunk_span(elemsize, perchunk)
   return nil
 end
 
+-- The descriptor field offsets measured on a DMM6500, named rather than spelled out at each
+-- use so the derived route below has something to compare what it found against, and so the
+-- one place that matters -- the native cursor rewind, which writes at compiled offsets -- can
+-- refuse a layout that is not this one.
+fftsa.nl.DOFF = { es = 8, pc = 12, nc = 16, vec = 68, stor = 72, s1 = 84, s2 = 100 }
+
 -- Every read here is guarded, not raw. A base reaching this is a word the firmware handed us
 -- -- a cached one, a sweep hit, or a pointer out of the instance's column chain -- and only the
 -- sweep hit is known to be in DRAM at all. An unguarded peek32 on the other two is an lwz on an
@@ -1095,20 +1156,263 @@ end
 function fftsa.nl._read_desc(base, elem0)
   if base == nil then return nil end
   local g = fftsa.nl._wg
-  if g(base + 72) ~= elem0 then return nil end     -- 0x48, the storage pointer
-  if g(base + 84) ~= base or g(base + 100) ~= base then return nil end
-  local elemsize = g(base + 8)
-  local perchunk = g(base + 12)
-  local nchunks  = g(base + 16)
+  local D = fftsa.nl.DOFF
+  if g(base + D.stor) ~= elem0 then return nil end     -- 0x48, the storage pointer
+  if g(base + D.s1) ~= base or g(base + D.s2) ~= base then return nil end
+  local elemsize = g(base + D.es)
+  local perchunk = g(base + D.pc)
+  local nchunks  = g(base + D.nc)
   if elemsize == nil or perchunk == nil or nchunks == nil then return nil end
   if nchunks < 1 or nchunks >= 4096 or elemsize < 8 or perchunk < 1 then return nil end
   local span = fftsa.nl._chunk_span(elemsize, perchunk)
   if span == nil then return nil end
   fftsa.nl.chunk_span = span
-  return base, elemsize, perchunk, g(base + 68), nchunks
+  return base, elemsize, perchunk, g(base + D.vec), nchunks
 end
 
-function fftsa.nl._find_desc(elem0, buf)
+-- ---------------------------------------------------------------------------
+-- The descriptor with its field offsets derived rather than assumed.
+--
+-- A DMM7510 1.7.16 reported 30 raw hits of a confirmed element 0 and not one of them a
+-- descriptor by the test above, with the sweep covering the whole backstop. Either the words
+-- holding that address were never read, which fftsa.nl.sweep_str now reports, or the layout is
+-- not the one measured on a DMM6500 -- and the second is answerable here without a second
+-- instrument.
+--
+-- Nothing below is an offset this module knows. Given one address where the storage pointer
+-- was found, it reads the neighbourhood once and derives:
+--
+--   base      the value that appears at two or more of those words AND is the address they
+--             are measured from, which is what an owner self-pointer is
+--   stor      base to the storage pointer, from the hit
+--   es, pc    a pair of adjacent words whose first equals the stride the content scan
+--             MEASURED and whose second makes a power-of-two chunk payload with it
+--   vec       a word that points at a word holding elem0, which is what a chunk vector's
+--             entry 0 is
+--   nc        a word in 1..4095 that counts exactly the leading vector entries which are
+--             plausible payloads, the next one not being
+--
+-- Each term is confirmed against something already measured, so none of them rests on
+-- another's being right. The caller gets the same five values _read_desc returns, plus the
+-- offsets, and refuses the native cursor rewind if they are not the compiled set.
+-- ---------------------------------------------------------------------------
+
+-- How far either side of a storage-pointer hit the descriptor can reach. On the measured
+-- layout the hit sits 0x48 above the base, so the geometry fields are 0x40 BELOW it and the
+-- two self-pointers 0x0C and 0x1C above. A base is only accepted within BACK of the hit, so
+-- these two spans always cover base..base+0x140 wherever in the record the hit falls.
+fftsa.nl.DERIVE_BACK, fftsa.nl.DERIVE_FWD = 256, 320
+fftsa.nl.DERIVE_SELF_MIN = 2
+-- The longest chunk vector this will walk. 16,384 readings of 24 bytes is twelve chunks and a
+-- capture has been measured at 49, so this is two orders of margin and bounds the walk at
+-- about a third of a second rather than leaving it to a field that could be any word.
+fftsa.nl.DERIVE_NC_MAX = 1024
+
+-- Is a word a plausible chunk payload address? In the backstop, 8-aligned because a payload
+-- holds doubles the firmware loads directly, and readable. Nothing here authenticates it --
+-- that is what entry 0 matching elem0 does -- it only bounds how far a vector walk may go.
+function fftsa.nl._payload_ok(a)
+  if type(a) ~= 'number' or a == 0 then return false end
+  if math.mod(a, 8) ~= 0 then return false end
+  return fftsa.nl._wg(a) ~= nil
+end
+
+function fftsa.nl._derive_desc(h, elem0, stride)
+  local nl = fftsa.nl
+  local g = nl._wg
+  if h == nil or type(h) ~= 'number' or math.mod(h, 4) ~= 0 then return nil end
+  if type(stride) ~= 'number' or stride < 8 then return nil end
+  local back, fwd = nl.DERIVE_BACK, nl.DERIVE_FWD
+  -- One guarded read a word over the neighbourhood, kept against its offset from the hit.
+  -- 145 reads, which is why this runs only after the measured layout has answered nothing.
+  local v, k = {}, nil
+  for k = -back, fwd, 4 do v[k] = g(h + k) end
+
+  -- The base. An owner self-pointer is a word whose value is the address the record starts
+  -- at, so the base is a value that both lies at or below the hit, within reach of it, and
+  -- appears at more than one of these words. Taking the most-repeated candidate rather than
+  -- the first keeps a single coincidental word from winning over a real pair.
+  local base, nself = nil, 0
+  for k = -back, fwd, 4 do
+    local b = v[k]
+    if b ~= nil and b > 0 and math.mod(b, 4) == 0 and b <= h and h - b <= back then
+      local c, k2 = 0, nil
+      for k2 = -back, fwd, 4 do
+        if v[k2] == b then c = c + 1 end
+      end
+      if c > nself then base, nself = b, c end
+    end
+  end
+  -- The hit that got furthest, for the dump on the error page. Which hit to show cannot be
+  -- decided by position -- the chunk vector holds the storage address too, and on a DMM6500
+  -- so does allocator bookkeeping -- so it is the one whose neighbourhood looked most like a
+  -- record that is worth the characters.
+  if nl._der_best == nil or nself > nl._der_best_n then
+    nl._der_best, nl._der_best_n = h, nself
+  end
+  if base == nil or nself < nl.DERIVE_SELF_MIN then
+    nl._der_why = 'no self-pointer pair within ' .. tostring(back) .. ' of ' .. hx(h)
+    return nil
+  end
+
+  -- Which two words those were. Without them the cache cannot re-validate a base found this
+  -- way: _read_desc would test the measured offsets, fail, and every describe() of the buffer
+  -- would sweep the whole backstop again -- which on a model that needs this route is a
+  -- minute of the glass frozen on every Apply.
+  local s1off, s2off = nil, nil
+  for k = -back, fwd, 4 do
+    if v[k] == base then
+      if s1off == nil then s1off = h + k - base
+      elseif s2off == nil then s2off = h + k - base end
+    end
+  end
+
+  -- Offsets from the base now, bounded by what was read: a field the window does not cover is
+  -- nil rather than a fresh read, so this cannot wander.
+  local at = function(off)
+    local kk = base + off - h
+    if kk < -back or kk > fwd then return nil end
+    return v[kk]
+  end
+  local span_hi = h + fwd - base
+
+  -- es and pc: the first adjacent pair whose element size is the stride the content scan
+  -- measured. That is the lock -- a word that happens to equal the stride with a neighbour
+  -- that happens to fill a payload is the only false positive left, and describe() checks
+  -- elemsize against the stride again on the way out.
+  local off_es, perchunk, span = nil, nil, nil
+  local off
+  for off = 0, span_hi - 4, 4 do
+    if at(off) == stride then
+      local pc = at(off + 4)
+      local sp = nl._chunk_span(stride, pc)
+      if sp ~= nil then off_es, perchunk, span = off, pc, sp end
+    end
+    if off_es ~= nil then break end
+  end
+  if off_es == nil then
+    nl._der_why = 'no elemsize=' .. tostring(stride) .. ' with a payload-filling perchunk in '
+                  .. hx(base) .. '+0..' .. tostring(span_hi)
+    return nil
+  end
+
+  -- vec: a word pointing at a word that holds elem0. A chunk vector's entry 0 is chunk 0's
+  -- payload, and chunk 0's payload is where element 0 is -- which is the address the content
+  -- scan confirmed against eleven readings. One indirection, content-checked.
+  local off_vec, vec = nil, nil
+  for off = 0, span_hi, 4 do
+    local p = at(off)
+    if p ~= nil and p > 0 and math.mod(p, 4) == 0 and g(p) == elem0 then
+      off_vec, vec = off, p
+      break
+    end
+  end
+  if off_vec == nil then
+    nl._der_why = 'no word pointing at ' .. hx(elem0) .. ' in ' .. hx(base) .. '+0..'
+                  .. tostring(span_hi)
+    return nil
+  end
+
+  -- nc: a word equal to the number of leading vector entries that are plausible payloads.
+  --
+  -- Walking the vector alone cannot find its end -- one entry past it is whatever the heap
+  -- holds next, and a plausible word there reads as another chunk -- and a field alone cannot
+  -- be told from any other small integer in the record. So the walk is done once, capped, and
+  -- the count has to equal exactly what it reached. A vector whose next word also looks like a
+  -- payload therefore refuses rather than overruns, and says which figure it refused.
+  local m = 0
+  while m < nl.DERIVE_NC_MAX do
+    if not nl._payload_ok(g(vec + m * 4)) then break end
+    m = m + 1
+  end
+  local off_nc = nil
+  for off = 0, span_hi, 4 do
+    if at(off) == m and m >= 1 then
+      off_nc = off
+      break
+    end
+  end
+  if off_nc == nil then
+    nl._der_why = 'no word equal to the ' .. tostring(m) .. ' plausible entries of the vector '
+                  .. 'at ' .. hx(vec)
+    return nil
+  end
+  local nchunks = m
+
+  nl.chunk_span = span
+  nl.desc_off = { es = off_es, pc = off_es + 4, nc = off_nc, vec = off_vec,
+                  stor = h - base, s1 = s1off, s2 = s2off, self_n = nself }
+  nl._der_why = nil
+  return base, stride, perchunk, vec, nchunks
+end
+
+-- Do the derived offsets agree with the layout the native image writes at? The cursor rewind
+-- in dsp_native.c stores at compiled displacements from the descriptor base, so a model whose
+-- descriptor is shaped differently must not be handed one -- the fields it would overwrite
+-- belong to whatever is really there.
+function fftsa.nl.desc_off_ok()
+  local o = fftsa.nl.desc_off
+  if o == nil then return true end        -- never derived, so the measured layout answered
+  local D = fftsa.nl.DOFF
+  return o.es == D.es and o.pc == D.pc and o.nc == D.nc
+         and o.vec == D.vec and o.stor == D.stor
+end
+
+function fftsa.nl.desc_off_str()
+  local o = fftsa.nl.desc_off
+  if o == nil then return 'doff=measured' end
+  return 'doff=stor' .. hx(o.stor) .. ',es' .. hx(o.es) .. ',nc' .. hx(o.nc)
+         .. ',vec' .. hx(o.vec) .. ',s' .. hx(o.s1 or 0) .. '/' .. hx(o.s2 or 0)
+         .. ',n' .. tostring(o.self_n)
+end
+
+-- The words around the hit the derived pass got furthest with.
+--
+-- This is the one diagnostic that lets a layout be worked out rather than guessed, and it is
+-- here because the channel is a screen grab from another continent: asking for one more
+-- figure costs a day, so the figures go on the glass now. The window spans the measured
+-- layout's own fields as seen from the storage pointer -- elemsize, perchunk and the chunk
+-- count sit 0x40 below it, the chunk vector 4 below, and the two self-pointers 0x0C and 0x1C
+-- above -- so whatever shape this model's record has, these words contain it.
+fftsa.nl.DUMP_LO, fftsa.nl.DUMP_HI = -72, 68
+
+function fftsa.nl.hit_dump_str()
+  local nl = fftsa.nl
+  local h = nl._der_best
+  if h == nil then
+    local d = nl._raw_at
+    if d == nil then return 'dump=none' end
+    h = d[1]
+  end
+  if h == nil then return 'dump=none' end
+  local o, k = 'dump' .. hx(h) .. tostring(nl.DUMP_LO) .. '[', nil
+  for k = nl.DUMP_LO, nl.DUMP_HI, 4 do
+    if k > nl.DUMP_LO then o = o .. ' ' end
+    local w = nl._wg(h + k)
+    if w == nil then o = o .. '-' else o = o .. hx(w) end
+  end
+  return o .. ']'
+end
+
+-- The distinct raw hits a report shows, and how many are kept to re-examine. The windows
+-- overlap by design -- every tight one lies inside the backstop -- so the same word is found
+-- several times and a raw count alone overstates how many places hold the address.
+fftsa.nl.HITS_KEEP, fftsa.nl.HITS_SHOW = 64, 6
+
+function fftsa.nl.hits_str()
+  local nl = fftsa.nl
+  local d = nl._raw_at
+  if d == nil or table.getn(d) == 0 then return 'at=none' end
+  local o, i = 'at=', nil
+  for i = 1, table.getn(d) do
+    if i > nl.HITS_SHOW then return o .. '+' .. tostring(table.getn(d) - nl.HITS_SHOW) end
+    if i > 1 then o = o .. ',' end
+    o = o .. hx(d[i])
+  end
+  return o
+end
+
+function fftsa.nl._find_desc(elem0, buf, stride)
   -- The cached base first, re-validated rather than trusted. Keyed on the storage address, so
   -- a buffer whose storage moved misses, and _read_desc refuses a stale base even if the key
   -- matched. This is the expensive half of describe() when the ladder has to escalate, so the
@@ -1123,9 +1427,19 @@ function fftsa.nl._find_desc(elem0, buf)
   -- Two counts, because they fail differently and the panel has to tell them apart. _raw_n is
   -- how many times the storage address appears at all: zero means the descriptor is outside
   -- every window swept. _hit_n is how many of those passed the two owner self-pointers: raw
-  -- hits with no confirmed one would mean the layout moved, which the image comparison says it
-  -- has not. The DMM7510 report had only the one count and it could not separate the two.
+  -- hits with no confirmed one means the layout is not the one measured, which is what the
+  -- derived pass below then answers. The DMM7510 report had only the one count.
   nl._hit_n, nl._hit_why, nl._raw_n, nl._win_hit = 0, nil, 0, nil
+  nl._raw_at, nl._der_why, nl.desc_off = {}, nil, nil
+  nl._der_best, nl._der_best_n = nil, -1
+  -- Which buffer this was, and how far the instance's column chain got. Both are invisible in
+  -- the report otherwise: a chain that walked nothing and one that walked eight records give
+  -- the same window count once the ladder's later stages are added, and the capacity says
+  -- whether the buffer the allocator built is the one that was asked for.
+  nl._desc_buf = 'cap' .. tostring(buf ~= nil and buf.capacity or nil)
+                 .. '/n' .. tostring(buf ~= nil and buf.n or nil)
+  nl.sweep_reset()
+  local seen, nseen = {}, 0
   local windows = fftsa.nl.scan_windows(buf, elem0)
   -- The chain pointers as the descriptor itself, before any sweeping. On a DMM6500 this does
   -- not answer: a sweep for the descriptor's own address found four references and all four
@@ -1134,6 +1448,7 @@ function fftsa.nl._find_desc(elem0, buf)
   -- validation, scan_windows has already walked the chain, and a model where one of those
   -- pointers is the descriptor gets it for nothing.
   local cand = fftsa.nl.col_ptrs(nl.inst)
+  nl._ncol = table.getn(cand)
   local ci
   for ci = 1, table.getn(cand) do
     local b, es, pc, v, nc = nl._read_desc(cand[ci], elem0)
@@ -1149,13 +1464,21 @@ function fftsa.nl._find_desc(elem0, buf)
     nl._raw_n = nl._raw_n + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
-      local base = hits[k] - 72       -- 0x48
-      local s1 = fftsa.nl._wg(base + 84)    -- 0x54, owner self-pointer
-      local s2 = fftsa.nl._wg(base + 100)   -- 0x64, second self-pointer
+      -- Kept for the derived pass and for the report, deduplicated: the same word is found
+      -- once per window containing it, and a second examination of it proves nothing twice.
+      if seen[hits[k]] == nil and nseen < nl.HITS_KEEP then
+        nseen = nseen + 1
+        seen[hits[k]] = true
+        nl._raw_at[nseen] = hits[k]
+      end
+      local D = fftsa.nl.DOFF
+      local base = hits[k] - D.stor
+      local s1 = fftsa.nl._wg(base + D.s1)
+      local s2 = fftsa.nl._wg(base + D.s2)
       if s1 == base and s2 == base then
-        local elemsize = fftsa.nl._wg(base + 8)
-        local perchunk = fftsa.nl._wg(base + 12)
-        local nchunks  = fftsa.nl._wg(base + 16)   -- 0x10, chunk count
+        local elemsize = fftsa.nl._wg(base + D.es)
+        local perchunk = fftsa.nl._wg(base + D.pc)
+        local nchunks  = fftsa.nl._wg(base + D.nc)
         -- The element size is a runtime field and need not divide the payload: a
         -- STYLE_STANDARD element of 24 bytes puts 1365 in a 32,768-byte payload, filling
         -- 32,760 and leaving 8 spare. So the test is a fit rather than an exact product, and
@@ -1177,8 +1500,23 @@ function fftsa.nl._find_desc(elem0, buf)
           -- Which stage answered, and where: the next buffer gets a tight window around this
           -- arena, so at most one call ever pays for the wide stages.
           nl._win_hit, nl.arena = wi, base
-          return base, elemsize, perchunk, fftsa.nl._wg(base + 68), nchunks
+          return base, elemsize, perchunk, fftsa.nl._wg(base + D.vec), nchunks
         end
+      end
+    end
+  end
+
+  -- Nothing matched the measured layout. The same hits again, with every offset derived from
+  -- the data instead -- which is the half of "the sweep found the address but no descriptor"
+  -- that a DMM6500 cannot answer, because its layout is the one being assumed.
+  if stride ~= nil then
+    local di
+    for di = 1, table.getn(nl._raw_at) do
+      local b, es, pc, v, nc = nl._derive_desc(nl._raw_at[di], elem0, stride)
+      if b ~= nil then
+        nl._desc_of, nl._desc_at = elem0, b
+        nl._win_hit, nl.arena = -1, b
+        return b, es, pc, v, nc
       end
     end
   end
@@ -1199,19 +1537,28 @@ end
 --
 -- Two adjacent big-endian words make a specific needle, and _read_desc applies the same
 -- validation as the other route. 878 hits on the instrument, exactly one a descriptor.
+fftsa.nl.DOFF_CAP = 116                   -- 0x74, the capacity field, n in the word above it
+
 function fftsa.nl._find_desc_by_sig(buf)
   local nl = fftsa.nl
+  nl._sig_why = nil
   local cap, n = buf.capacity, buf.n
-  if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then return nil end
+  if type(cap) ~= 'number' or type(n) ~= 'number' or cap < 1 or n < 1 then
+    nl._sig_why = 'cap=' .. tostring(cap) .. ' n=' .. tostring(n)
+    return nil
+  end
   local needle = u32_pack(cap) .. u32_pack(n)
   local windows = fftsa.nl.scan_windows(buf, nil)
   local wi
+  local nhits = 0
+  nl.sweep_reset()
   for wi = 1, table.getn(windows) do
     local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    nhits = nhits + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
-      local base = hits[k] - 116          -- 0x74, the capacity field
-      local elem0 = fftsa.nl._wg(base + 72)   -- 0x48, the storage pointer
+      local base = hits[k] - nl.DOFF_CAP
+      local elem0 = fftsa.nl._wg(base + nl.DOFF.stor)
       if elem0 ~= nil and elem0 ~= 0 then
         local b, es, pc, v, nc = nl._read_desc(base, elem0)
         if b ~= nil then
@@ -1222,6 +1569,11 @@ function fftsa.nl._find_desc_by_sig(buf)
       end
     end
   end
+  -- Named, because this route failing used to leave no trace at all: the caller fell through
+  -- to the content scan and reported whatever that said, so a capture buffer whose signature
+  -- was never found read exactly like one whose readings could not be confirmed.
+  nl._sig_why = 'cap=' .. tostring(cap) .. '/n=' .. tostring(n) .. ' sig hits=' .. tostring(nhits)
+                .. ' ' .. nl.sweep_str()
   return nil
 end
 
@@ -2023,13 +2375,13 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- STYLE_WRITABLE_FULL, so it does store extra values and asking for them is safe.
   local pdesc = nl.describe(pb, true)
   if pdesc == nil or pdesc.vec == nil then
-    return fftsa.nl._abort(cb, pb, 'plan buffer: no descriptor found by sweep -- '
-                           .. tostring(nl._stor_why) .. ' raw=' .. tostring(nl._raw_n)
-                           .. ' hits=' .. tostring(nl._hit_n)
-                           .. ' first[' .. tostring(nl._hit_why) .. ']'
-                           .. ' inst=' .. hx(nl.inst or 0)
-                           .. ' anchor=' .. hx(nl.heap_anchor() or 0)
-                           .. ' ' .. fftsa.nl.windows_str())
+    -- Only what diag() does not already carry. nl.why is reported THROUGH diag -- it prints
+    -- it as why= -- so the sweep counts, the hit list, the derived offsets, the window ladder
+    -- and the word dump would all appear twice, which cost four of the thirteen lines the
+    -- glass has.
+    return fftsa.nl._abort(cb, pb, 'plan: ' .. tostring(nl._stor_why)
+                           .. ' want=' .. tostring(chunks_wanted) .. 'ch for '
+                           .. tostring(nseg) .. 'seg')
   end
   trace('plan.desc', hx(pdesc.chunk1), tostring(pdesc.nchunks))
 
@@ -2381,6 +2733,12 @@ function fftsa.nl.call_dsp(cap, out, red)
     out_lo, out_hi = out.lo, out.hi
     out_ch1, out_ch2, out_per, out_desc = out.chunk1, out.chunk2, out.perchunk, out.desc
     if out_desc == nil or out_desc == 0 then return nil end
+    -- The cursor rewind in the image stores at displacements compiled into it. If the
+    -- descriptor was identified with offsets derived from the data and they are not those,
+    -- the fields it would write belong to something else -- which is how a freed-widget
+    -- bluescreen is reached. The app passes out = nil and asks for the reduction only, so
+    -- this refuses a call no caller makes today rather than permitting one.
+    if not nl.desc_off_ok() then return nil end
   end
 
   local ok = nl.write_params({
@@ -2581,7 +2939,9 @@ function fftsa.nl.describe(buf, has_extras)
   if not elem0 then return nil end
   local desc, elemsize, perchunk, vec, nchunks = sdesc, selemsize, sperchunk, svec, snchunks
   if desc == nil then
-    desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0, buf)
+    -- The stride goes with it: the derived route locks the element-size field against the
+    -- figure the content scan measured, which is the only thing it has that is not an offset.
+    desc, elemsize, perchunk, vec, nchunks = fftsa.nl._find_desc(elem0, buf, stride)
   end
   -- Each of the two halves names itself: _find_storage sets _stor_why on its own failures
   -- and clears it on the way in, so without these the caller reports "nil" for a refusal

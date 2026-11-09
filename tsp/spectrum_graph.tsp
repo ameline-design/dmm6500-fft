@@ -615,8 +615,7 @@ function fftsa.sg_build(title, nbins, npoints)
   -- Without this test every child is built against a nil parent, which does raise, in this
   -- code rather than the firmware's. fftsa.build() passes the reason to fftsa.start().
   if fftsa.sg_scr == nil then
-    fftsa.lasterr = "display object pool exhausted building the spectrum screen -- "
-                    .. "power cycle the instrument."
+    fftsa.lasterr = "OBJPOOL exhausted building the spectrum screen"
     return nil, fftsa.lasterr
   end
   -- Creating a screen makes it active, so the cover goes back in front before the
