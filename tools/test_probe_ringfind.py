@@ -20,7 +20,9 @@ from the cause.
 """
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -39,6 +41,25 @@ NCOL, BN = 255, 510
 
 FAIL = []
 SEEN = []
+LUAC = os.path.expanduser('~/tmp/lua502/lua-5.0.2/bin/luac')
+
+
+def lua_parse_error(cmd):
+    """luac -p on one statement, or '' if it parses. '' also when luac is absent, which is
+    stated once rather than silently skipped -- a check that cannot run must not read as a
+    pass."""
+    if not os.path.exists(LUAC):
+        return ''
+    with tempfile.NamedTemporaryFile('w', suffix='.lua', delete=False) as fh:
+        fh.write(cmd + '\n')
+        path = fh.name
+    try:
+        p = subprocess.run([LUAC, '-p', path], capture_output=True, text=True)
+        if p.returncode == 0:
+            return ''
+        return (p.stderr or p.stdout).strip().split('\n')[-1].split(': ', 1)[-1]
+    finally:
+        os.unlink(path)
 
 
 def check(name, cond, detail=''):
@@ -73,6 +94,16 @@ class StubDMM:
             FAIL.append('multiline statement: %r' % cmd[:120])
         if len(cmd) >= 1000:
             FAIL.append('statement is %d bytes: %r' % (len(cmd), cmd[:160]))
+        # AND IT HAS TO BE LUA. A statement that does not parse prints nothing, so the
+        # instrument looks wedged and the probe reports a desync with last=None -- which is
+        # indistinguishable from a refusal and sent a bench session after the wrong thing.
+        # The defect that produced this check was a Lua table constructor whose entries were
+        # joined with a space instead of a comma. Nothing else here could see it: the tag
+        # answer does not care whether the statement parses, and audit_probe.py works on the
+        # Python source rather than on the string it builds.
+        why = lua_parse_error(cmd)
+        if why:
+            FAIL.append('statement is not Lua 5.0.2: %s -- %r' % (why, cmd[:160]))
 
     @staticmethod
     def _answer(cmd):

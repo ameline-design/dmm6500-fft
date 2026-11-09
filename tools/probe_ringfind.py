@@ -296,7 +296,12 @@ def main():
         append_sentinels(d)
         print('seed  : four sentinels appended through buffer.write.reading')
 
-        sent = ' '.join("{db=%.1f,hz=%.1f}" % (db, hz) for db, hz in SENTINELS)
+        # COMMAS. A Lua table constructor separates entries with ',' or ';', and joining
+        # these with a space built a statement that is not Lua at all -- the instrument
+        # printed nothing, every retry, and the probe reported a desync with last=None. The
+        # stub harness could not see it either, because it answered by tag without caring
+        # whether the statement parsed. It runs luac -p over every statement now.
+        sent = ', '.join("{db=%.1f,hz=%.1f}" % (db, hz) for db, hz in SENTINELS)
         t0 = time.time()
         # The records first, reported with how many candidates confirmed: the buffer-side
         # staging ring holds the same two float32 pairs in a 28-byte record and confirms at a
