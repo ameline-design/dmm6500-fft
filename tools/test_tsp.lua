@@ -5047,6 +5047,37 @@ check('on a DMM7510 every armed period is a multiple of 50 ms', (function()
   return bad == nil and g7 == 0.050 and g65 == fftsa.tick_grid,
          bad or string.format('7510 grid %g, 6500 grid %g', g7, g65)
 end)())
+-- NO SETTING OF THE TWO LIVE KNOBS MAY STARVE THE INTERPRETER. A period that does not exceed
+-- the work leaves no idle, and every button handler and socket statement is Lua -- measured on
+-- the instrument as a total lockout that only ABORT recovered, taking the app with it.
+check('no grid or slack setting lets the period fall to the work', (function()
+  local kg, ki2, k7 = fftsa.tick_grid, fftsa.tick_idle, fftsa.tick_grid_7510
+  local bad, g, i, b = nil, nil, nil, nil
+  for _, g in ipairs({0.001, 0.01, 0.05, 0.1}) do
+    for _, i in ipairs({-1, 0, 0.0001, 0.02}) do
+      fftsa.tick_grid, fftsa.tick_grid_7510, fftsa.tick_idle = g, g, i
+      for b = 0.01, 0.60, 0.007 do
+        local p = fftsa.tick_period(b)
+        if p < b + fftsa.tick_floor then
+          bad = string.format('grid %g idle %g busy %.3f -> %.4f, only %.4f of room',
+                              g, i, b, p, p - b)
+        end
+      end
+      -- And a period on the floor is still on the grid, or 1727 fires on a 7510.
+      local p = fftsa.tick_period(0.05)
+      local k = p / g
+      if math.abs(k - math.floor(k + 0.5)) > 0.001 then
+        bad = bad or string.format('grid %g idle %g gives %.4f, off its own grid', g, i, p)
+      end
+      if bad ~= nil then break end
+    end
+    if bad ~= nil then break end
+  end
+  fftsa.tick_grid, fftsa.tick_idle, fftsa.tick_grid_7510 = kg, ki2, k7
+  return bad == nil, bad or string.format('16 knob pairs x 85 work times, always at least '
+                                          .. '%.0f ms of room and on the grid',
+                                          1000 * fftsa.tick_floor)
+end)())
 check('tick_period rounds up to the 10 ms grid and never below the 50 ms floor', (function()
   -- near(), not equality: ticks * grid does not reproduce the literal exactly.
   --

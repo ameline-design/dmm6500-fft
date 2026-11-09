@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.65'
+fftsa.VERSION = '8.66'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -1920,6 +1920,12 @@ fftsa.tick_idle = 0.020
 -- The period granularity. 0.05 is the firmware's minimum, not its resolution: on a 50 ms
 -- grid a frame needing 205 ms is armed at 250, where a finer grid costs nothing.
 --
+-- A MID-FRAME TICK IS NOT LOST, measured 2026-11-09: a fixed 0.05 period against a 100 ms
+-- frame delivered 9.92 fps, which is one frame per 100 ms and not one per 150. The firmware
+-- holds one pending, so the loop self-paces at whatever the work costs, rounded up to the
+-- grid. That is why tick_floor above is needed and why the period may be inaccurate but never
+-- absent.
+--
 -- A period off the 50 ms grid posts event 1727 and is still honoured. Measured both ways:
 -- 1727 fires exactly when the period is not a multiple of 0.05 -- ten periods, the seven
 -- non-multiples warned and 0.05/0.10/0.25 did not -- and at 1024 an armed 0.07 delivers 13
@@ -1958,6 +1964,23 @@ function fftsa.tick_grid_now()
   return fftsa.tick_grid
 end
 
+-- THE PERIOD MUST EXCEED THE WORK, AND THIS IS WHERE THAT IS ENFORCED.
+--
+-- fftsa.tick_grid and fftsa.tick_idle are live knobs, so the period is a function of two
+-- numbers a socket can set to anything. Set so that the period does not exceed the work, the
+-- frame loop runs back to back and leaves NO idle -- and every button handler and every socket
+-- statement is Lua, so nothing can get in at all. Measured 2026-11-09 at n=8192 by replacing
+-- this function with a constant 0.05: 733 statements refused in four minutes, End App dead,
+-- the hardware keys dead. ABORT freed the interpreter and took the app with it; nothing softer
+-- worked.
+--
+-- A yield at the end of the frame is NOT the same thing and does not help: delay() blocks the
+-- Lua thread, so the display task runs and the interpreter still does not.
+--
+-- So whatever the knobs say, the answer leaves at least tick_floor of room. Belt and braces
+-- against a setting, not against a bug.
+fftsa.tick_floor = 0.010
+
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return fftsa.tick_min end
   local g = fftsa.tick_grid_now()
@@ -1965,6 +1988,9 @@ function fftsa.tick_period(busy)
   if ticks < 1 then ticks = 1 end
   local p = ticks * g
   if p < fftsa.tick_min then p = fftsa.tick_min end
+  -- Up the grid until there is room, rather than to an off-grid value: a period that is not a
+  -- multiple of 0.05 posts event 1727, which is a modal prompt on a DMM7510.
+  while p < busy + fftsa.tick_floor do p = p + g end
   return p
 end
 
