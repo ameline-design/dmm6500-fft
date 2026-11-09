@@ -547,11 +547,29 @@ consistency. On a DMM6500 1.7.17a, fresh boot:
 | a repaint happened | the triggering append's own point appeared on the glass |
 | the written values | **did not appear. No plateau, two runs** |
 
-**The widget does not draw from the float value of a record.** The two int32 triples at
-`+0x00..0x1F` are the remaining candidate: they are pixel coordinates laid down when the
-append is processed. Writing them would mean replicating the widget's axis mapping inside this
-app, against state it does not publish -- which is not "write the values natively", it is
-reimplementing the widget's layout. Not recommended.
+**The widget does not draw from the float value of a record.** And the reason is identified:
+`+0x00` and `+0x0C` hold the **x and y pixel coordinates**, three identical int32 copies each,
+computed when the append is processed. Reading the dump again with the record base known
+(`ov = 0x20`) gives the whole record, and both axis maps predict the measured pixels exactly:
+
+| record | value, x | `+0x00` | predicted | `+0x0C` | predicted |
+|---|---|---|---|---|---|
+| sentinel 1 | 15.5 dB, 1024 Hz | **113** | 113.79 | **79** | 79.00 |
+| sentinel 2 | 16.5 dB, 2048 Hz | **127** | 127.72 | **77** | 77.00 |
+
+    x_px = 100 + (hz - flo) / (fhi - flo) * 680          flo = 10, fhi = 50000
+    y_px =  70 + (dbhi - db) / (dbhi - dblo) * 280       dbhi = +20, dblo = -120
+
+The x map uses the app's own `PLOT` rectangle unchanged. The y map needs **top = 70, not the 60
+in `PLOT`** -- the graph's drawable interior starts 10 px below the object.
+
+**So the pixel route is open, and it does NOT mean reimplementing the widget's layout.** Both
+maps are affine and both can be **calibrated at runtime** from the sentinel appends already
+being made: append two points with known dB and Hz, read their triples, solve for slope and
+intercept. Nothing compiled in, nothing read from the widget.
+
+**Untested, and it is the first thing to do:** whether writing a triple moves the point on the
+glass. Everything above is worthless if it does not.
 
 ### Three things the earlier notes had wrong, all now measured
 
@@ -652,10 +670,10 @@ down with them. What is left is 2 and 5, and neither crosses the 50 ms boundary 
 
 ## Dead ends, measured -- do not retry these
 
-- **Writing the display task's record ring.** The records were found, the slots were inside the
-  drawn window, the writes were read back, a repaint happened, and nothing changed. The float
-  value of a record is not what the widget draws. Full account above; do not re-open it without
-  first settling what the two int32 triples at `+0x00..0x1F` are.
+- **Writing the FLOAT VALUE of a display-task record.** The records were found, the slots were
+  inside the drawn window, the writes were read back, a repaint happened, and nothing changed.
+  The pixel coordinates at `+0x00` and `+0x0C` are what the widget draws -- see above. Writing
+  those is open and untested; writing the float value is not a route.
 - **Deriving a memory stride from the distance between two search hits.** `FINDS` matches its own
   needle, so both hits can be the needles' own storage. This bluescreened a 6500 at
   `PC 0x0022D270`. Confirm a stride against content at CANDIDATE strides instead.
