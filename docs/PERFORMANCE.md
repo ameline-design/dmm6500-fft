@@ -507,45 +507,89 @@ and 256 buffer writes at 65 µs is **16.6 ms** of the ~20 ms graph phase. So abo
 80 ms frame is marshalled API calls**, and it is a hard floor -- there is no bulk route into or out of
 a reading buffer from Lua (established three ways, see the dead ends).
 
-## The one route left past the appends: write the display task's own ring
+## Writing the display task's ring does not work -- CLOSED, measured 2026-11-09
 
-The 510 appends a folded pass makes are ~39 ms of a 105 ms frame at 2048, and they are a floor for
-the sanctioned path: `buffer.write.reading` is the only call the display task reads, it has no bulk
-form, and `dispatch`'s send is a synchronous vtable call so each append is a real round trip.
+The 510 appends a folded pass makes are ~39 ms of an ~80 ms frame at 2048, and they are a
+floor for the sanctioned path: `buffer.write.reading` is the only call the display task reads,
+it has no bulk form, `dispatch`'s send is a synchronous vtable call, and **fewer arguments are
+not cheaper** -- 255 appends cost 19.7 ms with five arguments, 21.8 with four, 20.5 with three
+and 25.0 with two, which is what a fixed round trip looks like. The undocumented sixth
+argument accepts a table and appends exactly one reading, ignoring it.
 
-What the widget draws is a ring of records the display task keeps for itself, one record per
-append. **Writing that ring directly is the only remaining way under the floor**, and at fixed
-slots it also satisfies the frequency invariant by construction -- so it needs 255 records, not
-510, and no fold.
+So the last candidate was the display task's own record ring. **It is not a route.**
 
-Measured on a DMM6500 1.7.17a: ring `0x03B53038..0x03B5CDF0`, span 40,376 = **721 records of 56
-bytes**; header 40,904 bytes below the ring with `lo`, `hi`, `oldest` and `write` at `+0x00`,
-`+0x04`, `+0x08`, `+0x0C` and the count at `+0x14`, capped at `0x2D0`; within a record, the value
-as float32 **twice** at `+0x20`/`+0x24`, flags at `+0x28`, the x as float32 twice at
-`+0x2C`/`+0x30`, and `2.0f` at `+0x34`. Record 128 read `-115.786` and `254.2428` against
-`readings[128] = -115.78624725` and `extravalues[128] = 254.24284363`.
+### The ring, and the record, both measured
 
-**None of that is compiled in or assumed.** `fftsa.nl.find_ring` appends four sentinel readings
-whose dB and Hz are exactly representable in float32, searches for a sentinel's dB packed as
-float32 twice, takes the **stride** from the distance between two sentinels' hits and the
-**value-to-x distance** from a search of one record's worth of bytes, confirms the whole run, and
-then finds the header by its own consistency -- an adjacent `(lo, hi)` pair a whole number of
-records apart with the confirmed record inside it and both cursors on the record grid. The test
-suite builds the fixture at a stride and a field order **nobody has measured** and requires the
-finder to recover those too, so it measures the instrument rather than recognising a 6500.
+Found with no compiled address: append sentinel readings whose dB and Hz are exactly
+representable in float32, search for a sentinel's dB packed as float32 twice, take the stride
+from candidates confirmed against the sentinel run, then find the header by its own
+consistency. On a DMM6500 1.7.17a, fresh boot:
 
-The one decoy that matters is the buffer-side staging ring: 28-byte records holding the same two
-float32 pairs, written by the same append, and not what the widget draws. It confirms at a stride
-just as convincingly. What separates them is the header — the staging ring keeps its bounds at
-`+0x8C` and `+0x94`, which are not adjacent, so there is no pair to find — and `find_ring` walks
-every record candidate until one has a header.
+    header  0x0350D928      ring 0x03517908..0x035216C0      721 records of 56 bytes
+    oldest  = ring lo       count = 514                      span = 40,376 = 721 x 56
 
-**Open, and it is the question the design rests on:** does the widget draw from those records, or
-are they a cache it refills from somewhere else? `tools/probe_ringfind.py --write` answers it in
-one run — it saves a run of records, writes an unmistakable dB into their value fields only, fires
-one append to provoke a repaint, and compares a checksum of the plot interior. Only the two
-float32 fields are touched, so the flags, the `2.0f` and the scratch extent bytes stay exactly as
-the firmware left them, and everything is restored first in the finally block.
+    rec +0x00 .. +0x1F   TWO int32 TRIPLES -- pixel coordinates, computed at append time
+    rec +0x20, +0x24     value, float32, twice
+    rec +0x28            flags, 0 on a numeric axis
+    rec +0x2C, +0x30     x, float32, twice
+    rec +0x34            0x40000000, which is 2.0f
+
+### The write, and why it settles it
+
+80 records inside the drawn window -- `oldest` and `count` taken from the header, not guessed
+-- had their value field written to +18 dB, with frames parked. Every link checked:
+
+| link | evidence |
+|---|---|
+| right structure | five locks, and a header-confirmed ring of 721 x 56 |
+| right slots | `oldest` and `count` read from the header |
+| the writes landed | **read back after writing: first and last records both hold +18.0f** |
+| a repaint happened | the triggering append's own point appeared on the glass |
+| the written values | **did not appear. No plateau, two runs** |
+
+**The widget does not draw from the float value of a record.** The two int32 triples at
+`+0x00..0x1F` are the remaining candidate: they are pixel coordinates laid down when the
+append is processed. Writing them would mean replicating the widget's axis mapping inside this
+app, against state it does not publish -- which is not "write the values natively", it is
+reimplementing the widget's layout. Not recommended.
+
+### Three things the earlier notes had wrong, all now measured
+
+- **A socket session does NOT stop the frame timer.** `sg_stamp` advanced 82,110 counts with a
+  probe connected. Sentinels appended from a probe are overwritten within ~100 ms, which
+  invalidated two earlier probe runs outright.
+- **Parking the frame loop FROM the socket does work.** 4.2 s and 6 refusals of persistent
+  retrying, then `sg_stamp` froze. The note saying it can never win is withdrawn.
+- **`FINDS` matches its own needle.** The pattern is a live Lua string in the swept heap:
+  searching for three dB values never appended anywhere returned exactly one hit each. Taking
+  a stride from the difference between two needles' hits is therefore meaningless, and when
+  two 8-byte needles are interned a plausible distance apart it is convincing. A probe built
+  on that wrote 120 floats over Lua's string table and the instrument bluescreened at
+  **PC 0x0022D270**, which disassembles to `lwz r0, 12(r12)` in `luaS_newlstr` -- the load of
+  `ts->tsv.len` while walking a bucket chain through an overwritten `next` pointer.
+
+Also measured while diagnosing: `FINDS` runs at **16.6 MB/s** in-app, and `KG.write` costs
+~68 us a record, so a Lua-side ring write would have been no cheaper than appending anyway.
+
+### Where the frame time actually is, and what to do next
+
+At 2048 the period is 0.10 s and the work is ~80 ms:
+
+| | ms | reducible |
+|---|---|---|
+| the trace fill, 510 appends at ~77 us | 39 | only by plotting fewer points |
+| acquisition, 2048 at 100 kS/s | 20.5 | no -- it is the record |
+| the compiled DSP | 3.1 | already compiled |
+| **everything else -- markers, peaks, THD, the settings line, bookkeeping** | **~17** | **never measured** |
+
+**That last row is the unexplored lever and it is the next thing to do.** It is as large as
+half the fill and nothing has ever broken it down. See `tools/probe_fillcost.py` for the
+pattern: `os.clock()` either side of each phase inside one frame, with the frame driven by
+hand.
+
+The other option needs no bench time and no tricks: **plot fewer columns.** `sg_ncol` 255 to
+128 halves the appends -- 39 ms to 19.7 -- and takes 2048 from 10 fps to about 12.5, at the
+cost of a visibly coarser trace. It is a judgement for the operator, not an optimisation.
 
 ## What is left to win
 
@@ -608,6 +652,15 @@ down with them. What is left is 2 and 5, and neither crosses the 50 ms boundary 
 
 ## Dead ends, measured -- do not retry these
 
+- **Writing the display task's record ring.** The records were found, the slots were inside the
+  drawn window, the writes were read back, a repaint happened, and nothing changed. The float
+  value of a record is not what the widget draws. Full account above; do not re-open it without
+  first settling what the two int32 triples at `+0x00..0x1F` are.
+- **Deriving a memory stride from the distance between two search hits.** `FINDS` matches its own
+  needle, so both hits can be the needles' own storage. This bluescreened a 6500 at
+  `PC 0x0022D270`. Confirm a stride against content at CANDIDATE strides instead.
+- **Assuming a socket session stops the app's frame timer.** It does not; `sg_stamp` advanced
+  82,110 counts with a probe connected. Park explicitly and confirm by reading `sg_stamp` twice.
 - **`bit.*` is slower than arithmetic for masking.** The firmware has an undocumented global `bit`
   table, but a call is 4.1 µs against 2.7 µs for `i - math.floor(i/256)*256`. It wins only where the
   pure-Lua alternative is a loop, and always for XOR, which has no cheap arithmetic equivalent.

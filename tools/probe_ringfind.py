@@ -42,10 +42,26 @@ Everything written is restored first in the finally block, before anything else 
 -- the 2350 lesson -- and the header goes back before the records, because an inconsistent
 cursor is the part that cannot be left behind.
 
-NO PARKING IS NEEDED AND NONE IS ATTEMPTED. A socket session suppresses display event dispatch,
-so the app's frame timer stops firing the moment this connects, the spectrum screen stays on the
-glass with its last trace, and the ring keeps the contents that trace was drawn from. Four
-attempts at parking the frame loop over the socket failed before that was understood.
+PARKING IS REQUIRED AND THIS DOES NOT DO IT -- FIX THAT BEFORE USING IT AGAIN.
+
+A socket session does NOT stop the app's frame timer. Measured 2026-11-09: sg_stamp advanced
+82,110 counts with a probe connected, so every sentinel appended here is overwritten within
+about 100 ms, long before a sweep reaches it. Two runs of this probe were invalidated that way
+and reported a desync that looked like a refusal.
+
+Parking FROM the socket DOES work, which an earlier note denied -- 4.2 s and 6 refusals of
+persistent retrying, then sg_stamp froze:
+
+    do if fftsa.saved_frame == nil then fftsa.saved_frame = fftsa.frame
+    fftsa.frame = function() end end print('P|' .. tostring(fftsa.saved_frame ~= nil)) end
+
+Confirm it by reading sg_stamp twice, not by that statement's own reply.
+
+AND THE QUESTION THIS WAS BUILT TO ANSWER IS ANSWERED, AND IT IS NO. Writing the float value of
+a record inside the drawn window changes nothing on the glass: writes read back present,
+repaint confirmed by the triggering append's own point appearing, values absent, twice. See
+docs/PERFORMANCE.md. What is still open is only what the two int32 triples at record
++0x00..0x1F are -- pixel coordinates is the hypothesis.
 """
 import os
 import struct
