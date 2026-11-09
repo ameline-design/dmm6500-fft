@@ -930,6 +930,65 @@ Where LUTs win decisively is **fused unary sequences** -- one read replacing rev
 scale-then-clamp-then-pack, at 1.4 µs against 4-8 µs for the steps. This app has no such step; the
 serial-decode project used exactly this for its MSB bit reversal.
 
+## Finding the display task's ring: follow the name, do not scan for readings
+
+The trace ring is reachable by a short chain and does not have to be hunted for. The firmware
+lays out one trace object per `display.graph.add` -- 0x14220 bytes on the GUI side, its pointer
+appended to the graph widget's null-terminated trace array -- and **the ring is inside that
+object**, behind a small header of bounds and cursors:
+
+| offset | content |
+|---|---|
+| `+0x08` | the buffer's name, NUL-terminated |
+| `+0x1F0` / `+0x1F4` | ring base / end |
+| `+0x1F8` | first unprocessed record |
+| `+0x200` / `+0x204` | write position / record count |
+| `+0x220` | the ring: 56-byte records |
+
+`0x220 - 0x1F0 = 0x30`, which is exactly the distance measured between the header and the ring
+on every boot this app has been found on -- eight of them, across five sessions. So the thing
+the finder calls a header is `trace+0x1F0`, and the ring follows from it by arithmetic.
+
+**The name is the needle.** This app creates its trace buffer into a bare global, `FFTSA_TRACE`,
+because a buffer the display task cannot name is subscribed as `defbuffer1` instead. That same
+name is what lands at `trace+0x08`. Searching for it beats searching for readings on every count
+that cost a session:
+
+* **It does not wait for the display task.** An append lands in a 28-byte staging ring on the
+  buffer side and is copied across later, so at the end of a fill the trace ring still holds the
+  *previous* pass. A needle built from this frame's decibels matches nothing -- measured: the
+  slice holding the staging ring confirmed a stride, and the slice holding the trace ring
+  confirmed nothing at all.
+* **It does not care what the spectrum looks like.** A trace pinned flat on the axis floor has no
+  distinct values to search for and no decibel span to fit a map from.
+* **It cannot be confused with the staging ring,** which holds the same two float32 pairs in the
+  same order and so confirms a stride just as convincingly.
+* **It says which trace.** The marker trace is a second object of the same shape, carrying
+  `FFTSA_MARK`.
+
+**What the header does not fix is the stride.** The span between the bounds is a whole number of
+records at more than one record size -- 40,376 bytes is 721 records of 56 and also 1,442 of 28 --
+so every plausible stride is offered and the map adjudicates. A wrong stride cuts the records in
+the wrong places, and the field that should hold a frequency then holds one this plan does not
+have, in almost every slot. 510 exact float32 matches against the app's own axis is not something
+another structure imitates.
+
+**Nothing above is taken from the layout at runtime.** The distance from the name to the bounds
+is derived by a bounded walk, the stride by content, the x and y pixel fields by which one tracks
+the frequency and which the value, and the value field by which offset the y pixel is affine in.
+A build that moved a field is still answered; a build that moved all of them refuses and the app
+keeps appending.
+
+**What would remove the scan entirely** is a pointer to the graph widget, which would give
+`graph+0x3EC` and the trace array directly. It is not available from Lua: `display.delete` is
+registered as `(int32)`, so a display handle is an integer id and not a userdata carrying a
+`CClassRef` the way a reading buffer's metatable does, and the id-to-pointer table would be a
+hardcoded firmware address. The remaining candidate is the buffer side, which *is* reachable
+without scanning -- `nl.cclass(fftsa.sg_buf)` gives the buffer's C++ instance, and subscribing
+installs an append hook on that very object. Whether the hook or the subscriber entry behind it
+carries the GUI trace pointer is not settled; it needs `rbuf_install_hooks` (0x0027F824) and
+`bufpub_fn_2bb684` (0x002BB684) read off the image.
+
 ## Two firmware facts about the pixel path
 
 Both from reading the firmware image:

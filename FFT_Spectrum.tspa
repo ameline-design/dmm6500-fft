@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.64
+-- $Version: 8.65
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -3711,6 +3711,7 @@ function fftsa.nl.px_clear()
   p.yoff, p.xoff, p.ov, p.ox, p.nseg = nil, nil, nil, nil, nil
   p.resid, p.span, p.hz1, p.hz2 = nil, nil, nil, nil
   p.drift, p.slot, p.slotdb, p.maptries = 0, nil, nil, 0
+  p.xcol, p.cands = nil, nil
 end
 
 -- Off for the rest of the session, with the reason kept for the error and About pages. The
@@ -3743,10 +3744,105 @@ function fftsa.nl.px_restart(why)
   nl.px.why = why
   nl.px.restarts = (laps or 0) + 1
   nl.px.wins, nl.px.wi, nl.px.at = nil, nil, nil
+  -- The name is tried again from scratch. noname is only a record of one ladder having been
+  -- swept without finding it, and a restart means the plan or the traces changed.
+  nl.px.noname = nil
   return nil
 end
 
 -- The ladder, cheap windows first and one pass over everything last.
+-- THE TRACE OBJECT CARRIES THE BUFFER'S NAME, and that is a far better needle than any
+-- reading.
+--
+-- The display task allocates one trace object per display.graph.add -- 0x14220 bytes on the
+-- GUI side, appended to the graph widget's null-terminated trace array -- and the record ring
+-- lives INSIDE it, at a fixed offset, behind a small header of bounds and cursors. The
+-- distance from that header to the ring measured 0x30 on every boot this app has been found
+-- on, which is what the layout says it should be.
+--
+-- Near the front of the same object is the buffer's NAME, as a NUL-terminated string. This app
+-- creates its trace buffer into a bare global for exactly that reason -- a buffer the display
+-- task cannot name is subscribed as defbuffer1 instead, and the graph then draws defbuffer1 on
+-- defbuffer1's units -- so the name is known, unique and chosen by this app: FFTSA_TRACE.
+--
+-- WHY IT BEATS SEARCHING FOR READINGS. Every failure the reading search met today is absent
+-- here:
+--
+--   * it does not wait for the display task. An append lands in a staging ring and is copied
+--     across later, so at the end of a fill the trace ring still holds the PREVIOUS pass and a
+--     needle built from this frame's decibels matches nothing. The name is there from the
+--     moment the trace is created.
+--   * it does not care what the spectrum looks like. A trace pinned flat on the axis floor
+--     offers no distinct values to search for and no decibel span to fit; the name is the same
+--     either way.
+--   * it cannot be confused with the staging ring, which holds the same floats in the same
+--     order in a 28-byte record and confirmed a stride just as well.
+--   * it says WHICH trace. The marker trace is a second object of the same shape; it carries
+--     FFTSA_MARK.
+--
+-- And one hit yields the whole geometry by arithmetic rather than by further searching: no
+-- stride to try, no header to scan for, no candidate list to work through.
+--
+-- NOTHING IS ASSUMED FROM THE LAYOUT. The distance from the name to the bounds pair is
+-- DERIVED: a bounded walk forward from the hit for two adjacent words that are a plausible
+-- ring -- the second above the first, their difference a whole number of records, the count and
+-- both cursors consistent with them -- which is the same test the record route applies, over a
+-- kilobyte instead of three hundred.
+fftsa.nl.PX_NAME = 'FFTSA_TRACE'
+-- How far past the name the bounds pair may sit. The layout puts the name at +0x08 and the
+-- bounds at +0x1F0, so 0x1E8; this is that with room for a build that moved a field.
+fftsa.nl.PX_NAME_SCAN = 1024
+
+-- Every geometry a trace object whose name was found at `at` could have.
+--
+-- A LIST, because the bounds do not fix the stride. The span between them is a whole number of
+-- records at more than one record size -- the measured ring is 40,376 bytes, which is 721
+-- records of 56 and also 1,442 of 28 -- and nothing in the header says which. So each plausible
+-- stride is returned and px_map adjudicates: a wrong stride cuts the records in the wrong
+-- places and its x field then holds a frequency this plan does not have, in almost every slot.
+--
+-- Same shape as the record route's output, so px_map takes either without knowing which found
+-- it: lo, hi, nrec, stride, hdr.
+function fftsa.nl.px_from_name(at)
+  local nl = fftsa.nl
+  local out, nout = {}, 0
+  local o
+  for o = 0, nl.PX_NAME_SCAN, 4 do
+    local h = at + o
+    local lo, hi = nl._wg(h), nl._wg(h + 4)
+    if lo ~= nil and hi ~= nil and hi > lo then
+      local span = hi - lo
+      -- The ring sits inside this very object, just past its own bounds words, so a pair that
+      -- points anywhere else is some other structure that happens to be ordered.
+      if lo > h and lo - h < nl.PX_NAME_SCAN and math.mod(span, 4) == 0 then
+        local sv
+        for sv = nl.REC_MIN, nl.REC_MAX, 4 do
+          if math.mod(span, sv) == 0 then
+            local n = span / sv
+            if n >= nl.RING_MIN and n <= nl.RING_MAX then
+              local old = nl._wg(h + nl.HDR_OLD)
+              local wr = nl._wg(h + nl.HDR_WRITE)
+              local cnt = nl._wg(h + nl.HDR_COUNT)
+              if old ~= nil and wr ~= nil and cnt ~= nil
+                 and old >= lo and old < hi and math.mod(old - lo, sv) == 0
+                 and wr >= lo and wr <= hi and math.mod(wr - lo, sv) == 0
+                 and cnt >= 1 and cnt <= n then
+                nout = nout + 1
+                out[nout] = { lo = lo, hi = hi, nrec = n, stride = sv, hdr = h,
+                              name_at = at, name_off = o }
+              end
+            end
+          end
+        end
+        -- The first bounds pair that stands up at all is the one: a second, further on, would
+        -- be inside the ring itself.
+        if nout > 0 then return out end
+      end
+    end
+  end
+  return out
+end
+
 function fftsa.nl.px_windows(buf)
   local nl = fftsa.nl
   local all = nl.scan_windows(buf, nil)
@@ -3847,13 +3943,22 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
   local nl = fftsa.nl
   local p = nl.px
   local out, nout = {}, 0
-  local xs, j = nl.px_xneedle(hz, nseg)
-  if xs == nil then
-    p.degen = (p.degen or 0) + 1
-    return out
+  -- The name first. It is longer, it is unique to this app, and it is in memory whatever the
+  -- display task and the spectrum are doing -- see px_from_name. The frequency series stays as
+  -- the second needle, for a build that does not keep the name where this can reach it.
+  local n1 = nl.PX_NAME .. string.char(0)
+  local byname, xs = true, nil
+  if p.noname then
+    local j
+    xs, j = nl.px_xneedle(hz, nseg)
+    byname = false
+    if xs == nil then
+      p.degen = (p.degen or 0) + 1
+      return out
+    end
+    p.xcol = j
+    n1 = xs[1] .. xs[1]
   end
-  p.xcol = j
-  local n1 = xs[1] .. xs[1]
   if p.wins == nil then
     p.wins = nl.px_windows(buf)
     p.wi, p.at, p.swept = 1, p.wins[1][1], p.swept or 0
@@ -3862,9 +3967,11 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
   while left > 0 do
     local w = p.wins[p.wi]
     if w == nil then
-      -- The ladder is spent and nothing confirmed. Round it again rather than refusing.
+      -- The ladder is spent. The name found nothing, so the next lap uses the other needle --
+      -- and if that fails too, laps simply counts how many times round it has been.
       p.wins, p.wi, p.at = nil, nil, nil
       p.laps = (p.laps or 0) + 1
+      if byname then p.noname = true end
       return out
     end
     if p.at == nil or p.at < w[1] or p.at + 8 > w[2] then
@@ -3884,11 +3991,22 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
       local k, sv
       for k = 1, table.getn(h) do
         p.hits = (p.hits or 0) + 1
-        for sv = nl.REC_MIN, nl.REC_MAX, 4 do
-          local g = nl.px_xconfirm(h[k], sv, xs)
-          if g ~= nil then
+        if byname then
+          -- One hit, every geometry it could be, by arithmetic. No header to go looking for:
+          -- the bounds come out of a bounded walk forward from the name.
+          local gs = nl.px_from_name(h[k])
+          local gi
+          for gi = 1, table.getn(gs) do
             nout = nout + 1
-            out[nout] = g
+            out[nout] = gs[gi]
+          end
+        else
+          for sv = nl.REC_MIN, nl.REC_MAX, 4 do
+            local g = nl.px_xconfirm(h[k], sv, xs)
+            if g ~= nil then
+              nout = nout + 1
+              out[nout] = g
+            end
           end
         end
       end
@@ -4047,14 +4165,18 @@ function fftsa.nl.px_map(g, db, hz, nseg)
   local nl = fftsa.nl
   local p = nl.px
   p.why = nil
-  if g == nil or g.lo == nil or g.hi == nil or g.nrec == nil or g.ox == nil
-     or g.hdr == nil then
+  if g == nil or g.lo == nil or g.hi == nil or g.nrec == nil or g.hdr == nil then
     p.why = 'no ring geometry to map'
     return false
   end
   local stride, ox = g.stride, g.ox
-  if stride == nil or stride < nl.REC_MIN or ox == nil or ox + 8 > stride then
-    p.why = 'record geometry ' .. tostring(stride) .. '/' .. tostring(ox) .. ' is not usable'
+  if stride == nil or stride < nl.REC_MIN then
+    p.why = 'record stride ' .. tostring(stride) .. ' is not usable'
+    return false
+  end
+  if ox ~= nil and ox + 8 > stride then
+    p.why = 'x field at ' .. tostring(ox) .. ' does not fit a ' .. tostring(stride)
+            .. '-byte record'
     return false
   end
   -- ONLY THE DRAWN WINDOW, which is not the whole ring.
@@ -4095,6 +4217,35 @@ function fftsa.nl.px_map(g, db, hz, nseg)
   -- The slot map, and the confirmation, in one pass.
   local key, j = {}, nil
   for j = 1, nseg do key[f32_pack(hz[j])] = j end
+
+  -- WHERE THE X FIELD IS, when the caller did not say. The record route finds it while
+  -- confirming a stride; the name route never looks at a record, so it is derived here -- the
+  -- one offset whose four bytes are a member of THIS plan's frequency series in every slot.
+  -- A permutation of the app's own axis, 510 slots deep, is not something another field can
+  -- imitate. The x is stored twice side by side, so the lower of the two matches wins.
+  if ox == nil then
+    local o, s2
+    for o = 0, stride - 4, 4 do
+      local all = true
+      for s2 = 1, cnt do
+        local b2 = (s2 - 1) * stride
+        if key[string.sub(blk, b2 + o + 1, b2 + o + 4)] == nil then
+          all = false
+          break
+        end
+      end
+      if all then
+        ox = o
+        break
+      end
+    end
+    if ox == nil then
+      p.why = 'no field in a ' .. tostring(stride) .. '-byte record holds this plan'
+              .. ' frequency in all ' .. tostring(cnt) .. ' slots'
+      return false
+    end
+    g.ox = ox
+  end
   local idx, miss, s, xv = {}, 0, nil, {}
   for s = 1, cnt do
     local base = (s - 1) * stride
@@ -4403,6 +4554,13 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t)
     end
     local g = c[table.getn(c)]
     table.remove(c)
+    -- A name-derived geometry already has its bounds and its header; only the record route
+    -- has to go looking for one.
+    if g.hdr ~= nil and g.lo ~= nil then
+      g.ox = nil
+      p.g, p.state, p.maptries = g, 'map', 0
+      return nil
+    end
     if nl.find_ring_header(g) ~= nil then
       -- val0 is the x field, so the offset the header check measured for it IS the x offset.
       -- The value field is not needed here and px_map derives it.
@@ -5940,7 +6098,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.64'
+fftsa.VERSION = '8.65'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is

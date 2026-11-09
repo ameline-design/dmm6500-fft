@@ -1709,6 +1709,49 @@ do
     return ki.memread(string.format('%X', RLO), string.format('%X', NREC * STRIDE))
   end
 
+  -- A SECOND fixture, shaped like a real trace object: the buffer's name near the front, the
+  -- bounds and cursors at +0x1F0, and the ring immediately past them at +0x220. The first
+  -- fixture deliberately puts its header 40 KB from its ring, which is what gates the record
+  -- route's header search over a distance; this one gates the name route, whose whole claim is
+  -- that the geometry follows from the name by a short walk.
+  local TLO = RLO - 1048576          -- a megabyte clear of the other fixture
+  local TNAME, TBOUND, TRING = TLO + 8, TLO + 496, TLO + 544   -- 0x08, 0x1F0, 0x220
+  local function tracefix()
+    local nm = fftsa.nl.PX_NAME .. string.char(0)
+    local i
+    for i = 0, string.len(nm) - 1 do
+      local a = TNAME + i
+      local w = a - math.mod(a, 4)
+      local old4 = IMG[w] or '\0\0\0\0'
+      local k = a - w + 1
+      IMG[w] = string.sub(old4, 1, k - 1) .. string.sub(nm, i + 1, i + 1)
+               .. string.sub(old4, k + 1)
+    end
+    wr32(TBOUND, TRING)
+    wr32(TBOUND + 4, TRING + NREC * STRIDE)
+    wr32(TBOUND + fftsa.nl.HDR_OLD, TRING)
+    wr32(TBOUND + fftsa.nl.HDR_WRITE, TRING + (WSLOT - 1) * STRIDE)
+    wr32(TBOUND + fftsa.nl.HDR_COUNT, NREC)
+    local s
+    for s = 1, NREC do
+      local rec = TRING + (s - 1) * STRIDE
+      local j = slot_index(s)
+      local v = fftsa.nl._f32_pack(DB[j])
+      local x = fftsa.nl._f32_pack(HZ[j])
+      local xp, yp = xpix(j), ypix(DB[j])
+      wr32(rec, xp)
+      wr32(rec + 4, xp)
+      wr32(rec + 8, xp)
+      wr32(rec + 12, yp)
+      wr32(rec + 16, yp)
+      wr32(rec + 20, yp)
+      wrs(rec + OV, v .. v)
+      wr32(rec + OV + 8, 0)
+      wrs(rec + OX, x .. x)
+      wr32(rec + OX + 8, 1073741824)
+    end
+  end
+
   fftsa.nl.RING_MIN = 8
   build(nil)
 
@@ -1955,6 +1998,7 @@ do
     -- so the answer can only come from a sweep that carried on where the last one stopped. The
     -- needle is the app's own first four columns, which is all a frame has.
     fftsa.nl.px_restart('test')
+    fftsa.nl.px.noname = true
     local SENT, i = {}, nil
     for i = 1, 4 do SENT[i] = { db = DB[i], hz = HZ[i] } end
     local s0 = nil
@@ -1996,6 +2040,7 @@ do
     -- every offset matches -- and a frequency of zero packs to four zero bytes, of which the
     -- ring's own records hold two words. Both have to be refused without sweeping anything.
     fftsa.nl.px_restart('test')
+    fftsa.nl.px.noname = true
     local flat, j = {}, nil
     for j = 1, NSEG do flat[j] = 4096 end
     check('an axis of equal frequencies is refused without sweeping anything',
@@ -2013,6 +2058,68 @@ do
           and string.sub(xs[1], 1, 4) ~= string.rep('\0', 4),
           'column ' .. tostring(col) .. ' of a band whose first frequency is '
           .. tostring(dc[1]))
+  end
+
+  -- ---- the name route --------------------------------------------------------
+  do
+    -- The whole geometry out of one hit on the buffer's name, by a bounded walk and no further
+    -- searching. This is the route the operator asked for: a pointer to follow rather than a
+    -- scan to run, and every offset in it derived rather than taken from the layout notes.
+    build(nil)
+    tracefix()
+    local gs = fftsa.nl.px_from_name(TNAME)
+    local g, gi = nil, nil
+    for gi = 1, table.getn(gs) do
+      if gs[gi].stride == STRIDE then g = gs[gi] end
+    end
+    check('the name yields the ring bounds and a stride among the candidates',
+          g ~= nil and g.lo == TRING and g.hi == TRING + NREC * STRIDE
+          and g.nrec == NREC and g.hdr == TBOUND,
+          g ~= nil and string.format('%d candidates, the %d-byte one is %X..%X n=%d, header '
+                                     .. 'at %X, %d bytes past the name', table.getn(gs),
+                                     g.stride, g.lo, g.hi, g.nrec, g.hdr, g.name_off)
+          or (tostring(table.getn(gs)) .. ' candidates, none at stride '
+              .. tostring(STRIDE)))
+    -- The span does not fix the stride, so more than one candidate is the expected answer and
+    -- px_map is what settles it. 1344 bytes is 24 records of 56 and also 56 of 24.
+    check('and more than one stride is offered rather than one guessed at',
+          table.getn(gs) > 1, tostring(table.getn(gs)) .. ' candidates')
+    -- And nothing is read out of the layout: the distance from the name to the bounds is
+    -- whatever the walk found, so a build that moved the field is still answered.
+    check('the distance from the name to the bounds is measured, not assumed',
+          g ~= nil and g.name_off == TBOUND - TNAME,
+          g ~= nil and (tostring(g.name_off) .. ' bytes, fixture has '
+                        .. tostring(TBOUND - TNAME)) or 'nil')
+    check('a name with no plausible ring after it yields nothing',
+          table.getn(fftsa.nl.px_from_name(TNAME + 65536)) == 0)
+  end
+
+  do
+    -- End to end on the name, with the x field DERIVED: the name route never looks at a
+    -- record, so which offset holds the frequency is settled by the one that carries a member
+    -- of this plan's own series in every slot.
+    build(nil)
+    tracefix()
+    FFTSA_PXRING = nil
+    fftsa.nl.px_restart('test')
+    fftsa.nl.px.state = 'idle'
+    local calls, n = 0, nil
+    while n == nil and calls < 500 do
+      calls = calls + 1
+      n = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 4000 + calls)
+    end
+    check('the whole path engages on the name, with the x field derived',
+          n == NSEG and fftsa.nl.px.state == 'on' and fftsa.nl.px.lo == TRING
+          and fftsa.nl.px.ox == OX and fftsa.nl.px.yoff == 12,
+          string.format('n=%s state=%s ring=%s x@%s y@%s v@%s after %d frames', tostring(n),
+                        tostring(fftsa.nl.px.state),
+                        fftsa.nl.px.lo and string.format('%X', fftsa.nl.px.lo) or 'nil',
+                        tostring(fftsa.nl.px.ox), tostring(fftsa.nl.px.yoff),
+                        tostring(fftsa.nl.px.ov), calls))
+    check('and it never needed the frequency needle',
+          fftsa.nl.px.noname == nil and fftsa.nl.px.xcol == nil,
+          'noname=' .. tostring(fftsa.nl.px.noname)
+          .. ' xcol=' .. tostring(fftsa.nl.px.xcol))
   end
 
   -- ---- the cache -------------------------------------------------------------
@@ -2054,6 +2161,7 @@ do
     build(nil)
     stage()
     fftsa.nl.px_restart('test')
+    fftsa.nl.px.noname = true
     local SENT, i = {}, nil
     for i = 1, 4 do SENT[i] = { db = DB[i], hz = HZ[i] } end
     local c, calls = {}, 0
@@ -2083,7 +2191,7 @@ do
     stage()
     FFTSA_PXRING = nil
     fftsa.nl.px_restart('test')
-    fftsa.nl.px.state = 'idle'
+    fftsa.nl.px.noname, fftsa.nl.px.state = true, 'idle'
     local calls, n = 0, nil
     while n == nil and calls < 500 do
       calls = calls + 1
@@ -2103,7 +2211,7 @@ do
     build(nil)
     FFTSA_PXRING = nil
     fftsa.nl.px_restart('test')
-    fftsa.nl.px.state = 'idle'
+    fftsa.nl.px.noname, fftsa.nl.px.state = true, 'idle'
     local saw, calls, n = {}, 0, nil
     while n == nil and calls < 500 do
       calls = calls + 1
