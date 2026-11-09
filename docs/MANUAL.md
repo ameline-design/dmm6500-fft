@@ -451,10 +451,14 @@ anything to a measurement. It is there so that an instrument on which the app *w
 be reported on -- **page to the end and send a grab of that page** if you are asked how a
 particular model behaved.
 
-## If the app will not start
+The state is re-read every time About is opened, so it describes the instrument as it is now
+and not as it was at launch. That matters when something has stopped working since: a compiled
+path that started and then gave up is recorded here and nowhere else.
 
-A red **FFT &lt;version&gt; did not start** page replaces the analyser, with the model and the
-firmware version beside the build. Everything below it is a diagnostic dump: addresses, window
+## If the app stops, or will not start
+
+A red **FFT &lt;version&gt;** page replaces the analyser, with the model and the firmware version
+beside the build. Everything below it is a diagnostic dump: addresses, window
 ranges, counters and a dump of the memory words the bind was looking at.
 
 **It is written to be read by whoever fixes the app, not by you.** Two things are worth doing
@@ -465,6 +469,13 @@ with it:
   two as on page one.
 * Send the captures. There is nothing to act on at the instrument; the app has already cleaned
   up after itself, and **End App** exits.
+
+**The same page appears if the analyser stops after it has been running.** The compiled path
+can start, produce spectra, and then give up -- a capture that fails, a reduction that will not
+decode -- and this archive carries no interpreted transform to fall back on, so that is the end
+of the run. Earlier builds reported it as one line along the bottom of a frozen trace, which
+was cut off before it reached the reason. It now puts the full diagnostic up by itself, because
+the only thing that ever gets sent back is a photograph of whatever was on the glass.
 
 ## How many points the trace carries
 
@@ -651,7 +662,7 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | About half the frame rate the table above gives | The compiled transform did not install, so the app is running the interpreted one. It installs once per power cycle, so a second launch without a power cycle always lands here: power cycle and launch once. A firmware upgrade is not the explanation -- the compiled path holds no address belonging to a firmware build and finds what it needs on the instrument it is running on. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
-| A red `FFT <version> did not start` page | The compiled path could not bind and this archive has no interpreted fallback. See "If the app will not start" above: capture every page. |
+| A red `FFT <version>` page instead of the analyser | The compiled path could not bind, or started and then gave up, and this archive has no interpreted fallback. See "If the app stops, or will not start" above: capture every page. |
 | A help dialog sits over the app after pressing HELP | Expected. Press EXIT to dismiss it. The firmware offers the app no way to receive that key, so the only way to notice the dialog is to poll the glass for it, and that poll waits on the display task: it cost 44 ms of every frame, a sixth of the rate at 16384 samples. It ships off. `fftsa.help_enabled = true` turns the recogniser back on, where it runs once a second rather than once a frame. |
 | Peak width changes as you tune | Expected. See above. |
 | A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |

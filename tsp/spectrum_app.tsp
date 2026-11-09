@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.62'
+fftsa.VERSION = '8.64'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -340,9 +340,12 @@ function fftsa.spectrum_interp(cap, buf)
   -- to it, and the call below would index a nil rather than be refused.
   if fftsa.fft_init == nil or dsp.spectrum == nil then
     if not fftsa.halted then
-      fftsa.halted = true
       fftsa.lasterr = 'the compiled DSP stopped and this archive has no interpreted fallback'
-      fftsa.say('HALTED: ' .. fftsa.lasterr)
+      -- WHAT STOPPED IT, not that it stopped. fftsa.nl_lasterr is the demotion's own reason,
+      -- set where nl.ready was cleared, and it is short: a refusal code and its name, or the
+      -- count a reduce would not accept. The sentence above fills the 70 characters a settings
+      -- line holds, which is how a DMM7510 report came back reading "...has no interpreted f".
+      fftsa.halt('HALTED ' .. tostring(fftsa.nl_lasterr))
     end
     return nil
   end
@@ -1089,10 +1092,11 @@ function fftsa.frame()
     -- After a run of failures stop retrying and say so on screen: a trace that
     -- stopped updating looks like a working analyser on a dead signal.
     if fftsa.errrun >= (fftsa.errmax or 20) then
-      fftsa.halted = true
-      display.settext(fftsa.sg_xunit,
-        "HALTED after " .. fftsa.errrun .. " failed frames: " ..
-        string.sub(tostring(fftsa.lasterr), 1, 60))
+      -- Through fftsa.halt, so a run of failed frames puts the same paged diagnostic on the
+      -- glass that a stopped compiled DSP does. Both are terminal and both are reported by a
+      -- photograph of whatever the instrument was showing.
+      fftsa.halt("HALTED after " .. fftsa.errrun .. " frames: " ..
+                 string.sub(tostring(fftsa.lasterr), 1, 40))
     end
   else
     fftsa.errrun = 0
@@ -1344,6 +1348,57 @@ end
 -- Appended from a marker rather than pushed, because fftsa.start() runs again on every launch
 -- while the module's load-time table does not: without the marker a second launch would carry
 -- two copies of the state and a tenth would carry ten.
+-- Everything a report needs, as one string, composed in ONE place.
+--
+-- Three readers want it -- the error screen a halt puts up, the About pages an operator can
+-- open, and the console -- and they were each building their own. A diagnostic that differs
+-- between the screen it lands on and the page it is grabbed from is worse than none: the
+-- report that arrives cannot be compared with the report that was expected.
+--
+-- The app's own state comes first. nl.diag() describes how the native path was DISCOVERED;
+-- what a frame then did with it is in fftsa.nl_lasterr and nowhere else, and that is the
+-- string that names a compiled DSP which started and then stopped.
+function fftsa.diag_str()
+  local app = 'halt=' .. tostring(fftsa.halted)
+              .. ' err=' .. tostring(fftsa.lasterr)
+              .. ' nlerr=' .. tostring(fftsa.nl_lasterr)
+              .. ' rc=' .. tostring(fftsa.nl ~= nil and fftsa.nl.last_rc)
+              .. ' nerr=' .. tostring(fftsa.errcount)
+              .. ' short=' .. tostring(fftsa.shortreads)
+              .. ' rot=' .. tostring(fftsa.nl_rotated)
+              .. ' n=' .. tostring(fftsa.n)
+              .. ' ncol=' .. tostring(fftsa.sg_ncol)
+  local d = nil
+  if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
+    local ok, got = pcall(fftsa.nl.diag)
+    if ok then d = got end
+  end
+  if d == nil then d = 'no native path: nl=' .. tostring(fftsa.nl ~= nil) end
+  local px = ''
+  if fftsa.nl ~= nil and fftsa.nl.px_str ~= nil then
+    local okp, gotp = pcall(fftsa.nl.px_str)
+    if okp then px = ' | ' .. tostring(gotp) end
+  end
+  return app .. ' | ' .. tostring(d) .. px
+end
+
+-- Stop, and put the reason on the glass where it can be photographed.
+--
+-- THE ERROR SCREEN HAS TO APPEAR BY ITSELF. A DMM7510 halted with the cause in a status line
+-- that holds 70 characters and in About pages nobody had been told to open, so the report that
+-- came back was a flat trace and a truncated sentence -- which said nothing the source did not
+-- already say. The only channel is a screen grab from another continent, so a halt shows the
+-- paged diagnostic without being asked.
+--
+-- The short line goes on the settings line as well, for the case where the screen cannot be
+-- built: an exhausted object pool is exactly the kind of failure that gets this far.
+function fftsa.halt(short)
+  fftsa.halted = true
+  pcall(fftsa.say, short)
+  pcall(fftsa.show_error, fftsa.diag_str(), true)
+  return nil
+end
+
 function fftsa.about_add_diag()
   if fftsa.about_text == nil then return false end
   if fftsa.about_diag_at == nil then
@@ -1353,14 +1408,8 @@ function fftsa.about_add_diag()
   for i = table.getn(fftsa.about_text), fftsa.about_diag_at, -1 do
     fftsa.about_text[i] = nil
   end
-  local d = nil
-  if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
-    local ok, got = pcall(fftsa.nl.diag)
-    if ok then d = got end
-  end
-  if d == nil then d = 'no native path: nl=' .. tostring(fftsa.nl ~= nil) end
   local body = fftsa.err_wrap('v' .. tostring(fftsa.VERSION) .. ' ' .. fftsa.node_str()
-                              .. ' ' .. tostring(d), fftsa.about_cols)
+                              .. ' | ' .. fftsa.diag_str(), fftsa.about_cols)
   -- A page boundary first, so the state starts at the top of a page and the licence is never
   -- half overwritten by it: a grab of that page is then the whole of what it reports.
   local at = fftsa.about_diag_at
@@ -1469,6 +1518,12 @@ end
 -- Always from the first page, so the screen reads the same every time it is opened.
 function fftsa.about()
   if fftsa.aboutscr == nil then return false end
+  -- REBUILT HERE, not only at launch. fftsa.start() adds the state once, which describes the
+  -- instrument as it was before the first frame ran -- and the failure worth reporting is a
+  -- demotion that happens later. Re-appending costs nothing: about_add_diag truncates from its
+  -- own marker first, so this is idempotent however many times About is opened, and the row
+  -- objects it writes into were built with the screen.
+  pcall(fftsa.about_add_diag)
   fftsa.about_show_page(1)
   display.changescreen(fftsa.aboutscr)
   return true
@@ -1873,6 +1928,21 @@ fftsa.tick_idle = 0.020
 -- 0.05 to silence the log: it would arm 1024 at 0.10 and cost about a third of the frame
 -- rate. The floor is real -- arm(0.045) is refused with event 1131.
 fftsa.tick_grid = 0.010
+-- EXCEPT ON A DMM7510, WHERE 1727 IS A MODAL DIALOG.
+--
+-- The paragraph above is a DMM6500 measurement: there the event goes to the log and the app
+-- runs on. On a DMM7510 the same warning is put on the glass as a prompt with Details,
+-- Suppress and OK -- over the running app, where it covers the trace, waits for a press, and
+-- makes the control socket refuse every statement while it is up. Seen on two of three screen
+-- grabs from a 7510 on 8.62, and the timer re-arms whenever measured work moves, so it comes
+-- back.
+--
+-- So that model takes the 50 ms grid and the frame rate that goes with it. eventlog.suppress
+-- exists in the firmware's registration table and would be the better fix -- it is what the
+-- dialog's own Suppress button must reach -- but it is undocumented, with no signature and no
+-- argument types recorded, and the instrument it would be guessed at on is on another
+-- continent. Not raising the event needs nothing undocumented.
+fftsa.tick_grid_7510 = 0.050
 fftsa.tick_min  = 0.050
 -- How far the period must move before a re-arm is worth it: every re-arm is a display timer
 -- deleted and created against a 463-object pool, and on a 10 ms grid a period that dithers
@@ -1882,9 +1952,15 @@ fftsa.tick_rearm = 0.020
 -- than the jitter it is meant to ignore and narrower than a size change.
 fftsa.tick_rise = 0.050
 
+-- The grid in force, which is a property of the instrument and not of the build.
+function fftsa.tick_grid_now()
+  if fftsa.is_7510 ~= nil and fftsa.is_7510() then return fftsa.tick_grid_7510 end
+  return fftsa.tick_grid
+end
+
 function fftsa.tick_period(busy)
   if busy == nil or busy <= 0 then return fftsa.tick_min end
-  local g = fftsa.tick_grid
+  local g = fftsa.tick_grid_now()
   local ticks = math.ceil((busy + fftsa.tick_idle) / g - 0.05)
   if ticks < 1 then ticks = 1 end
   local p = ticks * g
@@ -2234,7 +2310,15 @@ end
 --
 -- These children are created on a visible screen, which nothing else in the app does: it
 -- runs once, after startup has failed, and the cover is gone by then.
-function fftsa.show_error(msg)
+-- stay says the caller still has a screen worth leaving on the glass.
+--
+-- A build that fails here has nowhere to put the report, and for a STARTUP failure the only
+-- coherent move is the home screen -- the app's own screens are half built or absent. For a
+-- MID-RUN halt it is the opposite: the spectrum screen is intact and showing, the settings
+-- line already carries the short reason, and the home screen is a live measurement whose
+-- reading explains nothing. So the caller says which it is rather than this guessing from
+-- whichever handles happen to be non-nil.
+function fftsa.show_error(msg, stay)
   -- The build, then the diagnostic, and no prose in between. This page is read by whoever is
   -- fixing the app and not by whoever is standing in front of the instrument, so a sentence
   -- here costs characters that a hex word would have used -- and the version is the one thing
@@ -2298,7 +2382,12 @@ function fftsa.show_error(msg)
   end)
   if not shown or fftsa.errscr == nil then
     fftsa.errscr = nil
-    display.changescreen(display.SCREEN_HOME)
+    -- HOME only when there is no screen of this app's to stay on, which means a failure during
+    -- the build. The home screen is a LIVE MEASUREMENT: switching a running app to it hands
+    -- the measurement subsystem back to the front panel, which reconfigures the digitizer, and
+    -- the app's next capture fails. Doing that to report a halt would replace a diagnostic the
+    -- operator could photograph with a reading that explains nothing.
+    if not stay then display.changescreen(display.SCREEN_HOME) end
     print("fftsa: could not build the error screen either -- " .. full)
   end
   return fftsa.errscr

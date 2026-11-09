@@ -2652,6 +2652,9 @@ check('a halted app keeps its halt message on the line', (function()
   local after = tostring(OBJ[fftsa.sg_xunit].text)
   fftsa.frame_body = realbody
   fftsa.halted, fftsa.errrun, fftsa.errmax = false, 0, 20
+  -- A halt now puts the paged diagnostic on the glass, so a case that drives one has to put
+  -- the spectrum screen back or every later case runs against the error screen.
+  display.changescreen(fftsa.sg_scr)
   fftsa.fps, fftsa.fps_n, fftsa.fps_t0, fftsa.fps_show = nil, 0, nil, false
   local recovered = fftsa.options_apply()
   return halted and string.find(msg, 'fps-halt-boom', 1, true) ~= nil
@@ -2996,6 +2999,7 @@ check('a pending re-plan does not resurrect a halted app', (function()
   dsp.spectrum = realupd
   local halted, pending = fftsa.halted, fftsa.retune_pending
   fftsa.halted, fftsa.errrun, fftsa.errcount, fftsa.lasterr = false, 0, 0, nil
+  display.changescreen(fftsa.sg_scr)
   fftsa.retune_pending = false
   display.settext(fftsa.sg_xunit, fftsa.sg_xunit_text())
   return before == false and halted == true and pending == true,
@@ -5018,6 +5022,31 @@ end)())
 -- minimum, which is not its resolution. Pinned either side of a boundary so the rounding
 -- cannot drift unnoticed, and at the floor so a short frame cannot ask for less than the
 -- timer will take.
+-- A DMM7510 puts event 1727 on the glass as a modal prompt rather than in the log, so every
+-- period it is armed with has to be a multiple of 0.05 -- which is exactly when 1727 does not
+-- fire. Measured on a 6500: ten periods, the seven non-multiples warned and 0.05/0.10/0.25
+-- did not.
+check('on a DMM7510 every armed period is a multiple of 50 ms', (function()
+  local keep = fftsa.model_str
+  fftsa.model_str = 'DMM7510'
+  local bad, b = nil, nil
+  for b = 0.001, 0.400, 0.003 do
+    local p = fftsa.tick_period(b)
+    -- Integer multiple to within a rounding step, the arithmetic being in floating point.
+    local k = p / 0.05
+    if math.abs(k - math.floor(k + 0.5)) > 0.001 or p < fftsa.tick_min then
+      bad = string.format('busy %.3f armed %.4f', b, p)
+      break
+    end
+  end
+  local g7, g65 = nil, nil
+  g7 = fftsa.tick_grid_now()
+  fftsa.model_str = 'DMM6500'
+  g65 = fftsa.tick_grid_now()
+  fftsa.model_str = keep
+  return bad == nil and g7 == 0.050 and g65 == fftsa.tick_grid,
+         bad or string.format('7510 grid %g, 6500 grid %g', g7, g65)
+end)())
 check('tick_period rounds up to the 10 ms grid and never below the 50 ms floor', (function()
   -- near(), not equality: ticks * grid does not reproduce the literal exactly.
   --
@@ -5426,6 +5455,199 @@ check('with the ring off sg_fill clears and writes nseg', (function()
   fftsa.del_buf(b)
   return a == 40 and c == 40, string.format('first=%d second=%d, a missing clear gives 80',
                                             a, c)
+end)())
+
+-- ---------------------------------------------------------------------------
+-- The pixel fill's place in the frame, with the pixel path itself stubbed.
+--
+-- fftsa.nl.px_* is gated in tools/test_nl_reattach.lua against a real ring image. What belongs
+-- here is the other half: that THE APPEND PATH IS STILL THE FALLBACK, and that it is reached
+-- in every case where the pixel path does not draw -- switched off, no nl module at all, not
+-- engaged, declining a frame, or raising.
+-- ---------------------------------------------------------------------------
+
+-- A trace buffer and a stub nl, returned so each case can drive one frame and put it all back.
+local function pixbed(pxstate, frameresult, framebody)
+  local b = buffer.make(fftsa.sg_ring_cap(20), buffer.STYLE_WRITABLE_FULL)
+  b.fillmode = buffer.FILL_CONTINUOUS
+  local saved = { ring = fftsa.sg_ring, buf = fftsa.sg_buf, pix = fftsa.sg_pix,
+                  nl = fftsa.nl, stamp = fftsa.sg_stamp, wr = buffer.write.reading }
+  local log = { appends = 0, armed_after = nil, frames = 0 }
+  buffer.write.reading = function(bb, v, x, t, st)
+    log.appends = log.appends + 1
+    return saved.wr(bb, v, x, t, st)
+  end
+  fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_pix = true, b, true
+  fftsa.nl = {
+    px = { state = pxstate },
+    px_frame = function(db, hz, nseg, tb, t)
+      log.frames = log.frames + 1
+      log.frame_tb, log.frame_t = tb, t
+      if framebody ~= nil then return framebody(db, hz, nseg, tb, t) end
+      return frameresult
+    end,
+    px_try = function(db, hz, nseg, tb, t)
+      -- When the search ran, measured in appends already made. The needle is db[1] and the
+      -- only thing that puts it into the ring is the fill, so a search that runs before the
+      -- appends would be matching this frame's needle against last frame's records.
+      log.armed_after = log.appends
+      return nil
+    end,
+    px_off = function(why) fftsa.nl.px.state = 'off'; fftsa.nl.px.why = why end,
+    px_restart = function(why) fftsa.nl.px.state = 'idle'; fftsa.nl.px.why = why end,
+  }
+  local db, hz, i = {}, {}, nil
+  for i = 1, 20 do db[i], hz[i] = -60 - i, 50 * i end
+  return b, saved, log, db, hz
+end
+
+local function pixbed_done(b, saved)
+  fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_pix = saved.ring, saved.buf, saved.pix
+  fftsa.nl, fftsa.sg_stamp = saved.nl, saved.stamp
+  buffer.write.reading = saved.wr
+  fftsa.del_buf(b)
+end
+
+check('the search runs after the fill, never before it', (function()
+  local b, saved, log, db, hz = pixbed('seek', nil, nil)
+  local n = fftsa.sg_fill(db, hz, 20)
+  local want = fftsa.sg_ring_cap(20)
+  pixbed_done(b, saved)
+  return n == 20 and log.appends == want and log.armed_after == want,
+         string.format('appends=%d, the search saw %s of them, a pass is %d',
+                       log.appends, tostring(log.armed_after), want)
+end)())
+
+check('an engaged pixel path replaces the pass, and the fill appends nothing', (function()
+  local b, saved, log, db, hz = pixbed('on', 20, nil)
+  fftsa.sg_stamp = 1000
+  local n = fftsa.sg_fill(db, hz, 20)
+  local st = fftsa.sg_stamp
+  pixbed_done(b, saved)
+  -- One timestamp, reserved before px_frame is handed it. The append inside px_frame is
+  -- stubbed out here, so the appends counted are the fill's, and there must be none.
+  return n == 20 and log.frames == 1 and log.appends == 0
+         and log.frame_t == 1001 and st == 1001,
+         string.format('n=%s frames=%d appends=%d t=%s sg_stamp=%d', tostring(n),
+                       log.frames, log.appends, tostring(log.frame_t), st)
+end)())
+
+check('a pixel frame that raises falls back to appends and switches itself off', (function()
+  local b, saved, log, db, hz = pixbed('on', nil, function() error('ring went away', 0) end)
+  local n = fftsa.sg_fill(db, hz, 20)
+  local want = fftsa.sg_ring_cap(20)
+  local state, why = fftsa.nl.px.state, fftsa.nl.px.why
+  pixbed_done(b, saved)
+  return n == 20 and log.appends == want and state == 'off'
+         and string.find(tostring(why), 'raised', 1, true) ~= nil,
+         string.format('n=%s appends=%d of %d, state=%s why=%s', tostring(n), log.appends,
+                       want, tostring(state), tostring(why))
+end)())
+
+check('a pixel frame that declines the frame falls back to appends and stays on', (function()
+  local b, saved, log, db, hz = pixbed('on', nil, nil)
+  local n = fftsa.sg_fill(db, hz, 20)
+  local want = fftsa.sg_ring_cap(20)
+  local state = fftsa.nl.px.state
+  pixbed_done(b, saved)
+  return n == 20 and log.appends == want and state == 'on',
+         string.format('appends=%d of %d, state=%s', log.appends, want, tostring(state))
+end)())
+
+check('with the switch off nothing of the pixel path is reached', (function()
+  local b, saved, log, db, hz = pixbed('on', 20, nil)
+  fftsa.sg_pix = false
+  local n = fftsa.sg_fill(db, hz, 20)
+  local want = fftsa.sg_ring_cap(20)
+  pixbed_done(b, saved)
+  return n == 20 and log.frames == 0 and log.armed_after == nil and log.appends == want,
+         string.format('frames=%d appends=%d of %d', log.frames, log.appends, want)
+end)())
+
+check('with no nl module at all the fill is the one that always worked', (function()
+  local b, saved, log, db, hz = pixbed('on', 20, nil)
+  fftsa.nl = nil
+  local n = fftsa.sg_fill(db, hz, 20)
+  local want = fftsa.sg_ring_cap(20)
+  pixbed_done(b, saved)
+  return n == 20 and log.appends == want,
+         string.format('appends=%d of %d', log.appends, want)
+end)())
+
+-- FILL_ONCE never reaches the pixel path: it clears, and a clear resets the display task's own
+-- ring, so the drawn window is whatever this frame has written so far rather than a full one.
+check('the pixel path is not reached under FILL_ONCE', (function()
+  local b, saved, log, db, hz = pixbed('on', 20, nil)
+  fftsa.sg_ring = false
+  local n = fftsa.sg_fill(db, hz, 20)
+  pixbed_done(b, saved)
+  return n == 20 and log.frames == 0 and log.armed_after == nil and log.appends == 20,
+         string.format('frames=%d armed=%s appends=%d', log.frames,
+                       tostring(log.armed_after), log.appends)
+end)())
+
+-- THE ONE FAILURE THAT CANNOT BE FALLEN BACK FROM. The ring belongs to a trace object; freeing
+-- that object frees the ring, and a frame that then writes 40 KB into it is writing into the
+-- heap's free list -- which is how 0x318FC0, PegRect::operator& on a freed widget, is reached.
+-- Every place that removes a trace or replaces a trace buffer has to say so first.
+-- BEFORE the removeall, not merely somewhere in the same function: between the free and the
+-- stop, a frame would write into memory that has gone back to the allocator. So each hook is
+-- asserted against how many removeall calls had already been made when it fired.
+check('every place that frees a trace stops the pixel path before it does', (function()
+  local stops, nremove = {}, 0
+  local saved = { nl = fftsa.nl, removeall = display.graph.removeall,
+                  trace = FFTSA_TRACE, mark = FFTSA_MARK }
+  local function arm(tag)
+    nremove = 0
+    fftsa.nl = { px = { state = 'on' },
+                 px_restart = function(why) stops[tag] = nremove end }
+  end
+
+  -- A counting removeall for the bind, which has to finish: a raise there would leave the
+  -- graph with no trace for every case after this one.
+  display.graph.removeall = function(g) nremove = nremove + 1 end
+  arm('bind')
+  fftsa.sg_bind()
+
+  -- And a RAISING one for the two that reallocate. The raise is the boundary being measured:
+  -- it stops each function at its own removeall, so a stop recorded at all was recorded before
+  -- the free -- and nothing past that point runs, which is what keeps these two from taking
+  -- the buffers and the handover globals with them.
+  display.graph.removeall = function(g)
+    nremove = nremove + 1
+    error('removeall reached', 0)
+  end
+
+  arm('make')
+  local made, realmake = {}, buffer.make
+  buffer.make = function(n, style)
+    local b = realmake(n, style)
+    made[table.getn(made) + 1] = b
+    return b
+  end
+  local madeok = pcall(fftsa.sg_make_buffer, fftsa.sg_nbins, fftsa.sg_buf.capacity + 2)
+  buffer.make = realmake
+  local mi
+  for mi = 1, table.getn(made) do fftsa.del_buf(made[mi]) end
+
+  arm('destroy')
+  local destok = pcall(fftsa.sg_destroy, false)
+
+  display.graph.removeall = saved.removeall
+  fftsa.nl = saved.nl
+  FFTSA_TRACE, FFTSA_MARK = saved.trace, saved.mark
+  return stops['bind'] == 0 and stops['make'] == 0 and stops['destroy'] == 0
+         and not madeok and not destok,
+         string.format('removeall calls already made when each fired: bind=%s make=%s '
+                       .. 'destroy=%s (both reallocators stopped at it: %s %s)',
+                       tostring(stops['bind']), tostring(stops['make']),
+                       tostring(stops['destroy']), tostring(not madeok), tostring(not destok))
+end)())
+
+-- The shipped default, pinned where a change to it cannot be silent. The pixel path writes
+-- into an address it derived at runtime, so it is switched on deliberately and not by drift.
+check('the shipped default for the pixel path is recorded here', (function()
+  return fftsa.sg_pix == false, string.format('sg_pix=%s', tostring(fftsa.sg_pix))
 end)())
 
 -- sg_ncol is a live knob, and changing it must not touch the allocation: the buffer stays
@@ -5978,6 +6200,57 @@ check('show_error survives an exhausted pool and does not blank the panel',
   return ok and fftsa.errscr == nil and display.active == display.SCREEN_HOME,
          string.format('raised=%s errscr=%s active=%s', tostring(not ok),
                        tostring(fftsa.errscr), tostring(display.active))
+end)())
+-- THE OPERATOR MUST NOT HAVE TO PRESS ANYTHING. A DMM7510 halted and the report that came
+-- back was a flat trace and a status line cut off at "...has no interpreted f" -- the cause
+-- was in fftsa.nl_lasterr, and the About pages that carry it had to be opened by someone who
+-- knew they were there. The only channel is a photograph of whatever is on the glass, so a
+-- halt puts the paged diagnostic up by itself.
+print('\na halt reports itself (real code)')
+check('a halted frame puts the error screen on the glass, carrying the cause', (function()
+  local keep = {scr = display.active, halted = fftsa.halted, nlerr = fftsa.nl_lasterr,
+                err = fftsa.lasterr, init = fftsa.fft_init, spec = dsp.spectrum}
+  fftsa.halted, fftsa.nl_lasterr = false, 'call_dsp rc=-5 ECAPTURE'
+  -- The archive's own case: no interpreted transform to fall back to, so a demotion is the
+  -- end of the line. Both terms, because spectrum_interp tests both.
+  fftsa.fft_init, dsp.spectrum = nil, nil
+  local got = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
+  local scr, halted = display.active, fftsa.halted
+  local hit, rows = false, 0
+  for _, o in pairs(OBJ) do
+    if o.alive and o.parent == fftsa.errscr and o.type == display.OBJ_TEXT
+       and o.text ~= nil then
+      rows = rows + 1
+      if string.find(o.text, 'ECAPTURE', 1, true) ~= nil then hit = true end
+    end
+  end
+  fftsa.fft_init, dsp.spectrum = keep.init, keep.spec
+  fftsa.halted, fftsa.nl_lasterr, fftsa.lasterr = keep.halted, keep.nlerr, keep.err
+  display.changescreen(keep.scr)
+  return got == nil and halted and scr == fftsa.errscr and hit,
+         string.format('halted=%s on=%s (errscr=%s) %d rows, cause on the page: %s',
+                       tostring(halted), tostring(scr), tostring(fftsa.errscr), rows,
+                       tostring(hit))
+end)())
+-- And the halt does NOT reach for the home screen, whatever happens to the pool. The home
+-- screen is a live measurement: switching a running app to it hands the digitizer back to the
+-- front panel, so a halt that fell back to it would replace a report with a reading.
+check('a halt whose error screen cannot be built stays off the home screen', (function()
+  local keep = {scr = display.active, halted = fftsa.halted, create = display.create}
+  -- Started from a known screen of the app's, because the case before this one deliberately
+  -- leaves the panel on HOME -- and "it is still on HOME" would then pass whatever halt did.
+  display.changescreen(fftsa.sg_scr)
+  fftsa.halted = false
+  display.create = function() return nil end
+  local ok = pcall(fftsa.halt, 'synthetic halt')
+  local scr = display.active
+  display.create = keep.create
+  fftsa.halted = keep.halted
+  display.changescreen(keep.scr)
+  return ok and scr == fftsa.sg_scr,
+         string.format('raised=%s active=%s wanted the spectrum screen %s (home is %s)',
+                       tostring(not ok), tostring(scr), tostring(fftsa.sg_scr),
+                       tostring(display.SCREEN_HOME))
 end)())
 check('and with a working pool it builds a screen and shows it', (function()
   local h = fftsa.show_error('synthetic failure, readable')

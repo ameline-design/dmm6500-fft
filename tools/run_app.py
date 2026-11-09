@@ -93,15 +93,26 @@ def main():
     # is mains pickup and the instrument's own floor. Refusing to run at all when it is
     # switched off meant no app test rather than a slightly weaker one, and the weaker one
     # still exercises every path the app has.
-    try:
-        g = SDG()
-        g.sine(12500, 2.0, ch=1)
-        g.output(True, ch=1, load='HZ')
-        g.close()
-        print('generator : 12500 Hz 2 Vpp')
-    except Exception as exc:
-        print('generator : unreachable (%s) -- running against the open leads'
-              % type(exc).__name__)
+    #
+    # --no-gen LEAVES IT ALONE ENTIRELY, and that is not tidiness. An SDG part way through
+    # booting accepts the TCP connection and then answers nothing, and SDG() puts no timeout
+    # on the exchange that follows -- so this call does not fail, it HANGS, before a line of
+    # output. Measured 2026-11-09: the launcher sat holding an open idle socket to the DMM
+    # with the panel on the home screen and an empty log, which reads exactly like a dead
+    # instrument and is nothing of the sort. Whenever the generator is being set up by hand,
+    # or power cycled, pass this.
+    if '--no-gen' in sys.argv:
+        print('generator : left alone (--no-gen)')
+    else:
+        try:
+            g = SDG()
+            g.sine(12500, 2.0, ch=1)
+            g.output(True, ch=1, load='HZ')
+            g.close()
+            print('generator : 12500 Hz 2 Vpp')
+        except Exception as exc:
+            print('generator : unreachable (%s) -- running against the open leads'
+                  % type(exc).__name__)
 
     clear_dead_sockets()
     d = DMM(timeout=180)

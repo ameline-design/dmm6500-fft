@@ -282,6 +282,8 @@ function fftsa.sg_make_buffer(nbins, npoints)
   -- Detach before deleting: the firmware refuses to delete a buffer still bound to a
   -- graph, so remaking one while attached leaves the old buffer alive and still bound,
   -- and the widget draws both -- a second trace overlaid at the old resolution.
+  -- Before the traces go, because their rings go with them.
+  fftsa.sg_pix_stop('trace buffers reallocated')
   if fftsa.sg_graph ~= nil then
     display.graph.removeall(fftsa.sg_graph)
   end
@@ -501,6 +503,70 @@ fftsa.sg_fold = true
 -- Which way the next one-lap pass runs. Flipped by sg_fill and read nowhere else.
 fftsa.sg_up = true
 
+-- The pixel fill, which draws a pass by writing the display task's own records instead of
+-- appending to the buffer: 9.6 ms measured for a 510-record block against 39 ms of appends.
+-- fftsa.nl.px_try carries all of it and says what it costs.
+--
+-- THE APPEND PATH STAYS AS THE FALLBACK, and that is the whole shape of this. Nothing is
+-- removed: the fill below is what every build before this one shipped and what runs whenever
+-- the pixel path has not engaged, has been switched off, or has refused a frame. The pixel
+-- path is only ever a replacement for a fill it has already proved it can do.
+--
+-- Off by default. The ring the writes go into is found at runtime and the one unrecoverable
+-- outcome is writing into something that is not it, so the switch exists to be turned on
+-- deliberately -- from the socket, from a build that has been through the gates on the glass.
+fftsa.sg_pix = false
+
+-- The pixel path's two halves, and why they sit on opposite sides of the fill.
+--
+-- DRAWING replaces the fill, so it comes first and returns the points drawn. SEEKING needs the
+-- ring to hold THIS frame's decibels -- the needle is db[1], and the only thing that puts it
+-- into the ring is the append fill -- so it comes last. A search run before the fill would be
+-- matching this frame's needle against last frame's records and would never find anything.
+--
+-- Both are inside pcall. A raise anywhere in the pixel path costs the fallback for the rest of
+-- the session and not the frame: sg_fill carries on and appends, as it did before.
+function fftsa.sg_pix_draw(db, hz, nseg, tb)
+  local nl = fftsa.nl
+  if nl == nil or nl.px == nil or nl.px.state ~= 'on' then return nil end
+  -- One timestamp, reserved before the append that uses it, for the same reason the fill
+  -- reserves its whole range first: a write below a timestamp already in the ring raises event
+  -- 4924 as a modal dialog over the app, which also makes the control socket refuse every
+  -- statement, so the state that caused it cannot be read back either.
+  local t = (fftsa.sg_stamp or 0) + 1
+  fftsa.sg_stamp = t
+  local ok, n = pcall(nl.px_frame, db, hz, nseg, tb, t)
+  if not ok then
+    nl.px_off('px_frame raised: ' .. tostring(n))
+    return nil
+  end
+  return n
+end
+
+function fftsa.sg_pix_arm(db, hz, nseg, tb)
+  local nl = fftsa.nl
+  if nl == nil or nl.px == nil then return end
+  local st = nl.px.state
+  if st == 'on' or st == 'off' then return end
+  local t = (fftsa.sg_stamp or 0) + 1
+  fftsa.sg_stamp = t
+  local ok, err = pcall(nl.px_try, db, hz, nseg, tb, t)
+  if not ok then nl.px_off('px_try raised: ' .. tostring(err)) end
+end
+
+-- Back to appends, and the one call that must never be missed.
+--
+-- The ring is the display task's allocation for a TRACE OBJECT. Freeing that object frees the
+-- ring, and a frame that then writes 40 KB into it is writing into the heap's free list --
+-- which is how 0x318FC0, PegRect::operator& on a freed widget, is reached. So every place that
+-- removes a trace or replaces a trace buffer calls this, before it does so.
+function fftsa.sg_pix_stop(why)
+  local nl = fftsa.nl
+  if nl == nil or nl.px == nil or nl.px_restart == nil then return end
+  if nl.px.state == 'off' then return end
+  nl.px_restart(why)
+end
+
 function fftsa.sg_ring_cap(ncol)
   local n = ncol or fftsa.sg_ncol
   if fftsa.sg_fold then return 2 * n end
@@ -560,6 +626,12 @@ function fftsa.sg_fill(db, hz, nseg)
   -- itself. Up the band then back down it, so both joins are a point repeated. A short
   -- spectrum repeats its last point to fill the lap -- duplicates are zero-length edges and
   -- draw nothing -- and a long one is clamped.
+  -- The pixel path, when it has engaged: one memwrite and one append in place of the pass
+  -- below. nil means it has not engaged, or refused this frame, and the fill runs.
+  if fftsa.sg_pix then
+    local n = fftsa.sg_pix_draw(db, hz, nseg, tb)
+    if n ~= nil then return n end
+  end
   local cap = tb.capacity
   local room = cap
   if fftsa.sg_fold then room = math.floor(cap / 2) end
@@ -600,6 +672,7 @@ function fftsa.sg_fill(db, hz, nseg)
       end
     end
     fftsa.sg_up = not fftsa.sg_up
+    if fftsa.sg_pix then fftsa.sg_pix_arm(db, hz, nseg, tb) end
     return nseg
   end
   for i = 1, room do
@@ -612,6 +685,9 @@ function fftsa.sg_fill(db, hz, nseg)
     if j > last then j = last end
     wr(tb, db[j], hz[j], t + room + i, 0)
   end
+  -- The search, with the records this pass has just written. See sg_pix_arm for why it is here
+  -- and not above the fill.
+  if fftsa.sg_pix then fftsa.sg_pix_arm(db, hz, nseg, tb) end
   return nseg
 end
 
@@ -665,6 +741,7 @@ end
 -- Tear down in dependency order: detach the trace, drop the screen and its
 -- children, then free the buffer the trace referenced. Nils every handle.
 function fftsa.sg_destroy(release)
+  fftsa.sg_pix_stop('screen destroyed')
   if fftsa.sg_graph ~= nil then
     display.graph.removeall(fftsa.sg_graph)
   end
@@ -886,6 +963,9 @@ end
 function fftsa.sg_bind()
   local g = fftsa.sg_graph
   if g == nil then return false end
+  -- removeall frees the trace objects, and the display task's record ring with them. Anything
+  -- still holding that address would be writing 40 KB into the free list.
+  fftsa.sg_pix_stop('traces rebound')
   display.graph.removeall(g)
   display.graph.add(g, fftsa.sg_buf, display.ELEMENT_DATA,
                     fftsa.sg_buf, display.ELEMENT_EXTRA)

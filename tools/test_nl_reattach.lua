@@ -1531,6 +1531,621 @@ do
   tostring = SAVEDT
 end
 
+-- ---------------------------------------------------------------------------
+print('\nthe pixel fill')
+-- ---------------------------------------------------------------------------
+--
+-- The pixel path writes 40 KB into an address it derived at runtime, so what these cases are
+-- for is the refusals. Every term standing between a candidate and that write is withdrawn in
+-- turn: the bounds, the span, the residual, the slot map, the frequency series and the
+-- firmware's own point. A term that stops being consulted fails here rather than on the glass.
+
+do
+  local SAVEDT = tostring
+  fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 12288, 268435456
+
+  -- The same word-sparse image as the ring cases, with a memwrite that lands in it so a
+  -- read-back assertion means something.
+  local IMG = {}
+  local ZEROS = {}
+  local function zeros(n)
+    if ZEROS[n] == nil then ZEROS[n] = string.rep('\0', n) end
+    return ZEROS[n]
+  end
+  local function wr32(a, v)
+    IMG[a] = string.char(math.floor(v / 16777216), math.mod(math.floor(v / 65536), 256),
+                         math.mod(math.floor(v / 256), 256), math.mod(v, 256))
+  end
+  local function wrs(a, s)
+    local i
+    for i = 0, string.len(s) / 4 - 1 do
+      IMG[a + i * 4] = string.sub(s, i * 4 + 1, i * 4 + 4)
+    end
+  end
+  local function touches(w0, w1)
+    local p, _
+    for p, _ in pairs(IMG) do
+      if p >= w0 and p < w1 then return true end
+    end
+    return false
+  end
+  ki.memread = function(ah, lh)
+    local a, n = tonumber(ah, 16), tonumber(lh, 16)
+    if a == nil or n == nil or n <= 0 then return nil end
+    local w0 = a - math.mod(a, 4)
+    local w1 = a + n + 3
+    w1 = w1 - math.mod(w1, 4)
+    if not touches(w0, w1) then return zeros(n) end
+    local acc, k, p = {}, 0, nil
+    for p = w0, w1 - 4, 4 do
+      k = k + 1
+      acc[k] = IMG[p] or '\0\0\0\0'
+    end
+    return string.sub(table.concat(acc), a - w0 + 1, a - w0 + n)
+  end
+  -- nl._wg reads a word through peek32, and the header is read that way. Without this the
+  -- header comes from the ring section's own image, which this fixture never wrote to -- and
+  -- a count of zero reads as "this is not a ring" rather than as a harness gap.
+  ki.peek32 = function(ah)
+    local a = tonumber(ah, 16)
+    local w = IMG[a]
+    if w == nil then return '0' end
+    return string.format('%X', ((string.byte(w, 1) * 256 + string.byte(w, 2)) * 256
+                                + string.byte(w, 3)) * 256 + string.byte(w, 4))
+  end
+  local WROTE = nil
+  ki.memwrite = function(ah, s)
+    local a = tonumber(ah, 16)
+    WROTE = { at = a, len = string.len(s) }
+    local i
+    for i = 0, string.len(s) - 1 do
+      local p = a + i
+      local w = p - math.mod(p, 4)
+      local old = IMG[w] or '\0\0\0\0'
+      local k = p - w + 1
+      IMG[w] = string.sub(old, 1, k - 1) .. string.sub(s, i + 1, i + 1)
+               .. string.sub(old, k + 1)
+    end
+    return true
+  end
+  local APPENDS = {}
+  buffer.write = { reading = function(b, v, x, t, st)
+    APPENDS[table.getn(APPENDS) + 1] = { buf = b, db = v, hz = x, t = t }
+  end }
+
+  -- A spectrum with a peak in it, which is the point. A ramp is affine in frequency, so the x
+  -- pixel would fit the value field as well as the y pixel does and the two triples could not
+  -- be told apart -- on this fixture or on an instrument fed a ramp.
+  local DB = { -100, -92, -85, -40, -88, -95, -103, -110 }
+  -- A bin width the instrument actually produces, and dyadic so every member is exact in
+  -- float32. Round powers of two pack to one or two non-zero bytes, which makes a poor needle
+  -- and a fixture that flatters px_xneedle.
+  local HZ, NSEG = {}, 8
+  do
+    local j
+    for j = 1, NSEG do HZ[j] = 195.3125 * j end
+  end
+  local AY, BY = -2, 94.25
+  local function ypix(db) return math.floor(AY * db + BY + 0.5) end
+  local function xpix(j) return 100 + 102 * j end
+
+  -- The fold's order, which is what a pass writes: up the band and back down it.
+  local ORD = {}
+  do
+    local j
+    for j = 1, NSEG do ORD[j] = j end
+    for j = 1, NSEG do ORD[NSEG + j] = NSEG + 1 - j end
+  end
+
+  -- The column px_xneedle picks, which is what the staging lookalike has to carry too.
+  local XCOL = nil
+  do
+    local _, c = fftsa.nl.px_xneedle(HZ, NSEG)
+    XCOL = c or 1
+  end
+
+  local RLO, STRIDE, NREC, OV, OX = 62206008, 56, 24, 32, 44
+  local HDRAT = RLO - 40904
+  local WSLOT = 4                     -- where the header's write cursor points
+  -- Which spectrum column each slot carries. 24 slots over a 16-record pass, so the pattern
+  -- does not divide the ring and the phase is what the cursor left behind.
+  local PHASE = 5
+  local function slot_index(s)
+    return ORD[math.mod(s - 1 + PHASE, 2 * NSEG) + 1]
+  end
+
+  local function build(xf)
+    IMG = {}
+    wr32(HDRAT, RLO)
+    wr32(HDRAT + 4, RLO + NREC * STRIDE)
+    wr32(HDRAT + 8, RLO)
+    wr32(HDRAT + fftsa.nl.HDR_WRITE, RLO + (WSLOT - 1) * STRIDE)
+    wr32(HDRAT + fftsa.nl.HDR_COUNT, NREC)
+    local s
+    for s = 1, NREC do
+      local rec = RLO + (s - 1) * STRIDE
+      local j = slot_index(s)
+      local v = fftsa.nl._f32_pack(DB[j])
+      local x = fftsa.nl._f32_pack((xf or HZ)[j])
+      local xp, yp = xpix(j), ypix(DB[j])
+      wr32(rec, xp)
+      wr32(rec + 4, xp)
+      wr32(rec + 8, xp)
+      wr32(rec + 12, yp)
+      wr32(rec + 16, yp)
+      wr32(rec + 20, yp)
+      wrs(rec + OV, v .. v)
+      wr32(rec + OV + 8, 0)
+      wrs(rec + OX, x .. x)
+      wr32(rec + OX + 8, 1073741824)
+    end
+    fftsa.nl.arena = RLO
+  end
+  local function geom()
+    return { lo = RLO, hi = RLO + NREC * STRIDE, nrec = NREC, stride = STRIDE,
+             ov = OV, ox = OX, hdr = HDRAT, dx = OX - OV }
+  end
+
+  -- THE STAGING-RING LOOKALIKE, which is what the real instrument has and this fixture did
+  -- not. The buffer side pushes each append into a 28-byte record carrying the same two
+  -- float32 pairs in the same order, so it confirms a stride exactly as the trace record does
+  -- -- and 28 comes first in the REC_MIN..REC_MAX walk. It has no header, so it is the
+  -- candidate that must be rejected without losing the real one found in the same slice.
+  --
+  -- A kilobyte below the ring, which puts both inside one 4 KB sweep slice, and outside the
+  -- ring's own bounds so the real header cannot be mistaken for its.
+  local SLO = RLO - 1024
+  local function stage()
+    local i
+    for i = 1, 4 do
+      local rec = SLO + (i - 1) * 28
+      local v = fftsa.nl._f32_pack(DB[i])
+      local x = fftsa.nl._f32_pack(HZ[XCOL + i - 1])
+      wrs(rec, x .. x)
+      wrs(rec + 8, v .. v)
+    end
+  end
+  local function ringbytes()
+    return ki.memread(string.format('%X', RLO), string.format('%X', NREC * STRIDE))
+  end
+
+  fftsa.nl.RING_MIN = 8
+  build(nil)
+
+  -- ---- the triples, and the fit ----------------------------------------------
+  local rec1 = ki.memread(string.format('%X', RLO), string.format('%X', STRIDE))
+  local tr = fftsa.nl.px_triples(rec1, STRIDE)
+  check('both pixel triples are found in a record, and nothing else is',
+        table.getn(tr) == 2 and tr[1] == 0 and tr[2] == 12,
+        'offsets ' .. table.concat(tr, ','))
+
+  do
+    -- Four equal words in a row report ONE triple, not two. A y pixel of zero beside the two
+    -- zero words is exactly that, and the second offset would be three quarters padding.
+    local t2 = fftsa.nl.px_triples(string.rep('\0', 24) .. string.sub(rec1, 25), STRIDE)
+    check('a run of equal words past three reports one triple, not an overlapping pair',
+          table.getn(t2) == 1 and t2[1] == 0, 'offsets ' .. table.concat(t2, ','))
+  end
+
+  do
+    local blk = ringbytes()
+    local nl = fftsa.nl
+    local vals = nl.px_floats(blk, NREC, STRIDE, OV)
+    local a, b, w, sp, m = nl.px_fit(nl.px_words(blk, NREC, STRIDE, 12), vals, NREC)
+    check('the decibel map is recovered from the records the appends left',
+          a ~= nil and math.abs(a - AY) < 0.01 and math.abs(b - BY) < 1.0
+          and w <= 1.0 and m == NREC,
+          string.format('y = %.4f*db %+.3f, worst %.2f px, span %.0f dB, n=%d',
+                        a or 0, b or 0, w or -1, sp or -1, m or -1))
+    local ax, _, wx = nl.px_fit(nl.px_words(blk, NREC, STRIDE, 0), vals, NREC)
+    check('the x triple does not fit the value field',
+          ax ~= nil and wx > nl.PX_RESID_MAX,
+          string.format('the x triple fitted against the value is %.1f px out', wx or -1))
+    -- And the other way round, which is the test that NAMES the x triple: the x pixel is an
+    -- affine function of the frequency in the same record whatever the spectrum does, and the
+    -- y pixel is not unless the trace is a straight line.
+    local freq, s = {}, nil
+    for s = 1, NREC do freq[s] = HZ[slot_index(s)] end
+    local _, _, wxf = nl.px_fit(nl.px_words(blk, NREC, STRIDE, 0), freq, NREC)
+    local _, _, wyf = nl.px_fit(nl.px_words(blk, NREC, STRIDE, 12), freq, NREC)
+    check('against frequency the x triple fits and the y triple does not',
+          wxf <= nl.PX_RESID_MAX and wyf > nl.PX_RESID_MAX,
+          string.format('x %.2f px, y %.1f px', wxf, wyf))
+    -- A constant field fits nothing, which is what keeps the two zero words out of the
+    -- value-field search: they would otherwise be an affine map with every slope.
+    local zero = {}
+    for s = 1, NREC do zero[s] = 0 end
+    check('a constant independent variable is refused outright',
+          nl.px_fit(nl.px_words(blk, NREC, STRIDE, 12), zero, NREC) == nil)
+  end
+
+  -- ---- the map ---------------------------------------------------------------
+  do
+    fftsa.nl.px_restart('test')
+    local ok = fftsa.nl.px_map(geom(), DB, HZ, NSEG)
+    local p = fftsa.nl.px
+    local good, s = true, nil
+    for s = 1, NREC do
+      if p.idx == nil or p.idx[s] ~= slot_index(s) then good = false end
+    end
+    check('the map solves the y triple, the decibel map and every slot of the ring',
+          ok and p.yoff == 12 and math.abs(p.ay - AY) < 0.01 and good
+          and table.getn(p.T) == 3 * NREC,
+          ok and string.format('yoff=%s ay=%.3f slots=%s', tostring(p.yoff), p.ay or 0,
+                               tostring(good))
+          or ('refused: ' .. tostring(p.why)))
+    -- The three pieces a record have to reassemble into exactly what was read, or the write
+    -- lays down a block differing from the ring outside the y triples.
+    local re = table.concat(p.T)
+    check('the sliced pieces reassemble byte for byte into the ring they came from',
+          re == ringbytes(), string.format('%d bytes of %d', string.len(re), NREC * STRIDE))
+  end
+
+  do
+    -- A slot carrying a frequency this plan does not have. Ordinary right after a retune, and
+    -- the map has to refuse rather than draw that column from whatever index it guessed.
+    build(nil)
+    wrs(RLO + 2 * STRIDE + OX, fftsa.nl._f32_pack(999) .. fftsa.nl._f32_pack(999))
+    fftsa.nl.px_restart('test')
+    local ok = fftsa.nl.px_map(geom(), DB, HZ, NSEG)
+    check('a slot whose frequency is not in this plan refuses the whole map',
+          not ok and string.find(tostring(fftsa.nl.px.why), 'frequency', 1, true) ~= nil,
+          'why=' .. tostring(fftsa.nl.px.why))
+    build(nil)
+  end
+
+  do
+    -- Out of the backstop. This is the one term between an address derived from a search and a
+    -- memcpy into whatever happens to be there, so the header is consistent and only the
+    -- addresses are wrong -- a header that merely failed to parse would pass this case for the
+    -- wrong reason.
+    build(nil)
+    wr32(HDRAT, 8)
+    wr32(HDRAT + 4, 8 + NREC * STRIDE)
+    wr32(HDRAT + fftsa.nl.HDR_OLD, 8)
+    wr32(HDRAT + fftsa.nl.HDR_COUNT, NREC)
+    local g = geom()
+    g.lo, g.hi = 8, 8 + NREC * STRIDE
+    fftsa.nl.px_restart('test')
+    check('a window below the backstop is refused before a byte is written',
+          not fftsa.nl.px_map(g, DB, HZ, NSEG)
+          and string.find(tostring(fftsa.nl.px.why), 'backstop', 1, true) ~= nil,
+          'why=' .. tostring(fftsa.nl.px.why))
+    build(nil)
+  end
+
+  do
+    -- A narrow span. Pixels are integers, so a few decibels fit a slope badly while the points
+    -- left out of the fit still agree -- a residual test alone passes this, and the span test
+    -- is what catches it.
+    local keep, flat, j = DB, {}, nil
+    for j = 1, NSEG do flat[j] = -100 - j * 0.25 end
+    DB = flat
+    build(nil)
+    fftsa.nl.px_restart('test')
+    -- A flat trace has no decibel map in it to fit. The x pixel is still identified -- it
+    -- sweeps the plot however flat the trace is -- and the refusal lands on the value field,
+    -- which is where it belongs: a slope fitted over two decibels of noise would put every
+    -- column within a few rows of one another on a plot 280 rows tall.
+    check('a spectrum too flat to carry a decibel map is refused',
+          not fftsa.nl.px_map(geom(), DB, HZ, NSEG),
+          'why=' .. tostring(fftsa.nl.px.why))
+    DB = keep
+    build(nil)
+  end
+
+  -- ---- the frame -------------------------------------------------------------
+  do
+    fftsa.nl.px_restart('test')
+    check('the map stands up on the fixture before the frame cases run',
+          fftsa.nl.px_map(geom(), DB, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
+    local before = ringbytes()
+    -- A spectrum 6 dB up, so every y moves and nothing else may.
+    local up, j = {}, nil
+    for j = 1, NSEG do up[j] = DB[j] + 6 end
+    APPENDS, WROTE = {}, nil
+    local n = fftsa.nl.px_frame(up, HZ, NSEG, 'TB', 7777)
+    local after = ringbytes()
+    check('one frame is one memwrite of the whole ring',
+          n == NSEG and WROTE ~= nil and WROTE.at == RLO and WROTE.len == NREC * STRIDE,
+          WROTE and string.format('n=%s at %X, %d bytes', tostring(n), WROTE.at, WROTE.len)
+          or 'nothing was written')
+    local yok, elsewhere, s = true, 0, nil
+    for s = 1, NREC do
+      local o = (s - 1) * STRIDE
+      local want = ypix(up[slot_index(s)])
+      local k
+      for k = 0, 2 do
+        local p = o + 13 + k * 4
+        if (((string.byte(after, p) * 256 + string.byte(after, p + 1)) * 256
+             + string.byte(after, p + 2)) * 256) + string.byte(after, p + 3) ~= want then
+          yok = false
+        end
+      end
+      if string.sub(after, o + 1, o + 12) ~= string.sub(before, o + 1, o + 12)
+         or string.sub(after, o + 25, o + STRIDE)
+            ~= string.sub(before, o + 25, o + STRIDE) then
+        elsewhere = elsewhere + 1
+      end
+    end
+    check('every y triple is the predicted pixel, in all three copies', yok)
+    check('no byte outside a y triple is touched',
+          elsewhere == 0, tostring(elsewhere) .. ' records changed elsewhere')
+    -- ONE append, and the write cursor parked one slot PAST the drawn window so the record it
+    -- leaves is never drawn. That is what makes the provoking append free of any effect on the
+    -- picture, and it leaves one record in the ring this code never overwrites -- which is
+    -- where the firmware's own pixel is read back from to check the map.
+    local wrword = ki.memread(string.format('%X', HDRAT + fftsa.nl.HDR_WRITE),
+                              string.format('%X', 4))
+    local wr = (((string.byte(wrword, 1) * 256 + string.byte(wrword, 2)) * 256
+                 + string.byte(wrword, 3)) * 256) + string.byte(wrword, 4)
+    check('one append, with the cursor parked one slot past the drawn window',
+          table.getn(APPENDS) == 1 and APPENDS[1].t == 7777 and APPENDS[1].buf == 'TB'
+          and wr == RLO + NREC * STRIDE,
+          table.getn(APPENDS) == 1
+          and string.format('%d append(s), db=%s hz=%s t=%s, cursor at %X wanted %X',
+                            table.getn(APPENDS), tostring(APPENDS[1].db),
+                            tostring(APPENDS[1].hz), tostring(APPENDS[1].t), wr,
+                            RLO + NREC * STRIDE)
+          or (tostring(table.getn(APPENDS)) .. ' appends'))
+    -- And the window itself is put back, which is the thing that makes a second frame possible.
+    local oldword = ki.memread(string.format('%X', HDRAT + fftsa.nl.HDR_OLD),
+                               string.format('%X', 4))
+    local o0 = (((string.byte(oldword, 1) * 256 + string.byte(oldword, 2)) * 256
+                 + string.byte(oldword, 3)) * 256) + string.byte(oldword, 4)
+    check('and the drawn window is put back where the map found it',
+          o0 == RLO, string.format('oldest %X wanted %X', o0, RLO))
+    build(nil)
+  end
+
+  do
+    -- The plan moving under the map. nseg is the obvious one; the frequency series moving with
+    -- nseg unchanged is the one that would otherwise draw the new spectrum at the old
+    -- frequencies, correctly and silently.
+    fftsa.nl.px_restart('test')
+    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    check('a changed nseg restarts rather than drawing',
+          fftsa.nl.px_frame(DB, HZ, NSEG - 1, 'TB', 1) == nil
+          and fftsa.nl.px.state == 'idle', 'why=' .. tostring(fftsa.nl.px.why))
+    fftsa.nl.px_restart('test')
+    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    local moved, j = {}, nil
+    for j = 1, NSEG do moved[j] = HZ[j] + 1 end
+    check('a moved frequency series restarts rather than drawing',
+          fftsa.nl.px_frame(DB, moved, NSEG, 'TB', 1) == nil
+          and fftsa.nl.px.state == 'idle', 'why=' .. tostring(fftsa.nl.px.why))
+  end
+
+  do
+    -- The map going stale, which is the only thing that can happen once the appends stop:
+    -- nothing else on the instrument computes a pixel, so the one append's own answer is the
+    -- whole check. One frame out of tolerance must not be enough to drop the path.
+    build(nil)
+    fftsa.nl.px_restart('test')
+    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    fftsa.nl.px.state = 'on'          -- what px_try sets once the map stands up
+    -- Driven the way sg_pix_draw drives it: px_frame is called only while the state is 'on',
+    -- so a drop ends the run rather than being followed by a frame that restarts for its own
+    -- reasons and overwrites the reason under test.
+    local k, dropped = nil, nil
+    for k = 1, fftsa.nl.PX_DRIFT_RUN + 2 do
+      if dropped ~= nil then break end
+      fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 1000 + k)
+      -- The firmware's answer for the slot just appended, 40 px off what the map predicts.
+      if fftsa.nl.px.slot ~= nil then
+        wr32(RLO + (fftsa.nl.px.slot - 1) * STRIDE + 12,
+             ypix(fftsa.nl.px.slotdb) + 40)
+      end
+      if dropped == nil and fftsa.nl.px.state ~= 'on' then dropped = k end
+    end
+    -- Frame 1 has no previous point to check, so the first disagreement is seen on frame 2 and
+    -- the run completes on frame PX_DRIFT_RUN + 1. Dropping sooner would mean one rounding
+    -- edge could cost the path; dropping later, or never, means a stale map keeps drawing.
+    check('the map is dropped after a run of disagreeing frames, and not on one of them',
+          dropped == fftsa.nl.PX_DRIFT_RUN + 1
+          and string.find(tostring(fftsa.nl.px.why), 'px out', 1, true) ~= nil,
+          'dropped on frame ' .. tostring(dropped) .. ' of '
+          .. tostring(fftsa.nl.PX_DRIFT_RUN + 2) .. ', why=' .. tostring(fftsa.nl.px.why))
+    build(nil)
+  end
+
+  -- ---- the search ------------------------------------------------------------
+  do
+    -- Resumable, over slices far smaller than the distance the ring sits from the window start,
+    -- so the answer can only come from a sweep that carried on where the last one stopped. The
+    -- needle is the app's own first four columns, which is all a frame has.
+    fftsa.nl.px_restart('test')
+    local SENT, i = {}, nil
+    for i = 1, 4 do SENT[i] = { db = DB[i], hz = HZ[i] } end
+    local s0 = nil
+    for i = 1, NREC - 3 do
+      if slot_index(i) == XCOL and slot_index(i + 1) == XCOL + 1
+         and slot_index(i + 2) == XCOL + 2 and slot_index(i + 3) == XCOL + 3 then
+        s0 = i
+        break
+      end
+    end
+    check('the fixture has the four columns the needle was built from, consecutive',
+          s0 ~= nil, 'the run from column ' .. tostring(XCOL) .. ' starts at slot '
+          .. tostring(s0))
+    local c, calls = {}, 0
+    while table.getn(c) == 0 and calls < 500 do
+      calls = calls + 1
+      c = fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
+    end
+    -- EVERY confirmed stride, not the first. The staging ring holds the same two float32 pairs
+    -- in the same order in a 28-byte record, so a hit confirms more than once and the first
+    -- confirmation is the one with no header. Returning only that threw the real geometry away
+    -- and moved the cursor past it: 981 MB swept and reported absent, measured on the glass.
+    local want, k = nil, nil
+    for k = 1, table.getn(c) do
+      if c[k].stride == STRIDE then want = c[k] end
+    end
+    check('the search finds the records over many budgeted slices, and says where',
+          want ~= nil and s0 ~= nil and want.val0 == RLO + (s0 - 1) * STRIDE + OX,
+          string.format('%d confirmations after %d slices of 4 KB: %s', table.getn(c), calls,
+                        want ~= nil and string.format('val0=%X at stride %d', want.val0,
+                                                      want.stride)
+                        or 'none at the real stride'))
+    check('and it took many slices, so the slices really do resume',
+          calls > 4, tostring(calls) .. ' slices of 4 KB')
+  end
+
+  do
+    -- An axis with no usable needle in it. Four equal frequencies cannot confirm a stride --
+    -- every offset matches -- and a frequency of zero packs to four zero bytes, of which the
+    -- ring's own records hold two words. Both have to be refused without sweeping anything.
+    fftsa.nl.px_restart('test')
+    local flat, j = {}, nil
+    for j = 1, NSEG do flat[j] = 4096 end
+    check('an axis of equal frequencies is refused without sweeping anything',
+          table.getn(fftsa.nl.px_seek(flat, NSEG, 65536, nil)) == 0
+          and fftsa.nl.px.wins == nil and fftsa.nl.px.degen == 1,
+          'wins=' .. tostring(fftsa.nl.px.wins)
+          .. ' flat=' .. tostring(fftsa.nl.px.degen))
+    -- And the column chosen out of a real axis is never one that packs to all zeros, even
+    -- when that is where the band starts.
+    local dc = {}
+    for j = 1, NSEG do dc[j] = (j - 1) * 195.3125 end
+    local xs, col = fftsa.nl.px_xneedle(dc, NSEG)
+    check('a band starting at dc does not take dc as its needle',
+          xs ~= nil and col ~= nil and col > 1
+          and string.sub(xs[1], 1, 4) ~= string.rep('\0', 4),
+          'column ' .. tostring(col) .. ' of a band whose first frequency is '
+          .. tostring(dc[1]))
+  end
+
+  -- ---- the cache -------------------------------------------------------------
+  do
+    FFTSA_PXRING = nil
+    check('no cache reads back as no geometry', fftsa.nl.px_cache_get() == nil)
+    fftsa.nl.px_cache_put(geom())
+    local c = fftsa.nl.px_cache_get()
+    check('the cached geometry round-trips through the global',
+          c ~= nil and c.lo == RLO and c.hi == RLO + NREC * STRIDE and c.nrec == NREC
+          and c.stride == STRIDE and c.ox == OX and c.hdr == HDRAT and c.ov == nil,
+          tostring(FFTSA_PXRING))
+    -- And is re-validated from content, never trusted: an address the ring has moved off maps
+    -- nothing, because every one of its slots would have to carry a frequency out of this
+    -- plan's own series and freed memory does not.
+    --
+    -- NOT by shifting the address a word. The value and the x are stored TWICE, so reading
+    -- four bytes late gives the same float, and px_triples then finds the y triple four bytes
+    -- late as well -- a 4-byte shift re-derives itself into the same correct geometry and is
+    -- not a stale cache at all. The case to write is the one that happens: the ring is
+    -- somewhere else and the old address holds something that is not a ring.
+    local stale = geom()
+    stale.lo, stale.hi = RLO + 131072, RLO + 131072 + NREC * STRIDE
+    fftsa.nl.px_restart('test')
+    check('a cached address the ring has moved off falls through to the search',
+          not fftsa.nl.px_map(stale, DB, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
+  end
+
+  -- ---- a lookalike in the same slice -----------------------------------------
+  do
+    -- One sweep slice holding both the staging lookalike and the real ring. The slice has to
+    -- come back with BOTH confirmations: returning the first one and dropping it when it has
+    -- no header leaves the cursor past the real ring, which reads as "swept and absent" and
+    -- cost 981 MB of sweeping on the instrument before it was understood.
+    --
+    -- The budget spans the whole first window, so "one slice" is a fact here rather than an
+    -- alignment that happened: at 4 KB the two sit 1,640 bytes apart and a slice edge falls
+    -- between them often enough that the case would pass or fail on the fixture's address.
+    build(nil)
+    stage()
+    fftsa.nl.px_restart('test')
+    local SENT, i = {}, nil
+    for i = 1, 4 do SENT[i] = { db = DB[i], hz = HZ[i] } end
+    local c, calls = {}, 0
+    while table.getn(c) == 0 and calls < 20 do
+      calls = calls + 1
+      c = fftsa.nl.px_seek(HZ, NSEG, 1048576, nil)
+    end
+    local s28, s56, k = nil, nil, nil
+    for k = 1, table.getn(c) do
+      if c[k].stride == 28 then s28 = c[k] end
+      if c[k].stride == STRIDE then s56 = c[k] end
+    end
+    check('one slice holding a lookalike and the ring returns both confirmations',
+          s28 ~= nil and s56 ~= nil and s28.val0 == SLO and s56.val0 ~= SLO,
+          string.format('%d confirmations in slice %d: 28-byte=%s 56-byte=%s',
+                        table.getn(c), calls, s28 and string.format('%X', s28.val0) or 'none',
+                        s56 and string.format('%X', s56.val0) or 'none'))
+    check('and only the real one carries a header',
+          s28 ~= nil and s56 ~= nil and fftsa.nl.find_ring_header(s28) == nil
+          and fftsa.nl.find_ring_header(s56) ~= nil,
+          'why=' .. tostring(fftsa.nl.ring_why))
+  end
+
+  do
+    -- And the whole path gets there anyway, with the lookalike in the way.
+    build(nil)
+    stage()
+    FFTSA_PXRING = nil
+    fftsa.nl.px_restart('test')
+    fftsa.nl.px.state = 'idle'
+    local calls, n = 0, nil
+    while n == nil and calls < 500 do
+      calls = calls + 1
+      n = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 3000 + calls)
+    end
+    check('the path engages past a headerless lookalike in the same slice',
+          n == NSEG and fftsa.nl.px.state == 'on' and fftsa.nl.px.lo == RLO
+          and fftsa.nl.px.stride == STRIDE,
+          string.format('n=%s state=%s ring=%s/%s after %d frames', tostring(n),
+                        tostring(fftsa.nl.px.state),
+                        fftsa.nl.px.lo and string.format('%X', fftsa.nl.px.lo) or 'nil',
+                        tostring(fftsa.nl.px.stride), calls))
+  end
+
+  -- ---- the whole path --------------------------------------------------------
+  do
+    build(nil)
+    FFTSA_PXRING = nil
+    fftsa.nl.px_restart('test')
+    fftsa.nl.px.state = 'idle'
+    local saw, calls, n = {}, 0, nil
+    while n == nil and calls < 500 do
+      calls = calls + 1
+      n = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 2000 + calls)
+      saw[fftsa.nl.px.state] = true
+    end
+    check('idle to seek to map to on, and the frame that engages also draws',
+          n == NSEG and fftsa.nl.px.state == 'on' and saw['seek'] and saw['map']
+          and FFTSA_PXRING ~= nil,
+          string.format('n=%s state=%s via=%s after %d frames, cache=%s', tostring(n),
+                        tostring(fftsa.nl.px.state), tostring(fftsa.nl.px.from), calls,
+                        tostring(FFTSA_PXRING)))
+    check('and the state reads back as one field for the error page',
+          string.find(fftsa.nl.px_str(), 'px=on', 1, true) == 1
+          and string.find(fftsa.nl.px_str(), 'map=', 1, true) ~= nil,
+          fftsa.nl.px_str())
+    -- The cache then takes the next launch straight to the map, with no sweep at all.
+    fftsa.nl.px.state, fftsa.nl.px.swept = 'idle', 0
+    local n2 = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 9999)
+    check('a cached ring engages on the first frame and sweeps nothing',
+          n2 == NSEG and fftsa.nl.px.state == 'on' and fftsa.nl.px.from == 'cache'
+          and (fftsa.nl.px.swept or 0) == 0,
+          string.format('n=%s via=%s swept=%s', tostring(n2), tostring(fftsa.nl.px.from),
+                        tostring(fftsa.nl.px.swept)))
+  end
+
+  do
+    -- Off is off: nothing is swept, nothing is written, and the caller keeps its appends.
+    fftsa.nl.px_off('the test said so')
+    WROTE = nil
+    check('a path switched off draws nothing and writes nothing',
+          fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 1) == nil and WROTE == nil
+          and string.find(fftsa.nl.px_str(), 'px=off', 1, true) == 1,
+          fftsa.nl.px_str())
+  end
+
+  ki.memwrite, buffer.write = nil, nil
+  FFTSA_PXRING, fftsa.nl.arena = nil, nil
+  fftsa.nl.px_restart('suite done')
+  tostring = SAVEDT
+end
+
 ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR
 
 print()
