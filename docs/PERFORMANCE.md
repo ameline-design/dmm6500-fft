@@ -507,7 +507,115 @@ and 256 buffer writes at 65 µs is **16.6 ms** of the ~20 ms graph phase. So abo
 80 ms frame is marshalled API calls**, and it is a hard floor -- there is no bulk route into or out of
 a reading buffer from Lua (established three ways, see the dead ends).
 
-## Writing the display task's ring does not work -- CLOSED, measured 2026-11-09
+## Writing the display task's ring DOES work -- the PIXELS are what it draws
+
+**Measured on hardware 2026-11-09, on a DMM6500 1.7.17a.** The float value of a record is not
+what the widget draws; the two int32 triples at `rec+0x00` and `rec+0x0C` are, and writing one
+moves the trace.
+
+### The triples are identified from what was appended, not from the axis arithmetic
+
+Four sentinels stepping 1024, 2048, 4096, 8192 Hz against a constant 1 dB step:
+
+    +0x00 across the four:  113, 127, 155, 211     diffs 14, 28, 56   = 1 : 2 : 4
+    +0x0C across the four:  294, 296, 298, 300     diffs  2,  2,  2   = constant
+
+So the triple whose successive differences scale with the frequency steps is the x pixel and
+the one whose differences are constant is the y pixel. That holds whatever the span is set to,
+and on a model whose plot rectangle has never been measured -- which is the point, because the
+intercept is not a constant (below).
+
+Three identical int32 copies of each, in every record ever dumped. They are therefore **not** a
+previous/this/next window over the polyline: record 0's third copy would then equal record 1's
+x, and it does not.
+
+### The write draws. One point, 40 px, proved by a pixel diff of two grabs
+
+Frames parked, one record inside the drawn window (`oldest` and `count` from the header, not
+the cursor), its y triple written from 293 to 253, one append to provoke the repaint:
+
+    x=769  y 278..297     x=772  y 252..283   <- the target column
+    x=770  y 261..293     x=773  y 252..292
+    x=771  y 252..291     x=774  y 262..291   x=775  y 283..291
+
+A 40 px deflection reaching exactly the y that was written, with the polyline drawn to and
+from it across the neighbouring columns. Everything else that changed between the two grabs is
+3 px of ordinary trace jitter. **A checksum alone would not have been evidence** -- the
+triggering append draws a point of its own -- which is why the proof is a diff of two pictures.
+
+### A whole pass drawn by pixels: 19.3 ms against 39 ms of appends
+
+510 records of the drawn window, y triples only, written one `ki.memwrite` of 12 bytes at a
+time with the pixel computed in Lua from the calibrated map:
+
+    510 records   19.269 ms on the instrument clock   37.8 us a record
+
+The glass drew the sawtooth the write asked for, across the whole band -- so a pass can be
+drawn with **no appends at all** bar the one that provokes the repaint. Against 39 ms for the
+510 appends it replaces, that is already half the fill gone, and 37.8 us a record is nearly all
+per-call overhead: a `string.format` of the address and four `string.char` calls each.
+
+**Calibrate the slope over a WIDE decibel span.** A 3 dB spread between the first and last
+sentinel put the fitted slope at 1.667 px/dB where the true figure is 2.0 -- the pixels are
+integers, so a short span has no resolution. The middle sentinels still predicted within
+0.67 px, which is why that check alone is not enough. Sentinels near both ends of the window.
+
+### And 9.6 ms in ONE memwrite, which is the shape a frame would use
+
+`ki.memwrite` is `memcpy(addr, data, #data)` with no destination validation, so the whole
+drawn window goes in one call. The block is held as three pieces a record -- everything below
+the y triple, the y triple, everything above it -- sliced out of the records **the app itself
+wrote**, so the x pixels, the value, the x float and the `2.0f` stay the app's own. A frame
+then stores 510 table entries, concatenates once, and writes once. The twelve bytes of a y
+triple are precomputed for all 480 panel rows, so nothing is formatted or built per record.
+
+    510 records   9.588 ms   18.8 us a record   one memwrite of 28,560 bytes
+
+So the ladder, all measured on the same instrument and the same pass:
+
+| route | per pass | per record |
+|---|---|---|
+| `buffer.write.reading`, the sanctioned path | **39 ms** | 77 us |
+| pixel write, one `ki.memwrite` a record | 19.3 ms | 37.8 us |
+| pixel write, one `ki.memwrite` for the block | **9.6 ms** | 18.8 us |
+| native, computing the pixels in the DSP pass | not yet measured | |
+
+At 2048 the frame is ~80 ms: 39 fill, 20.5 acquisition, 3.1 compiled DSP, ~17 unaccounted.
+Replacing the fill with the bulk write takes it to ~50 ms, which is **10 fps to about 20**. The
+remaining 18.8 us a record is Lua VM work -- a modulo, a multiply-add, a floor, a compare, two
+table operations -- and the compiled path already has `red_db` as float32 in the arena, so the
+native form is a few hundred instructions a record and should be under a millisecond.
+
+### WHAT IS NOT SOLVED: finding the ring costs 41 s
+
+Everything above starts from a known ring. Finding it from scratch is a two-pass sweep of the
+window ladder -- **41 s**, measured repeatedly -- and the geometry **moves between boots**, so
+it cannot be compiled in. 41 s at launch is not shippable, so one of these has to come first:
+
+* find it faster. The ladder's last stage is the whole 268 MB backstop; the ring was found
+  without reaching it, so a tighter set of centres may be enough, and the display task's
+  allocation may sit near something the app already has an address for.
+* find it once and keep it, the way `NLBOOT` keeps the native install across a relaunch. A
+  global survives a relaunch and dies with the power cycle, which is exactly the lifetime the
+  ring address has.
+* find it in the background across frames, and keep appending until it answers.
+
+Until one of those is done the bypass is measured and not shippable.
+
+### THE Y INTERCEPT IS NOT A CONSTANT. Calibrate at runtime
+
+The slope is 2 px/dB in both sessions measured, 280 px over a 140 dB window. The intercept
+moved: one boot fits `y = 94.4 - 2*db`, an earlier dump fitted `y = 110 - 2*db`. Fifteen pixels
+apart, same app, same axis limits. So the two sentinel appends that calibrate the maps are not
+a convenience, they are the mechanism -- anything compiled in is wrong on the next launch.
+
+    x_px = ax * hz + bx        ax, bx from two sentinels at different frequencies
+    y_px = ay * db + by        ay, by from two sentinels at different decibels
+
+Solve from the extremes, then CHECK the sentinels the fit did not use: they have to come back
+within a pixel, or the field is not an affine function of what was appended.
+
+## Why the appends are a floor for the SANCTIONED path -- measured 2026-11-09
 
 The 510 appends a folded pass makes are ~39 ms of an ~80 ms frame at 2048, and they are a
 floor for the sanctioned path: `buffer.write.reading` is the only call the display task reads,
@@ -517,6 +625,32 @@ and 25.0 with two, which is what a fixed round trip looks like. The undocumented
 argument accepts a table and appends exactly one reading, ignoring it.
 
 So the last candidate was the display task's own record ring. **It is not a route.**
+
+### Finding it costs 41 s, and three things make it cost more than that
+
+Measured over five runs on 2026-11-09, all on one boot of a DMM6500 1.7.17a.
+
+**The display task has to be given cycles before the records exist.** An append pushes into the
+buffer-side staging ring and posts a message; the display task drains that into its own ring,
+and it runs only while the Lua thread is blocked. A run that appended four sentinels and swept
+immediately found the 28-byte staging ring and a `.bss` lookalike **and not the trace ring** --
+the sentinels were still undrained. One `delay(1.5)` after the appends took the needle count
+from 16 to 370 and the trace ring appeared.
+
+**A fixed sentinel set does not work twice.** Nothing clears the old records while frames are
+parked, so each run's needle matched every previous run's leftovers: needle hits went 370 then
+1243, record candidates 5 then 10, and the search 41 s then 46 s. The probe now offsets its
+decibels by a 64th per run -- a dyadic rational, so exact in float32 -- and the count went back
+to 17 hits and 3 candidates. The format has to be `%.17g`: `%.1f` rounds the offset away and
+the needle then describes a value nobody appended.
+
+**The geometry is stable within a boot and moves between boots.** Every run of this boot
+answered `val0 = 0x036DF7C8`, stride 56, ring `0x036D8818..0x036E25D0`, header `0x036CE838`,
+value at `+0x20`, x at `+0x2C` -- and an earlier boot's was `0x03517908..0x035216C0` with
+header `0x0350D928`. So a measured geometry is worth caching for the session and worth
+re-confirming before use, never assuming: `probe_ringfind.py --ring` takes the six numbers and
+checks all four sentinel records hold their own decibel at the stated offset before it
+proceeds.
 
 ### The ring, and the record, both measured
 
@@ -608,6 +742,35 @@ hand.
 The other option needs no bench time and no tricks: **plot fewer columns.** `sg_ncol` 255 to
 128 halves the appends -- 39 ms to 19.7 -- and takes 2048 from 10 fps to about 12.5, at the
 cost of a visibly coarser trace. It is a judgement for the operator, not an optimisation.
+
+## The frame holds the interpreter three quarters of the time
+
+At 9.5 fps with ~80 ms of work a frame, a socket statement arriving at random has about a 1 in
+4 chance of landing between frames. The rest are refused outright:
+
+    FAILURE: A command from another interface is running, use ABORT to stop it
+
+**A refusal and a slow reply need opposite handling, and getting that backwards is expensive.**
+A refused statement never ran, so sending it again costs nothing and is the only way to land
+one -- which is why `park()` retries. A statement that has merely not answered yet IS running,
+and re-sending it queues the work again: `probe_ringfind.py` re-sent a 268 MB sweep fourteen
+times that way, and the instrument then answered nothing for a quarter of an hour. The
+control socket returned `b''`, the HTTP grab timed out, and only `ping` showed the LAN stack
+was healthy; after a DST the first thing out of the socket was the finished answer.
+
+**And never answer a refusal with ABORT.** ABORT aborts the running script, which here is a
+frame. A frame cut in half left `sg_stamp` behind the timestamps already in the ring, so every
+frame after it rewrote a lower one -- event 4924, "Time in a 'writable' reading buffer cannot
+reverse", raised as a MODAL DIALOG over the app, which then made the socket refuse everything.
+Three symptoms, one cause, and none of them nameable from the socket. `tools/screenshot.py` is
+HTTP and touches no Lua state, so it works while the socket is refusing: one grab named it in
+seconds. A dialog is dismissed by a key, not a statement -- `tools/panel_key.py`, EXIT is
+button 6 -- and after clearing it, `fftsa.busy` has to be cleared too, because an abort inside
+a frame leaves the latch set and every later frame returns early.
+
+`sg_fill` now reserves its stamp range **before** the first write rather than recording it
+after the last, so a fill that is cut short leaves the stamp ahead. A gap in the timestamps is
+harmless; a reversal is not.
 
 ## What is left to win
 

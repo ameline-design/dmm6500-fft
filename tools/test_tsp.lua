@@ -5370,6 +5370,47 @@ check('a short ring pass is padded, not left short', (function()
                        tostring(s2), tostring(e2), tostring(tail))
 end)())
 
+-- AN INTERRUPTED FILL MUST NOT LEAVE THE STAMP BEHIND THE RING.
+--
+-- buffer.write.reading refuses a timestamp below the one in the slot it overwrites, and the
+-- firmware raises that refusal as event 4924 in a MODAL DIALOG over the running app -- which
+-- also makes the control socket answer "a command from another interface is running" for every
+-- statement, so the cause cannot be read back. Measured on the instrument after a socket ABORT
+-- cut a fill in half: the app stopped drawing and needed an injected EXIT press to clear it.
+--
+-- So the stamp range is reserved BEFORE the first write. This drives that by raising inside
+-- the fill, which is what an abort does, and then asking whether the stamp is clear of every
+-- timestamp the half-finished pass already wrote.
+check('a fill cut off part-way leaves sg_stamp above every timestamp it wrote', (function()
+  local cap = 20
+  local b = buffer.make(cap, buffer.STYLE_WRITABLE_FULL)
+  b.fillmode = buffer.FILL_CONTINUOUS
+  local keep, kb, keepf, keeps = fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_fold, fftsa.sg_stamp
+  fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_fold = true, b, true
+  fftsa.sg_stamp = 1000
+  local db, hz, i = {}, {}, nil
+  for i = 1, 10 do db[i], hz[i] = -70 - i, 250 * i end
+  -- Fail the fifth append, the way an abort lands mid-loop. The real write is restored
+  -- immediately after, so nothing below this case sees the stub.
+  local realwr = buffer.write.reading
+  local seen, hit = 0, 0
+  buffer.write.reading = function(bb, v, x, t, st)
+    seen = seen + 1
+    if seen == 5 then error('aborted mid-fill') end
+    hit = t
+    return realwr(bb, v, x, t, st)
+  end
+  local ok = pcall(fftsa.sg_fill, db, hz, 10)
+  buffer.write.reading = realwr
+  local after = fftsa.sg_stamp
+  fftsa.sg_ring, fftsa.sg_buf, fftsa.sg_fold = keep, kb, keepf
+  fftsa.sg_stamp = keeps
+  fftsa.del_buf(b)
+  return (not ok) and after > hit and hit > 0,
+         string.format('raised=%s highest timestamp written=%d, sg_stamp now %d',
+                       tostring(not ok), hit, after)
+end)())
+
 -- Off, sg_fill is the shipped fill and nothing else: a clear, then one append a point.
 check('with the ring off sg_fill clears and writes nseg', (function()
   local b = buffer.make(300, buffer.STYLE_WRITABLE_FULL)

@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.59
+-- $Version: 8.60
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -688,6 +688,22 @@ function fftsa.sg_fill(db, hz, nseg)
   if fftsa.sg_fold then room = math.floor(cap / 2) end
   if nseg > room then nseg = room end
   local t = fftsa.sg_stamp
+  -- THE RANGE IS RESERVED BEFORE THE FIRST WRITE, not recorded after the last.
+  --
+  -- A fill that does not finish otherwise leaves sg_stamp BEHIND timestamps that are already
+  -- in the ring, and every frame after it then rewrites a lower one. The firmware answers that
+  -- with event 4924, "Time in a 'writable' reading buffer cannot reverse", as a MODAL DIALOG
+  -- over the running app -- which also makes the control socket refuse every statement with "a
+  -- command from another interface is running", so the state that caused it cannot be read
+  -- back either. Measured 2026-11-09 after a socket ABORT cut a fill in half: the app drew
+  -- nothing further and needed an injected EXIT press to clear the dialog.
+  --
+  -- Reserving first costs a gap in the timestamps whenever a fill is cut short. A gap is
+  -- harmless -- the widget reads the values, and buffer.write.reading only requires that time
+  -- does not go backwards.
+  local used = room
+  if fftsa.sg_fold then used = 2 * room end
+  fftsa.sg_stamp = t + used
   local last = nseg
   -- One lap, alternating direction, so this pass ends where the next one begins and the join
   -- between them is a repeated point rather than a step across the whole band.
@@ -707,7 +723,6 @@ function fftsa.sg_fill(db, hz, nseg)
       end
     end
     fftsa.sg_up = not fftsa.sg_up
-    fftsa.sg_stamp = t + room
     return nseg
   end
   for i = 1, room do
@@ -720,7 +735,6 @@ function fftsa.sg_fill(db, hz, nseg)
     if j > last then j = last end
     wr(tb, db[j], hz[j], t + room + i, 0)
   end
-  fftsa.sg_stamp = t + 2 * room
   return nseg
 end
 
@@ -4927,7 +4941,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.59'
+fftsa.VERSION = '8.60'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is

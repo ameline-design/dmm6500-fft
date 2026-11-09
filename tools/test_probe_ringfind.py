@@ -41,6 +41,7 @@ NCOL, BN = 255, 510
 
 FAIL = []
 SEEN = []
+GRABS = []
 LUAC = os.path.expanduser('~/tmp/lua502/lua-5.0.2/bin/luac')
 
 
@@ -62,7 +63,11 @@ def lua_parse_error(cmd):
         os.unlink(path)
 
 
+SEEN_CHECKS = []
+
+
 def check(name, cond, detail=''):
+    SEEN_CHECKS.append(name)
     print(('  PASS  ' if cond else '  FAIL  ') + name + (('   ' + detail) if detail else ''))
     if not cond:
         FAIL.append(name)
@@ -73,18 +78,33 @@ class StubDMM:
 
     def __init__(self, *a, **k):
         self.stmts = []
+        self.wrote = {}
+        self.pending = []
 
     def drain(self):
-        pass
+        del self.pending[:]
 
     def close(self):
         pass
 
     def send(self, s):
+        # The probe now sends once and reads separately, which is what stopped it queueing a
+        # slow statement fourteen times. The stub answers the same way: the reply is computed
+        # at send time and handed back by the next line().
         self._check(s)
+        self.pending.append(self._answer(s))
+
+    def line(self, timeout=None):
+        if self.pending:
+            return self.pending.pop(0)
+        return None
+
+    RAISE_ON = None
 
     def q(self, cmd, timeout=None):
         self._check(cmd)
+        if StubDMM.RAISE_ON and StubDMM.RAISE_ON in cmd:
+            raise KeyboardInterrupt('interrupted inside %r' % cmd[:40])
         return self._answer(cmd)
 
     def _check(self, cmd):
@@ -105,10 +125,72 @@ class StubDMM:
         if why:
             FAIL.append('statement is not Lua 5.0.2: %s -- %r' % (why, cmd[:160]))
 
-    @staticmethod
-    def _answer(cmd):
+    SENT_X = [113, 127, 155, 211]        # deltas 14, 28, 56 -- the 1:2:4 of the Hz steps
+    SENT_Y = [239, 241, 243, 245]        # deltas 2, 2, 2 -- the constant dB step
+
+    def record(self, k):
+        """A 56-byte record as a DMM6500 lays one down: two int32 triples, two zero words,
+        the value twice, a flags word, the x twice, then 2.0f."""
+        import struct as _s
+        x = self.SENT_X[k] if k < 4 else 300 + k
+        y = self.SENT_Y[k] if k < 4 else 200
+        v = _s.pack('>f', -100.0 - (k if k < 4 else 0))
+        hz = _s.pack('>f', 1024.0 * (2 ** k) if k < 4 else 20000.0)
+        return (_s.pack('>III', x, x, x) + _s.pack('>III', y, y, y)
+                + b'\0' * 8 + v + v + b'\0' * 4 + hz + hz + _s.pack('>f', 2.0))
+
+    def mem(self, a, n):
+        """Reads come from what was written if anything was, else from the synthetic ring.
+        Serving writes back is what makes the probe's read-back assertion mean something."""
+        out = bytearray()
+        for i in range(n):
+            if a + i in self.wrote:
+                out.append(self.wrote[a + i])
+            elif RING_LO <= a + i < RING_HI:
+                k, off = divmod(a + i - RING_LO, STRIDE)
+                out.append(self.record(k)[off])
+            else:
+                out.append(0)
+        return bytes(out)
+
+    def _answer(self, cmd):
         m = re.search(r"print\((?:string\.format\()?'([A-Z0-9]+)\|", cmd)
         tag = m.group(1) if m else None
+        mw = re.search(r"KG\.write\((\d+), *string\.char\(([0-9,]+)\)", cmd)
+        if mw:
+            a = int(mw.group(1))
+            for i, b in enumerate(int(x) for x in mw.group(2).split(',')):
+                self.wrote[a + i] = b
+            return 'V|true' if tag == 'V' else '%s|true' % (tag or 'V')
+        mr = re.search(r"ki\.memread\('([0-9A-F]+)', *'([0-9A-F]+)'\)", cmd)
+        if mr and tag == 'D':
+            return 'D|' + self.mem(int(mr.group(1), 16), int(mr.group(2), 16)).hex().upper()
+        if tag == 'PK':
+            return 'PK|true'
+        if tag == 'UP':
+            return 'UP|true'
+        if tag == 'SP':
+            # The same value both times, which is what park() requires to call it stopped.
+            return 'SP|787950'
+        # The install statement DEFINES ZP, whose body contains a print -- so the first
+        # print( in the text is ZT|, not the ZI|ok the statement actually reaches. Matched on
+        # the definition rather than on the tag regex, which cannot see inside a function.
+        if 'function ZP(' in cmd:
+            return 'ZI|ok'
+        if 'ZY = {}' in cmd:
+            return 'ZY|480'
+        if tag == 'ZB':
+            return 'ZB|28560,1530'
+        if tag == 'ZQ':
+            return 'ZQ|3.104,28560'
+        if tag == 'Z3':
+            return 'Z3|true'
+        if tag == 'ZT' or tag == 'ZC':
+            return 'ZT|4.812'
+        if tag == 'S2':
+            return 'S2|28560'
+        if tag == 'RW':
+            return 'RW|%d,%d,%d' % (RING_LO, 255, RING_LO + 254 * STRIDE)
         if tag == 'A':
             return 'A|true|true'
         if tag == 'R':
@@ -170,6 +252,12 @@ def run(argv):
         mod = types.ModuleType('probe_ringfind_under_test')
         mod.__dict__['__name__'] = 'probe_ringfind_under_test'
         exec(compile(src, 'probe_ringfind.py', 'exec'), mod.__dict__)
+        # The grab runs screenshot.py out of process, which talks to the real instrument over
+        # the LAN. A test must not do that: the first run of this harness timed out against a
+        # live DMM. Replaced on the module rather than by patching subprocess, because
+        # patching that globally once broke luac for every statement check in this file.
+        del GRABS[:]
+        mod.shot = lambda d, path: GRABS.append(path) or True
         mod.main()
     finally:
         sys.argv = saved
@@ -185,6 +273,9 @@ def main():
         (['--pass'], 'the whole-pass refusal without --yes', 'add --yes'),
         (['--pass', '--yes', '--hold', '2'], 'the whole-pass prototype', 'restore: header'),
         (['--write'], 'the single-record experiment', 'restore: '),
+        (['--pixel'], 'the pixel-triple experiment', 'Compare /tmp/pixel_before.png'),
+        (['--pixelpass'], 'the whole-pass pixel prototype', 'Compare /tmp/pass_before.png'),
+        (['--pixelbulk'], 'the one-memwrite pass', 'in ONE memwrite'),
     ):
         buf = io.StringIO()
         before = len(FAIL)
@@ -201,6 +292,14 @@ def main():
               % (name, len(stmts)), len(FAIL) == before, '%d statements' % len(stmts))
         check('%s reaches its end' % name, want in out,
               'looked for %r' % want)
+        if argv == ['--pixel']:
+            check('the pixel phase grabs the glass before and after',
+                  GRABS == ['/tmp/pixel_before.png', '/tmp/pixel_after.png'],
+                  'grabs: %s' % (GRABS or 'none'))
+        if argv == ['--pixelpass']:
+            check('the pass phase grabs the glass before and after',
+                  GRABS == ['/tmp/pass_before.png', '/tmp/pass_after.png'],
+                  'grabs: %s' % (GRABS or 'none'))
 
     # The restore has to be in the finally, so it happens even when the body raises. The
     # write phase above raises on the stub's refusal, so the restore statement must still be
@@ -214,6 +313,23 @@ def main():
     restored = [s for s in SEEN if 'KG.write' in s and 'Z1|' in s]
     check('a refusal mid-write still runs the restore', len(restored) > 0,
           '%d restore statements after the raise' % len(restored))
+
+    # THE CLEANUP HAS TO SURVIVE BEING INTERRUPTED IN THE MIDDLE OF ITSELF. Chained steps
+    # meant a KeyboardInterrupt inside the second one skipped the third and the unpark, and
+    # the app was left with its frames stopped on a real instrument -- which looks exactly
+    # like a wedge and sent the recovery after the wrong fault.
+    buf = io.StringIO()
+    StubDMM.RAISE_ON = 'KG.armed = false KG.wb = nil end end'
+    try:
+        with contextlib.redirect_stdout(buf):
+            run(['--pixel'])
+    except BaseException:                                                # noqa: BLE001
+        pass
+    StubDMM.RAISE_ON = None
+    out = buf.getvalue()
+    check('an interrupt inside the cleanup still reaches the unpark',
+          'UP|' in out or 'unpark' in out,
+          'cleanup output: %r' % (out[-220:].replace('\n', ' | ') or 'none'))
 
     # And no statement may define a tag that another statement with a different field count
     # also uses, because ask() matches on the prefix alone.
@@ -229,7 +345,7 @@ def main():
           'clashing: %s' % (', '.join(clashes) or 'none'))
 
     print()
-    print('%d checks, %d failed' % (8 + 2, len(FAIL)))
+    print('%d checks, %d failed' % (len(SEEN_CHECKS), len(FAIL)))
     for f in FAIL:
         print('  ' + f)
     return 1 if FAIL else 0
