@@ -592,12 +592,31 @@ Everything above starts from a known ring. Finding it from scratch is a two-pass
 window ladder -- **41 s**, measured repeatedly -- and the geometry **moves between boots**, so
 it cannot be compiled in. 41 s at launch is not shippable.
 
-**Stopping the sweep at the first window that confirms a candidate does not help, measured.**
+**Two changes together make the lucky case free and the unlucky case half price. The spread is
+the story, and it is wide.**
+
+| boot | find | why |
+|---|---|---|
+| ring 0x3638BD0, arena far away | **42.3 s** | nothing confirmed until the backstop window |
+| ring 0x3C69BE8, fresh launch | **0.0 s** | confirmed in the FIRST window, 1 hit, 1 candidate |
+
+The changes: confirm per window and stop at the first window that confirms, and run the second
+search only on a window where the first search found something -- a window with no hits has
+nothing to intersect, and sweeping the 268 MB backstop twice was half the cost. Neither
+weakens a lock: the intersection still drops a hit that moved, and what actually caught the
+self-hit pair that bluescreened the instrument was the stride confirmation, which is unchanged.
+
+**So the find is cheap when the ring lands near a centre `scan_windows` already has, and a full
+sweep when it does not.** Which of those happens is not under the app's control today, so the
+shippable shape is: try the cheap ladder at launch, and if it does not answer, fall back to
+searching in the background across frames while the app runs on appends.
+
+**Stopping early on its own did not help, measured.**
 `find_ring_records` now does both searches, the intersection and the stride confirmation per
 window and stops as soon as a candidate stands up, with a `full` fallback for the case where
-the window that answered holds the staging ring and not the trace ring. It still took **42.3
-s**, because the window that confirmed first was the LAST one -- the whole backstop. All three
-candidates came out of it:
+the window that answered holds the staging ring and not the trace ring. On the boot it was first tried on it still took **42.3 s**, because
+the window that confirmed first was the LAST one -- the whole backstop. All three candidates
+came out of it:
 
     362C274 / 28    the buffer-side staging ring
     3638BD0 / 56    the trace ring
@@ -623,8 +642,8 @@ Two other routes, neither tried:
 * find it in the background across frames, appending until it answers, and switch the fill
   over when it does. The app would run on appends until then, so nothing regresses.
 
-**Also not fixed, and it varies: the header's distance below the ring.** 0x9FE0 one boot, 0x30
-the next. `find_ring_header` searches for it rather than assuming, which is why that was never
+**Also not fixed, and it varies: the header's distance below the ring.** 0x9FE0, then 0x30,
+then 0xA020 -- three boots, three figures. `find_ring_header` searches for it rather than assuming, which is why that was never
 a problem -- worth stating because it is the kind of figure a later shortcut would be tempted
 to compile in.
 

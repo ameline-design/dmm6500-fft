@@ -1669,9 +1669,23 @@ function fftsa.nl.find_ring_records(sentinels, full)
   for wi = 1, table.getn(windows) do
     local lo, hi = windows[wi][1], windows[wi][2]
     local h1 = nl.FINDS(lo, hi, n1)
-    local h2 = nl.FINDS(lo, hi, n1)
     h1n = h1n + table.getn(h1)
-    h2n = h2n + table.getn(h2)
+    -- THE SECOND SEARCH ONLY WHERE THE FIRST FOUND SOMETHING.
+    --
+    -- It sweeps the same window again so that a hit which MOVED between the two can be
+    -- dropped: the needle is a live Lua string in the heap being searched, so every search
+    -- returns its own storage. But a window with no hits has nothing to intersect, and
+    -- sweeping it twice was half of a 41 s find -- the backstop alone is 268 MB.
+    --
+    -- The lock is not weakened. What actually caught the self-hit pair that bluescreened the
+    -- instrument was the STRIDE confirmation below, not the intersection; the intersection is
+    -- defence in depth over the same candidates, and candidates only exist where h1 is
+    -- non-empty. So the window that would have been excused is a window with nothing in it.
+    local h2 = {}
+    if table.getn(h1) > 0 then
+      h2 = nl.FINDS(lo, hi, n1)
+      h2n = h2n + table.getn(h2)
+    end
     -- Deduped as well as intersected. The ladder's windows overlap, so one address comes back
     -- once per window it falls in, and without this the confirm loop runs that many times over
     -- for nothing -- a handful of hits became 29 candidates on the first run of it.
