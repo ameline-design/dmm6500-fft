@@ -1279,23 +1279,53 @@ function fftsa.nl.find_ring_records(sentinels)
     nl.ring_why = 'sentinels 1 and 2 pack to the same float32'
     return nil
   end
-  local n1, n2 = pat[1] .. pat[1], pat[2] .. pat[2]
+  local n1 = pat[1] .. pat[1]
 
-  -- Both needles over the same windows. The second is what gives the stride: the display task
-  -- appends in order, so sentinel 2's record is exactly one stride above sentinel 1's.
+  -- TWO SEARCHES, AND THE STRIDE COMES FROM CANDIDATES RATHER THAN FROM A HIT DIFFERENCE.
+  --
+  -- FINDS matches its own needle. The pattern is a live Lua string in the swept heap, so every
+  -- search returns one hit that is the needle's own storage -- measured by searching for three
+  -- dB values never appended anywhere and getting exactly one hit each. Differencing two
+  -- needles' hits therefore produces a meaningless stride, and when two 8-byte needles happen
+  -- to be interned 56 bytes apart it produces a CONVINCING one: that is how 120 records of
+  -- float were written over Lua's string table, which bluescreened at 0x0022D270 in
+  -- luaS_newlstr walking a chain through an overwritten next pointer.
+  --
+  -- The needle is re-interned on every call, so a self-hit lands somewhere different each
+  -- search while a real record does not move. Two searches and an intersection is the lock,
+  -- and it costs one extra sweep rather than any knowledge of where the Lua heap is.
   local windows = nl.scan_windows(nil, nil)
-  local h1, h2, wi = {}, {}, nil
-  for wi = 1, table.getn(windows) do
-    local a = nl.FINDS(windows[wi][1], windows[wi][2], n1)
-    local b = nl.FINDS(windows[wi][1], windows[wi][2], n2)
-    local k
-    for k = 1, table.getn(a) do h1[table.getn(h1) + 1] = a[k] end
-    for k = 1, table.getn(b) do h2[table.getn(h2) + 1] = b[k] end
-    if table.getn(h1) > 0 and table.getn(h2) > 0 then break end
+  local pass = function()
+    local got, wi = {}, nil
+    for wi = 1, table.getn(windows) do
+      local a = nl.FINDS(windows[wi][1], windows[wi][2], n1)
+      local k
+      for k = 1, table.getn(a) do got[table.getn(got) + 1] = a[k] end
+    end
+    return got
   end
-  nl.ring_hits = table.getn(h1) .. '/' .. table.getn(h2)
-  if table.getn(h1) == 0 or table.getn(h2) == 0 then
-    nl.ring_why = 'value needle not in memory, hits ' .. tostring(nl.ring_hits)
+  local h1, h2 = pass(), pass()
+  -- Deduped. The ladder's windows overlap, so one address comes back once per window it falls
+  -- in, and without this the confirm loop below runs that many times over for nothing -- a
+  -- handful of hits became 29 candidates on the first run of it.
+  local stable, ns = {}, 0
+  local a, b
+  for a = 1, table.getn(h1) do
+    local seen, keep = nil, false
+    for b = 1, table.getn(h2) do
+      if h1[a] == h2[b] then keep = true end
+    end
+    if keep then
+      for b = 1, ns do
+        if stable[b] == h1[a] then seen = true end
+      end
+      if not seen then ns = ns + 1; stable[ns] = h1[a] end
+    end
+  end
+  nl.ring_hits = table.getn(h1) .. '/' .. table.getn(h2) .. '/' .. ns
+  if ns == 0 then
+    nl.ring_why = 'no value needle hit survived two searches, hits '
+                  .. tostring(nl.ring_hits)
     return nil
   end
 
@@ -1304,14 +1334,11 @@ function fftsa.nl.find_ring_records(sentinels)
   -- just as well -- and it is not what the widget draws. Only the header tells them apart, and
   -- the staging ring has no adjacent bounds pair to find, so the caller walks the list.
   local out, nout = {}, 0
-  local a, b
-  for a = 1, table.getn(h1) do
-    for b = 1, table.getn(h2) do
-      local s = h2[b] - h1[a]
-      if s >= nl.REC_MIN and s <= nl.REC_MAX and math.mod(s, 4) == 0 then
-        local g = nl._ring_confirm(h1[a], s, sentinels, pat)
-        if g ~= nil then nout = nout + 1; out[nout] = g end
-      end
+  local ci, sv
+  for ci = 1, ns do
+    for sv = nl.REC_MIN, nl.REC_MAX, 4 do
+      local g = nl._ring_confirm(stable[ci], sv, sentinels, pat)
+      if g ~= nil then nout = nout + 1; out[nout] = g end
     end
   end
   nl.ring_cands = out

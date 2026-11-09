@@ -1166,6 +1166,61 @@ do
         and string.find(tostring(fftsa.nl.ring_why), 'no stride', 1, true) ~= nil,
         'why=' .. tostring(fftsa.nl.ring_why))
 
+  -- THE SELF-HIT, WHICH COST A POWER CYCLE AND A BLUESCREEN. FINDS matches its own needle:
+  -- the pattern is a live Lua string in the swept heap. Differencing two needles' hits for a
+  -- stride is therefore meaningless, and when two 8-byte needles are interned a plausible
+  -- distance apart it is CONVINCING -- 120 records of float went over Lua's string table and
+  -- the next intern faulted at 0x0022D270 in luaS_newlstr, walking a chain through a next
+  -- pointer that had been overwritten.
+  --
+  -- The lock is that a needle is re-interned per search, so a self-hit MOVES between two
+  -- searches while a real record does not. FINDS here returns the record plus a decoy at a
+  -- different address each call, with sentinel 2 planted one plausible stride above the decoy
+  -- so that the old hit-difference logic would have confirmed it.
+  build(RLO, STRIDE, NREC, 32, 44, 40904)
+  local FINDS_KEEP = fftsa.nl.FINDS
+  local MOVER = {RLO - 262144, RLO - 393216}
+  local turn = 0
+  local v1 = fftsa.nl._f32_pack(SENT[1].db)
+  local v2b = fftsa.nl._f32_pack(SENT[2].db)
+  local mi
+  for mi = 1, 2 do
+    wrs(MOVER[mi], v1 .. v1)
+    wrs(MOVER[mi] + STRIDE, v2b .. v2b)
+  end
+  fftsa.nl.FINDS = function(lo, hi, p)
+    local out, n = {}, 0
+    if p == v1 .. v1 then
+      turn = turn + 1
+      local m = MOVER[math.mod(turn - 1, 2) + 1]
+      if m >= lo and m <= hi then n = n + 1 out[n] = m end
+      if RLO + 32 >= lo and RLO + 32 <= hi then n = n + 1 out[n] = RLO + 32 end
+    end
+    return out
+  end
+  local gm = fftsa.nl.find_ring_records(SENT)
+  -- The right record, exactly one candidate, and the mover nowhere in the list. Asserting the
+  -- hit COUNT would be asserting how the ladder's windows overlap, which is not the claim.
+  local mseen = false
+  local mk
+  if fftsa.nl.ring_cands ~= nil then
+    for mk = 1, table.getn(fftsa.nl.ring_cands) do
+      if fftsa.nl.ring_cands[mk].val0 == MOVER[1]
+         or fftsa.nl.ring_cands[mk].val0 == MOVER[2] then mseen = true end
+    end
+  end
+  check('a needle hit that moves between two searches is dropped as the self-hit',
+        gm ~= nil and gm.val0 == RLO + 32 and not mseen
+        and table.getn(fftsa.nl.ring_cands) == 1,
+        gm == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
+        or string.format('val0=%X cands=%d mover=%s hits=%s', gm.val0,
+                         table.getn(fftsa.nl.ring_cands), tostring(mseen),
+                         tostring(fftsa.nl.ring_hits)))
+
+  -- Restored, or every case below runs against the mock above and passes or fails for the
+  -- wrong reason -- which is exactly what happened the first time.
+  fftsa.nl.FINDS = FINDS_KEEP
+
   -- THE DECOY THAT MATTERS. The buffer-side staging ring holds the same two float32 pairs in a
   -- 28-byte record, written in the same order by the same append, and it is NOT what the widget
   -- draws -- writing it buys nothing and advancing its cursors ends in a modal 2350. It
