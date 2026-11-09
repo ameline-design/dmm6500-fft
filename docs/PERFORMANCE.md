@@ -590,17 +590,45 @@ native form is a few hundred instructions a record and should be under a millise
 
 Everything above starts from a known ring. Finding it from scratch is a two-pass sweep of the
 window ladder -- **41 s**, measured repeatedly -- and the geometry **moves between boots**, so
-it cannot be compiled in. 41 s at launch is not shippable, so one of these has to come first:
+it cannot be compiled in. 41 s at launch is not shippable.
 
-* find it faster. The ladder's last stage is the whole 268 MB backstop; the ring was found
-  without reaching it, so a tighter set of centres may be enough, and the display task's
-  allocation may sit near something the app already has an address for.
-* find it once and keep it, the way `NLBOOT` keeps the native install across a relaunch. A
-  global survives a relaunch and dies with the power cycle, which is exactly the lifetime the
-  ring address has.
-* find it in the background across frames, and keep appending until it answers.
+**Stopping the sweep at the first window that confirms a candidate does not help, measured.**
+`find_ring_records` now does both searches, the intersection and the stride confirmation per
+window and stops as soon as a candidate stands up, with a `full` fallback for the case where
+the window that answered holds the staging ring and not the trace ring. It still took **42.3
+s**, because the window that confirmed first was the LAST one -- the whole backstop. All three
+candidates came out of it:
 
-Until one of those is done the bypass is measured and not shippable.
+    362C274 / 28    the buffer-side staging ring
+    3638BD0 / 56    the trace ring
+    A7D574  / 68    the .bss lookalike
+
+**The ring is not reliably near anything the ladder centres on.** One boot put it 40 KB from
+`nl.arena`, which made stage 1 look sufficient; the next put it nowhere near, and
+`scan_windows(nil, nil)` has only `nl.inst`, the column pointers and `nl.arena` to work from --
+all of them the *buffer's* structures, where the ring is the *display task's* allocation.
+
+**The lead worth following: anchor on the staging ring.** It is 0x C95C -- 51 KB -- below the
+trace ring in the boot above, it is owned by the buffer side, and the append path reaches it
+from structures the app already has addresses for. Find that first, then sweep a tight window
+around it. Two addresses from two boots is not a distance to rely on, so it would have to be
+measured across several.
+
+Two other routes, neither tried:
+
+* find it once and keep it in a global, the way `NLBOOT` keeps the native install across a
+  relaunch. A global survives a relaunch and dies with the power cycle, which is exactly the
+  lifetime the ring address has -- so the cost falls to once per power cycle rather than once
+  per launch. It does not remove the 41 s, it just stops paying it repeatedly.
+* find it in the background across frames, appending until it answers, and switch the fill
+  over when it does. The app would run on appends until then, so nothing regresses.
+
+**Also not fixed, and it varies: the header's distance below the ring.** 0x9FE0 one boot, 0x30
+the next. `find_ring_header` searches for it rather than assuming, which is why that was never
+a problem -- worth stating because it is the kind of figure a later shortcut would be tempted
+to compile in.
+
+Until the find is cheap the bypass is measured and not shippable.
 
 ### THE Y INTERCEPT IS NOT A CONSTANT. Calibrate at runtime
 

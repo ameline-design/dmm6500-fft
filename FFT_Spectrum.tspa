@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 8.60
+-- $Version: 8.61
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -3193,7 +3193,7 @@ fftsa.nl.RING_MIN, fftsa.nl.RING_MAX = 8, 4096
 --   stride  bytes between consecutive records, measured from two sentinels
 --   dx      value field to x field, measured, and signed -- the x may precede the value
 --   nconf   how many sentinels were confirmed at that geometry
-function fftsa.nl.find_ring_records(sentinels)
+function fftsa.nl.find_ring_records(sentinels, full)
   local nl = fftsa.nl
   nl.ring_why = nil
   local ns = sentinels ~= nil and table.getn(sentinels) or 0
@@ -3230,52 +3230,66 @@ function fftsa.nl.find_ring_records(sentinels)
   -- search while a real record does not move. Two searches and an intersection is the lock,
   -- and it costs one extra sweep rather than any knowledge of where the Lua heap is.
   local windows = nl.scan_windows(nil, nil)
-  local pass = function()
-    local got, wi = {}, nil
-    for wi = 1, table.getn(windows) do
-      local a = nl.FINDS(windows[wi][1], windows[wi][2], n1)
-      local k
-      for k = 1, table.getn(a) do got[table.getn(got) + 1] = a[k] end
-    end
-    return got
-  end
-  local h1, h2 = pass(), pass()
-  -- Deduped. The ladder's windows overlap, so one address comes back once per window it falls
-  -- in, and without this the confirm loop below runs that many times over for nothing -- a
-  -- handful of hits became 29 candidates on the first run of it.
-  local stable, ns = {}, 0
-  local a, b
-  for a = 1, table.getn(h1) do
-    local seen, keep = nil, false
-    for b = 1, table.getn(h2) do
-      if h1[a] == h2[b] then keep = true end
-    end
-    if keep then
-      for b = 1, ns do
-        if stable[b] == h1[a] then seen = true end
-      end
-      if not seen then ns = ns + 1; stable[ns] = h1[a] end
-    end
-  end
-  nl.ring_hits = table.getn(h1) .. '/' .. table.getn(h2) .. '/' .. ns
-  if ns == 0 then
-    nl.ring_why = 'no value needle hit survived two searches, hits '
-                  .. tostring(nl.ring_hits)
-    return nil
-  end
-
-  -- EVERY confirmed candidate, not the first. The buffer-side staging ring holds the same two
-  -- float32 pairs in a 28-byte record, appended in the same order, so it confirms at a stride
-  -- just as well -- and it is not what the widget draws. Only the header tells them apart, and
-  -- the staging ring has no adjacent bounds pair to find, so the caller walks the list.
+  -- WINDOW BY WINDOW, AND STOP AT THE FIRST ONE THAT CONFIRMS A CANDIDATE.
+  --
+  -- Sweeping the whole ladder before confirming anything cost 41 s, measured repeatedly -- and
+  -- the ring is about 40 KB from nl.arena, which stage 1 already puts a tight window around.
+  -- The last stage is the whole 268 MB backstop and is where almost all of that time goes, so
+  -- stopping as soon as a candidate stands up skips it.
+  --
+  -- BOTH LOCKS SURVIVE BEING APPLIED PER WINDOW. The two searches still drop a needle's own
+  -- storage, because the needle is re-interned per search wherever it lands; the stride
+  -- confirmation still rejects one. What changes is only how much memory is read before the
+  -- answer is believed.
+  --
+  -- `full` sweeps the whole ladder anyway and is the caller's fallback: stopping early can
+  -- stop on a window that holds the 28-byte staging ring and not the trace ring, and the only
+  -- thing that tells those apart is the header, which the caller looks for. So a caller that
+  -- finds no header among the fast candidates asks again with full set.
   local out, nout = {}, 0
-  local ci, sv
-  for ci = 1, ns do
-    for sv = nl.REC_MIN, nl.REC_MAX, 4 do
-      local g = nl._ring_confirm(stable[ci], sv, sentinels, pat)
-      if g ~= nil then nout = nout + 1; out[nout] = g end
+  local h1n, h2n, nsall = 0, 0, 0
+  local wi
+  for wi = 1, table.getn(windows) do
+    local lo, hi = windows[wi][1], windows[wi][2]
+    local h1 = nl.FINDS(lo, hi, n1)
+    local h2 = nl.FINDS(lo, hi, n1)
+    h1n = h1n + table.getn(h1)
+    h2n = h2n + table.getn(h2)
+    -- Deduped as well as intersected. The ladder's windows overlap, so one address comes back
+    -- once per window it falls in, and without this the confirm loop runs that many times over
+    -- for nothing -- a handful of hits became 29 candidates on the first run of it.
+    local stable, ns = {}, 0
+    local a, b
+    for a = 1, table.getn(h1) do
+      local seen, keep = false, false
+      for b = 1, table.getn(h2) do
+        if h1[a] == h2[b] then keep = true end
+      end
+      if keep then
+        for b = 1, ns do
+          if stable[b] == h1[a] then seen = true end
+        end
+        for b = 1, nout do
+          if out[b].val0 == h1[a] then seen = true end
+        end
+        if not seen then ns = ns + 1; stable[ns] = h1[a] end
+      end
     end
+    nsall = nsall + ns
+    -- EVERY confirmed candidate in this window, not the first. The buffer-side staging ring
+    -- holds the same two float32 pairs in a 28-byte record, appended in the same order, so it
+    -- confirms at a stride just as well -- and it is not what the widget draws.
+    local ci, sv
+    for ci = 1, ns do
+      for sv = nl.REC_MIN, nl.REC_MAX, 4 do
+        local g = nl._ring_confirm(stable[ci], sv, sentinels, pat)
+        if g ~= nil then nout = nout + 1; out[nout] = g end
+      end
+    end
+    nl.ring_win, nl.ring_nwin = wi, table.getn(windows)
+    if nout > 0 and not full then break end
   end
+  nl.ring_hits = h1n .. '/' .. h2n .. '/' .. nsall
   nl.ring_cands = out
   if nout == 0 then
     nl.ring_why = 'no stride between ' .. nl.REC_MIN .. ' and ' .. nl.REC_MAX
@@ -3287,9 +3301,9 @@ end
 
 -- The whole discovery: the records, then the header that identifies which candidate is the
 -- display task's ring rather than a staging ring that looks like one.
-function fftsa.nl.find_ring(sentinels)
+function fftsa.nl.find_ring(sentinels, full)
   local nl = fftsa.nl
-  if nl.find_ring_records(sentinels) == nil then return nil end
+  if nl.find_ring_records(sentinels, full) == nil then return nil end
   local c = nl.ring_cands
   local i
   for i = 1, table.getn(c) do
@@ -3301,6 +3315,17 @@ function fftsa.nl.find_ring(sentinels)
   end
   nl.ring_why = 'no header for any of ' .. tostring(table.getn(c)) .. ' record candidates: '
                 .. tostring(nl.ring_why)
+  -- The fast search stops at the first window that confirms anything, and that window can
+  -- hold the staging ring and not the trace ring. Only the header tells them apart, so a
+  -- fast pass with no header is exactly the case the whole ladder exists for.
+  --
+  -- UNLESS IT ALREADY SWEPT THE LOT. Measured 2026-11-09: the window that confirmed first was
+  -- the LAST one, the whole backstop -- the ring is not reliably near any centre scan_windows
+  -- has when it is called with no buffer. Re-running the full ladder then costs a second 42 s
+  -- to read the same memory and reach the same answer.
+  if not full and nl.ring_win ~= nil and nl.ring_win < nl.ring_nwin then
+    return nl.find_ring(sentinels, true)
+  end
   return nil
 end
 
@@ -4941,7 +4966,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.60'
+fftsa.VERSION = '8.61'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
