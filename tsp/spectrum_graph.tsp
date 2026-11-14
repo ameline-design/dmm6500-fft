@@ -214,6 +214,43 @@ end
 -- The settings line: what Options holds that the axes do not already show, so neither the
 -- span nor the dB range is repeated. Written twice per Apply, before the capture and again
 -- after, so the rate and bin width it ends up showing are the measured ones.
+-- "F " at the head of the settings line while the pixel path is engaged, and nothing when it
+-- is not.
+--
+-- The line is rewritten once a second, when the frame rate window closes, so this follows the
+-- path without a clock of its own -- and that is what it is for: a frame rate that dips for a
+-- second or two says nothing about WHY on its own, and an F that goes with the dip says the
+-- path dropped, while an F that stays through it says the time went somewhere else entirely.
+--
+-- nl absent is not an error. The module is optional, and the app ran without it for its whole
+-- life before the path existed.
+-- AND IT HAS TO CATCH A DROP THE REWRITE WOULD HIDE.
+--
+-- The line is written once a second and a drop costs four held frames plus a re-map, which at
+-- 15 fps is under half of one. So "F throughout" and "F, dropped and back twice" look
+-- identical, and the operator reported the first while the second was possible -- the F stayed
+-- lit across an FFT size change, where sg_bind drops the path deliberately.
+--
+-- So the restart counter is sampled here and compared with the last line write. A number after
+-- the F is how many times the path dropped since this line last said anything, which is the
+-- one thing a once-a-second sample can still say truthfully about a sub-second event.
+--
+-- Reading state here mutates sg_fast_re, which is unusual in a text builder and is the point:
+-- the latch has to be cleared by the write that reports it, or a single drop marks the line
+-- for the rest of the session.
+function fftsa.sg_fast_text()
+  local nl = fftsa.nl
+  if nl == nil or nl.px == nil then return "" end
+  local re = nl.px.restarts or 0
+  local was = fftsa.sg_fast_re
+  fftsa.sg_fast_re = re
+  if nl.px.state ~= 'on' then return "" end
+  if was ~= nil and re > was then
+    return string.format("F%d ", re - was)
+  end
+  return "F "
+end
+
 function fftsa.sg_xunit_text()
   -- Over-range replaces the line rather than appending to it: there is no room for both, and
   -- beside a record the range could not represent the point count and bin width are beside
@@ -222,7 +259,7 @@ function fftsa.sg_xunit_text()
   -- Total for the same reason opt_info_text is: apply() builds this line after the hardware
   -- is configured, so a nil count or an unknown range index reads as a gap rather than
   -- aborting the Apply.
-  local t = string.format("%d pts   %s   %s", fftsa.n or 0,
+  local t = string.format("%s%d pts   %s   %s", fftsa.sg_fast_text(), fftsa.n or 0,
                           tostring(fftsa.opt_info_text(fftsa.fs, fftsa.n)),
                           tostring(fftsa.range_labels[fftsa.range_to_idx(fftsa.range)]))
   -- Start 1999 / Stop 2000 is a legal pair and one plotted point at any bin width: the trace
@@ -508,14 +545,78 @@ fftsa.sg_up = true
 -- fftsa.nl.px_try carries all of it and says what it costs.
 --
 -- THE APPEND PATH STAYS AS THE FALLBACK, and that is the whole shape of this. Nothing is
--- removed: the fill below is what every build before this one shipped and what runs whenever
--- the pixel path has not engaged, has been switched off, or has refused a frame. The pixel
--- path is only ever a replacement for a fill it has already proved it can do.
+-- removed: the fill below is what runs whenever the pixel path has not engaged, has been
+-- switched off, or has refused a frame. The pixel path is only ever a replacement for a fill
+-- it has already proved it can do.
 --
--- Off by default. The ring the writes go into is found at runtime and the one unrecoverable
--- outcome is writing into something that is not it, so the switch exists to be turned on
--- deliberately -- from the socket, from a build that has been through the gates on the glass.
-fftsa.sg_pix = false
+-- It engages by POINTER through the GUI object table rather than by scanning the heap, draws
+-- the same spectrum as the appends to the pixel -- same fundamental, same floor, same peak
+-- table -- and takes the frame from 93.2 ms to 56.8 ms, 9.5 fps to 11, with the 510 appends a
+-- frame gone.
+--
+-- A drawn pass is right only while the display task's oldest-record cursor is at the ring
+-- base, and AN APPEND MOVES THAT CURSOR: the widget draws in storage order and the x values
+-- are the FIRMWARE's, so a window starting at slot j runs x[j]..x[n] then x[1].. and the line
+-- doubles back across the plot. Measured on the glass with one append a frame as the repaint:
+-- correct about one frame in three, wrapped in the others, and restoring the cursor at the top
+-- of the next frame loses the race with the task. That is why the repaint is provoked by a
+-- cursor and not by an append, and why an engaged frame has nothing to restore -- see
+-- sg_pix_repaint.
+--
+-- What makes having it on safe is not that it cannot fail. It is that every failure falls
+-- back: a frame it refuses, a map it cannot fit and a window it finds moved all return to the
+-- fill below, which is the path the app shipped on for its whole life before this. The ring is
+-- still an address derived at runtime, so the identification is checked at every step -- the
+-- buffer's own name in the trace object, the bounds bracketing the ring, 510 exact float
+-- matches against this app's own axis -- and a frame that fails any of them appends instead.
+fftsa.sg_pix = true
+
+-- AND ARMED ONLY ON THE MODEL IT HAS BEEN MEASURED ON.
+--
+-- Being safe elsewhere is not the same as being worth running elsewhere. Every offset the path
+-- uses is derived at runtime, every dereference is gated on a span of addresses this session
+-- has already read, and every candidate has to match 510 exact float32 frequencies of this
+-- app's own axis -- so a model whose trace object is laid out differently refuses rather than
+-- writes. What it cannot do is refuse for free: the search costs a slice and an adjudication
+-- every frame for the life of the session, and on a DMM7510 that is a frame rate given up for
+-- an answer that cannot come. Its image has no mulli by 0x260 and none of the 6500's
+-- signatures, so the object stride is not the one the walk assumes.
+--
+-- A plain global on each side of it, so one assignment from the socket arms it on a model it
+-- has never run on -- which is how the measurement gets made -- and sg_pix still switches the
+-- whole thing off.
+fftsa.sg_pix_any = false
+
+-- ONE ARM DECISION, AND BOTH SIDES ASK IT.
+--
+-- The draw side asked this; the two search call sites asked `sg_pix` alone. On a stock DMM7510
+-- that meant the search ran, could reach state 'on', and never drew -- and sg_fast_text shows
+-- the F on state alone, so the bottom line would have claimed a fast path the frame was not
+-- using. A false F is worse than no F: it is the one indicator a user is told to report by.
+--
+-- The 7510 exclusion is also gone, because the route exists for it now: its subscriber table is
+-- at 0x005189C8 in its own display payload, and the name, graph and routing offsets, the
+-- graph-trace kind and all eight trace and widget offsets are the same as the 6500's. What it
+-- gets is a different search window. If that window is wrong on some build, the route refuses
+-- and says so on the About page, which is the outcome this was conservative about -- and a
+-- refusal that explains itself is worth more than a model that never tries.
+function fftsa.sg_pix_armed()
+  if not fftsa.sg_pix then return false end
+  return true
+end
+
+-- How an engaged frame makes the display task repaint: 'cursor' or 'append'.
+--
+-- 'append' is one buffer.write.reading whose only purpose is to provoke the repaint, and it
+-- wraps the trace: the append moves the task's oldest-record cursor, the widget draws in
+-- storage order, and a window that does not start at the ring base runs its x values backwards
+-- once. Restoring the cursor afterwards races the task and loses two frames in three,
+-- measured. It is kept only so the comparison can be made on the glass without a rebuild.
+--
+-- 'cursor' sets a graph cursor to the firmware's own OFF sentinel instead. It is synchronous,
+-- so the GUI acknowledges it, and it touches no record -- so the cursors never move and there
+-- is nothing to restore. A live knob, so the two can be compared from the socket on one boot.
+fftsa.sg_pix_repaint = 'cursor'
 
 -- The pixel path's two halves, and why they sit on opposite sides of the fill.
 --
@@ -536,6 +637,16 @@ function fftsa.sg_pix_draw(db, hz, nseg, tb)
   local t = (fftsa.sg_stamp or 0) + 1
   fftsa.sg_stamp = t
   local ok, n = pcall(nl.px_frame, db, hz, nseg, tb, t)
+  -- The pointer hunt belongs HERE, not in px_try.
+  --
+  -- When the path is engaged this half of the frame does the work and px_try's engaged arm is
+  -- never reached -- so a hook placed there never ran, and the hunt had to be driven by hand
+  -- over the socket. Measured on the glass at 9.11: px.state was 'on' with PX_PTRHUNT true
+  -- and ph_n still nil after twenty seconds of frames.
+  --
+  -- After the draw, so a hunt slice can never delay the frame it is measuring, and inside its
+  -- own pcall for the same reason the draw has one.
+  if nl.PX_PTRHUNT then pcall(nl.px_ptrhunt) end
   if not ok then
     nl.px_off('px_frame raised: ' .. tostring(n))
     return nil
@@ -550,7 +661,9 @@ function fftsa.sg_pix_arm(db, hz, nseg, tb)
   if st == 'on' or st == 'off' then return end
   local t = (fftsa.sg_stamp or 0) + 1
   fftsa.sg_stamp = t
-  local ok, err = pcall(nl.px_try, db, hz, nseg, tb, t)
+  -- The graph handle goes with it: the pointer route walks the GUI object table at that id,
+  -- which is what replaces the heap sweep once the table's base has been derived.
+  local ok, err = pcall(nl.px_try, db, hz, nseg, tb, t, fftsa.sg_graph)
   if not ok then nl.px_off('px_try raised: ' .. tostring(err)) end
 end
 
@@ -564,6 +677,28 @@ function fftsa.sg_pix_stop(why)
   local nl = fftsa.nl
   if nl == nil or nl.px == nil or nl.px_restart == nil then return end
   if nl.px.state == 'off' then return end
+  nl.px_restart(why)
+end
+
+-- THE MAP IS STALE BUT THE RING IS NOT, and only an ENGAGED path has anything to drop.
+--
+-- sg_pix_stop exists for the cases where the trace OBJECT goes away: a rebind, a reallocated
+-- buffer, a destroyed screen. There the ring address itself becomes a pointer into the heap's
+-- free list, so a search in progress has to be abandoned whatever state it is in.
+--
+-- A moved axis is not that. It invalidates the PIXELS ALREADY WRITTEN, and a path that has not
+-- engaged has written none -- so dropping it there discards the search's ladder, its cursor and
+-- its cache retries to fix a problem that does not exist yet.
+--
+-- Measured on the glass at 9.04: re=4 with the ring 0.11 MB from inst, inside the first window
+-- the ladder offers, and swept=34MB at window 7 of 17. The ladder was built and thrown away
+-- four times. The app pins both axes while it builds the screen and each write fires
+-- EVENT_SCALE itself, so the first gesture checks of a launch see a moved axis and were
+-- restarting a search that had nothing invested in the axis at all.
+function fftsa.sg_pix_stale(why)
+  local nl = fftsa.nl
+  if nl == nil or nl.px == nil or nl.px_restart == nil then return end
+  if nl.px.state ~= 'on' then return end
   nl.px_restart(why)
 end
 
@@ -628,7 +763,7 @@ function fftsa.sg_fill(db, hz, nseg)
   -- draw nothing -- and a long one is clamped.
   -- The pixel path, when it has engaged: one memwrite and one append in place of the pass
   -- below. nil means it has not engaged, or refused this frame, and the fill runs.
-  if fftsa.sg_pix then
+  if fftsa.sg_pix_armed() then
     local n = fftsa.sg_pix_draw(db, hz, nseg, tb)
     if n ~= nil then return n end
   end
@@ -672,7 +807,7 @@ function fftsa.sg_fill(db, hz, nseg)
       end
     end
     fftsa.sg_up = not fftsa.sg_up
-    if fftsa.sg_pix then fftsa.sg_pix_arm(db, hz, nseg, tb) end
+    if fftsa.sg_pix_armed() then fftsa.sg_pix_arm(db, hz, nseg, tb) end
     return nseg
   end
   for i = 1, room do
@@ -687,7 +822,7 @@ function fftsa.sg_fill(db, hz, nseg)
   end
   -- The search, with the records this pass has just written. See sg_pix_arm for why it is here
   -- and not above the fill.
-  if fftsa.sg_pix then fftsa.sg_pix_arm(db, hz, nseg, tb) end
+  if fftsa.sg_pix_armed() then fftsa.sg_pix_arm(db, hz, nseg, tb) end
   return nseg
 end
 
@@ -1175,6 +1310,12 @@ function fftsa.sg_restore_y(g)
   if y1 == nil or y2 == nil
      or fftsa.sg_moved(y1, fftsa.sg_dbmin, span)
      or fftsa.sg_moved(y2, fftsa.sg_dbmax, span) then
+    -- AN AXIS THAT MOVED INVALIDATES THE MAP. The pixel path writes y pixels from a slope and
+    -- an intercept fitted against the axis as it stood when the map was made, so every pixel
+    -- it writes until the pin lands is in the wrong place -- and the pin is a gesture check
+    -- away, not a frame. Dropping the path costs the hold and a re-map from the cached
+    -- geometry, which is a few frames of appending.
+    fftsa.sg_pix_stale('the dB axis moved')
     fftsa.sg_pin_y(g)
     return true
   end
@@ -1224,6 +1365,7 @@ function fftsa.sg_settle_x(g)
   -- move is back onto the span. Guarding the lower limit alone would leave a left-anchored
   -- zoom -- which moves the upper one by itself -- invisible.
   if x1 == nil or x2 == nil then
+    fftsa.sg_pix_stale('the frequency axis read back nil')
     fftsa.sg_pin_x()
     return true
   end
@@ -1232,6 +1374,12 @@ function fftsa.sg_settle_x(g)
     fftsa.sg_seen_lo, fftsa.sg_seen_hi = nil, nil
     return false
   end
+  -- The same reason as the dB axis, and here it is worse: the x pixels are the plot columns
+  -- the slots were mapped onto, so a moved frequency axis leaves the trace drawn where the old
+  -- axis put it while the labels move under it. Dropped here rather than after the settle,
+  -- because unlocked the settle waits for the finger to stop -- which is every frame of the
+  -- drag drawn against an axis that is no longer there.
+  fftsa.sg_pix_stale('the frequency axis moved')
   if fftsa.sg_lock then
     fftsa.sg_seen_lo, fftsa.sg_seen_hi = nil, nil
     fftsa.sg_pin_x()

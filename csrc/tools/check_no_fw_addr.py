@@ -28,7 +28,12 @@ this checks the three places an address could hide and fails the build if one ap
      bluescreened.
 
   5. EVERY integer literal in the native path that falls inside DRAM, against a list that
-     states why each one is not an address. Checks 1 to 4 only look in firmware .text, and
+     states why each one is not an address -- or, for the four the operator has explicitly
+     allowed, why being wrong costs performance and not correctness. That exception is
+     narrow and was granted on 2026-11-10 for SEARCH HINTS only: a value that orders a
+     scan, or that is walked and then validated against the app's own data before anything
+     is believed. Nothing branches to one, and checks 1 to 4 still refuse an address
+     anywhere near an entry point. Checks 1 to 4 only look in firmware .text, and
      that is how this gate passed a build whose write backstop and heap sweep windows were
      both the DMM6500's heap measured in hex -- 0x01036000..0x0D836000, which is in DRAM,
      is 1024-aligned so the round-number exclusion waved it through, and which left 45% of
@@ -67,21 +72,82 @@ DRAM_ALLOW = {
     32768: 'CHUNK_BYTES, the reading-buffer chunk payload, and the sweep slice size',
     65536: 'the 16-bit split in the float packers and in hex formatting',
     262144: 'TIGHT, 256 KB: the tight descriptor window, a distance and not a place',
+    393216: 'RD_MAX_BYTES, 384 KB: what one frame of the ring search may read. A budget',
     1000000: 'a seed reading written into a buffer this module creates',
-    1048576: 'the chunk payload ceiling, and MB arithmetic in a report',
+    1048576: 'the chunk payload ceiling, MB arithmetic in a report, and PX_WIN_CHEAP -- the '
+             'width at which a search window costs one frame and is tried before any window '
+             'that has to justify its placement',
     2000000: 'a seed reading',
     3000000: 'a seed reading',
     4000000: 'a seed reading',
+    16511: 'PX_SUB_KIND, 0x407F: the graph-trace subscription kind, compared against a word '
+           'read out of a subscriber slot. Not an address -- see TEXT_ALLOW',
+    5308416: 'PX_SUB_LO_7510, 0x00510000: the same search window for a DMM7510. Its display '
+             'code is a separate payload (rom/rom7519.zx, header disp7510_r) whose loader maps '
+             'the application sections by subtracting 0xFF200000, so RAM address equals '
+             'flattened-image offset -- the relation confirmed on the DMM6500 against four '
+             'strings with independently known RAM addresses. In those terms 1.7.16a puts the '
+             'subscriber table at 0x005189C8, 64 slots of 0x100, inside this window and wholly '
+             'inside that build\'s .bss (0x004FFDC0..0x005E9C10). A SEARCH WINDOW on the same '
+             'terms as the 6500 one below: the slot is the name hit minus 8, so the base, the '
+             'stride and the count are never used, and a wrong window costs one 64 KB read',
+    14024704: 'PX_SUB_LO, 0x00D60000: where to start looking for the buffer name in the '
+              'firmware\'s STATIC subscriber table. A SEARCH WINDOW, not a place: the slot is '
+              'the name hit minus 8, so the table base, stride and count are never used, and a '
+              'wrong window costs one 64 KB read. Measured tables at 0x00D67708 (1.7.17a) and '
+              '0x00D67A48 (1.7.18a) both fall inside it. Nothing is dereferenced until the slot '
+              'kind, the graph back-pointer, the subscription handle and 510 float32 '
+              'frequencies all agree',
+    2097152: 'PX_INST_BANDS edge and PX_NBUDGET_MAX, 2 MB: how far below the trace buffer '
+             'instance the band reaches, and the largest slice a frame may scan. A distance '
+             'and a size',
+    6291456: 'PX_INST_BANDS, 6 MB: a sub-band edge in the instance-relative search band, a '
+             'distance from a runtime address and not a place',
     4194304: 'MID, 4 MB: the second descriptor window, a distance',
     5402624: 'TEXT_HI, 0x527000. THE ONE MODEL-DEPENDENT FIRMWARE FIGURE LEFT IN THE TREE. '
              'It is a ceiling the backstop and the lua_CFunction check rest on, and every '
              'image measured so far puts its heap floor above it -- check_fw_strategy.py '
              'asserts that per image. A model that does not would need this derived',
+    # THE TWO BELOW ARE ADDRESSES, and they are here under a narrow rule the operator set on
+    # 2026-11-10: "if the search starts are consistent, we can hard code them in the tspa
+    # application - as long as if they are wrong it only costs a small bit of performance.
+    # Never correctness."
+    #
+    # That holds by construction for these and not by care. Neither is dereferenced on its own
+    # authority: the table base is walked, and the walk has to arrive at a trace object carrying
+    # THIS app's own buffer name before anything is believed -- then px_map has to match 510
+    # exact float32 frequencies of the app's own axis before a byte is written. A wrong value
+    # here costs three reads.
+    #
+    # There were two more, PX_SEED_HINT_LO and _HI, the span the ring had occupied on this
+    # bench. They are gone: px_inst_win derives a narrower window from the trace buffer's own
+    # instance every launch, so the exception is no longer needed to order the search.
+    #
+    # Nothing branches to either. The gate's first concern -- the trampoline jumping into
+    # firmware .text -- is untouched: these are data addresses in .bss, and checks 1 to 4 still
+    # refuse an address anywhere near an entry point.
+    13727904: 'PX_OBJTAB_HINTS[1], 0x00D178A0: the GUI object table on a DMM6500 at 1.7.17a, '
+              'read out of the image from the addis/addi pair beside the indexing mulli 0x260. '
+              'A hint for the pointer route, validated by the buffer name before use',
+    13728736: 'PX_OBJTAB_HINTS[2], 0x00D17BE0: the same table on 1.7.18a, 0x340 higher, which '
+              'is the measured .bss delta between those builds. Same validation',
     8388608: '2^23, the float32 significand',
     16777216: '2^24, byte arithmetic in the branch decoder and the packers',
     25165824: 'ANCHOR_NEAR, 24 MB: a sweep radius',
     67108864: '2^26, the primary opcode field in the branch decoder',
     134217728: 'ANCHOR_FAR, 128 MB: a sweep radius',
+}
+
+# Values in the .text range that are NOT addresses, each with the reason. The .text check has
+# only a round-number escape, and a constant the firmware uses as an identifier can land in the
+# range by arithmetic coincidence -- so the honest answer is to name it here rather than to
+# disguise it as a sum of two allowed numbers, which is the sort of hiding this gate exists to
+# prevent. Printed in the output for the same reason.
+TEXT_ALLOW = {
+    16511: 'PX_SUB_KIND, 0x407F: the PEG message and subscription kind the firmware uses for a '
+           'graph-trace subscription, passed to bufsub_subscribe by graph_trace_add and '
+           'COMPARED against a word read out of a subscriber slot. Nothing branches to it and '
+           'nothing is read from it; a wrong value makes every slot refuse',
 }
 
 # Firmware .text, the same extent TEXT_LO and TEXT_HI declare. A call target has to be in
@@ -223,7 +289,7 @@ def check_module(src):
         v = int(m.group(1))
         if not TEXT_LO <= v < TEXT_HI:
             continue
-        if _round(v):
+        if v in TEXT_ALLOW or _round(v):
             allowed.append(v)
         else:
             bad.append('tsp/native_link.tsp has %d (0x%08X), which is in firmware .text '

@@ -1458,7 +1458,22 @@ do
         g == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
         or string.format('val0=%X stride=%d dx=%d nconf=%d', g.val0, g.stride, g.dx, g.nconf))
 
+  -- THE LAST READ LOOP IN THE AUDIT. find_ring_header walks HDR_BELOW + HDR_ABOVE around the
+  -- record in SWEEP_BLOCK pieces, and tests each prefix hit against the block it already has,
+  -- so its reads are the window divided by the block size and nothing per hit. 320 KB in 32 KB
+  -- pieces is ten, plus a handful where a field straddles a block edge and falls back to a
+  -- word read. Asserted, because every other cost bug in this module was a loop whose reads
+  -- turned out to scale with something the heap chose.
+  local hrd, hpk = 0, 0
+  local km0, kp0 = ki.memread, ki.peek32
+  ki.memread = function(a, n) hrd = hrd + 1; return km0(a, n) end
+  ki.peek32 = function(a) hpk = hpk + 1; return kp0(a) end
   local h = fftsa.nl.find_ring_header(g)
+  ki.memread, ki.peek32 = km0, kp0
+  check('the header walk reads the window and nothing per hit',
+        h ~= nil and hrd <= 16 and hpk <= 16,
+        string.format('%d memread(s) and %d peek32(s) over %d KB of window', hrd, hpk,
+                      math.floor((fftsa.nl.HDR_BELOW + fftsa.nl.HDR_ABOVE) / 1024)))
   check('finds the ring header from the record, with no offset given',
         h ~= nil and h.hdr == HDR and h.lo == RLO and h.nrec == NREC,
         h == nil and ('nil, why=' .. tostring(fftsa.nl.ring_why))
@@ -1865,6 +1880,16 @@ print('\nthe pixel fill')
 
 do
   local SAVEDT = tostring
+  -- The fixture's mock heap, declared live. px_live refuses a pointer outside the span this
+  -- module has already dereferenced, which is what stops the table walk following a garbage
+  -- widget pointer into unmapped memory -- PC=0022D200 on the glass. The mock has no such
+  -- hazard, so the span is simply stated here.
+  fftsa.nl.map_lo, fftsa.nl.map_hi = 4096, 134217728
+  -- No image here, so nfind cannot answer and _finds_native declines; FINDS then uses the
+  -- ladder, which PX_SWEEP permits for the suite only. That keeps the bind-time search tested
+  -- while the app itself has no path to it.
+  local SAVED_NF = fftsa.nl.nfind
+  local SAVED_RDY, SAVED_FA = fftsa.nl.ready, fftsa.nl.find_addr
   fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI = 12288, 268435456
 
   -- The same word-sparse image as the ring cases, with a memwrite that lands in it so a
@@ -1931,6 +1956,71 @@ do
     end
     return true
   end
+
+  -- THE IMAGE'S SEARCH, EMULATED, because it is the only search the app can reach.
+  --
+  -- The pixel path engages by pointer, by its cached geometry, or by the native search. The
+  -- Lua sweep is not reachable from it and there is no knob that makes it so, so every case
+  -- below that has to search drives this.
+  --
+  -- It answers the way nfind does and no better: at most FIND_MAX hits, then a resume address
+  -- that is the next START POSITION nothing has examined -- so a needle straddling the end of
+  -- one call is found by the next, which is what stops a short answer reading as an absence.
+  -- And it costs no ki.memread, because the image loads memory directly rather than through
+  -- the firmware's read, which is the whole reason it is fast enough to run in a frame.
+  local NF_MAX = 32
+  local nf_calls, nf_bytes = 0, 0
+  local function img_bytes(a, n)
+    local w0 = a - math.mod(a, 4)
+    local w1 = a + n + 3
+    w1 = w1 - math.mod(w1, 4)
+    local acc, k, p = {}, 0, nil
+    for p = w0, w1 - 4, 4 do
+      k = k + 1
+      acc[k] = IMG[p] or '\0\0\0\0'
+    end
+    return string.sub(table.concat(acc), a - w0 + 1, a - w0 + n)
+  end
+  local function nf_emu(lo, hi, pat, cap)
+    fftsa.nl.find_why = nil
+    if type(pat) ~= 'string' then
+      fftsa.nl.find_why = 'needle is not a string'
+      return nil
+    end
+    local plen = string.len(pat)
+    if plen < 1 or plen > fftsa.nl.NFIND_PAT_MAX then
+      fftsa.nl.find_why = 'needle is ' .. tostring(plen) .. ' bytes, not 1..'
+                          .. tostring(fftsa.nl.NFIND_PAT_MAX)
+      return nil
+    end
+    if type(lo) ~= 'number' or type(hi) ~= 'number' or hi <= lo then
+      fftsa.nl.find_why = 'range is not lo < hi'
+      return nil
+    end
+    local top = hi
+    if cap ~= nil and cap > 0 and lo + cap < top then top = lo + cap end
+    nf_calls = nf_calls + 1
+    nf_bytes = nf_bytes + (top - lo)
+    local out, n = {}, 0
+    -- A block the image has never written is zeros, so only an all-zero needle can be in it.
+    if touches(lo - math.mod(lo, 4), top + plen + 4)
+       or string.find(pat, '[^%z]') == nil then
+      local s = img_bytes(lo, top - lo + plen - 1)
+      local at = 1
+      while n < NF_MAX do
+        local f = string.find(s, pat, at, true)
+        if f == nil or lo + f - 1 >= top then break end
+        n = n + 1
+        out[n] = lo + f - 1
+        at = f + 1
+      end
+    end
+    if n >= NF_MAX then return out, out[n] + 1 end
+    return out, top
+  end
+  fftsa.nl.nfind = nf_emu
+  fftsa.nl.ready, fftsa.nl.find_addr = true, 4096
+
   local APPENDS = {}
   buffer.write = { reading = function(b, v, x, t, st)
     APPENDS[table.getn(APPENDS) + 1] = { buf = b, db = v, hz = x, t = t }
@@ -2254,6 +2344,70 @@ do
                             tostring(APPENDS[1].hz), tostring(APPENDS[1].t), wr,
                             RLO + NREC * STRIDE)
           or (tostring(table.getn(APPENDS)) .. ' appends'))
+    -- THE CURSOR REPAINT: no append at all, which is the point of it. The append is what
+    -- moves the display task's oldest-record cursor, and a drawn window that does not start
+    -- at the ring base runs its x values backwards once -- the wrap measured on the glass at
+    -- 8.72. A frame that still appends in cursor mode would bring it straight back.
+    do
+      local saved_mode = fftsa.sg_pix_repaint
+      local saved_graph = display.graph
+      local curs = {}
+      display.graph = { cursor = function(g, ty, a, b)
+        curs[table.getn(curs) + 1] = { g = g, ty = ty, a = a, b = b }
+      end }
+      fftsa.sg_pix_repaint = 'cursor'
+      APPENDS = {}
+      fftsa.nl.px.gid = 52
+      local nc = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 8888)
+      check('the cursor repaint draws the pass and appends NOTHING',
+            nc == NSEG and table.getn(APPENDS) == 0 and table.getn(curs) == 1
+            and curs[1].g == 52,
+            string.format('n=%s appends=%d cursors=%d g=%s', tostring(nc),
+                          table.getn(APPENDS), table.getn(curs),
+                          table.getn(curs) > 0 and tostring(curs[1].g) or 'none'))
+      -- 9e37 is the firmware's OFF sentinel, so the cursor draws nothing. A real position
+      -- would put a line on the plot every frame.
+      check('and it sets the cursor to the off sentinel rather than a position',
+            table.getn(curs) == 1 and curs[1].a >= 9e37 and curs[1].b >= 9e37
+            and curs[1].ty == display.CURSOR_VERTICAL,
+            table.getn(curs) > 0 and string.format('ty=%s a=%s b=%s', tostring(curs[1].ty),
+                                                   tostring(curs[1].a), tostring(curs[1].b))
+            or 'no cursor call')
+      -- A refused cursor keeps the path and skips the repaint: the pixels for the pass are
+      -- already in the ring, so the glass keeps the previous picture for a frame and the next
+      -- cursor shows both. Tearing the map down over one refusal costs a re-map and the frames
+      -- of appending with it, which reads as a frame rate that will not settle. What it must
+      -- never do is append, because the append is what wraps the trace.
+      display.graph = { cursor = function() error('refused') end }
+      APPENDS = {}
+      local re0 = fftsa.nl.px.restarts or 0
+      local nb = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 8889)
+      check('one refused cursor skips the repaint, keeps the map and appends nothing',
+            nb == NSEG and table.getn(APPENDS) == 0
+            and fftsa.nl.px.curfail == 1 and (fftsa.nl.px.restarts or 0) == re0,
+            string.format('n=%s appends=%d curfail=%s restarts %s->%s', tostring(nb),
+                          table.getn(APPENDS), tostring(fftsa.nl.px.curfail),
+                          tostring(re0), tostring(fftsa.nl.px.restarts)))
+      -- A RUN of them is different: the GUI is not going to answer and the map is worth
+      -- nothing without a repaint, so the path comes down.
+      local nc2, run = nil, nil
+      for run = 2, fftsa.nl.PX_CURSOR_RUN do
+        nc2 = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 8889 + run)
+      end
+      check('a run of PX_CURSOR_RUN refusals tears the path down, still without appending',
+            nc2 == nil and table.getn(APPENDS) == 0
+            and (fftsa.nl.px.restarts or 0) == re0 + 1
+            and fftsa.nl.px.state == 'idle'
+            and string.find(tostring(fftsa.nl.px.whyframe), 'refused', 1, true) ~= nil,
+            string.format('n=%s appends=%d state=%s restarts %s->%s why=%s', tostring(nc2),
+                          table.getn(APPENDS), tostring(fftsa.nl.px.state), tostring(re0),
+                          tostring(fftsa.nl.px.restarts),
+                          tostring(fftsa.nl.px.whyframe or fftsa.nl.px.why)))
+      fftsa.sg_pix_repaint = saved_mode
+      display.graph = saved_graph
+      fftsa.nl.px.gid = nil
+    end
+
     -- And the window itself is put back, which is the thing that makes a second frame possible.
     local oldword = ki.memread(string.format('%X', HDRAT + fftsa.nl.HDR_OLD),
                                string.format('%X', 4))
@@ -2277,9 +2431,15 @@ do
     assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
     local moved, j = {}, nil
     for j = 1, NSEG do moved[j] = HZ[j] + 1 end
+    -- With re-pointing off, which is what the knob is for: the series moved and the path has
+    -- no way to follow it, so it must restart rather than draw the new spectrum at the old
+    -- frequencies, correctly and silently.
+    local keeprp = fftsa.nl.PX_REPOINT
+    fftsa.nl.PX_REPOINT = false
     check('a moved frequency series restarts rather than drawing',
           fftsa.nl.px_frame(DB, moved, NSEG, 'TB', 1) == nil
           and fftsa.nl.px.state == 'idle', 'why=' .. tostring(fftsa.nl.px.why))
+    fftsa.nl.PX_REPOINT = keeprp
   end
 
   do
@@ -2335,11 +2495,27 @@ do
     check('the fixture has the four columns the needle was built from, consecutive',
           s0 ~= nil, 'the run from column ' .. tostring(XCOL) .. ' starts at slot '
           .. tostring(s0))
+    -- No narrow window and nothing learned, because the mechanism under test is the budgeted
+    -- slice and its resumable cursor. A window ahead of the fixture's ring would be spent
+    -- before the ring was reached -- 500 slices of 4 KB is 2 MB -- which is the performance
+    -- cost of a wrong window behaving exactly as intended, and not what this case is for. That
+    -- cost has its own gate below.
+    local keepinst2 = fftsa.nl.inst
+    local keepseed = FFTSA_PXSEED
+    fftsa.nl.inst = nil
+    FFTSA_PXSEED = nil
+    fftsa.nl.px.wins, fftsa.nl.px.wi, fftsa.nl.px.at = nil, nil, nil
     local c, calls = {}, 0
     while table.getn(c) == 0 and calls < 500 do
       calls = calls + 1
+      -- One call is one frame, so it gets one frame's read allowance. px_seek is driven by
+      -- px_try on the instrument and takes its refill from the frame stamp; called directly it
+      -- has to be told, or the first 48 reads are the only ones it ever gets.
+      fftsa.nl.rd_frame_reset()
       c = fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
     end
+    fftsa.nl.inst = keepinst2
+    FFTSA_PXSEED = keepseed
     -- EVERY confirmed stride, not the first. The staging ring holds the same two float32 pairs
     -- in the same order in a 28-byte record, so a hit confirms more than once and the first
     -- confirmation is the one with no header. Returning only that threw the real geometry away
@@ -2356,6 +2532,57 @@ do
                         or 'none at the real stride'))
     check('and it took many slices, so the slices really do resume',
           calls > 4, tostring(calls) .. ' slices of 4 KB')
+  end
+
+  do
+    -- THE FREQUENCY ROUTE COSTS ONE READ PER HIT, not one per candidate stride. It was 29 --
+    -- REC_MIN..REC_MAX in fours -- and the hit count is whatever the heap holds, so a slice
+    -- could be thousands of round trips inside one uninterruptible frame. Measured on the
+    -- glass at 8.81: 0.1 fps at 2048 points, ten seconds in a single frame.
+    do
+      local xs, j = fftsa.nl.px_xneedle(HZ, NSEG)
+      local reads, peeks = 0, 0
+      local km, kp = ki.memread, ki.peek32
+      ki.memread = function(a, n) reads = reads + 1; return km(a, n) end
+      ki.peek32 = function(a) peeks = peeks + 1; return kp(a) end
+      local gs = fftsa.nl.px_xconfirm_all(RLO + (SLOT0 or 1) * 0, xs)
+      ki.memread, ki.peek32 = km, kp
+      check('every candidate stride is tested off one read, whatever the answer',
+            xs ~= nil and reads <= 1 and peeks == 0,
+            string.format('%d memread(s), %d peek32(s), %d confirmation(s)', reads, peeks,
+                          gs ~= nil and table.getn(gs) or -1))
+    end
+
+    -- THE NAME NEEDLE IS CAPPED. It keeps absolute precedence -- it is the only needle that
+    -- says WHICH trace -- but it does not get to sweep the whole backstop to discover it is
+    -- not in memory. Measured on the glass at 8.80: swept=276MB with laps=1, then the
+    -- frequency series found the ring in the seed window almost at once.
+    -- THIS PASS'S bytes, not the session's. The bound is on what the pass has swept without a
+    -- single hit: judged on the cumulative total it fired on the first slice of every pass
+    -- after the second, because the total was already past the bound whatever the pass had
+    -- done -- and the needle that says WHICH trace was gone before the pass that mattered.
+    fftsa.nl.px_restart('test')
+    fftsa.nl.px.swept = fftsa.nl.PX_NAME_GIVEUP
+    fftsa.nl.px.sweptpass = fftsa.nl.PX_NAME_GIVEUP
+    fftsa.nl.px.namehits = 0
+    fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
+    check('the name needle gives up at PX_NAME_GIVEUP and the lap switches needles',
+          fftsa.nl.px.noname == true and fftsa.nl.px.gaveup == 1,
+          string.format('noname=%s gaveup=%s col=%s', tostring(fftsa.nl.px.noname),
+                        tostring(fftsa.nl.px.gaveup), tostring(fftsa.nl.px.xcol)))
+    -- And a lap that HAS seen the name keeps it, however far it has swept: a name hit that
+    -- did not map is still far better evidence than a frequency that matches everywhere.
+    fftsa.nl.px_restart('test')
+    -- gaveup is cumulative and survives a restart on purpose, so the test is that it does not
+    -- move rather than that it is absent.
+    local gave0 = fftsa.nl.px.gaveup
+    fftsa.nl.px.swept = fftsa.nl.PX_NAME_GIVEUP * 4
+    fftsa.nl.px.namehits = 3
+    fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
+    check('a lap that has seen the name keeps using it however far it has swept',
+          fftsa.nl.px.noname == nil and fftsa.nl.px.gaveup == gave0,
+          string.format('noname=%s gaveup %s->%s', tostring(fftsa.nl.px.noname),
+                        tostring(gave0), tostring(fftsa.nl.px.gaveup)))
   end
 
   do
@@ -2417,6 +2644,214 @@ do
           table.getn(fftsa.nl.px_from_name(TNAME + 65536)) == 0)
   end
 
+  -- ---- the pointer route ----------------------------------------------------
+  do
+    -- THREE READS INSTEAD OF A SWEEP. The fixture models the chain GRAPH.md recovered from
+    -- the image: a GUI object table indexed by the display handle, a widget whose
+    -- null-terminated trace array at +0x3EC points at the trace object, and the trace object
+    -- tracefix() already builds at the documented offsets.
+    --
+    -- Placed within a few kilobytes of the trace so that any window covering it covers these
+    -- too -- the derivation sweeps for a four-byte needle over the same ladder.
+    local GID = 7
+    local WID = TLO - 4096
+    -- BELOW THE HEAP, as the real table is: GRAPH.md puts it at a static 0x00D17BE0 and the
+    -- 6500's heap starts at 0x01036000. px_anchor refuses a base inside the heap, because the
+    -- forward walk cannot tell the table from any word that happens to hold the widget
+    -- pointer -- it reads back the word the base came from. A fixture with the table in the
+    -- heap would make that check untestable.
+    local OBJ = 1048576
+    local function wire()
+      build(nil)
+      tracefix()
+      wr32(WID + fftsa.nl.PX_GRAPH_TRACE, TLO)         -- trace array entry 0
+      wr32(WID + fftsa.nl.PX_GRAPH_TRACE + 4, 0)       -- and its null terminator
+      -- The widget pointer sits at +0x50 INSIDE the entry, not at its start: GRAPH.md:178.
+      wr32(OBJ + GID * fftsa.nl.PX_OBJ_STRIDE + fftsa.nl.PX_OBJ_WIDGET, WID)
+    end
+
+    wire()
+    fftsa.nl.px_objbase = OBJ
+    local gs = fftsa.nl.px_from_ptr(GID)
+    local g = nil
+    local gi
+    for gi = 1, table.getn(gs) do
+      if gs[gi].stride == STRIDE then g = gs[gi] end
+    end
+    check('the ring comes back from the display handle through the object table',
+          g ~= nil and g.lo == TRING and g.nrec == NREC and g.hdr == TBOUND,
+          g ~= nil and string.format('%X..%X n=%d hdr=%X', g.lo, g.hi, g.nrec, g.hdr)
+          or (tostring(table.getn(gs)) .. ' candidates, none at stride '
+              .. tostring(STRIDE)))
+    check('and it is marked as having come by pointer rather than by a sweep',
+          g ~= nil and g.via_ptr == true, g ~= nil and tostring(g.via_ptr) or 'nil')
+
+    -- THE MARKER TRACE, which is the case the name field exists for. A second object of the
+    -- same shape with a valid ring of its own and a different name: only the name tells them
+    -- apart, so an array walk that skips it on geometry alone would pass this by accident.
+    local MLO = TLO + 65536
+    local function wrstr(at, str)
+      local i
+      for i = 0, string.len(str) - 1 do
+        local a = at + i
+        local w = a - math.mod(a, 4)
+        local old4 = IMG[w] or '\0\0\0\0'
+        local k = a - w + 1
+        IMG[w] = string.sub(old4, 1, k - 1) .. string.sub(str, i + 1, i + 1)
+                 .. string.sub(old4, k + 1)
+      end
+    end
+    wire()
+    -- A complete trace object: the mark name at +0x08, bounds at +0x1F0, ring at +0x220 with
+    -- cursors that stand up. Everything px_from_name checks, and the wrong name.
+    wrstr(MLO + 8, 'FFTSA_MARK' .. string.char(0))
+    wr32(MLO + 496, MLO + 544)
+    wr32(MLO + 500, MLO + 544 + NREC * STRIDE)
+    wr32(MLO + 496 + fftsa.nl.HDR_OLD, MLO + 544)
+    wr32(MLO + 496 + fftsa.nl.HDR_WRITE, MLO + 544)
+    wr32(MLO + 496 + fftsa.nl.HDR_COUNT, NREC)
+    -- It must be a trace object by every test but the name, or this gates nothing.
+    check('the decoy IS a valid trace object apart from its name',
+          table.getn(fftsa.nl.px_from_name(MLO + 8)) > 0,
+          'decoy geometry stands up on its own')
+    wr32(WID + fftsa.nl.PX_GRAPH_TRACE, MLO)           -- the marker trace is entry 0
+    wr32(WID + fftsa.nl.PX_GRAPH_TRACE + 4, TLO)       -- ours is second
+    wr32(WID + fftsa.nl.PX_GRAPH_TRACE + 8, 0)
+    fftsa.nl.px_objbase = OBJ
+    local g2 = fftsa.nl.px_from_ptr(GID)
+    check('the array walk skips the marker trace and lands on this app\'s own',
+          table.getn(g2) > 0 and g2[1].hdr == TBOUND and g2[1].lo == TRING,
+          table.getn(g2) > 0 and string.format('hdr=%X lo=%X (mark is at %X)',
+                                               g2[1].hdr, g2[1].lo, MLO + 496)
+          or '0 candidates')
+
+    -- THE BASE IS NOT DERIVED ANY MORE. The compiled hint answers, or this instrument's own
+    -- record does once a base has worked. The derivation that used to live here searched for
+    -- the word holding the widget pointer and subtracted -- but the table is static in low
+    -- memory, about 47 MB from a ring in the GUI heap, so a bounded search could never reach it
+    -- and an unbounded one bluescreened the instrument. Its forward check was vacuous besides.
+    wire()
+    fftsa.nl.px_objbase = nil
+    local keeph = fftsa.nl.PX_OBJTAB_HINTS
+    fftsa.nl.PX_OBJTAB_HINTS = { OBJ }
+    local byhint = fftsa.nl.px_from_ptr(GID)
+    -- AND THE ENTRY IS FOUND WHEN THE HANDLE IS NOT THE INDEX, which is the one link in the
+    -- walk that cannot be read out of a firmware image.
+    do
+      wire()
+      fftsa.nl.px_objbase = nil
+      local kh2 = fftsa.nl.PX_OBJTAB_HINTS
+      fftsa.nl.PX_OBJTAB_HINTS = { OBJ }
+      fftsa.nl.px_objfound = nil
+      fftsa.nl.rd_frame_reset()
+      -- A handle that is not the table index at all.
+      local g2 = fftsa.nl.px_from_ptr(GID + 23)
+      fftsa.nl.PX_OBJTAB_HINTS = kh2
+      -- AND THE WALK RESUMES ACROSS FRAMES. 64 entries at a few reads each is more than one
+    -- frame's read allowance, so a walk that restarted at zero every frame would try the same
+    -- low ids for ever and never reach a high one.
+    do
+      wire()
+      fftsa.nl.px_objbase, fftsa.nl.px.objscan = nil, 0
+      local kh3 = fftsa.nl.PX_OBJTAB_HINTS
+      fftsa.nl.PX_OBJTAB_HINTS = { OBJ }
+      local krd = fftsa.nl.RD_MAX_CALLS
+      -- An allowance that cannot reach GID in one frame, so the walk has to carry on.
+      fftsa.nl.RD_MAX_CALLS = 6
+      local frames, g3 = 0, {}
+      while frames < 40 and table.getn(g3) == 0 do
+        frames = frames + 1
+        fftsa.nl.rd_frame_reset()
+        g3 = fftsa.nl.px_from_ptr(GID + 23)
+      end
+      fftsa.nl.RD_MAX_CALLS = krd
+      fftsa.nl.PX_OBJTAB_HINTS = kh3
+      check('the entry walk resumes across frames instead of restarting at zero',
+            table.getn(g3) > 0 and fftsa.nl.px_objid == GID and frames > 1,
+            string.format('found id=%s after %d frame(s) at %d reads each',
+                          tostring(fftsa.nl.px_objid), frames, 6))
+    end
+
+    check('the entry is found by validation when the handle is not the index',
+            table.getn(g2) > 0 and g2[1].lo == TRING and fftsa.nl.px_objid == GID
+            and fftsa.nl.px_objfound ~= nil,
+            string.format('%d candidate(s), id=%s, why=%s', table.getn(g2),
+                          tostring(fftsa.nl.px_objid), tostring(fftsa.nl.px_objfound)))
+    end
+
+    check('the compiled hint reaches the ring, and is adopted as the base',
+          table.getn(byhint) > 0 and byhint[1].lo == TRING
+          and fftsa.nl.px_objbase == OBJ,
+          string.format('%d candidate(s), base=%s', table.getn(byhint),
+                        tostring(fftsa.nl.px_objbase)))
+    -- A WRONG HINT COSTS READS AND NOTHING ELSE: it cannot answer, because the walk has to end
+    -- on a trace carrying this app's own buffer name.
+    wire()
+    fftsa.nl.px_objbase = nil
+    fftsa.nl.PX_OBJTAB_HINTS = { OBJ + 64 }
+    local rd0 = 0
+    local km1 = ki.memread
+    local kp1 = ki.peek32
+    ki.memread = function(a, n) rd0 = rd0 + 1; return km1(a, n) end
+    ki.peek32 = function(a) rd0 = rd0 + 1; return kp1(a) end
+    fftsa.nl.rd_frame_reset()
+    local bad = fftsa.nl.px_from_ptr(GID)
+    local leftover = fftsa.nl.rd_over()
+    ki.memread, ki.peek32 = km1, kp1
+    -- Bounded by the entry walk, not by one entry: the handle is not trusted to be the index,
+    -- so a base that answers nothing is only known to be wrong once the table has been tried.
+    -- PX_OBJ_SCAN entries at a few reads each, and the frame's read budget caps it besides --
+    -- still far less than one sweep slice, which is the thing this exists to avoid.
+    check('a wrong hint answers nothing and costs a bounded walk of the table',
+          table.getn(bad) == 0 and fftsa.nl.px_objbase == nil
+          and rd0 <= fftsa.nl.PX_OBJ_SCAN * 4,
+          string.format('%d candidate(s), base=%s, %d read(s), bound %d', table.getn(bad),
+                        tostring(fftsa.nl.px_objbase), rd0, fftsa.nl.PX_OBJ_SCAN * 4))
+    -- AND IT TAKES ITS SHARE OF THE FRAME, NOT THE WHOLE FRAME. This is the bound that
+    -- decides the engage time, and it is not the same bound as above.
+    --
+    -- The walk and the search run in the same frame -- the idle arm falls through rather than
+    -- returning -- but the walk runs first, and px_seek's loop will not take a slice once
+    -- rd_over() is true. So a walk bounded only by the frame's allowance left the search
+    -- unable to scan a single byte in every frame the walk was running: 9.05 engaged in 2.0 s
+    -- with the walk starved to one frame, 9.07 gave it its frames and engagement went to
+    -- 4.2 s. Nothing about the search changed between them.
+    --
+    -- Both halves are asserted, because either alone passes while the defect stands: that the
+    -- walk spent no more than its share, AND that the frame still has allowance left for the
+    -- search when the walk hands back.
+    check('the walk takes its share of the frame and leaves the rest for the search',
+          rd0 <= fftsa.nl.PX_OBJ_CALLS and not leftover
+          and fftsa.nl.PX_OBJ_CALLS < fftsa.nl.RD_MAX_CALLS,
+          string.format('%d read(s) of a %d share and a %d allowance, over=%s',
+                        rd0, fftsa.nl.PX_OBJ_CALLS, fftsa.nl.RD_MAX_CALLS,
+                        tostring(leftover)))
+    fftsa.nl.PX_OBJTAB_HINTS = keeph
+
+    -- A base that has gone stale must refuse, not answer from whatever is at the offset.
+    wire()
+    -- Off by one entry, and the hint has to be out of the way or it would answer instead.
+    local keephint = fftsa.nl.PX_OBJTAB_HINTS
+    fftsa.nl.PX_OBJTAB_HINTS = nil
+    fftsa.nl.px_objbase = OBJ + fftsa.nl.PX_OBJ_STRIDE
+    check('a table base off by one entry is refused rather than believed',
+          table.getn(fftsa.nl.px_from_ptr(GID)) == 0, 'stale base')
+
+    fftsa.nl.PX_OBJTAB_HINTS = keephint
+    -- And the handle changing takes the base with it, because the table is indexed by id.
+    wire()
+    fftsa.nl.px_objbase = OBJ
+    fftsa.nl.px.gid = GID
+    fftsa.nl.px.state = 'seek'
+    fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 7777, GID + 1)
+    check('a changed display handle discards the derived base',
+          fftsa.nl.px_objbase == nil and fftsa.nl.px.gid == GID + 1,
+          string.format('base=%s gid=%s',
+                        tostring(fftsa.nl.px_objbase), tostring(fftsa.nl.px.gid)))
+    fftsa.nl.px_objbase = nil
+    fftsa.nl.px.gid = nil
+  end
+
   do
     -- End to end on the name, with the x field DERIVED: the name route never looks at a
     -- record, so which offset holds the frequency is settled by the one that carries a member
@@ -2471,6 +2906,308 @@ do
           not fftsa.nl.px_map(stale, DB, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
   end
 
+  -- ---- the name walk costs one read ------------------------------------------
+  do
+    -- THE WALK IS A KILOBYTE AND IT USED TO BE 257 IPC ROUND TRIPS. nl._wg is ki.peek32, one
+    -- call per word, and px_seek hands every aligned hit in a slice to this -- so a slice with
+    -- tens of hits was tens of thousands of round trips inside one frame, and a frame cannot
+    -- be interrupted. Measured on the glass as a 4 to 5 second stall while the search ran.
+    local peeks, reads = 0, 0
+    local kp, km = ki.peek32, ki.memread
+    ki.peek32 = function(a) peeks = peeks + 1; return kp(a) end
+    ki.memread = function(a, n) reads = reads + 1; return km(a, n) end
+    local g = fftsa.nl.px_from_name(TLO + 8)
+    ki.peek32, ki.memread = kp, km
+    check('the name walk finds the ring in one read and no word-at-a-time peeks',
+          table.getn(g) > 0 and g[1].hdr == TBOUND and reads == 1 and peeks == 0,
+          string.format('%d candidate(s) hdr=%s, %d memread(s) and %d peek32(s)',
+                        table.getn(g),
+                        table.getn(g) > 0 and string.format('%X', g[1].hdr) or 'none',
+                        reads, peeks))
+    -- An unaligned hit answered nothing before, because _wg refuses an unaligned address, and
+    -- it must still answer nothing -- without paying for a read to find that out.
+    peeks, reads = 0, 0
+    ki.peek32 = function(a) peeks = peeks + 1; return kp(a) end
+    ki.memread = function(a, n) reads = reads + 1; return km(a, n) end
+    local gu = fftsa.nl.px_from_name(TLO + 8 + 2)
+    ki.peek32, ki.memread = kp, km
+    check('an unaligned hit is refused without reading anything',
+          table.getn(gu) == 0 and reads == 0 and peeks == 0,
+          string.format('%d candidate(s), %d memread(s), %d peek32(s)',
+                        table.getn(gu), reads, peeks))
+  end
+
+  -- ---- the seeded window -----------------------------------------------------
+  do
+    -- THE LAST RING IS THE FIRST PLACE TO LOOK. Without this the ladder reaches the ring only
+    -- in its backstop pass -- the windows before it are centred on the buffer's instance and
+    -- storage, and the ring is a display task allocation in neither -- so a span or size change
+    -- fell through to 200 MB at PX_BUDGET a frame, 800 frames, which reads as never recovering.
+    -- An Apply takes a new trace object from a pool of thirty 0x14220-byte objects, 2.4 MB in
+    -- all, so the new ring is inside a window this wide around the old one.
+    local keep, keeps = FFTSA_PXRING, FFTSA_PXSEED
+    local keepinst = fftsa.nl.inst
+    FFTSA_PXRING, FFTSA_PXSEED = nil, nil
+    -- THE INSTANCE BAND IS THE ONLY NARROW WINDOW a machine with no record on its key has, and
+    -- it is offered as sub-bands because px_seek takes anything wider than PX_WIN_MAX for its
+    -- backstop pass and defers it to last. No address is compiled in for this: the band is
+    -- derived from the trace buffer's own C++ instance, which this module has dereferenced.
+    local INST = 58000000
+    fftsa.nl.inst = INST
+    local bands = fftsa.nl.px_inst_wins()
+    local nb = table.getn(bands)
+    -- EVERY SUB-BAND WITHIN PX_WIN_MAX. One that is not gets deferred to the backstop's
+    -- position, which throws away the whole reason the band is offered in pieces.
+    local wide = 0
+    local bi
+    for bi = 1, nb do
+      if bands[bi][2] - bands[bi][1] > fftsa.nl.PX_WIN_MAX then wide = wide + 1 end
+    end
+    check('each instance sub-band is inside PX_WIN_MAX, so none is taken for the backstop',
+          nb > 0 and wide == 0,
+          string.format('%d band(s), %d wider than %d', nb, wide, fftsa.nl.PX_WIN_MAX))
+    -- AND THEY TILE THE MEASURED RANGE WITH NO HOLE IN IT. Ten launches put the ring from
+    -- 0.96 MB below inst to 32 MB above; the band covers -2 to +8 MB of that. A gap between
+    -- two sub-bands is a ring that is never reached from the band at all, and it reads on the
+    -- glass exactly like a search that is simply slow -- which is how 11 MB and then 9 MB were
+    -- swept past a ring at +2.25 MB.
+    local holes, lo1, hiN = 0, bands[1][1], bands[nb][2]
+    for bi = 2, nb do
+      if bands[bi][1] ~= bands[bi - 1][2] then holes = holes + 1 end
+    end
+    check('the sub-bands tile the band with no gap between them',
+          holes == 0 and lo1 < INST and hiN > INST,
+          string.format('[%X,%X] in %d band(s), %d gap(s)', lo1, hiN, nb, holes))
+    -- And with no instance either -- before the first bind -- there is no narrow window and
+    -- the ladder is the buffer-side windows and the backstop, which is what it always was.
+    fftsa.nl.inst = nil
+    local nw = fftsa.nl.px_windows(nil)
+    check('and with no instance yet the ladder falls back to the buffer-side windows',
+          table.getn(fftsa.nl.px_inst_wins()) == 0
+          and nw[table.getn(nw)][2] - nw[table.getn(nw)][1] > fftsa.nl.PX_WIN_MAX,
+          string.format('%d window(s), last is %d wide', table.getn(nw),
+                        nw[table.getn(nw)][2] - nw[table.getn(nw)][1]))
+    -- CHEAP, THEN THE BAND, THEN WIDTH -- and two measured failures bound this from both
+    -- sides, so the gate asserts all three groups and not just one rule.
+    --
+    --   9.08  swept=29MB  the ring in a 256 KB buffer-side window that sat behind a learned
+    --                     span grown to 23 MB. Ordering by trusted source let a cheap window
+    --                     wait on an expensive one.
+    --   9.13  swept=35MB  the ring at inst+4.48 MB, inside instance band 2, which sorted to
+    --                     window 15 of 17 for being 4 MB wide. Ordering purely by width put
+    --                     the window most likely to be right behind fourteen that were not.
+    --
+    -- A gate on either rule alone passes while the other failure stands, which is how the
+    -- second one shipped.
+    fftsa.nl.inst = INST
+    local ow = fftsa.nl.px_windows(nil)
+    local now = table.getn(ow)
+    local isband = function(w)
+      local k
+      for k = 1, table.getn(bands) do
+        if bands[k][1] == w[1] and bands[k][2] == w[2] then return true end
+      end
+      return false
+    end
+    -- Where the three groups start and end, walked once.
+    local lastcheap, firstband, lastband, firstrest = 0, nil, nil, nil
+    local cheapdesc, restdesc = 0, 0
+    local prevcheap, prevrest = nil, nil
+    for bi = 1, now do
+      local wd = ow[bi][2] - ow[bi][1]
+      if wd <= fftsa.nl.PX_WIN_CHEAP then
+        lastcheap = bi
+        if prevcheap ~= nil and wd < prevcheap then cheapdesc = cheapdesc + 1 end
+        prevcheap = wd
+      elseif isband(ow[bi]) then
+        if firstband == nil then firstband = bi end
+        lastband = bi
+      else
+        if firstrest == nil then firstrest = bi end
+        if prevrest ~= nil and wd < prevrest then restdesc = restdesc + 1 end
+        prevrest = wd
+      end
+    end
+    check('every cheap window is tried before anything that is not cheap',
+          lastcheap > 0 and firstband ~= nil and lastcheap < firstband
+          and cheapdesc == 0,
+          string.format('%d cheap window(s) first, %d out of order among them, band starts '
+                        .. 'at %s of %d', lastcheap, cheapdesc, tostring(firstband), now))
+    check('the instance band is tried before every wide window, including the backstop',
+          firstband ~= nil and lastband ~= nil and firstrest ~= nil
+          and lastband < firstrest
+          and lastband - firstband + 1 == table.getn(bands),
+          string.format('band at %s..%s of %d, %d sub-band(s), wide windows from %s',
+                        tostring(firstband), tostring(lastband), now, table.getn(bands),
+                        tostring(firstrest)))
+    check('the wide windows are ordered narrowest first, with the backstop last',
+          restdesc == 0 and ow[now][2] - ow[now][1] > fftsa.nl.PX_WIN_MAX,
+          string.format('%d out of order among the wide ones, last is %d wide',
+                        restdesc, ow[now][2] - ow[now][1]))
+    -- Back to no instance for the blocks below. An instance left set changes every window the
+    -- ladder offers, which changes the slices a later gate measures -- the cross-block leak
+    -- that made this suite's results depend on its order.
+    fftsa.nl.inst = nil
+    local SEED = 62206008
+    fftsa.nl.px_cache_put({ lo = SEED, hi = SEED + 4096, nrec = 24, stride = 56,
+                            ox = 44, hdr = SEED - 496 })
+    local w = fftsa.nl.px_windows(nil)
+    local near = fftsa.nl.PX_SEED_NEAR
+    local has = function(t, x, y)
+      local i
+      for i = 1, table.getn(t) do
+        if t[i][1] == x and t[i][2] == y then return i end
+      end
+      return nil
+    end
+    -- THE SPAN IS IN THE LADDER, and where in it is decided by width rather than by the span
+    -- being this machine's own record. Asserting the position was what the ladder used to
+    -- promise, and the promise is gone: a span that has grown wide sorts to the back on
+    -- purpose, because what it costs is the only thing knowable about it.
+    check('the learned span is offered as a window, with tolerance either side',
+          fftsa.nl.px_seed() == SEED and table.getn(w) >= 3
+          and has(w, SEED - near, SEED + near) ~= nil,
+          string.format('seed=%s span window at %s of %d',
+                        tostring(fftsa.nl.px_seed()),
+                        tostring(has(w, SEED - near, SEED + near)), table.getn(w)))
+    -- A SPAN GROWN PAST ITS CEILING IS NOT OFFERED AT ALL. The span only ever widens -- it is
+    -- every address this instrument has confirmed -- so after enough launches it covers more
+    -- range than the backstop pass would in one slice, and sorted by width it lands beside the
+    -- backstop. Measured at 9.08: a span of 23 MB, and the ring 86 KB from inst in a 256 KB
+    -- window that the ladder reached after twenty-nine frames. Dropping it is what leaves the
+    -- narrow windows to be tried first.
+    do
+      local keepspan = FFTSA_PXSEED
+      local wide = fftsa.nl.PX_SEED_SPAN_MAX + 1024
+      FFTSA_PXSEED = string.format('%d,%d', SEED, SEED + wide)
+      local ws = fftsa.nl.px_windows(nil)
+      check('a learned span wider than its ceiling is dropped rather than offered',
+            has(ws, SEED - near, SEED + wide + near) == nil,
+            string.format('span %d wide, ceiling %d, %d window(s)',
+                          wide, fftsa.nl.PX_SEED_SPAN_MAX, table.getn(ws)))
+      FFTSA_PXSEED = keepspan
+    end
+    -- AND IT LEARNS. A second confirmation at a different address widens the span rather
+    -- than replacing it, which is what absorbs the display task's pool handing out a
+    -- different trace object on the next launch.
+    local SEED2 = SEED + 2097152
+    fftsa.nl.px_cache_put({ lo = SEED2, hi = SEED2 + 4096, nrec = 24, stride = 56,
+                            ox = 44, hdr = SEED2 - 496 })
+    local a2, b2 = fftsa.nl.px_seed_span()
+    local w2 = fftsa.nl.px_windows(nil)
+    check('a second ring widens the learned span instead of replacing it',
+          a2 == SEED and b2 == SEED2 and has(w2, SEED - near, SEED2 + near) ~= nil,
+          string.format('span=[%X,%X], window at %s of %d', a2 or 0, b2 or 0,
+                        tostring(has(w2, SEED - near, SEED2 + near)), table.getn(w2)))
+    -- And the seed is reached before the backstop, which is the whole point: the backstop is
+    -- the pass that costs 800 frames.
+    local back, i = nil, nil
+    for i = 1, table.getn(w) do
+      if w[i][2] - w[i][1] > fftsa.nl.PX_WIN_MAX then back = i end
+    end
+    check('and the backstop pass is last, after every seeded and buffer-side window',
+          back == table.getn(w),
+          string.format('backstop at %s of %d', tostring(back), table.getn(w)))
+    -- A WRONG WINDOW COSTS SLICES AND NOTHING ELSE, which is the condition the operator set
+    -- for starting the search anywhere other than the beginning. The instance window only
+    -- orders the ladder: it is not read from, not written to, and not believed -- so it is
+    -- bounded, and the ladder carries on past it to the buffer-side windows and the backstop.
+    do
+      local keeplearned = FFTSA_PXSEED
+      FFTSA_PXSEED = nil
+      fftsa.nl.inst = 58000000
+      local wh = fftsa.nl.px_windows(nil)
+      local nh = table.getn(wh)
+      local last = wh[nh]
+      -- EVERY WINDOW BUT THE BACKSTOP IS INSIDE PX_WIN_MAX, so each costs a bounded amount of
+      -- scanning and none of them is taken for the backstop pass and deferred to the end. And
+      -- the backstop is still there and still last, which is what makes a wrong narrow window
+      -- cost slices rather than correctness: the ladder reaches the whole proven span either
+      -- way, just later.
+      local over, sum, i2 = 0, 0, nil
+      for i2 = 1, nh - 1 do
+        local wd = wh[i2][2] - wh[i2][1]
+        sum = sum + wd
+        if wd > fftsa.nl.PX_WIN_MAX then over = over + 1 end
+      end
+      check('a wrong window costs a bounded first pass and the ladder still reaches everything',
+            nh >= 2 and over == 0 and last[2] - last[1] > fftsa.nl.PX_WIN_MAX
+            and last[1] <= fftsa.nl.BACKSTOP_LO and last[2] >= fftsa.nl.BACKSTOP_HI,
+            string.format('%d window(s), %d over %d, %d bytes before the backstop, which is '
+                          .. '%d wide', nh, over, fftsa.nl.PX_WIN_MAX, sum,
+                          last[2] - last[1]))
+      -- And a derived window is never written to the key as if this machine had confirmed a
+      -- ring there.
+      fftsa.nl._px_saved = nil
+      check('with nothing learned there is nothing to save, window or no window',
+            fftsa.nl.px_cache_save() == false, 'save with no learned span')
+      fftsa.nl.inst = nil
+      FFTSA_PXSEED = keeplearned
+    end
+
+    -- ---- and it survives a power cycle, which is the whole point --------------
+    --
+    -- Every cache in this app is a Lua global, so a power cycle loses all of it and the first
+    -- search of a boot starts with nothing learned. The key's copy is what carries the span
+    -- across. Nothing read back out of it is trusted: px_map re-validates from content before
+    -- a byte is written, so a stale file costs one read.
+    do
+      local wrote = nil
+      local keepio, keepfile = io, file
+      io = { open = function(nm, mode)
+        if mode ~= 'w' and mode ~= 'r' then return nil end
+        if mode == 'w' then
+          return { write = function(self, b) wrote = b end, close = function() end }
+        end
+        if wrote == nil then return nil end
+        return { read = function(self, n) return wrote end, close = function() end }
+      end }
+      file = { usbdriveexists = function() return 1 end }
+      local keepkey = fftsa.nl.PX_CACHE_KEY
+      fftsa.nl.PX_CACHE_KEY = true
+      -- 0-BASED, as this firmware's readdir is, and listing the directory is how existence is
+      -- settled: io.open on a file that is not there POSTS 2203 as a modal dialog over the
+      -- running app, and pcall is no defence because the file API posts rather than raises.
+      -- Measured the expensive way on 8.80.
+      local keepfs = fs
+      fs = { readdir = function(d)
+        if d ~= fftsa.nl.PX_CACHE_DIR then return nil end
+        local t = {}
+        t[0] = 'something_else.tspa'
+        if wrote ~= nil then t[1] = fftsa.nl.PX_CACHE_NAME end
+        return t
+      end }
+      fftsa.nl._px_saved = nil
+      local saved = fftsa.nl.px_cache_save()
+      -- A power cycle, modelled exactly: every global gone.
+      FFTSA_PXRING, FFTSA_PXSEED = nil, nil
+      fftsa.nl._px_loaded = nil
+      local loaded = fftsa.nl.px_cache_load()
+      local la, lb = fftsa.nl.px_seed_span()
+      local lc = fftsa.nl.px_cache_get()
+      io, file, fs = keepio, keepfile, keepfs
+      fftsa.nl.PX_CACHE_KEY = keepkey
+      check('the learned span and the geometry survive a power cycle through the key',
+            saved and loaded and la == SEED and lb == SEED2
+            and lc ~= nil and lc.lo == SEED2 and lc.stride == 56,
+            string.format('saved=%s loaded=%s span=[%s,%s] ring=%s',
+                          tostring(saved), tostring(loaded), tostring(la), tostring(lb),
+                          lc ~= nil and string.format('%X/%d', lc.lo, lc.stride) or 'nil'))
+      -- With no key in the slot a save must not raise into the frame, and must not claim it
+      -- wrote. file.usbdriveexists is the guard: a write with no key posts 2203 over the app.
+      file = { usbdriveexists = function() return 0 end }
+      fftsa.nl.PX_CACHE_KEY = true
+      fftsa.nl._px_saved = nil
+      local nokey = fftsa.nl.px_cache_save()
+      file = keepfile
+      fftsa.nl.PX_CACHE_KEY = keepkey
+      check('a save with no key in the slot refuses quietly rather than raising',
+            nokey == false, 'save returned ' .. tostring(nokey))
+    end
+    FFTSA_PXRING, FFTSA_PXSEED = keep, keeps
+    fftsa.nl.inst = keepinst
+  end
+
   -- ---- a lookalike in the same slice -----------------------------------------
   do
     -- One sweep slice holding both the staging lookalike and the real ring. The slice has to
@@ -2483,20 +3220,45 @@ do
     -- between them often enough that the case would pass or fail on the fixture's address.
     build(nil)
     stage()
+    -- No seed, because the ladder under test is the unseeded one: a cached ring puts a 4 MB
+    -- window at the front, which is wider than this budget, and then "one slice" stops being
+    -- a fact. The seeding has its own gate below.
+    FFTSA_PXRING, FFTSA_PXSEED = nil, nil
     fftsa.nl.px_restart('test')
     fftsa.nl.px.noname = true
     local SENT, i = {}, nil
     for i = 1, 4 do SENT[i] = { db = DB[i], hz = HZ[i] } end
-    local c, calls = {}, 0
-    while table.getn(c) == 0 and calls < 20 do
+    -- DRAINED ACROSS FRAMES, AND THE SLICE IS READ ONCE. A frame's read allowance can stop
+    -- the hit walk part way through a dense slice, so the two confirmations need not arrive in
+    -- the same call. What must hold is that neither is lost and that the bytes are not swept
+    -- again to recover the second: the hits are kept, not rediscovered.
+    local c, calls, all, nall = {}, 0, {}, 0
+    local swept_at_first = nil
+    while calls < 20 do
       calls = calls + 1
+      fftsa.nl.rd_frame_reset()
       c = fftsa.nl.px_seek(HZ, NSEG, 1048576, nil)
+      local ci
+      for ci = 1, table.getn(c) do
+        nall = nall + 1
+        all[nall] = c[ci]
+      end
+      if swept_at_first == nil and nall > 0 then swept_at_first = fftsa.nl.px.swept end
+      if nall >= 2 then break end
     end
+    local swept_at_end = fftsa.nl.px.swept
     local s28, s56, k = nil, nil, nil
-    for k = 1, table.getn(c) do
-      if c[k].stride == 28 then s28 = c[k] end
-      if c[k].stride == STRIDE then s56 = c[k] end
+    for k = 1, nall do
+      if all[k].stride == 28 then s28 = all[k] end
+      if all[k].stride == STRIDE then s56 = all[k] end
     end
+    check('a dense slice is swept once and every confirmation in it is kept',
+          s28 ~= nil and s56 ~= nil and swept_at_first ~= nil
+          and swept_at_end == swept_at_first,
+          string.format('28-byte=%s 56-byte=%s over %d call(s), swept %d -> %d bytes',
+                        s28 ~= nil and string.format('%X', s28.val0) or 'none',
+                        s56 ~= nil and string.format('%X', s56.val0) or 'none', calls,
+                        swept_at_first or -1, swept_at_end or -1))
     check('one slice holding a lookalike and the ring returns both confirmations',
           s28 ~= nil and s56 ~= nil and s28.val0 == SLO and s56.val0 ~= SLO,
           string.format('%d confirmations in slice %d: 28-byte=%s 56-byte=%s',
@@ -2541,11 +3303,34 @@ do
       n = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 2000 + calls)
       saw[fftsa.nl.px.state] = true
     end
-    check('idle to seek to map to on, and the frame that engages also draws',
-          n == NSEG and fftsa.nl.px.state == 'on' and saw['seek'] and saw['map']
-          and FFTSA_PXRING ~= nil,
-          string.format('n=%s state=%s via=%s after %d frames, cache=%s', tostring(n),
-                        tostring(fftsa.nl.px.state), tostring(fftsa.nl.px.from), calls,
+    -- THE SEARCH RUNS WHILE THE STATE IS STILL IDLE, and the frame that engages also draws
+    -- rather than returning nil and leaving the caller to append a pass it has already mapped.
+    --
+    -- The search's own states are seek, hdr and map, and a candidate found by the SEARCH walks
+    -- all three. A candidate found by one of the cheap routes does not: the idle arm maps it
+    -- where it stands and that frame draws, which is what this gate is on.
+    --
+    -- `seek` is a LATCH rather than a stage: the cheap routes -- the cached geometry and the
+    -- object table entry -- are worth several frames each, and they used to be spent BEFORE
+    -- the search started, so their frames were pure latency whenever they failed. The frame
+    -- now falls through to the search with the state left at idle, so the cheap routes are
+    -- retried next frame and neither waits for the other. Whichever answers first wins.
+    --
+    -- So a path that engages from the search inside PX_CACHE_TRIES frames never sets `seek` at
+    -- all, and asserting that it passed through it is asserting the old serial order.
+    --
+    -- `from` is pinned as well. Without it this gate passes on a run that engaged from the
+    -- cache a previous block wrote, which is the opposite of what it is here to prove.
+    check('the search engages from idle, and the frame that engages also draws',
+          n == NSEG and fftsa.nl.px.state == 'on' and saw['idle'] and not saw['seek']
+          and fftsa.nl.px.from == 'search' and (fftsa.nl.px.swept or 0) > 0
+          and calls < fftsa.nl.PX_CACHE_TRIES and FFTSA_PXRING ~= nil,
+          string.format('n=%s state=%s via=%s after %d frames of %d, states=%s%s%s, '
+                        .. 'swept=%s, cache=%s',
+                        tostring(n), tostring(fftsa.nl.px.state),
+                        tostring(fftsa.nl.px.from), calls, fftsa.nl.PX_CACHE_TRIES,
+                        saw['idle'] and 'idle ' or '', saw['seek'] and 'seek ' or '',
+                        saw['on'] and 'on' or '', tostring(fftsa.nl.px.swept),
                         tostring(FFTSA_PXRING)))
     check('and the state reads back as one field for the error page',
           string.find(fftsa.nl.px_str(), 'px=on', 1, true) == 1
@@ -2571,8 +3356,1043 @@ do
           fftsa.nl.px_str())
   end
 
+  do
+    -- THE CACHE IS WORTH MORE THAN ONE FRAME. px_map needs every slot of the drawn window to
+    -- carry a frequency this plan has, and on a relaunch the trace object has only just been
+    -- created -- so the first attempt fails whatever the address, and says nothing about
+    -- whether it was right. Abandoning it there sent a relaunch to the sweep: 20 seconds and
+    -- about 50 MB on the glass to find a ring the cache could have named.
+    fftsa.nl.px_restart('cache tries')
+    -- A geometry that is the right shape but will not map yet: the ring is where the cache
+    -- says, the frequencies are not in it.
+    fftsa.nl.px_cache_put({ lo = TRING, hi = TRING + NREC * STRIDE, nrec = NREC,
+                            stride = STRIDE, ox = OX, hdr = TBOUND })
+    local keephz, j = {}, nil
+    for j = 1, NSEG do keephz[j] = HZ[j] + 7919 end
+    local tries, st = 0, nil
+    for j = 1, fftsa.nl.PX_CACHE_TRIES + 2 do
+      fftsa.nl.px_try(DB, keephz, NSEG, 'TB', 7100 + j, GID)
+      if fftsa.nl.px.state == 'idle' then tries = tries + 1 end
+      st = fftsa.nl.px.state
+    end
+    -- KEEPS TRYING, which is the whole point: a cache that cannot map on the first frame says
+    -- nothing about whether its address is right, and neither does a pointer route whose
+    -- live-address span is not wide enough yet. Both improve as the app runs. What must never
+    -- happen is the path giving up for the session -- measured on the glass as an app that ran
+    -- its whole session on the append path with why='no pointer and no usable cache'.
+    check('a cache that cannot map yet is retried, not abandoned on the first frame',
+          tries >= fftsa.nl.PX_CACHE_TRIES - 1 and st ~= 'off' and st ~= 'on',
+          string.format('%d idle frame(s) of %d allowed, then state=%s, cachetries=%s',
+                        tries, fftsa.nl.PX_CACHE_TRIES, tostring(st),
+                        tostring(fftsa.nl.px.cachetries)))
+  end
+
+  do
+    -- THE NATIVE SEARCH, through its marshalling. The image cannot run here, so call_native
+    -- is replaced by a check of the REQUEST it was handed plus a fabricated answer. That is
+    -- deliberately what this gates: the needle packed into four big-endian words, the block
+    -- layout, and the answer decoded back. A wrong byte in a needle finds nothing for ever,
+    -- and nothing else in the suite would notice.
+    local keepready, keepentry = fftsa.nl.ready, fftsa.nl.entry
+    local keepfa, keepfw = fftsa.nl.find_addr, fftsa.nl.FIND_WORDS
+    local keepfm, keepcn = fftsa.nl.FIND_MAX, fftsa.nl.call_native
+    local keepwp, keepmw, keepmr = fftsa.nl.write_params, ki.memwrite, ki.memread
+    -- The REAL nfind for this block: the fixture emulates it everywhere else, and what is
+    -- under test here is nfind's own marshalling.
+    local keepemu = fftsa.nl.nfind
+    fftsa.nl.nfind = SAVED_NF
+    local FB, REQ = 4096, nil
+    local H1, H2, NX = 61000000, 61000064, 61999999
+    fftsa.nl.ready, fftsa.nl.entry = true, 1
+    local keepnf = fftsa.nl.NFIND
+    fftsa.nl.NFIND = true
+    fftsa.nl.find_addr, fftsa.nl.FIND_WORDS, fftsa.nl.FIND_MAX = FB, 42, 32
+    local sawmode = nil
+    fftsa.nl.write_params = function(t) sawmode = t.mode; return true end
+    ki.memwrite = function(a, b) if tonumber(a, 16) == FB then REQ = b end end
+    local function be(v)
+      return string.char(math.mod(math.floor(v / 16777216), 256),
+                         math.mod(math.floor(v / 65536), 256),
+                         math.mod(math.floor(v / 256), 256), math.mod(v, 256))
+    end
+    ki.memread = function(a, n)
+      if tonumber(a, 16) == FB + 32 then
+        return be(NX) .. be(2) .. be(H1) .. be(H2)
+      end
+      return keepmr(a, n)
+    end
+    fftsa.nl.call_native = function() return 2 end
+    local want = 'FFTSA_TRACE' .. string.char(0)
+    local hits, nxt = fftsa.nl.nfind(1000, 9000, want, 777)
+    -- The request, byte for byte: four header words then the needle in four more, first byte
+    -- in the top of the first.
+    --
+    -- THE FOURTH WORD CARRIES TWO FIELDS, which is the one place this wire format is not
+    -- obvious. The image reads the needle length as the low half and the scan step as the high
+    -- half -- `flen = (fb[3] << 16) >> 16` and `fstep = fb[3] >> 16` -- and it does that with
+    -- shifts rather than a mask because a 0xFFFF literal in the C file is indistinguishable
+    -- from an address to the firmware-address gate. Pack them the wrong way round and the
+    -- image searches for a 4-byte needle with a step of eleven, finds nothing for ever, and
+    -- nothing else in the suite notices.
+    local STEP = fftsa.nl.NFIND_STEP or 1
+    local expect = be(1000) .. be(9000) .. be(777)
+                   .. be(string.len(want) + STEP * 65536)
+    local wi
+    for wi = 0, 3 do
+      local acc = 0
+      local bi
+      for bi = 1, 4 do
+        local k = wi * 4 + bi
+        local c = 0
+        if k <= string.len(want) then c = string.byte(want, k) end
+        acc = acc * 256 + c
+      end
+      expect = expect .. be(acc)
+    end
+    check('the native search marshals its request byte for byte',
+          REQ == expect and sawmode == fftsa.nl.MODE_FIND,
+          string.format('%d request byte(s), %s, mode=%s, step=%d',
+                        REQ and string.len(REQ) or -1,
+                        REQ == expect and 'identical' or 'DIFFERENT', tostring(sawmode),
+                        STEP))
+    -- AND THE STEP IS IN THE HIGH HALF, stated separately from the byte compare so that a
+    -- packing that happens to agree with a hand-written expectation still has to put the two
+    -- fields where the image looks for them.
+    do
+      local w4 = 0
+      local bi
+      for bi = 13, 16 do w4 = w4 * 256 + string.byte(REQ, bi) end
+      check('the step is the high half of the length word and the length the low half',
+            math.floor(w4 / 65536) == STEP and math.mod(w4, 65536) == string.len(want),
+            string.format('word 4 = %d: step %d, len %d', w4, math.floor(w4 / 65536),
+                          math.mod(w4, 65536)))
+    end
+    -- A 4-STEP SCAN OF AN UNALIGNED RANGE ALIGNS UPWARD AND SAYS SO. Rounding the start
+    -- silently moves it past bytes the caller believes were searched, which is the same defect
+    -- as a short read reported as an absence -- so the aligned start comes back as `next` on
+    -- an empty result and the caller resumes from there.
+    if STEP == 4 then
+      REQ = nil
+      local uh, un = fftsa.nl.nfind(1001, 9000, want, 777)
+      local rlo = 0
+      local bi
+      if REQ ~= nil then for bi = 1, 4 do rlo = rlo * 256 + string.byte(REQ, bi) end end
+      check('an unaligned range is aligned upward rather than rounded in silence',
+            rlo == 1004 and uh ~= nil,
+            string.format('asked from 1001, searched from %d', rlo))
+      -- And a range with no aligned start left in it is refused with a reason, rather than
+      -- answering "nothing here" about bytes it never looked at.
+      local sh, sn = fftsa.nl.nfind(1001, 1003, want, 777)
+      check('a range too short to align is refused with a reason, not reported empty',
+            sh ~= nil and table.getn(sh) == 0 and sn == 1003
+            and fftsa.nl.find_why ~= nil,
+            string.format('%s hit(s), next=%s, why=%s',
+                          sh and table.getn(sh) or 'nil', tostring(sn),
+                          tostring(fftsa.nl.find_why)))
+    end
+    check('and decodes the hits and the resume address back out',
+          hits ~= nil and table.getn(hits) == 2 and hits[1] == H1 and hits[2] == H2
+          and nxt == NX,
+          string.format('%s hit(s) %s %s, next=%s',
+                        hits and table.getn(hits) or 'nil',
+                        hits and table.getn(hits) > 0 and tostring(hits[1]) or '-',
+                        hits and table.getn(hits) > 1 and tostring(hits[2]) or '-',
+                        tostring(nxt)))
+    -- A needle longer than the block can carry is refused, not truncated: a truncated needle
+    -- matches more than it should and the caller cannot tell.
+    local long = fftsa.nl.nfind(1000, 9000, string.rep('x', 17), 0)
+    check('a needle over the block size is refused rather than truncated',
+          long == nil and fftsa.nl.find_why ~= nil, tostring(fftsa.nl.find_why))
+    fftsa.nl.ready, fftsa.nl.entry = keepready, keepentry
+    fftsa.nl.find_addr, fftsa.nl.FIND_WORDS = keepfa, keepfw
+    fftsa.nl.FIND_MAX, fftsa.nl.call_native = keepfm, keepcn
+    fftsa.nl.write_params, ki.memwrite, ki.memread = keepwp, keepmw, keepmr
+    fftsa.nl.nfind = keepemu
+    fftsa.nl.NFIND = keepnf
+    -- AND IT IS CLAMPED TO MEASURED MEMORY, NOT TO THE BACKSTOP. Conflating the two
+    -- bluescreened the instrument at PC=0022D200: the backstop is the span Lua may ASK
+    -- ki.memread about, and ki.memread answers nil for anything unmapped, while the image
+    -- loads directly and faults. So a range beyond the measured top must come back as no
+    -- hits, having scanned nothing, rather than as a fault.
+    do
+      local kml, kmh = fftsa.nl.map_lo, fftsa.nl.map_hi
+      local asked = nil
+      local kn = fftsa.nl.nfind
+      local kr, kfa = fftsa.nl.ready, fftsa.nl.find_addr
+      local knf2, kmb = fftsa.nl.NFIND, fftsa.nl.map_bounds
+      -- The clamp still has to be right, because it is what a safe range would be handed to.
+      -- Armed and given measured bounds only for the length of these two cases.
+      fftsa.nl.NFIND = true
+      fftsa.nl.map_bounds = function() return 1000, 9000 end
+      fftsa.nl.ready, fftsa.nl.find_addr = true, 4096
+      fftsa.nl.map_lo, fftsa.nl.map_hi = 1000, 9000
+      fftsa.nl.nfind = function(a, b) asked = { a, b }; return {}, b end
+      local past = fftsa.nl._finds_native(20000, 30000, 'abcd')
+      check('a range past the measured top of memory scans nothing',
+            past ~= nil and table.getn(past) == 0 and asked == nil,
+            'asked=' .. (asked and (tostring(asked[1]) .. '..' .. tostring(asked[2]))
+                         or 'nothing'))
+      asked = nil
+      fftsa.nl._finds_native(500, 30000, 'abcd')
+      check('and a range that straddles it is clamped to what was measured',
+            asked ~= nil and asked[1] == 1000 and asked[2] == 9000,
+            'asked=' .. (asked and (tostring(asked[1]) .. '..' .. tostring(asked[2]))
+                         or 'nothing'))
+      fftsa.nl.map_lo, fftsa.nl.map_hi, fftsa.nl.nfind = kml, kmh, kn
+      fftsa.nl.ready, fftsa.nl.find_addr = kr, kfa
+      fftsa.nl.NFIND, fftsa.nl.map_bounds = knf2, kmb
+      -- AND THE SHIPPED DEFAULT IS OFF, with no probe left that could fault. Two bluescreens
+      -- at PC=0022D200 came from bounding the image's loads by the backstop and then from
+      -- probing outward to find the edge of memory -- ki.memread does not validate, so the
+      -- probe is itself what falls off the end.
+      -- THE LUA RING SWEEP SHIPS FORBIDDEN. PX_SWEEP is armed by this block only, to drive
+      -- the ladder the bind path still shares; the shipped value is false, so a frame that
+      -- has no pointer and no cache gets the native search or nothing.
+      check('the Lua ring sweep is not permitted in the shipped module', (function()
+        local fh = io.open('tsp/native_link.tsp', 'r')
+        if fh == nil then return false, 'cannot read the module' end
+        local body = fh:read('*a')
+        fh:close()
+        -- No knob at all, and the pixel path's seek requires the image.
+        local off = string.find(body, 'fftsa.nl.PX_SWEEP = false', 1, true) ~= nil
+        local on = string.find(body, 'fftsa.nl.PX_SWEEP = true', 1, true) ~= nil
+        local native = string.find(body, 'nl.NFIND and mlo ~= nil and nl.ready', 1, true) ~= nil
+        return off and not on and native,
+               'ships false=' .. tostring(off) .. ' any true=' .. tostring(on)
+               .. ' native-gated=' .. tostring(native)
+      end)())
+    end
+  end
+
+  do
+    -- NO FRAME OF THE SEARCH MAY READ WITHOUT BOUND, and this is the gate each of the four
+    -- cost bugs needed and none of them had. Every one was the same shape: an iteration count
+    -- taken from the heap with an IPC round trip in the body, inside a frame that cannot be
+    -- interrupted -- 257 peek32 for each name hit, 29 memread for each frequency hit, a holder
+    -- sweep over the whole of DRAM, and a dense slice re-walked for ever. Each was found by the
+    -- operator losing minutes of bench time to it, one at a time. Counting the reads per frame
+    -- turns the whole class into one assertion.
+    --
+    -- Driven from idle so the frames cover seeking, the header walk, the map and the engaged
+    -- draw -- every path a frame can take.
+    fftsa.nl.px_restart('read budget')
+    FFTSA_PXRING, FFTSA_PXSEED = nil, nil
+    fftsa.nl.rd_peak_calls, fftsa.nl.rd_peak_bytes = 0, 0
+    -- THE RUNNING FIGURES TOO, not just the peaks. rd_frame_reset moves the frame that just
+    -- ended into last= and zeroes the accumulator, so last= read after a px_try is the
+    -- PREVIOUS frame's -- and on the first iteration it is whatever the block before this one
+    -- left behind. This gate read 1031 KB against a 1024 KB ceiling for exactly that reason:
+    -- the figure was another block's and no frame here had ever exceeded the budget.
+    fftsa.nl.nf_peak_bytes, fftsa.nl.nf_last_bytes = 0, 0
+    fftsa.nl._nf_bytes, fftsa.nl._nf_secs = 0, 0
+    fftsa.nl.rd_last_calls, fftsa.nl.rd_last_bytes = 0, 0
+    fftsa.nl._rd_calls, fftsa.nl._rd_bytes = 0, 0
+    local f, worst, worstb, at = nil, 0, 0, nil
+    for f = 1, 150 do
+      fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 9000 + f, GID)
+      if (fftsa.nl.rd_last_calls or 0) > worst then
+        worst = fftsa.nl.rd_last_calls
+        at = fftsa.nl.px.state
+      end
+      if (fftsa.nl.rd_last_bytes or 0) > worstb then worstb = fftsa.nl.rd_last_bytes end
+    end
+    -- One more frame so the last one's accumulator is moved into the peak rather than left
+    -- unexamined, and the module's own running maximum is the figure judged -- the same one
+    -- the About page reports.
+    fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 9000 + 151, GID)
+    local worstnf = fftsa.nl.nf_peak_bytes or 0
+    -- A BACKSTOP, AND ONLY THAT. This fixture's heap is not dense in either needle, so a
+    -- reintroduced per-item read cost does not necessarily show up here -- measured: putting
+    -- the 257-peek name walk back left this gate reading 10 per frame and passing. What catches
+    -- that class is the per-site read counts above, one for each loop in the module that
+    -- reads. This one exists to catch a NEW loop nobody thought to count.
+    --
+    -- Twice the allowance, because a loop asks the budget AFTER a read and so may overshoot by
+    -- one item, and because px_map's window is a single large read of its own.
+    check('no frame of the search reads without bound',
+          worst > 0 and worst <= fftsa.nl.RD_MAX_CALLS * 2,
+          string.format('worst frame %d reads (%d KB), allowance %d, worst state %s',
+                        worst, math.floor(worstb / 1024), fftsa.nl.RD_MAX_CALLS,
+                        tostring(at)))
+    -- AND NEITHER DOES THE IMAGE, which now has its own allowance. Moving the scanned bytes
+    -- off the read account is what let the slice grow to the hardware's speed; without a bound
+    -- of its own that is an unbounded scan inside a frame, which is the same defect in a new
+    -- place. The ceiling is a slice that would cost 40 ms even at ki.memread's 25 MB/s.
+    check('and the image scans no more in a frame than the timed budget allows',
+          worstnf > 0 and worstnf <= fftsa.nl.PX_NBUDGET_MAX,
+          string.format('worst frame scanned %d KB, ceiling %d KB',
+                        math.floor(worstnf / 1024),
+                        math.floor(fftsa.nl.PX_NBUDGET_MAX / 1024)))
+  end
+
+  -- ---- the slice is sized by the clock, not by a figure in the tree -----------
+  do
+    local keepb, keepr = fftsa.nl.px_nbudget, fftsa.nl.px_nrate
+    local keepnf = fftsa.nl.nfind
+    local keepa, keepbb = fftsa.nl.px_nb_a, fftsa.nl.px_nb_b
+    fftsa.nl.px_nbudget, fftsa.nl.px_nrate = fftsa.nl.PX_NBUDGET_MIN, nil
+    -- AND THE TWO FIT SAMPLES, because they are what decides which arm of px_nb_note runs.
+    -- With a pair already standing from the block above, a note that cannot be timed took the
+    -- fitted arm instead of the doubling arm and this gate tested the wrong one.
+    fftsa.nl.px_nb_a, fftsa.nl.px_nb_b = nil, nil
+    -- With an image the slice is the timed budget; without one it is the read path's figure,
+    -- because then the search IS ki.memread.
+    local withimg = fftsa.nl.px_budget()
+    fftsa.nl.nfind = nil
+    local without = fftsa.nl.px_budget()
+    fftsa.nl.nfind = keepnf
+    check('the slice size follows which engine is doing the searching',
+          withimg == fftsa.nl.px_nbudget and without == fftsa.nl.PX_BUDGET,
+          string.format('image=%d read path=%d', withimg, without))
+    -- A slice too fast to time doubles, which is how a budget set from a Lua read's rate
+    -- climbs to the image's without anybody asserting what the image's rate is.
+    fftsa.nl.px_nb_note(262144, 0)
+    local doubled = fftsa.nl.px_nbudget
+    check('a slice the clock cannot resolve doubles the next one',
+          doubled == 524288, string.format('%d KB', math.floor(doubled / 1024)))
+    -- AND A SIZE NOTED OVER AND OVER ALTERNATES rather than climbing, because two samples of
+    -- the same size cannot separate the fixed cost from the rate. The alternation is what
+    -- produces the second point: one frame at the floor, the next at twice it, and the fit
+    -- lands on the frame after that. Noting one size for ever is a frame that is not following
+    -- the budget, and then nothing is learned -- which is the honest outcome, not a runaway.
+    local i, lowest, highest = nil, nil, nil
+    for i = 1, 20 do
+      fftsa.nl.px_nb_note(262144, 0)
+      local b = fftsa.nl.px_nbudget
+      if lowest == nil or b < lowest then lowest = b end
+      if highest == nil or b > highest then highest = b end
+    end
+    check('a size noted over and over alternates instead of climbing',
+          lowest == fftsa.nl.PX_NBUDGET_MIN and highest == fftsa.nl.PX_NBUDGET_MIN * 2
+          and fftsa.nl.px_nrate == nil,
+          string.format('%d KB to %d KB over 20 notes, rate=%s',
+                        math.floor(lowest / 1024), math.floor(highest / 1024),
+                        tostring(fftsa.nl.px_nrate)))
+    -- A FIT FROM AN IMPOSSIBLE RATE IS CLAMPED, not believed. The budget is a frame's time
+    -- turned into bytes, and the one thing it may never be is larger than the ceiling -- a
+    -- frame cannot be interrupted, so a slice sized from a mistimed pair would be a scan with
+    -- no bound inside it.
+    fftsa.nl.px_nb_a, fftsa.nl.px_nb_b, fftsa.nl.px_nrate = nil, nil, nil
+    fftsa.nl.px_nb_note(262144, 0.000001)
+    fftsa.nl.px_nb_note(1048576, 0.000002)
+    check('a fit from a rate too high to be real is clamped to the ceiling',
+          fftsa.nl.px_nbudget == fftsa.nl.PX_NBUDGET_MAX and fftsa.nl.px_nrate ~= nil,
+          string.format('%d KB of %d KB at %.0f MB/s',
+                        math.floor(fftsa.nl.px_nbudget / 1024),
+                        math.floor(fftsa.nl.PX_NBUDGET_MAX / 1024),
+                        fftsa.nl.px_nrate / 1048576))
+    -- AND AN OVERHEAD THAT EATS THE WHOLE FRAME LEAVES THE FLOOR, not a negative slice. This
+    -- is the case the two-point fit exists for: the time a frame spends adjudicating hits is
+    -- fixed cost, and if it alone exceeds the target then no slice size helps.
+    fftsa.nl.px_nb_a, fftsa.nl.px_nb_b, fftsa.nl.px_nrate = nil, nil, nil
+    fftsa.nl.px_nb_note(262144, fftsa.nl.PX_NMS * 4)
+    fftsa.nl.px_nb_note(1048576, fftsa.nl.PX_NMS * 4 + 0.001)
+    check('an overhead larger than the frame target leaves the slice on its floor',
+          fftsa.nl.px_nbudget == fftsa.nl.PX_NBUDGET_MIN
+          and (fftsa.nl.px_nover or 0) > fftsa.nl.PX_NMS,
+          string.format('%d KB, overhead %.1f ms against a %.1f ms target',
+                        math.floor(fftsa.nl.px_nbudget / 1024),
+                        (fftsa.nl.px_nover or 0) * 1000, fftsa.nl.PX_NMS * 1000))
+    -- A TIMED PAIR SETS THE BUDGET FROM THE RATE, and the floor is what stops a slow frame
+    -- collapsing the slice to nothing. 4 MB/s for a 30 ms target is 126 KB, below the floor,
+    -- so the floor is the answer -- and 4 MB/s is not a made-up figure: it is what this
+    -- reported on the glass at 9.05 on the launch where the whole slice was timed instead of
+    -- the scan, with ninety-one name hits charged to the bytes the image had scanned.
+    --
+    -- Its own pair, because a fit needs two points at distinct sizes with a positive slope,
+    -- and a pair left standing from the gate above gives a negative one -- a larger slice
+    -- recorded as faster -- which produces no fit at all and no rate to divide by.
+    fftsa.nl.px_nb_a, fftsa.nl.px_nb_b, fftsa.nl.px_nrate = nil, nil, nil
+    local RATE = 4194304
+    fftsa.nl.px_nb_note(262144, 262144 / RATE)
+    fftsa.nl.px_nb_note(1048576, 1048576 / RATE)
+    check('a timed slice sizes the next one from the measured rate, and clamps it',
+          fftsa.nl.px_nbudget == fftsa.nl.PX_NBUDGET_MIN
+          and fftsa.nl.px_nrate ~= nil
+          and fftsa.nl.px_nrate > RATE * 0.99 and fftsa.nl.px_nrate < RATE * 1.01,
+          string.format('%d KB at %.1f MB/s, wanted the %d KB floor at %.1f MB/s',
+                        math.floor(fftsa.nl.px_nbudget / 1024),
+                        (fftsa.nl.px_nrate or 0) / 1048576,
+                        math.floor(fftsa.nl.PX_NBUDGET_MIN / 1024), RATE / 1048576))
+    -- A sample too small to be the scan is not a measurement of the scan.
+    fftsa.nl.px_nbudget, fftsa.nl.px_nrate = 524288, nil
+    fftsa.nl.px_nb_note(4096, 0.5)
+    check('a slice too small to be the scan is not believed',
+          fftsa.nl.px_nbudget == 524288 and fftsa.nl.px_nrate == nil,
+          string.format('%d KB, rate=%s', math.floor(fftsa.nl.px_nbudget / 1024),
+                        tostring(fftsa.nl.px_nrate)))
+    fftsa.nl.px_nbudget, fftsa.nl.px_nrate = keepb, keepr
+    fftsa.nl.px_nb_a, fftsa.nl.px_nb_b = keepa, keepbb
+  end
+
+  -- ---- the name needle's retirement, and how long its counters live ----------
+  --
+  -- A freed trace object keeps the buffer name, so on an instrument the app has been run on
+  -- the needle matches every corpse of every previous run -- 1424 of them in one boot. It is
+  -- retired after PX_NAME_FAIL hits that produce no candidate at all, and the frequency needle
+  -- carries on, because a freed ring holds zeros and the frequencies can only match a live one.
+  --
+  -- THE COUNTER AND THE FLAG MUST HAVE THE SAME LIFETIME. px_restart clears the flag -- a
+  -- restart means the plan or the traces changed, so the corpse count says nothing about the
+  -- pass ahead -- and it used to leave the count alone. The needle was then revived by every
+  -- restart and re-condemned at once by hits from the passes before it. Measured on the glass
+  -- at 9.14 from a clean boot: re=4, nh=69, namedead=69, noname=1, by=freq, win=13/17,
+  -- swept=27MB, eng=10.6s, with the ring inside the instance band that the ladder tries third.
+  -- Seventeen hits a pass, condemned by a bound of sixty-four.
+  do
+    fftsa.nl.px_restart('name needle')
+    FFTSA_PXRING, FFTSA_PXSEED = nil, nil
+    local p = fftsa.nl.px
+    p.nhall = 0
+    -- One short of the bound, and nothing may be retired yet.
+    p.namehits, p.ncand, p.noname = fftsa.nl.PX_NAME_FAIL - 1, 0, nil
+    fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 14001, GID)
+    local under = p.noname
+    -- At the bound, and it is.
+    p.namehits, p.ncand, p.noname = fftsa.nl.PX_NAME_FAIL, 0, nil
+    fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 14002, GID)
+    check('the name needle is retired at its bound and not before',
+          under == nil and p.noname == true and p.namedead ~= nil,
+          string.format('under=%s at=%s namedead=%s', tostring(under), tostring(p.noname),
+                        tostring(p.namedead)))
+    -- A RESTART REVIVES IT, COUNTERS AND ALL. The flag alone is not a reprieve.
+    local hitsbefore = p.namehits
+    fftsa.nl.px.swept = fftsa.nl.PX_NAME_GIVEUP * 4
+    fftsa.nl.px.sweptpass = fftsa.nl.PX_NAME_GIVEUP * 4
+    fftsa.nl.px_restart('traces rebound')
+    check('a restart revives the name needle and zeroes the counts that condemned it',
+          p.noname == nil and (p.namehits or 0) == 0 and (p.ncand or 0) == 0
+          and (p.sweptpass or 0) == 0 and (p.nhall or 0) == hitsbefore,
+          string.format('noname=%s nh=%s ncand=%s sweptpass=%s nhall=%s of %d before',
+                        tostring(p.noname), tostring(p.namehits), tostring(p.ncand),
+                        tostring(p.sweptpass), tostring(p.nhall), hitsbefore))
+    -- AND THE SESSION'S SWEPT TOTAL DOES NOT CONDEMN IT EITHER, which is the bug that cost the
+    -- most. The byte bound asks whether THIS pass has swept far enough without a hit to
+    -- conclude the name is not in memory. Asked of the cumulative total it answers yes on the
+    -- first slice of every pass after the second -- the total is already past the bound whatever
+    -- the pass has done -- so on a launch that restarts while the app builds its screens, the
+    -- pass with the live trace object in it runs without the only needle that says which trace.
+    --
+    -- swept stays cumulative, because that is the honest figure for what was scanned and the
+    -- report shows both. Only the judgement is per pass.
+    do
+      local gaveup1 = p.gaveup or 0
+      p.swept = fftsa.nl.PX_NAME_GIVEUP * 4
+      p.sweptpass, p.namehits, p.ncand, p.noname = 0, 0, 0, nil
+      fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
+      check('a session total past the byte bound does not condemn a pass that is inside it',
+            p.noname == nil and (p.gaveup or 0) == gaveup1
+            and (p.sweptpass or 0) < fftsa.nl.PX_NAME_GIVEUP,
+            string.format('swept=%d of a %d bound, this pass %d, noname=%s',
+                          p.swept, fftsa.nl.PX_NAME_GIVEUP, p.sweptpass or 0,
+                          tostring(p.noname)))
+    end
+    -- AND THE CORPSE COUNT NO LONGER CONDEMNS IT, which is the regression itself: with the
+    -- count left cumulative the first frame after the restart retired it again.
+    --
+    -- Asserted on `gaveup`, which only the corpse branch increments. The needle has two other
+    -- ways to be condemned -- a whole ladder swept with no hit at all, and PX_NAME_GIVEUP
+    -- bytes with no hit -- and both are correct and may well fire in a fixture whose ladder is
+    -- small enough to finish a lap in one frame. Asserting on `noname` alone would be a gate on
+    -- all three at once, which would pass or fail for reasons that have nothing to do with the
+    -- count under test.
+    local gaveup0 = p.gaveup or 0
+    p.namehits, p.ncand = fftsa.nl.PX_NAME_FAIL - 1, 0
+    fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 14003, GID)
+    check('and the corpses counted before the restart no longer condemn it after one',
+          (p.gaveup or 0) == gaveup0,
+          string.format('gaveup %d -> %d with nh=%s and nhall=%s', gaveup0,
+                        p.gaveup or 0, tostring(p.namehits), tostring(p.nhall)))
+    fftsa.nl.px_restart('name needle done')
+  end
+
+  -- ---- the subscriber table: the trace without searching for it ---------------
+  --
+  -- graph_trace_add calls bufsub_subscribe(0x407F, graph, trace+0x08, &routing_element), which
+  -- copies the NAME to slot+0x08, the graph to slot+0x34 and the routing element's ADDRESS to
+  -- slot+0x40. So the slot is name_address - 8 and the trace is *(*(slot+0x40)) -- no table
+  -- base, no stride, no slot count, and nothing that depends on the display handle.
+  --
+  -- Confirmed on a DMM6500 at 1.7.17a with the app running: slot 00D67CD0 kind 0000407F
+  -- graph 03134A28 p4 03134EC0, *(p4) = 0352D4B0, trace+0x08 = FFTSA_TRACE, trace+0x00 =
+  -- 03134A28, trace+0x30 = 00D67CD0, trace+0x1F0 = 0352D6D0..03537488 count 510, and
+  -- trace+0x220 = 0352D6D0. Every link confirms another.
+  do
+    local SUBW = fftsa.nl.PX_SUB_LO
+    local SLOT = SUBW + 2048
+    local SGRAPH = TLO - 8192
+    local SP4 = SGRAPH + fftsa.nl.PX_ROUTE_LO + 4
+    -- THE DECOY, BELOW THE SLOT SO IT IS FOUND FIRST. The c2c request record holds a copy of
+    -- the name and a pointer to the current slot, and it sits below the table -- measured, two
+    -- name hits in the window, the first at 00D67598 whose first word read back 00D67CD0, the
+    -- live slot's own address. A search that took the first hit would have followed it.
+    local DECOY = SUBW + 1024
+    local function wrstr(at, str)
+      local i
+      for i = 0, string.len(str) - 1 do
+        local a = at + i
+        local w = a - math.mod(a, 4)
+        local old4 = IMG[w] or string.rep(string.char(0), 4)
+        local k = a - w + 1
+        IMG[w] = string.sub(old4, 1, k - 1) .. string.sub(str, i + 1, i + 1)
+                 .. string.sub(old4, k + 1)
+      end
+    end
+    local NM = fftsa.nl.PX_NAME .. string.char(0)
+    local function wire(kind, p4, back, sub)
+      build(nil)
+      tracefix()
+      fftsa.nl.px_subslot = nil
+      fftsa.nl.px_subfinds = 0
+      fftsa.nl.px_subwin = nil
+      fftsa.nl.sub_walkdone = nil
+      wr32(DECOY, SLOT)
+      wrstr(DECOY + fftsa.nl.PX_SUB_NAME, NM)
+      wr32(SLOT, kind)
+      wrstr(SLOT + fftsa.nl.PX_SUB_NAME, NM)
+      wr32(SLOT + fftsa.nl.PX_SUB_GRAPH, SGRAPH)
+      wr32(SLOT + fftsa.nl.PX_SUB_P4, p4)
+      wr32(SP4, TLO)
+      wr32(TLO + fftsa.nl.PX_TR_GRAPH, back)
+      wr32(TLO + fftsa.nl.PX_TR_SUB, sub)
+    end
+
+    wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+    local got = fftsa.nl.px_sub_slot()
+    check('the slot is found by the name, and the decoy below it is passed over',
+          got == SLOT and (fftsa.nl.sub_hits or 0) == 2,
+          string.format('slot=%s wanted %X, %s name hit(s)', tostring(got) and
+                        (got and string.format('%X', got) or 'nil'), SLOT,
+                        tostring(fftsa.nl.sub_hits)))
+    local gs = fftsa.nl.px_from_bufsub()
+    local g = nil
+    local gi
+    for gi = 1, table.getn(gs) do
+      if gs[gi].stride == STRIDE then g = gs[gi] end
+    end
+    check('the chain reaches the trace object with no search at all',
+          g ~= nil and g.lo == TRING and g.hdr == TBOUND and g.via_sub == true,
+          g ~= nil and string.format('ring %X hdr %X via_sub=%s', g.lo, g.hdr,
+                                     tostring(g.via_sub))
+          or string.format('%d candidate(s), why=%s', table.getn(gs),
+                           tostring(fftsa.nl.sub_why)))
+    -- A TRACE OUTSIDE THE APP'S OWN SPAN IS STILL THE RIGHT TRACE.
+    --
+    -- Measured on the glass at 9.24, second run of a boot: the chain found the right slot and
+    -- the right trace and px_live refused it 209 times -- `3E0EF30 outside 11EB018..3C8C7C8` --
+    -- because the span is built from addresses THIS APP has read and the trace object belongs
+    -- to the display task, which on a relaunch allocated above it. The route never engaged, so
+    -- the sweep ran: swept=126MB, nh=538, under 3 fps at 2048 points.
+    --
+    -- The span is not a map of what is mapped. ki.memread is: it validates and refuses where
+    -- ki.peek32 faults, which is what the abandoned Lua sweep relied on over hundreds of
+    -- megabytes. So the chain reads through _rdw and the confirmed trace JOINS the span.
+    do
+      local keepml, keepmh = fftsa.nl.map_lo, fftsa.nl.map_hi
+      local keepok = fftsa.nl.sub_trace_ok
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+      fftsa.nl.sub_trace_ok = nil
+      -- A span that excludes the trace entirely, which is what a relaunch produced.
+      fftsa.nl.map_lo, fftsa.nl.map_hi = TLO + 1048576, TLO + 2097152
+      fftsa.nl._map_age = 0
+      local out9 = fftsa.nl.px_from_bufsub()
+      local g9, gi9 = nil, nil
+      for gi9 = 1, table.getn(out9) do
+        if out9[gi9].stride == STRIDE then g9 = out9[gi9] end
+      end
+      check('a trace outside the app own span is read anyway, and joins it',
+            g9 ~= nil and g9.lo == TRING and fftsa.nl.sub_trace_ok == TLO,
+            g9 ~= nil and string.format('ring %X, span now includes %X', g9.lo,
+                                        fftsa.nl.sub_trace_ok or 0)
+            or string.format('%d candidate(s), why=%s', table.getn(out9),
+                             tostring(fftsa.nl.sub_why)))
+      -- THE TWO HALVES SEPARATELY, because the end-to-end check above passes either way: the
+      -- span re-derivation unions several of this app's own addresses and in this fixture they
+      -- happen to reach the trace. A gate that cannot fail when the mechanism is removed is
+      -- not testing the mechanism.
+      do
+        local keeplo, keephi = fftsa.nl.map_lo, fftsa.nl.map_hi
+        fftsa.nl.map_lo, fftsa.nl.map_hi = TLO + 1048576, TLO + 2097152
+        fftsa.nl._map_age = 0
+        -- One: it is px_live that refuses an address outside the span, not _wg -- _wg is
+        -- gated on the BACKSTOP, the whole proven DRAM extent, which was my mistaken premise
+        -- when writing this. So the mechanism is that the chain no longer consults px_live and
+        -- reads through _rdw, which goes through the firmware's validating read path.
+        local lived = fftsa.nl.px_live(TLO + fftsa.nl.PX_TRACE_BNDS)
+        local byr = fftsa.nl._rdw(TLO + fftsa.nl.PX_TRACE_BNDS)
+        check('px_live refuses an address outside the span that memread reads fine',
+              lived == false and byr == TRING,
+              string.format('px_live=%s _rdw=%s wanted %X', tostring(lived), tostring(byr),
+                            TRING))
+        -- Two: the span. A confirmed trace is one of the addresses map_bounds unions.
+        fftsa.nl.sub_trace_ok = nil
+        fftsa.nl.map_lo, fftsa.nl.map_hi = nil, nil
+        fftsa.nl._map_age = fftsa.nl.MAP_REFRESH
+        local lo0, hi0 = fftsa.nl.map_bounds()
+        local FAR = 251658240
+        fftsa.nl.sub_trace_ok = FAR
+        fftsa.nl.map_lo, fftsa.nl.map_hi = nil, nil
+        fftsa.nl._map_age = fftsa.nl.MAP_REFRESH
+        local lo1, hi1 = fftsa.nl.map_bounds()
+        check('a confirmed trace widens the span that px_from_trace is judged against',
+              lo0 ~= nil and lo1 ~= nil and hi1 > hi0 and FAR < hi1 and FAR >= lo1
+              and fftsa.nl.px_live(FAR) == true,
+              string.format('%X..%X without it, %X..%X with %X', lo0 or 0, hi0 or 0,
+                            lo1 or 0, hi1 or 0, FAR))
+        fftsa.nl.sub_trace_ok = nil
+        fftsa.nl.map_lo, fftsa.nl.map_hi = keeplo, keephi
+        fftsa.nl._map_age = 0
+      end
+      fftsa.nl.map_lo, fftsa.nl.map_hi = keepml, keepmh
+      fftsa.nl.sub_trace_ok = keepok
+      fftsa.nl._map_age = 0
+    end
+    -- A CORPSE KEEPS ITS NAME AND ITS POINTER. Unsubscribe clears only the kind, and removing
+    -- one of several equivalent subscribers can leave -2 there rather than zero. So liveness is
+    -- the kind being exactly 0x407F, and this is the gate that says so: with the kind cleared,
+    -- the slot still carries a perfectly good name and a perfectly good chain behind it.
+    wire(0, SP4, SGRAPH, SLOT)
+    local dead = fftsa.nl.px_from_bufsub()
+    local deadslot = fftsa.nl.px_sub_slot()
+    check('a slot whose kind has been cleared is refused, name and chain notwithstanding',
+          table.getn(dead) == 0 and deadslot == nil and fftsa.nl.sub_why ~= nil,
+          string.format('%d candidate(s), slot=%s, why=%s', table.getn(dead),
+                        tostring(deadslot), tostring(fftsa.nl.sub_why)))
+    -- And -2 is not liveness either, which is the case a "non-zero kind" test would pass.
+    -- Written as the unsigned word the firmware actually leaves there: peek32 hands back a hex
+    -- string and tonumber makes it 4294967294, never a negative.
+    wire(4294967294, SP4, SGRAPH, SLOT)
+    local rep = fftsa.nl.px_from_bufsub()
+    check('a removed representative holding -2 is refused as well',
+          table.getn(rep) == 0, string.format('%d candidate(s), why=%s', table.getn(rep),
+                                              tostring(fftsa.nl.sub_why)))
+    -- THE CROSS-CHECK BETWEEN THE TWO WORDS. slot+0x40 must point inside the routing array of
+    -- the widget named by slot+0x34, and the firmware wrote those two words from different
+    -- stores. A slot holding anything else is refused WITHOUT the dereference.
+    wire(fftsa.nl.PX_SUB_KIND, SGRAPH + fftsa.nl.PX_ROUTE_HI + 64, SGRAPH, SLOT)
+    local out = fftsa.nl.px_from_bufsub()
+    check('a routing pointer outside the widget is refused without being followed',
+          table.getn(out) == 0 and fftsa.nl.sub_why ~= nil,
+          tostring(fftsa.nl.sub_why))
+    -- AND THE TRACE HAS TO POINT BACK AT BOTH. Either half failing means the slot and the trace
+    -- disagree -- a torn read while the display task removes a trace, or a corpse whose kind has
+    -- not been cleared yet -- and a name match is not enough to believe the chain.
+    wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH + 16, SLOT)
+    local bg = fftsa.nl.px_from_bufsub()
+    check('a trace that names a different graph is refused',
+          table.getn(bg) == 0 and fftsa.nl.sub_why ~= nil, tostring(fftsa.nl.sub_why))
+    wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT + 296)
+    local bs2 = fftsa.nl.px_from_bufsub()
+    check('a trace that names a different subscription is refused',
+          table.getn(bs2) == 0 and fftsa.nl.sub_why ~= nil, tostring(fftsa.nl.sub_why))
+    -- THE WINDOW IS READ ONCE. The slot address is kept and re-checked with a single word,
+    -- because a 64 KB read every frame would put the route back in the same class of cost as
+    -- the thing it replaces.
+    wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+    fftsa.nl.px_from_bufsub()
+    -- THE INVARIANT IS THAT THE WINDOW IS NOT RE-READ, not that the walk is short. Counting
+    -- reads conflated the two and broke when the chain moved from peek32 to memread -- the
+    -- same number of IPC round trips through a different primitive. So this watches for a read
+    -- of the WINDOW's size, which is the expensive thing being avoided.
+    local wins = 0
+    local km = ki.memread
+    ki.memread = function(a, n)
+      if tonumber(n, 16) == fftsa.nl.PX_SUB_BYTES then wins = wins + 1 end
+      return km(a, n)
+    end
+    fftsa.nl.px_from_bufsub()
+    ki.memread = km
+    check('a second attempt re-checks the slot rather than re-reading the window',
+          wins == 0, string.format('%d window-sized read(s) on the second attempt', wins))
+    -- AN EMPTY RING IS "NOT FILLED YET", NOT "DEAD", AND THE ROUTE MUST OUTLIVE IT.
+    --
+    -- px_from_name's last test is `cnt >= 1`. For a heap search that IS the corpse test and it
+    -- is right: a freed ring holds zeros. For this route it is wrong, because the slot's kind
+    -- is live and the trace points back at both the graph and the slot -- so an empty ring means
+    -- the appends have not been through it yet.
+    --
+    -- Measured on the glass at 9.17: sub=D67CD0/2hit reached the right trace on the first
+    -- frames, was refused on the empty ring, and was never offered again because the idle arm
+    -- stops running once the state latches to 'seek'. The search then found that same trace's
+    -- own +0x220 twenty-six megabytes later. eng=4.7s/23f.
+    --
+    -- So the gate is not "does it work" -- that is above -- but "is it still asked once the
+    -- state has latched", which is what px_seek now does on every frame of the search.
+    do
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      -- An empty ring: the count word the header carries, zeroed.
+      wr32(TBOUND + fftsa.nl.HDR_COUNT, 0)
+      local empty = fftsa.nl.px_from_bufsub()
+      check('a slot whose ring is still empty yields nothing, and says so without giving up',
+            table.getn(empty) == 0 and fftsa.nl.px_subslot == SLOT,
+            string.format('%d candidate(s), slot still %s',
+                          table.getn(empty),
+                          fftsa.nl.px_subslot and string.format('%X', fftsa.nl.px_subslot)
+                          or 'nil'))
+      -- And the SEARCH arm asks again. Driven with the state already latched to 'seek', which
+      -- is the state the idle arm cannot run in and where the route used to be abandoned.
+      tracefix()
+      fftsa.nl.px.state = 'seek'
+      local gs2 = fftsa.nl.px_seek(HZ, NSEG, 4096, nil)
+      local g2, gi2 = nil, nil
+      for gi2 = 1, table.getn(gs2 or {}) do
+        if gs2[gi2].via_sub == true then g2 = gs2[gi2] end
+      end
+      check('the search arm asks the subscriber slot again once the ring has filled',
+            g2 ~= nil and g2.lo == TRING and fftsa.nl.px.via == 'sub',
+            g2 ~= nil and string.format('ring %X via=%s', g2.lo, tostring(fftsa.nl.px.via))
+            or string.format('%d candidate(s) from px_seek, why=%s',
+                             table.getn(gs2 or {}), tostring(fftsa.nl.sub_why)))
+      -- The window budget is per PASS, not per session: a restart rebinds the traces, so reads
+      -- spent looking for the old subscription say nothing about the new one. Left cumulative,
+      -- it was exhausted by earlier blocks of this very suite.
+      fftsa.nl.px_subfinds = fftsa.nl.PX_SUB_FINDS + 1
+      fftsa.nl.px_subslot = nil
+      local spent = fftsa.nl.px_sub_slot()
+      fftsa.nl.px_restart('budget')
+      fftsa.nl.px_subslot = nil
+      local after = fftsa.nl.px_sub_slot()
+      check('a restart gives the window budget back, and keeps nothing stale',
+            spent == nil and after == SLOT,
+            string.format('spent=%s after a restart=%s', tostring(spent),
+                          after and string.format('%X', after) or 'nil'))
+    end
+    -- A KNOWN SLOT SUPPRESSES THE SWEEP, which is where the time actually went.
+    --
+    -- Measured at 9.19: swept=10MB/0pass -- the pass that engaged scanned nothing, and the
+    -- 10 MB was spent in the frames before the last rebind on an object that was then freed.
+    -- The app rebinds its traces while building its screens (re=5, "the drawn window moved
+    -- from 368C938+510 to 368C938+59" after "traces rebound"), so a sweep running alongside a
+    -- known slot is racing a target that keeps moving and discards everything it finds.
+    do
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      wr32(TBOUND + fftsa.nl.HDR_COUNT, 0)       -- the ring not filled yet
+      fftsa.nl.px_sub_slot()                     -- so the slot is known
+      fftsa.nl.px.state = 'seek'
+      fftsa.nl.px.subwait = 0
+      local sw0 = fftsa.nl.px.swept or 0
+      fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 15001, nil)
+      check('a known slot with an unfilled ring waits instead of sweeping',
+            (fftsa.nl.px.swept or 0) == sw0 and fftsa.nl.px.state == 'idle'
+            and (fftsa.nl.px.subwait or 0) == 1,
+            string.format('swept %d -> %d, state=%s, subwait=%s', sw0,
+                          fftsa.nl.px.swept or 0, tostring(fftsa.nl.px.state),
+                          tostring(fftsa.nl.px.subwait)))
+      -- AND THE WAIT IS BOUNDED, or a build whose slot means something else never searches.
+      local keepok = fftsa.nl.px_subok
+      fftsa.nl.px_subok = nil
+      fftsa.nl.px.subwait = fftsa.nl.PX_SUB_WAIT
+      fftsa.nl.px.state = 'seek'
+      fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 15002, nil)
+      check('and the wait is bounded, so the sweep still runs if the ring never fills',
+            (fftsa.nl.px.swept or 0) > sw0,
+            string.format('swept %d -> %d after %d frames of waiting', sw0,
+                          fftsa.nl.px.swept or 0, fftsa.nl.PX_SUB_WAIT))
+      -- UNLESS THE CHAIN HAS ALREADY ANSWERED ONCE on this instrument, in which case the
+      -- sweep has nothing to add: whatever it finds is the object the slot already names. This
+      -- is what makes "no scans once it is in fast mode" hold across a drop, not just while
+      -- the path is engaged.
+      local sw1 = fftsa.nl.px.swept or 0
+      fftsa.nl.px_subok = true
+      fftsa.nl.px.subwait = fftsa.nl.PX_SUB_WAIT * 10
+      fftsa.nl.px.state = 'seek'
+      fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 15003, nil)
+      check('a route that has answered once retires the sweep for the session',
+            (fftsa.nl.px.swept or 0) == sw1 and fftsa.nl.px.state == 'idle',
+            string.format('swept %d -> %d with subwait=%s, state=%s', sw1,
+                          fftsa.nl.px.swept or 0, tostring(fftsa.nl.px.subwait),
+                          tostring(fftsa.nl.px.state)))
+      fftsa.nl.px_subok = keepok
+      tracefix()
+    end
+    -- ---- NO SEARCHING ONCE THE F IS ON THE GLASS ----------------------------
+    --
+    -- sg_fast_text returns "" unless px.state == 'on' (tsp/spectrum_graph.tsp), so the F is
+    -- shown exactly when the path is engaged. px_try's engaged arm returns px_frame at once and
+    -- no search code is reachable from it -- this gate is what keeps that true, by counting the
+    -- calls rather than by reading the control flow.
+    --
+    -- Measured on the glass at 9.20: swept=0MB/0pass for the whole launch and rd=0/0KB on the
+    -- engaged frame. The 34.8 MB in nf= is the one-off bind-time descriptor discovery, which
+    -- runs before any frame and is not the pixel path.
+    do
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      tracefix()
+      -- Engage through the ordinary route, so this is the real engaged state and not a field
+      -- poked into place.
+      fftsa.nl.px.state = 'seek'
+      local calls, n2 = 0, nil
+      while n2 == nil and calls < 40 do
+        calls = calls + 1
+        n2 = fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 16000 + calls, nil)
+      end
+      local onstate = fftsa.nl.px.state
+      local sw2 = fftsa.nl.px.swept or 0
+      -- Now count everything a frame could spend while the F is up.
+      local finds, reads, peeks = 0, 0, 0
+      local kf, km, kp = fftsa.nl.FINDS, ki.memread, ki.peek32
+      fftsa.nl.FINDS = function(a, b, c) finds = finds + 1; return kf(a, b, c) end
+      ki.memread = function(a, b) reads = reads + 1; return km(a, b) end
+      ki.peek32 = function(a) peeks = peeks + 1; return kp(a) end
+      local drew, f2, whys = 0, nil, ''
+      for f2 = 1, 12 do
+        if fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 17000 + f2, nil) == NSEG then
+          drew = drew + 1
+        else
+          whys = whys .. ' f' .. tostring(f2) .. '=' .. tostring(fftsa.nl.px.whyframe
+                 or fftsa.nl.px.why)
+        end
+      end
+      fftsa.nl.FINDS, ki.memread, ki.peek32 = kf, km, kp
+      -- WHAT IS ASSERTED IS THE SEARCHING, NOT THE STABILITY. This fixture's ring is static:
+      -- nothing advances the firmware's own reference point, so after a few frames the drift
+      -- check correctly refuses the map -- "the map is 294.0 px out on the firmware's own
+      -- point" -- and the path cycles. That is the fixture, not the product; on the instrument
+      -- the display task maintains the ring and the F stays up. Pinning the frame count here
+      -- would be pinning the harness's limitation.
+      --
+      -- What this gate exists for is the guarantee the operator asked for: once the F is on the
+      -- glass there is no search work. Zero FINDS and a swept figure that does not move say
+      -- that, and they say it whether or not the frames in between drew.
+      check('once the F is up, an engaged frame searches nothing and sweeps nothing',
+            onstate == 'on' and drew > 0 and finds == 0
+            and (fftsa.nl.px.swept or 0) == sw2,
+            string.format('state=%s, %d/12 frames drew, %d FINDS, swept %d -> %d, '
+                          .. '%d memread %d peek32%s', tostring(onstate), drew, finds, sw2,
+                          fftsa.nl.px.swept or 0, reads, peeks, whys))
+      -- AND WHAT A DROP COSTS. px_restart sends the path back to idle, holds PX_HOLD frames of
+      -- plain appends -- an engaged frame wrote pixel triples rather than values, so the two no
+      -- longer describe the same spectrum and nothing can be fitted until a few ordinary passes
+      -- have been through -- and then re-walks the slot. With the chain already proven there is
+      -- no sweep in any of it.
+      local sw3 = fftsa.nl.px.swept or 0
+      finds = 0
+      fftsa.nl.FINDS = function(a, b, c) finds = finds + 1; return kf(a, b, c) end
+      fftsa.nl.px_dropframe('the drawn window moved')
+      local held = fftsa.nl.px.hold or 0
+      local back, f3 = nil, nil
+      for f3 = 1, 20 do
+        if back == nil and fftsa.nl.px.state == 'on' then back = f3 end
+        fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 18000 + f3, nil)
+      end
+      fftsa.nl.FINDS = kf
+      -- Same scoping: that it came BACK is asserted, not that it stayed, for the reason above.
+      check('a drop holds for PX_HOLD frames, then re-engages with no search of any kind',
+            held == fftsa.nl.PX_HOLD and back ~= nil and finds == 0
+            and (fftsa.nl.px.swept or 0) == sw3,
+            string.format('held=%d of %d, back at frame %s, %d FINDS, swept %d -> %d, state=%s',
+                          held, fftsa.nl.PX_HOLD, tostring(back), finds, sw3,
+                          fftsa.nl.px.swept or 0, tostring(fftsa.nl.px.state)))
+    end
+    -- ---- A MODEL WHOSE LAYOUT IS NOT THE 6500'S -----------------------------
+    --
+    -- There is no DMM7510 on the bench and there will not be one before this ships, so the
+    -- 7510 arm has to be exercised here or not at all. Its display code IS the same
+    -- architecture -- rom/rom7519.zx, header disp7510_r, flattening to RAM 0..0xD03000 with
+    -- S$BE at 0x00170F30, S$BA at 0x00171520, PEG Main at 0x0016E398 and defbuffer1 beside
+    -- them -- but every address and offset is unknown.
+    --
+    -- So this builds a table that shares NOTHING with the 6500's: a different place, a
+    -- different kind constant, a different name offset, and the trace reached through a
+    -- different word of the slot. The route has to find it anyway, because the only thing it
+    -- is allowed to rely on is a name this app chose itself.
+    do
+      local FLO = fftsa.nl.PX_SUB_FROM + 2 * fftsa.nl.PX_SUB_STEP
+      local FSLOT = FLO + 4096
+      local FNAME = 16                       -- not the 6500's 8
+      local FKIND = 25000                    -- not 0x407F
+      local FP4 = 96                         -- not 0x40, and no graph word at 0x34
+      local function wrstr2(at, str)
+        local i
+        for i = 0, string.len(str) - 1 do
+          local a = at + i
+          local w = a - math.mod(a, 4)
+          local old4 = IMG[w] or string.rep(string.char(0), 4)
+          local k = a - w + 1
+          IMG[w] = string.sub(old4, 1, k - 1) .. string.sub(str, i + 1, i + 1)
+                   .. string.sub(old4, k + 1)
+        end
+      end
+      local keepd, keepa, keepl = fftsa.nl.PX_SUB_DERIVE, fftsa.nl.PX_SUB_ANYKIND,
+                                  fftsa.nl.PX_SUB_LADDER
+      fftsa.nl.PX_SUB_DERIVE, fftsa.nl.PX_SUB_ANYKIND = true, true
+      fftsa.nl.PX_SUB_LADDER = true
+      build(nil)
+      tracefix()
+      fftsa.nl.px_subslot, fftsa.nl.px_subwin = nil, nil
+      fftsa.nl.px_subfinds, fftsa.nl.sub_walkdone = 0, nil
+      fftsa.nl.sub_walkat, fftsa.nl.sub_hits, fftsa.nl.sub_first = 0, nil, nil
+      wr32(FSLOT, FKIND)
+      wrstr2(FSLOT + FNAME, fftsa.nl.PX_NAME .. string.char(0))
+      -- One level only on this model: the slot word points straight at the trace.
+      wr32(FSLOT + FP4, TLO)
+      -- The walk resumes across frames, so give it the frames it needs.
+      local gs3, tries = {}, 0
+      while table.getn(gs3) == 0 and tries < 60 do
+        tries = tries + 1
+        fftsa.nl.rd_frame_reset()
+        gs3 = fftsa.nl.px_from_bufsub()
+      end
+      local g3, gi3 = nil, nil
+      for gi3 = 1, table.getn(gs3) do
+        if gs3[gi3].stride == STRIDE then g3 = gs3[gi3] end
+      end
+      check('an unknown model: the name is found by ladder and the offsets are derived',
+            g3 ~= nil and g3.lo == TRING and fftsa.nl.px_subslot == FSLOT
+            and fftsa.nl.sub_nameoff == FNAME and fftsa.nl.sub_derived == true,
+            g3 ~= nil and string.format('ring %X, slot %X, nameoff=%s, p4off=%s, %s level(s)',
+                                        g3.lo, fftsa.nl.px_subslot or 0,
+                                        tostring(fftsa.nl.sub_nameoff),
+                                        tostring(fftsa.nl.sub_p4off),
+                                        tostring(fftsa.nl.sub_levels))
+            or string.format('%d tries, slot=%s, why=%s', tries,
+                             tostring(fftsa.nl.px_subslot), tostring(fftsa.nl.sub_why)))
+      -- AND ON THE 6500 ARM NONE OF THAT IS ALLOWED TO RUN, because every figure there is
+      -- measured and a derivation could only make it slower or less certain.
+      fftsa.nl.PX_SUB_DERIVE, fftsa.nl.PX_SUB_ANYKIND = false, false
+      fftsa.nl.PX_SUB_LADDER = false
+      fftsa.nl.px_subslot, fftsa.nl.px_subwin = nil, nil
+      fftsa.nl.px_subfinds, fftsa.nl.sub_derived = 0, nil
+      local reads2 = 0
+      local km2 = ki.memread
+      ki.memread = function(a, b) reads2 = reads2 + 1; return km2(a, b) end
+      local none = fftsa.nl.px_from_bufsub()
+      local again = fftsa.nl.px_from_bufsub()
+      ki.memread = km2
+      check('on a 6500 a missing name costs one window read and no ladder',
+            table.getn(none) == 0 and table.getn(again) == 0 and reads2 <= 2
+            and fftsa.nl.sub_derived == nil,
+            string.format('%d memread(s) for two attempts, derived=%s, why=%s', reads2,
+                          tostring(fftsa.nl.sub_derived), tostring(fftsa.nl.sub_why)))
+      -- THE 6500 MUST NOT BE SLOWED BY ANY OF THIS, which is the operator's requirement and
+      -- the reason all three knobs default off: an instrument whose model this module fails to
+      -- recognise gets the measured path, not the exploratory one.
+      check('the unknown-model machinery is off unless a model asks for it',
+            keepd == false and keepa == false and keepl == false,
+            string.format('derive=%s anykind=%s ladder=%s', tostring(keepd), tostring(keepa),
+                          tostring(keepl)))
+      -- AND WHAT A 6500 FRAME PAYS FOR THE ROUTE, counted. Once the slot is known this is a
+      -- re-check and a walk: one word for the kind, the graph and the routing pointer, the
+      -- element, the two back-pointers, and the name. A regression here is the route turning
+      -- into something that has to be rationed per frame, which is the whole thing it replaced.
+      fftsa.nl.PX_SUB_DERIVE, fftsa.nl.PX_SUB_ANYKIND = keepd, keepa
+      fftsa.nl.PX_SUB_LADDER = keepl
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+      fftsa.nl.px_from_bufsub()
+      local r6, p6 = 0, 0
+      local km6, kp6 = ki.memread, ki.peek32
+      ki.memread = function(a, b) r6 = r6 + 1; return km6(a, b) end
+      ki.peek32 = function(a) p6 = p6 + 1; return kp6(a) end
+      local got6 = fftsa.nl.px_from_bufsub()
+      ki.memread, ki.peek32 = km6, kp6
+      -- THE WINDOW VALUES THEMSELVES, independently of the fixture.
+      --
+      -- Every gate above places its synthetic slot at whatever PX_SUB_LO happens to be, so a
+      -- model selection that was reversed, or dropped, would still pass all of them. These two
+      -- assert the measured numbers outright: 0x00D60000 for a DMM6500, whose table is at
+      -- 0x00D67708 (1.7.17a) and 0x00D67A48 (1.7.18a); 0x00510000 for a DMM7510, whose table is
+      -- at 0x005189C8 with 64 slots of 0x100 -- read out of rom7519's own loader mapping, where
+      -- RAM address equals flattened-image offset.
+      check('the compiled windows are the measured ones, and each holds its table',
+            fftsa.nl.PX_SUB_LO == 14024704 and fftsa.nl.PX_SUB_LO_7510 == 5308416
+            and fftsa.nl.PX_SUB_BYTES == 65536
+            and 14024704 <= 14055176 and 14055176 < 14024704 + 65536
+            and 5308416 <= 5343688 and 5343688 + 64 * 256 < 5308416 + 65536,
+            string.format('6500 %X, 7510 %X, %d bytes', fftsa.nl.PX_SUB_LO,
+                          fftsa.nl.PX_SUB_LO_7510, fftsa.nl.PX_SUB_BYTES))
+      -- A GUARDED READ CAN ANSWER nil, AND A DIAGNOSTIC MAY NOT RAISE ON IT. hx is
+      -- string.format('%X', v), so a refused back-pointer read would have thrown inside the
+      -- frame instead of reaching the About page with its reason -- in the one path whose whole
+      -- job is to explain itself on a model nobody can measure.
+      do
+        wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subslot, fftsa.nl.px_subwin = nil, nil
+        fftsa.nl.px_subfinds = 0
+        -- An unreadable trace: the routing element points somewhere _wg refuses.
+        wr32(SP4, 2)
+        local raised = nil
+        local okc, errc = pcall(function() return fftsa.nl.px_from_bufsub() end)
+        if not okc then raised = tostring(errc) end
+        check('an unreadable pointer in the chain reports a reason instead of raising',
+              raised == nil and fftsa.nl.sub_why ~= nil,
+              raised or tostring(fftsa.nl.sub_why))
+        wr32(SP4, TLO)
+      end
+      -- ROUND TRIPS, NOT PRIMITIVES. ki.memread and ki.peek32 each cost one trip through the
+      -- firmware's read path, and the chain reads through memread now rather than peek32
+      -- because memread validates and refuses where peek32 faults. Counting them separately
+      -- made this gate fail on a change that moved cost from one column to the other without
+      -- adding any.
+      check('a 6500 call walks the known slot in a handful of round trips, and no window read',
+            table.getn(got6) > 0 and (r6 + p6) <= 20,
+            string.format('%d candidate(s), %d round trip(s): %d memread, %d peek32',
+                          table.getn(got6), r6 + p6, r6, p6))
+      -- AND THE SAME COUNTED OVER A WHOLE px_try FRAME, which is the figure the operator's
+      -- requirement is about. The route is called from the idle arm AND from px_seek, so a
+      -- frame can walk the chain twice -- a count taken on one call does not prove a per-frame
+      -- cost, and it was being quoted as though it did.
+      do
+        wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+        fftsa.nl.px.state = 'seek'
+        local c6 = 0
+        while fftsa.nl.px.state ~= 'on' and c6 < 40 do
+          c6 = c6 + 1
+          fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 19000 + c6, nil)
+        end
+        local onstate6 = fftsa.nl.px.state
+        local ra, pa = 0, 0
+        local kma, kpa = ki.memread, ki.peek32
+        ki.memread = function(a, b) ra = ra + 1; return kma(a, b) end
+        ki.peek32 = function(a) pa = pa + 1; return kpa(a) end
+        fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 19500, nil)
+        local re, pe = ra, pa
+        fftsa.nl.px.state = 'seek'
+        fftsa.nl.px_try(DB, HZ, NSEG, 'TB', 19600, nil)
+        ki.memread, ki.peek32 = kma, kpa
+        -- An engaged frame is NOT zero reads and should not be asserted as such: it reads the
+        -- ring's own cursors to check the map still describes the window being drawn -- the
+        -- drift check, which is what refuses a map that has gone stale rather than drawing a
+        -- wrong spectrum. Two reads. What must be zero in fast mode is SEARCHING, which the
+        -- gate above counts as FINDS calls and swept bytes.
+        check('a 6500 engaged frame costs two round trips, and a searching one a handful',
+              onstate6 == 'on' and (re + pe) <= 2
+              and ((ra - re) + (pa - pe)) <= 24,
+              string.format('engaged %d round trip(s); searching %d',
+                            re + pe, (ra - re) + (pa - pe)))
+      end
+      -- THE DECOY MUST NOT WIN UNDER THE LOOSE KIND TEST. The c2c request record carries the
+      -- name with a pointer to the live slot 8 bytes before it, and it sits BELOW the table, so
+      -- a forward search finds it first. A plausible non-zero word satisfies the loose test and
+      -- a slot address is plausible -- so a single pass would cache the decoy and never reach
+      -- the real slot behind it. Exact kind has to be exhausted across every hit first.
+      do
+        local keepa2 = fftsa.nl.PX_SUB_ANYKIND
+        fftsa.nl.PX_SUB_ANYKIND = true
+        wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+        local pick = fftsa.nl.px_sub_slot()
+        check('the loose kind test does not let the decoy win over an exact match',
+              pick == SLOT and fftsa.nl.sub_loose ~= true,
+              string.format('picked %s, wanted the real slot %X, loose=%s',
+                            pick and string.format('%X', pick) or 'nil', SLOT,
+                            tostring(fftsa.nl.sub_loose)))
+        fftsa.nl.PX_SUB_ANYKIND = keepa2
+      end
+      fftsa.nl.px_subslot, fftsa.nl.px_subwin = nil, nil
+      fftsa.nl.px_subfinds, fftsa.nl.sub_walkdone = 0, nil
+    end
+    fftsa.nl.px_subslot = nil
+    fftsa.nl.px_restart('subscriber done')
+  end
+
   ki.memwrite, buffer.write = nil, nil
   FFTSA_PXRING, fftsa.nl.arena = nil, nil
+  fftsa.nl.nfind = SAVED_NF
+  fftsa.nl.ready, fftsa.nl.find_addr = SAVED_RDY, SAVED_FA
+  fftsa.nl.map_lo, fftsa.nl.map_hi = nil, nil
   fftsa.nl.px_restart('suite done')
   tostring = SAVEDT
 end

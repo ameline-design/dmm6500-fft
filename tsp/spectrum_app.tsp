@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '8.69'
+fftsa.VERSION = '9.26'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -122,6 +122,22 @@ fftsa.flo_max = fftsa.fhi_max - 1000
 fftsa.range   = 10          -- digitizer input range (V): 0.1 / 1 / 10
 fftsa.fs      = 100000      -- sample rate (picked from fftsa.fhi, then measured)
 fftsa.binhz   = 0           -- true bin width, from measured fs
+-- The bin width in force, HELD rather than taken fresh every frame. See binhz_hold.
+fftsa.binhz_pin = nil
+-- How far a new measurement has to be from the held one before it is adopted, as a fraction.
+--
+-- THE SERIES THE TRACE IS WRITTEN FROM HAS TO BE BIT-STABLE, and a rate measured from each
+-- capture's own timestamps is not: measure_fs is (n-1)/(tN-t1), so quantisation in the
+-- timestamps moves it in the last bits every frame. The pixel path keys its slot map on the
+-- frequencies the firmware stored when the appends ran, so a series that moves at all
+-- invalidates the map -- measured on the instrument as the drop reason "the frequency series
+-- moved under the slot map", with 556 MB swept and fifteen restarts recovering from it.
+--
+-- This is a hold, not a rounding: the value in force is a measurement, so its accuracy is
+-- that of one measurement rather than of this tolerance. The tolerance only says when a
+-- different rate is believed, and 0.1% is far more than timestamp jitter and far less than
+-- any rate change a digitizer clock can actually make.
+fftsa.BINHZ_REPIN = 1e-3
 fftsa.busy    = false       -- reentrancy guard (never preserved across a reload)
 fftsa.stop_pending = false  -- a teardown deferred until the running frame ends
 fftsa.retune_pending = false -- a gesture's span, waiting for its re-plan between frames
@@ -288,6 +304,30 @@ function fftsa.measure_fs(buf)
   local t1, tN = buf.relativetimestamps[1], buf.relativetimestamps[n]
   if tN <= t1 then return back end
   return (n - 1) / (tN - t1)
+end
+
+-- The bin width to use this frame: the held one, unless the capture says the rate has really
+-- changed. One value for the trace AND the markers, which is the invariant the frame below
+-- depends on -- they would otherwise describe different frequencies.
+--
+-- binhz_repins counts the adoptions. A count that climbs with the frame number means the hold
+-- is not holding and the tolerance is below the jitter, which is the one thing about this that
+-- cannot be settled off the instrument.
+function fftsa.binhz_hold(cap)
+  local b = fftsa.measure_fs(cap) / fftsa.n
+  local pin = fftsa.binhz_pin
+  if pin == nil or pin <= 0 or b <= 0 then
+    fftsa.binhz_pin = b
+    return b
+  end
+  local d = b - pin
+  if d < 0 then d = -d end
+  if d > pin * fftsa.BINHZ_REPIN then
+    fftsa.binhz_pin = b
+    fftsa.binhz_repins = (fftsa.binhz_repins or 0) + 1
+    return b
+  end
+  return pin
 end
 
 -- The clamped frame-class counts, recomputed every frame so every knob stays live. Both
@@ -582,6 +622,9 @@ function fftsa.apply()
   fftsa.fs_acq = fftsa.measure_fs(fftsa.cap)
   fftsa.fs     = fftsa.fs_acq
   fftsa.binhz  = fftsa.fs / fftsa.n
+  -- The hold starts here, at the count and span just committed, so the first frame is already
+  -- stable. Re-pinned rather than cleared: this capture is as good a measurement as a frame's.
+  fftsa.binhz_pin = fftsa.binhz
   -- Large transforms outrun the 2 s default, so the guard follows the measured frame cost
   -- with margin rather than a multiple of the sample count.
   fftsa.busy_max = math.max(2.0, 3.0 * fftsa.frame_estimate(fftsa.n))
@@ -752,9 +795,10 @@ function fftsa.frame_body()
       fftsa.shortreads = fftsa.nl_shortreads
       return
     end
-    -- The bin width this capture delivered, off its own timestamps: the samplerate
-    -- read-back does not match what arrives, so it is never the source.
-    local binhz = fftsa.measure_fs(fftsa.cap) / fftsa.n
+    -- The bin width in force, off the capture's own timestamps -- the samplerate read-back
+    -- does not match what arrives, so it is never the source -- but HELD, because the trace's
+    -- frequency series has to be the same one from frame to frame. binhz_hold says why.
+    local binhz = fftsa.binhz_hold(fftsa.cap)
     -- nil for the output: the primitive reduces and touches no reading buffer.
     nseg = fftsa.nl.call_dsp(fftsa.nl_cap, nil, fftsa.nl_reduction(binhz))
     if nseg == nil then
@@ -1058,6 +1102,25 @@ function fftsa.frame()
       if move < 0 then
         move, need = -move, fftsa.tick_grid
       end
+      -- A MODELLED PERIOD IS NOT A CONVERGED ONE, so the deadband does not apply to the first
+      -- measurement after a size change.
+      --
+      -- The deadband exists to stop a converged period re-arming on jitter: every step is a
+      -- timer delete and create, and chasing noise swung the rate at 4096. It has no business
+      -- gating the FIRST correction after the period was set from frame_estimate, which is a
+      -- model and not a measurement -- and the asymmetry makes that worse in the direction
+      -- that hurts most. A model short of the truth by less than tick_rise is never corrected
+      -- at all: the timer fires into a frame that is still running, the tick is dropped, and
+      -- the result is an uneven cadence at an effectively halved rate that never settles.
+      --
+      -- Measured on the glass at 8.97, both directions of a size change: slow and uneven for
+      -- several seconds before the rate settled, with the F lit throughout -- so the fast path
+      -- was carrying every one of those frames and the unevenness was this loop alone.
+      --
+      -- period_modelled already shortens the window to one frame here. This makes that first
+      -- window adopt what it measured, in either direction, which is one window instead of
+      -- several seconds of hunting. Jitter is still deadbanded every window after it.
+      if fftsa.period_modelled then need = 0 end
       if fftsa.period == nil or move >= need then
         fftsa.period = want
         fftsa.arm(want)
@@ -1368,6 +1431,7 @@ function fftsa.diag_str()
               .. ' rot=' .. tostring(fftsa.nl_rotated)
               .. ' n=' .. tostring(fftsa.n)
               .. ' ncol=' .. tostring(fftsa.sg_ncol)
+              .. ' repin=' .. tostring(fftsa.binhz_repins or 0)
   local d = nil
   if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
     local ok, got = pcall(fftsa.nl.diag)

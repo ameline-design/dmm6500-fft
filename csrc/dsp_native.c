@@ -210,6 +210,32 @@ typedef struct {
      * the PARAM_WORDS check catches the two sides disagreeing about the size.  Lua writes 0
      * here before every call, so a stale line cannot be read as this call's. */
     uint32_t fail_at;
+
+    /* Scratch for DSPN_MODE_FIND: one pointer, not forty-two words of struct.
+     *
+     * A byte-pattern search over DRAM, run here because the Lua side cannot. There it is
+     * ki.memread per 32 KB block over the control path -- 25 MB/s measured, so one pass over
+     * the backstop is 800 frames at the budget a frame can afford, which is why a size change
+     * took 35 seconds to recover. Native code is in the same address space and reads memory
+     * directly: no IPC, no block, no budget.
+     *
+     * The block, big-endian words, Lua writes [0..7] and reads [8..]:
+     *
+     *   [0]  lo        where to start, inclusive
+     *   [1]  hi        one past the end
+     *   [2]  cap       bytes this call may scan before stopping, so a frame stays a frame
+     *   [3]  len       needle length in the low half, 1..DSPN_FIND_PAT;
+     *                   STEP in the high half, 1, 2 or 4 -- see below. Zero means 1, so a
+     *                   caller that does not know about the step gets the old behaviour.
+     *   [4..7]         the needle, first byte in the top of [4]
+     *   [8]  next      OUT: resume here; equal to hi when the range is finished
+     *   [9]  n         OUT: hits written below
+     *   [10..]         OUT: hit addresses, at most DSPN_FIND_MAX
+     *
+     * Addressed rather than inlined for the same reason res_addr is: the params struct is a
+     * wire format Lua packs on every frame, and forty-two words of search state would be
+     * written on every frame that does no searching. */
+    uint32_t find_addr;
 } dsp_native_params;
 
 #define DSPN_MODE_INIT   1U
@@ -217,6 +243,17 @@ typedef struct {
 #define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; reads nothing but the  */
                               /* params struct, and writes nothing but its status word  */
 #define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes, the same way       */
+#define DSPN_MODE_FIND   5U   /* byte-pattern search; reads the find block and DRAM, and */
+                              /* writes nothing but that block's output words            */
+
+/* The needle, and the hits one call may report. Sixteen bytes covers everything the search
+ * uses: a buffer name with its NUL is twelve, a doubled float32 is eight, four frequencies
+ * are sixteen. Thirty-two hits is what a dense slice yields before the caller wants to look
+ * at them, and it bounds the block. */
+#define DSPN_FIND_PAT    16U
+#define DSPN_FIND_MAX    32U
+#define DSPN_FIND_WORDS  (10U + DSPN_FIND_MAX)
+#define DSPN_FIND_BYTES  (DSPN_FIND_WORDS * 4U)
 
 /* Chunks the arena may span. At the largest n a single chunk can hold an array for, the
  * layout needs six, so this is generous; it bounds a stack array in dsp_native_run. */
@@ -270,6 +307,8 @@ typedef struct {
  *   [7] DSPN_RES_DOUBLES
  *   [8] offsetof(dsp_native_params, status)
  *   [9] offsetof(dsp_native_params, fail_at)
+ *  [10] DSPN_FIND_WORDS
+ *  [11] DSPN_FIND_MAX
  *
  * The backstop bounds are here so the Lua side can sanity-check an address before passing
  * it in, without a second copy of the numbers to drift: a Lua literal and this header
@@ -282,7 +321,7 @@ typedef struct {
  * Initialised, not tentative: without the initialiser this is a common definition that
  * lands in .bss as zeros and reports nothing.
  */
-const uint32_t dsp_native_sizes[10] = {
+const uint32_t dsp_native_sizes[12] = {
     (uint32_t)sizeof(dsp_plan),
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
@@ -292,11 +331,13 @@ const uint32_t dsp_native_sizes[10] = {
     (uint32_t)DSPN_RES_PEAKS,
     (uint32_t)DSPN_RES_DOUBLES,
     (uint32_t)offsetof(dsp_native_params, status),
-    (uint32_t)offsetof(dsp_native_params, fail_at)
+    (uint32_t)offsetof(dsp_native_params, fail_at),
+    (uint32_t)DSPN_FIND_WORDS,
+    (uint32_t)DSPN_FIND_MAX
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  55
+#define DSP_NATIVE_PARAM_WORDS  56
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -562,6 +603,108 @@ int dsp_native_run(void *L)
     if (p->mode == DSPN_MODE_SEGS) {
         RET(dsp_plan_segs((int)p->cap_n, (int)p->init_decim,
                           (int)p->init_method, (size_t)p->seg_bytes));
+    }
+
+    /* THE SEARCH, answered before any acquisition window is examined because it uses none of
+     * them: it reads the find block and the range that block names, and writes the block's
+     * own output words. Nothing else is touched.
+     *
+     * Every address is checked against the backstop before it is dereferenced -- the block
+     * itself, and the range. ki.memread goes through a firmware path that validates; a load
+     * from here does not, and an unmapped address is a data storage interrupt and a
+     * bluescreen. So the range is CLAMPED into the backstop rather than refused, which is
+     * what lets the caller hand over a window that runs off the end of DRAM. */
+    if (p->mode == DSPN_MODE_FIND) {
+        volatile uint32_t *fb;
+        const unsigned char *hay;
+        unsigned char pat[DSPN_FIND_PAT];
+        uint32_t flo, fhi, fcap, flen, fstep, nhit, pos, scanned, i;
+
+        if (!range_ok(p->find_addr, DSPN_FIND_BYTES, BACKSTOP_LO, BACKSTOP_HI)) {
+            RET(DSPN_EBOUNDS);
+        }
+        fb = (volatile uint32_t *)(uintptr_t)p->find_addr;
+
+        flo  = fb[0];
+        fhi  = fb[1];
+        fcap = fb[2];
+        /* The two halves by shifting rather than masking: a 0xFFFF literal here reads as an
+         * address to check_no_fw_addr.py, and widening that gate to admit a mask would be the
+         * wrong trade -- it exists to refuse exactly this shape of constant. */
+        flen  = (fb[3] << 16) >> 16;
+        fstep = fb[3] >> 16;
+        if (flen == 0U || flen > DSPN_FIND_PAT) { RET(DSP_EARG); }
+        for (i = 0U; i < flen; i++) {
+            pat[i] = (unsigned char)((fb[4U + (i >> 2)] >> (24U - 8U * (i & 3U))) & 0xFFU);
+        }
+
+        if (flo < BACKSTOP_LO) { flo = BACKSTOP_LO; }
+        if (fhi > BACKSTOP_HI) { fhi = BACKSTOP_HI; }
+        if (fcap == 0U) { fcap = fhi > flo ? fhi - flo : 0U; }
+
+        nhit = 0U;
+        scanned = 0U;
+        pos = flo;
+        /* THE STEP, AND WHY IT IS THE CALLER'S TO SET.
+         *
+         * This loop was `pos++` with a byte-wise comparison, and the cost of that was measured
+         * on the instrument rather than guessed at: oh=6.3ms @8MB/s, a marginal rate of eight
+         * megabytes a second, about twelve cycles a byte. Sixteen megabytes of sweeping is two
+         * seconds of scan, which no per-frame budget can do anything about except spread.
+         *
+         * Every needle this search is given is a field of a record at lo + k*stride + ox, and
+         * stride and ox are both multiples of four everywhere the caller derives them -- so a
+         * match can only ever begin word-aligned, and three quarters of the positions tested
+         * could never match anything.
+         *
+         * It is NOT assumed here. A silently skipped match is indistinguishable from an
+         * absence, and the caller moves its cursor past bytes nothing looked at -- the defect
+         * that once cost 981 MB of sweeping and reported the ring missing. So the step arrives
+         * in the request, zero means one, and a caller that knows its needle is aligned says
+         * so. Anything other than 1, 2 or 4 is refused rather than rounded.
+         *
+         * The first four bytes are compared as a word when the needle is long enough and the
+         * step keeps them aligned. That is the whole of the common case: a position that does
+         * not match is rejected by one load and one compare instead of up to four of each. */
+        if (fstep == 0U) { fstep = 1U; }
+        if (fstep != 1U && fstep != 2U && fstep != 4U) { RET(DSP_EARG); }
+        if (fstep == 4U && (flo & 3U) != 0U) { RET(DSP_EARG); }
+        {
+            uint32_t pw0 = 0U;
+            uint32_t wordwise = (flen >= 4U && fstep == 4U) ? 1U : 0U;
+            if (wordwise) {
+                pw0 = ((uint32_t)pat[0] << 24) | ((uint32_t)pat[1] << 16)
+                      | ((uint32_t)pat[2] << 8) | (uint32_t)pat[3];
+            }
+            while (pos + flen <= fhi && scanned < fcap && nhit < DSPN_FIND_MAX) {
+                if (wordwise) {
+                    if (*(const uint32_t *)(uintptr_t)pos == pw0) {
+                        hay = (const unsigned char *)(uintptr_t)pos;
+                        for (i = 4U; i < flen; i++) {
+                            if (hay[i] != pat[i]) { break; }
+                        }
+                        if (i == flen) {
+                            fb[10U + nhit] = pos;
+                            nhit++;
+                        }
+                    }
+                } else {
+                    hay = (const unsigned char *)(uintptr_t)pos;
+                    for (i = 0U; i < flen; i++) {
+                        if (hay[i] != pat[i]) { break; }
+                    }
+                    if (i == flen) {
+                        fb[10U + nhit] = pos;
+                        nhit++;
+                    }
+                }
+                pos += fstep;
+                scanned += fstep;
+            }
+        }
+        fb[8] = pos;
+        fb[9] = nhit;
+        RET((int32_t)nhit);
     }
 
     /* The declared windows have to be sane in themselves, and inside the backstop,

@@ -262,15 +262,16 @@ def main():
     sizes_addr = elf.symbol_named("dsp_native_sizes")
     if sizes_addr is None:
         sys.exit("dsp_native_sizes not found: the Lua side needs the target's struct sizes")
-    raw = elf.read_at(sizes_addr, 40)
-    if raw is None or len(raw) != 40:
+    raw = elf.read_at(sizes_addr, 48)
+    if raw is None or len(raw) != 48:
         sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
     (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
-     res_peaks, res_doubles, status_off, fail_off) = struct.unpack(">IIIIIIIIII", raw)
+     res_peaks, res_doubles, status_off, fail_off,
+     find_words, find_max) = struct.unpack(">IIIIIIIIIIII", raw)
     # fail_off is excluded from the zero test: it is an offset and a zero one would mean the
     # field had moved to the front of the struct, which the fit test below catches anyway.
     if 0 in (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
-             res_peaks, res_doubles, status_off):
+             res_peaks, res_doubles, status_off, find_words, find_max):
         sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
                  "rather than an initialised one in .rodata")
     if bs_lo >= bs_hi:
@@ -310,6 +311,9 @@ def main():
         fh.write("-- results block: Lua reserves the memory and decodes what lands in it\n")
         fh.write("fftsa.nl.RES_PEAKS = %d\n" % res_peaks)
         fh.write("fftsa.nl.RES_DOUBLES = %d\n" % res_doubles)
+        fh.write("-- the find block, for the native search: Lua reserves it and packs it\n")
+        fh.write("fftsa.nl.FIND_WORDS = %d\n" % find_words)
+        fh.write("fftsa.nl.FIND_MAX = %d\n" % find_max)
         fh.write("-- the word in the image the params address is patched into, and the word\n")
         fh.write("-- of the params struct the call reports through\n")
         fh.write("fftsa.nl.PARAMS_SLOT = %d\n" % params_slot)

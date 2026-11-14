@@ -14,6 +14,33 @@ screen and buffer the app made.
 samples a frame, 256 bins, 10 frames a second. Options offers larger records for finer bin spacing,
 at a slower update rate.
 
+### The `F` at the start of the bottom line
+
+The bottom line reads `F  2048 pts  …` once the app is drawing by its **fast path**. Instead of
+appending 510 readings one at a time for the firmware's display task to copy, it writes the
+pixel records straight into the task's own ring in a single operation, and asks for one repaint.
+That is about twice the frame rate, and it is what the rate figures in *Limits* assume.
+
+It should appear **within about three seconds of launch**, and then stay. A number after it --
+`F2`, `F3` -- counts how many times the path has had to re-acquire since the line last changed.
+Changing the span or the sample count does that, and so does anything that makes the firmware
+rebuild its trace: the count going up by one now and then is normal and costs a few frames each
+time, during which the app falls back to appending.
+
+**If no `F` appears within five seconds**, the fast path has not found what it needs on your
+instrument. Nothing is wrong with the measurements -- the append path is correct and shows the
+same spectrum -- but you are getting about half the frame rate, and we would like to fix it.
+
+Go to **Options → About** and page through with **PgDn**. There are four pages; the later ones
+are short. **Photograph every page** and post them to the
+EEVblog thread [TSP and Lua scripts for modern Keithley DMMs, SMUs etc](https://www.eevblog.com/forum/testgear/tsp-and-lua-scripts-for-modern-keithley-dmms-smus-etc/),
+saying which instrument and firmware version you have -- the About page's first line gives both.
+
+Those pages carry every address the fast path examined and the reason it stopped: which memory
+window it read, whether it found the app's own buffer name there, which link of the chain
+refused and with what value. The DMM6500's entire layout was worked out from one such
+photograph, so one from a model we have not been able to test is genuinely enough to act on.
+
 **Both axes are labelled in the units you want: kHz across, dB down.** That is worth a note only
 because it was not always so, and the two mechanisms are worth knowing if you read the source. The
 graph object's X axis is labelled in seconds whenever it is bound to a reading's timestamp, with a
@@ -241,6 +268,12 @@ works either way.
 ## Options
 
 ![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Reset, Apply and Cancel along the bottom. Start Freq reads 10.0000 Hz, Stop Freq 50.0000 kHz, Input Range 10 V, Window Hann, Kaiser Beta 12 -90dB and FFT Samples 512](manual-options.png)
+
+**If the Options key is slow to respond, something is talking to the instrument.** Front-panel
+keys are dispatched by the firmware's display task, and that dispatch stops while a LAN or USB
+session is connected -- a script, a probe, anything holding the control socket. Presses queue
+rather than land, and arrive together when the session closes. Close it and the key is immediate
+again. On its own the app stays responsive at every sample count.
 
 | Field | |
 |---|---|
@@ -660,6 +693,9 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 | Peak flat-topped at +20 dBV | Over range. |
 | Peaks update but the trace is missing | A frame failed inside the refill, leaving the trace unbound. Fixed in this build; on an older one, change the span or the sample count to force a rebind. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
+| No `F` at the start of the bottom line after five seconds | The fast path has not found the firmware's trace ring on this instrument, so the app is appending instead -- correct, about half the rate. Photograph all four **About** pages and post them to the EEVblog TSP scripts thread; they name the window it read and the link that refused. See *The `F` at the start of the bottom line*. |
+| The `F` number keeps climbing while you watch | The path is re-acquiring repeatedly. A few are normal after a span or sample-count change. Continuous climbing with the rate down is worth reporting, with the About pages. |
+| Options, or any front-panel key, slow to respond | Something is holding the instrument's control socket -- a LAN or USB session stops the display task dispatching keys. Close it and the presses arrive. Not related to the sample count. |
 | About half the frame rate the table above gives | The compiled transform did not install, so the app is running the interpreted one. It installs once per power cycle, so a second launch without a power cycle always lands here: power cycle and launch once. A firmware upgrade is not the explanation -- the compiled path holds no address belonging to a firmware build and finds what it needs on the instrument it is running on. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | A red `FFT <version>` page instead of the analyser | The compiled path could not bind, or started and then gave up, and this archive has no interpreted fallback. See "If the app stops, or will not start" above: capture every page. |

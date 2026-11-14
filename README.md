@@ -18,6 +18,29 @@ frames a second.
 
 `docs/MANUAL.md` is the user manual. Start there to operate it; read on for how it works.
 
+## The F indicator, and what to do if it does not appear
+
+The bottom line of the spectrum screen begins with **`F`** once the app is drawing by its fast
+path — writing pixel records straight into the firmware's graph ring instead of appending
+readings one at a time. That roughly doubles the frame rate. It appears within about three
+seconds of launch and then stays up; `F2`, `F3` and so on count the times it has had to
+re-acquire, which a span or sample-count change will do.
+
+**If no `F` appears within five seconds of starting the app**, the fast path has not found what
+it needs on your instrument and the app is running on the slower append path — correct, just
+about half the rate. Please help us fix it: go to **Options → About**, page through all four
+pages, photograph each, and post them to the
+EEVblog thread [TSP and Lua scripts for modern Keithley DMMs, SMUs etc](https://www.eevblog.com/forum/testgear/tsp-and-lua-scripts-for-modern-keithley-dmms-smus-etc/).
+Those pages carry the addresses the app looked at and the reason it stopped, which is what
+makes the difference diagnosable without the instrument in front of us. Say which model and
+firmware version you are on — the About page's first line has both.
+
+**If the Options key is slow to respond, something is talking to the instrument.** Front-panel
+keys are dispatched by the display task, and a LAN or USB session — a script, a probe, anything
+holding the control socket — stops that dispatch while it is connected, so presses queue instead
+of landing. Close the session and the key is immediate again. On its own the app stays
+responsive at every sample count.
+
 ## What it does
 
 - **Digitizes** up to 1 MS/s, with selectable 512 to 16,384 samples per frame (default 512).

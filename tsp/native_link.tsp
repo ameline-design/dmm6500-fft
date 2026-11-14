@@ -72,6 +72,11 @@ fftsa.nl.MODE_INIT  = 1
 fftsa.nl.MODE_RUN   = 2
 fftsa.nl.MODE_BYTES = 3
 fftsa.nl.MODE_SEGS  = 4
+-- The byte-pattern search, run in the image because Lua cannot afford it: there a sweep is
+-- ki.memread per 32 KB over the control path at 25 MB/s measured, so one pass over the
+-- backstop is 800 frames of the budget a frame can spare. Native code is in the same address
+-- space and loads memory directly -- no IPC, no block, no budget.
+fftsa.nl.MODE_FIND  = 5
 
 fftsa.nl.MAGIC = 1146310705   -- 0x44535031, 'DSP1'
 
@@ -95,7 +100,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 55
+fftsa.nl.PARAM_WORDS = 56
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -232,6 +237,13 @@ local function u32_at(s, p)
 end
 
 local function hx(v) return string.format('%X', v) end
+-- The same, for a value that came from a GUARDED read and may therefore be nil. hx would raise
+-- on it, and the places that format one are all diagnostics in the frame path -- so a refused
+-- read would have thrown inside the frame instead of reaching the About page with its reason.
+local function hxn(v)
+  if type(v) ~= 'number' then return tostring(v) end
+  return string.format('%X', v)
+end
 
 -- An IEEE-754 binary64 as the two 32-bit halves the target reads it back from, high half
 -- first: the params struct is a wire format and Lua 5.0.2 cannot lay out a double, so every
@@ -705,6 +717,7 @@ function fftsa.nl._wg(addr)
   local lo, hi = fftsa.nl.BACKSTOP_LO, fftsa.nl.BACKSTOP_HI
   if lo == nil or hi == nil or lo >= hi then lo, hi = 0, fftsa.nl.DRAM_END end
   if addr < lo or addr + 4 > hi then return nil end
+  fftsa.nl.rd_note(4)
   return tonumber(ki.peek32(hx(addr)), 16)
 end
 
@@ -719,6 +732,44 @@ end
 --
 -- The pointer is read through _wg, so a metatable shaped differently on some other build
 -- answers nil and the caller falls back to the sweep.
+-- ONE WORD FROM A POINTER A FIRMWARE STRUCTURE HANDED US.
+--
+-- WHAT MAKES THIS SAFE IS THE BOUNDS, NOT THE PRIMITIVE, and getting that backwards cost two
+-- changes in a row. ki.memread is `lua_pushlstring(L, (const char *)addr, count)` -- a straight
+-- copy from wherever the address parsed to -- and peek8/16/32 end in the load itself. NEITHER
+-- validates an address, so neither is the safe alternative to the other.
+--
+-- What decides whether a load faults is the BATs the boot code programs, and DRAM is ONE BAT:
+-- 0x00000000..0x10000000, all 256 MB of it, mapped read/write. There is no unmapped hole inside
+-- it to hit. So an aligned read anywhere in the backstop cannot take a data storage interrupt,
+-- and a pointer followed out of a firmware structure needs no proof that its target is mapped.
+-- Every bluescreen on record came from an address OUTSIDE the five mapped ranges, and from one
+-- cause: a numeric argument rendered in decimal and then parsed as hex.
+--
+-- px_live was therefore the wrong gate, and it cost the whole route on a relaunch. Its span is
+-- built from addresses THIS APP has read -- useful for rejecting a garbage widget pointer, no
+-- use at all as a fault guard. Measured at 9.24 run 2: the chain found the right slot and the
+-- right trace and px_live refused it 209 times, `3E0EF30 outside 11EB018..3C8C7C8`, because the
+-- display task had allocated above the app's own allocations. The comment on px_live predicted
+-- exactly that and I walked into it from the other side.
+--
+-- So this reads through memread, which costs the same single round trip as peek32 and returns
+-- the bytes without a hex round-trip, and it applies the SAME bounds _wg does -- including the
+-- lower one. Without that it would read the vector area, which is mapped and meaningless.
+function fftsa.nl._rdw(addr)
+  local nl = fftsa.nl
+  if type(addr) ~= 'number' or addr <= 0 or math.mod(addr, 4) ~= 0 then return nil end
+  local lo, hi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if lo == nil or hi == nil or lo >= hi then lo, hi = 0, nl.DRAM_END end
+  if addr < lo or addr + 4 > hi then return nil end
+  local s = nil
+  local ok = pcall(function() s = ki.memread(hx(addr), '4') end)
+  nl.rd_note(4)
+  if not ok or type(s) ~= 'string' or string.len(s) < 4 then return nil end
+  return ((string.byte(s, 1) * 256 + string.byte(s, 2)) * 256
+          + string.byte(s, 3)) * 256 + string.byte(s, 4)
+end
+
 function fftsa.nl.cclass(buf)
   if type(buf) ~= 'table' and type(buf) ~= 'userdata' then return nil end
   local mt = getmetatable(buf)
@@ -973,10 +1024,363 @@ function fftsa.nl.sweep_str()
          .. ' short=' .. tostring(nl._sw_short)
 end
 
+-- ---------------------------------------------------------------------------
+-- WHAT A FRAME IS ALLOWED TO READ, counted rather than reasoned about.
+--
+-- Four separate costs in this module turned out to be an iteration count taken from the heap
+-- with an IPC round trip in the body, inside a frame that cannot be interrupted: 257 peek32 per
+-- name hit, 29 memread per frequency hit, an unbudgeted whole-DRAM holder sweep, and a slice
+-- re-walked for ever. Each was found on the glass, one at a time. Bounding them one at a time
+-- is how the fourth came to exist.
+--
+-- Every read in the module reports its size here, and the FRAME-DRIVEN loops answer to it:
+-- px_seek's slice walk and its per-hit walk stop when the allowance is spent and carry on next
+-- frame with their cursors intact.
+--
+-- IT IS NOT ENFORCED INSIDE FINDS, and that distinction is the point. FINDS is also the
+-- descriptor discovery that nl_bind runs at Apply, where sweeping for a second or two is the
+-- expected cost and there is no frame to protect -- gating it there made bind fail outright.
+-- What bounds a single FINDS call is its caller's slice, which is PX_BUDGET. Likewise
+-- find_ring_header is bounded by HDR_BELOW + HDR_ABOVE, 320 KB in ten blocks.
+--
+-- The accounting is the half that matters most. A loop that forgets to ask the budget still
+-- cannot run away unseen, because its reads land in peak= on the diagnostic page.
+fftsa.nl.RD_MAX_CALLS = 48
+fftsa.nl.RD_MAX_BYTES = 393216          -- 384 KB, about 15 ms at the measured 25 MB/s
+
+fftsa.nl._rd_calls, fftsa.nl._rd_bytes = 0, 0
+
+-- Called at the top of every entry point that reads, keyed on the caller's own timestamp.
+--
+-- KEYED, AND NOT LEFT TO THE CALLER TO REMEMBER. The first form of this was a call in
+-- sg_pix_draw, which meant anything else driving px_try -- a probe, a test, a future caller --
+-- never refilled the allowance, so the search stalled permanently after its first 48 reads.
+-- A budget whose refill is somebody else's job is not a budget. Both halves of a frame take
+-- their own stamp from sg_stamp, so each gets its own allowance and neither can be starved by
+-- the other.
+function fftsa.nl.rd_frame(t)
+  local nl = fftsa.nl
+  if t ~= nil and t == nl._rd_t then return false end
+  nl._rd_t = t
+  -- The measured span's age, in frames, which is the only frame counter in the module and the
+  -- only place a frame boundary is known.
+  nl._map_age = (nl._map_age or 0) + 1
+  nl.rd_frame_reset()
+  return true
+end
+
+-- Keeps the frame just ended as last= and the worst ever as peak=, which is the figure that
+-- says whether anything is running away.
+function fftsa.nl.rd_frame_reset()
+  local nl = fftsa.nl
+  if (nl._rd_calls or 0) > (nl.rd_peak_calls or 0) then nl.rd_peak_calls = nl._rd_calls end
+  if (nl._rd_bytes or 0) > (nl.rd_peak_bytes or 0) then nl.rd_peak_bytes = nl._rd_bytes end
+  -- AND A PEAK FOR SEARCH FRAMES ALONE. peak= is dominated by the bind-time descriptor
+  -- discovery, which runs before any frame does and so lands in the first frame's account:
+  -- 6779 calls and 132 MB, which is not a frame and cannot be compared with a 48-call
+  -- allowance. Without a figure that excludes it there is no way to tell whether a search frame
+  -- is reading forty-eight times or six thousand.
+  if nl.px ~= nil and nl.px.state ~= nil and nl.px.state ~= 'on' and nl._rd_t ~= nil then
+    if (nl._rd_calls or 0) > (nl.rd_speak_calls or 0) then
+      nl.rd_speak_calls = nl._rd_calls
+    end
+  end
+  nl.rd_last_calls, nl.rd_last_bytes = nl._rd_calls, nl._rd_bytes
+  nl._rd_calls, nl._rd_bytes = 0, 0
+  if (nl._nf_bytes or 0) > (nl.nf_peak_bytes or 0) then nl.nf_peak_bytes = nl._nf_bytes end
+  nl.nf_last_bytes = nl._nf_bytes
+  nl._nf_bytes = 0
+  nl._nf_secs = 0
+end
+
+function fftsa.nl.rd_note(bytes)
+  local nl = fftsa.nl
+  nl._rd_calls = (nl._rd_calls or 0) + 1
+  nl._rd_bytes = (nl._rd_bytes or 0) + (bytes or 0)
+end
+
+-- THE IMAGE'S BYTES ARE NOT READ BYTES, and keeping them apart is what lets the search run at
+-- the speed of the hardware.
+--
+-- RD_MAX_BYTES bounds the IPC a frame may spend: each ki.memread is a round trip through the
+-- firmware's read path at 25 MB/s, and 384 KB of it is 15 ms. The image's scan shares none of
+-- that -- one round trip sets up the request and the loop then loads DRAM directly -- so the
+-- same byte count costs a different time, and charging it to the read allowance stopped the
+-- native slice at a Lua slice's size. The round trip is still counted, with no bytes against
+-- it; the bytes are counted here and bounded by px_nbudget, which is timed.
+function fftsa.nl.nf_note(bytes, secs)
+  local nl = fftsa.nl
+  nl._nf_bytes = (nl._nf_bytes or 0) + (bytes or 0)
+  -- AND THE TIME THE SCAN ITSELF TOOK, which is not the time the slice took.
+  --
+  -- px_nb_note used to be handed the clock either side of the whole px_seek call, and I argued
+  -- that attributing the adjudication to the scan only made the budget smaller, so it was safe.
+  -- It is not safe. Measured on the glass at 9.05, two launches apart: nh=2 gave @28MB/s and an
+  -- 846 KB slice; nh=91 gave @4MB/s and the slice back on its floor. Ninety-one name hits is
+  -- ninety-one window reads through the firmware, and charging those to the bytes the image
+  -- scanned collapses the budget exactly when there is most range left to cover.
+  --
+  -- So the scan is timed where it happens, around the image call and nothing else.
+  nl._nf_secs = (nl._nf_secs or 0) + (secs or 0)
+end
+
+-- Has this frame read enough? Asked by every resumable loop in the search.
+function fftsa.nl.rd_over()
+  local nl = fftsa.nl
+  return (nl._rd_calls or 0) >= nl.RD_MAX_CALLS
+      or (nl._rd_bytes or 0) >= nl.RD_MAX_BYTES
+end
+
+function fftsa.nl.rd_str()
+  local nl = fftsa.nl
+  local o = string.format('rd=%d/%dKB peak=%d/%dKB srch=%d', nl.rd_last_calls or 0,
+                          math.floor((nl.rd_last_bytes or 0) / 1024), nl.rd_peak_calls or 0,
+                          math.floor((nl.rd_peak_bytes or 0) / 1024),
+                          nl.rd_speak_calls or 0)
+  -- The image's own account, and the budget the clock settled it on. Reported because the
+  -- whole of the native search's speed is in these two figures and neither is asserted
+  -- anywhere: nf= is what one frame scanned, nb= what the next frame may.
+  if (nl.nf_peak_bytes or 0) > 0 then
+    o = o .. string.format(' nf=%dKB/%dKB nb=%dKB', math.floor((nl.nf_last_bytes or 0) / 1024),
+                           math.floor((nl.nf_peak_bytes or 0) / 1024),
+                           math.floor((nl.px_nbudget or 0) / 1024))
+    if nl.px_nrate ~= nil then
+      o = o .. string.format(' @%.0fMB/s', nl.px_nrate / 1048576)
+    end
+    -- The fixed cost, which is the figure that explains the budget: it is what the target has
+    -- to clear before a bigger slice buys anything at all.
+    if nl.px_nover ~= nil then
+      o = o .. string.format(' oh=%.1fms', nl.px_nover * 1000)
+    end
+  end
+  return o
+end
+-- ---------------------------------------------------------------------------
+
 fftsa.nl.SWEEP_BLOCK = 32768
+
+-- Prefer the image. One place, so every caller of FINDS gets it -- the ring search and the
+-- bind-time descriptor discovery alike -- without any of them knowing.
+--
+-- The contract is FINDS', not nfind's: every hit in the range, not the first thirty-two. So
+-- this loops on the resume address the image returns. Each call is bounded by FIND_MAX hits
+-- and by NFIND_CAP bytes, and `next` strictly advances, so it terminates.
+--
+-- AND IT NEVER RETURNS EARLY, which the first version did on the read budget. A partial answer
+-- from FINDS is indistinguishable from "the needle is not in this range", so a caller moves
+-- its cursor past bytes nothing looked at -- the same defect that cost 981 MB of sweeping when
+-- a confirmation was dropped instead of returned. What keeps a frame a frame is the CALLER's
+-- range: px_seek slices at PX_BUDGET, and bind-time discovery is not in a frame at all.
+-- THE NATIVE SEARCH IS OFF, AND PROBING FOR THE EDGE OF MEMORY IS WHY.
+--
+-- Three attempts, two bluescreens at PC=0022D200, and the premise was wrong from the start.
+--
+-- The first bounded the image's find loop by the BACKSTOP, 0x3000..0x10000000. That is the span
+-- the LUA side may ask about, not the span that is mapped: DRAM ends far below it and the image
+-- loads directly, so the scan walked off the end. Data storage interrupt.
+--
+-- The second tried to MEASURE the mapped range, probing outward with ki.memread until a read
+-- refused. There is no such refusal. nl._wg's own comment in this file says it outright --
+-- "ki.peek32 is an lwz with no validation, so a bad address is a precise data storage
+-- interrupt and a bluescreen" -- and ki.memread is no different. The probe meant to find the
+-- edge of memory is itself the thing that falls off it, which is why that attempt crashed
+-- before a single frame was drawn.
+--
+-- So neither a probe nor the backstop can establish this. What would: a range mapped by
+-- CONSTRUCTION -- the chunk payloads this app already owns, or heap bounds read out of the
+-- firmware's own allocator structures rather than guessed at from outside. Until there is one,
+-- the Lua sweep runs. It is slow and it has never once crashed, because every address it hands
+-- ki.memread comes from a window something else already proved.
+-- THE LUA SWEEP LOOP IS NOT REACHABLE FROM THE PIXEL PATH. There is no knob for it, because a
+-- knob is a configuration in which it runs: operator, 2026-11-11, "The LUA sweep loop is NEVER
+-- acceptable." One pass over the backstop at 25 MB/s is 800 frames.
+--
+-- So the pixel path engages by pointer or by cache, and if it must search, the image does it.
+-- FINDS_NATIVE_ONLY is set for the duration of a px_seek slice and makes FINDS answer nil
+-- rather than reaching for the loop -- nil, not an empty table, because "no hits here" would
+-- move the caller's cursor past bytes nothing looked at.
+--
+-- The loop itself stays in FINDS for the bind-time descriptor discovery, which is one search at
+-- Apply and has always worked. The offline suite emulates the image rather than enabling the
+-- loop, so nothing in the pixel path's tests depends on a path the app cannot take.
+fftsa.nl.FINDS_NATIVE_ONLY = false
+
+-- Suite-only, and false in the app. The offline tests drive the ladder that bind-time
+-- descriptor discovery shares; the app has no way to set this and the gate below asserts the
+-- shipped value, so there is no configuration of the APP in which the Lua loop runs.
+fftsa.nl.PX_SWEEP = false
+
+-- Frames the pointer route is given before anything else is tried. It needs the app to have
+-- allocated enough for px_live to have a span, which takes a few frames from launch, and the
+-- hold after each restart spaces them out. Thirty is a couple of seconds and it costs a few
+-- reads a frame.
+fftsa.nl.PX_PTR_TRIES = 30
+
+fftsa.nl.NFIND = true
+
+-- THE RANGE, FROM ADDRESSES THIS MODULE HAS ALREADY DEREFERENCED.
+--
+-- Not a probe. Every address below is one something has read successfully this session, so each
+-- is mapped by evidence rather than by assumption:
+--
+--   the heap anchor      a live Lua table's own storage, via tostring
+--   the C++ instance     the trace buffer's, through its metatable's CClassRef
+--   the chunk payloads   handed over by the firmware's allocator and written every frame
+--   the plan arena       allocated by this app and written by the image already
+--   a confirmed ring     found and validated by a previous search, if there was one
+--
+-- The span between the lowest and highest of them is one allocator region, so the memory
+-- between two live allocations is heap and is mapped. That is the whole claim, and it is a
+-- different kind of claim from "the backstop says 256 MB" or "probe until a read refuses":
+-- both of those reasoned about memory nothing had touched.
+--
+-- Two or more distinct addresses are required -- one gives no span -- and the result is
+-- clamped to the backstop as a second line. Narrow is fine: it is where this app's own
+-- allocations live, which is where the display task's allocations live too, and every ring
+-- found on this bench has been inside it.
+fftsa.nl.MAP_MIN_SPAN = 65536
+
+-- Frames a measured span is kept before it is taken again.
+--
+-- IT IS MEASURED TOO EARLY TO BE FINAL, and everything downstream is clamped to it: the range
+-- the image is given, and px_live's gate on every dereference. The first answer can come
+-- before the buffer has its chunks, so the span can be narrower than the heap the display task
+-- is allocating in -- and a span frozen below the ring is a session that can never find it.
+--
+-- So it is re-derived on a cadence and UNIONED with what was already known. Every address in
+-- either half was dereferenced successfully, so the union is still a span of proven memory and
+-- it can only widen. Sixteen frames is about a second, and the twenty-four reads it costs land
+-- in one frame of the sixteen rather than in every one.
+fftsa.nl.MAP_REFRESH = 16
+
+function fftsa.nl.map_bounds()
+  local nl = fftsa.nl
+  if nl.map_lo ~= nil and (nl._map_age or 0) < nl.MAP_REFRESH then
+    return nl.map_lo, nl.map_hi
+  end
+  local known, n = {}, 0
+  local function add(v)
+    if type(v) == 'number' and v > 0 then
+      n = n + 1
+      known[n] = v
+    end
+  end
+  add(nl.heap_anchor())
+  -- THE TRACE THE SUBSCRIBER CHAIN CONFIRMED. The span is otherwise built from addresses this
+  -- APP has read, and the trace object belongs to the display task -- so on a relaunch it can
+  -- sit outside, and px_from_trace would refuse the one answer the chain had already proved.
+  -- It is added only after the slot's kind matched, the routing pointer lay inside the named
+  -- graph's array, and the trace pointed back at both: at that point the firmware has told us
+  -- three times over where its object is, and a memread of it has succeeded.
+  -- BOTH ENDS OF WHAT WILL BE READ FROM IT. The span's ceiling is max(known) and px_live asks
+  -- for `addr < hi`, so noting the trace's own address sets the ceiling TO it and still refuses
+  -- it -- the widening would have done nothing for the one address it was added for. Noting the
+  -- end of the range px_from_name walks is what actually covers the object.
+  add(nl.sub_trace_ok)
+  if nl.sub_trace_ok ~= nil then add(nl.sub_trace_ok + nl.PX_NAME_SCAN) end
+  add(nl.inst)
+  add(nl.arena)
+  add(nl.params)
+  add(nl.find_addr)
+  add(nl.res_addr)
+  local c = nl.px_cache_get()
+  if c ~= nil then
+    add(c.lo)
+    add(c.hi)
+  end
+  local cp = nl.col_ptrs(nl.inst)
+  local i
+  if type(cp) == 'table' then
+    for i = 1, table.getn(cp) do add(cp[i]) end
+  end
+  -- A re-derivation that comes up short does not throw away a span that stood: the addresses
+  -- that made it were read successfully, and the age is reset so the cost is not paid again on
+  -- the next call.
+  local function keep(why)
+    nl.map_why = why
+    nl._map_age = 0
+    if nl.map_lo ~= nil then return nl.map_lo, nl.map_hi end
+    return nil
+  end
+  if n < 2 then
+    return keep('only ' .. tostring(n) .. ' address known to be live; need two for a span')
+  end
+  local lo, hi = known[1], known[1]
+  for i = 2, n do
+    if known[i] < lo then lo = known[i] end
+    if known[i] > hi then hi = known[i] end
+  end
+  -- The union with what was already known, which is what makes this widen and never narrow.
+  if nl.map_lo ~= nil then
+    if nl.map_lo < lo then lo = nl.map_lo end
+    if nl.map_hi > hi then hi = nl.map_hi end
+  end
+  local blo, bhi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if blo == nil or bhi == nil or blo >= bhi then blo, bhi = 0, nl.DRAM_END end
+  if lo < blo then lo = blo end
+  if hi > bhi then hi = bhi end
+  if hi - lo < nl.MAP_MIN_SPAN then
+    return keep('live addresses span only ' .. tostring(hi - lo) .. ' bytes')
+  end
+  nl.map_lo, nl.map_hi, nl.map_n = lo, hi, n
+  nl._map_age = 0
+  nl.map_why = nil
+  return lo, hi
+end
+
+
+fftsa.nl.NFIND_CAP = 4194304
+
+function fftsa.nl._finds_native(lo, hi, pat)
+  local nl = fftsa.nl
+  if not nl.NFIND then return nil end
+  if nl.nfind == nil or not nl.ready then return nil end
+  -- CLAMPED TO MEASURED MEMORY, not to the backstop. Outside it there is nothing to find and
+  -- a load would fault, so a range wholly outside answers "no hits" -- which is what the Lua
+  -- sweep answers there too, by skipping the blocks ki.memread refuses.
+  local mlo, mhi = nl.map_bounds()
+  if mlo == nil then return nil end
+  if lo < mlo then lo = mlo end
+  if hi > mhi then hi = mhi end
+  if hi <= lo + string.len(pat) then return {} end
+  if nl.find_addr == nil or nl.find_addr == 0 then return nil end
+  if string.len(pat) > (nl.NFIND_PAT_MAX or 0) then return nil end
+  local out, n, at = {}, 0, lo
+  while at + string.len(pat) <= hi do
+    local t0 = os.clock()
+    local hits, nxt = nl.nfind(at, hi, pat, nl.NFIND_CAP)
+    local el = os.clock() - t0
+    if hits == nil then return nil end
+    local k
+    for k = 1, table.getn(hits) do
+      n = n + 1
+      out[n] = hits[k]
+    end
+    if nxt == nil or nxt <= at then return out end
+    -- The bytes the image actually scanned, so swept= and nf= tell the truth. Accounted but
+    -- NOT obeyed: this must finish the caller's range.
+    --
+    -- The round trip is charged to the read allowance with no bytes against it, because that
+    -- is what it costs -- one request write, one call, one answer read. The bytes are charged
+    -- to the image's own account, which px_nbudget bounds from the clock.
+    nl._sw_bytes = (nl._sw_bytes or 0) + (nxt - at)
+    nl._sw_blocks = (nl._sw_blocks or 0) + 1
+    nl.rd_note(0)
+    nl.nf_note(nxt - at, el)
+    at = nxt
+  end
+  return out
+end
 
 function fftsa.nl.FINDS(lo, hi, pat)
   local nl  = fftsa.nl
+  -- The image first. nil means there is none, or it refused, and the Lua sweep below is what
+  -- every build before the native search shipped with.
+  local nat = nl._finds_native(lo, hi, pat)
+  if nat ~= nil then return nat end
+  -- The pixel path takes native or nothing: an empty table here would read as "the needle is
+  -- not in this range" and move its cursor past bytes nothing looked at.
+  if nl.FINDS_NATIVE_ONLY then return nil end
   local a   = lo
   local out = {}
   local n   = 0
@@ -985,6 +1389,7 @@ function fftsa.nl.FINDS(lo, hi, pat)
     local want = fftsa.nl.SWEEP_BLOCK
     if a + want > hi then want = hi - a end
     local s = ki.memread(hx(a), hx(want))
+    nl.rd_note(want)
     local got = 0
     nl._sw_blocks = nl._sw_blocks + 1
     if s == nil then
@@ -2002,6 +2407,276 @@ end
 fftsa.nl.HDR_BELOW, fftsa.nl.HDR_ABOVE = 262144, 65536
 fftsa.nl.HDR_OLD, fftsa.nl.HDR_WRITE, fftsa.nl.HDR_COUNT = 8, 12, 20
 
+-- THE SAME THREE OFFSETS, DERIVED, FOR A MODEL THEY HAVE NOT BEEN READ OFF.
+--
+-- The three above are the DMM6500's, read off its 1.7.17a image, and they stay the 6500's
+-- mechanism: it works there and nothing here changes it. They are the last assumed constants
+-- in the name route -- everything else about the trace object is already searched for, which is
+-- why that route is the one a new model can take.
+--
+-- A DMM7510 cannot use them. Its GUI object is a different size (no mulli by 0x260 anywhere in
+-- its image), its table base is not findable by the scan that found the 6500's, and matching
+-- the 6500's accessor into it scores 9 words of 40 against a flat tail -- so there is no
+-- pointer route there and no image-read offsets either.
+--
+-- But the cursor words identify themselves, because the ring they describe is already known by
+-- the time they are wanted. Two of them are POINTERS INTO THAT RING, record-aligned, and the
+-- third is its record COUNT. That is a strong enough shape to find, and a wrong answer cannot
+-- survive px_map, which still has to match 510 exact float32 frequencies of this app's own axis
+-- before a byte is written.
+--
+-- Ambiguity is refused rather than resolved by preference: more than one offset answering for a
+-- role means this object does not say which, and the next candidate is cheaper than a guess.
+fftsa.nl.PX_HDR_SCAN = 64
+-- Frames a candidate's cursor offsets get to resolve themselves before it is abandoned. Each
+-- costs one read, and two consecutive frames with an append between them is the whole test, so
+-- this is generous: it covers a frame the fill skipped and a candidate seen mid-wrap.
+fftsa.nl.PX_HDR_TRIES = 12
+
+-- THE CURSOR OFFSETS, FROM WHAT THE WORDS DO RATHER THAN WHERE THEY SIT.
+--
+-- ring_header has said how to do this since it was written: "a caller proves the field order by
+-- CAUSE rather than by layout: read this, append one reading, read it again. The count must
+-- rise by one and the write cursor advance by exactly one stride. Nothing else in memory does
+-- that." Shape cannot -- against the 6500, where the answer is known to be 8/12/20, four
+-- ordered pairs of record-aligned pointers fit the two cursors.
+--
+-- Two samples a frame apart, with the fill appending between them. What each role does:
+--
+--   while the ring is FILLING   count rises by 1, write advances one stride, oldest sits still
+--   once the ring is FULL       count holds at nrec, and both cursors advance one stride
+--
+-- So the filling regime separates all three outright, and the full regime separates the count
+-- but may leave the two cursors doing the same thing. That is reported rather than resolved:
+-- the oldest cursor sitting still is the only positive evidence that tells it from the write
+-- cursor, and without it nothing is written. A trace object is not somewhere to guess at an
+-- offset -- a wrong word is how PegRect::operator& on a freed widget is reached.
+--
+-- Returns true once g carries h_old, h_wr and h_cnt. Otherwise false, with g.h_why saying what
+-- it is still waiting for, which is what reaches the About page.
+function fftsa.nl.px_hdr_resolve(g)
+  local nl = fftsa.nl
+  if g == nil or g.hdr == nil or g.h_cnt == nil or g.h_pairs == nil then return false end
+  if g.h_old ~= nil then return true end
+  local want = nl.PX_HDR_SCAN + 4
+  local blk = ki.memread(hx(g.hdr), hx(want))
+  nl.rd_note(want)
+  if blk == nil or string.len(blk) < want then
+    g.h_why = 'header window read gave ' .. tostring(blk ~= nil and string.len(blk) or 0)
+    return false
+  end
+  local prev = g.h_prev
+  g.h_prev = blk
+  if prev == nil then
+    g.h_why = 'first sample taken, the next frame says which word moved'
+    return false
+  end
+  local at = function(s, o)
+    if o < 0 or o + 4 > string.len(s) then return nil end
+    return u32_at(s, o + 1)
+  end
+  local sv, n = g.stride, g.nrec
+  local c0, c1 = at(prev, g.h_cnt), at(blk, g.h_cnt)
+  if c0 == nil or c1 == nil then
+    g.h_why = 'the count offset is outside the window'
+    return false
+  end
+  -- Which regime, from the count alone.
+  local filling = (c1 == c0 + 1)
+  if not filling and not (c1 == n and c0 == n) then
+    g.h_why = 'the count went ' .. tostring(c0) .. ' to ' .. tostring(c1)
+              .. ', neither filling nor full'
+    return false
+  end
+  -- Every pair still standing after this frame's evidence.
+  local keep, nk, i = {}, 0, nil
+  for i = 1, table.getn(g.h_pairs) do
+    local pr = g.h_pairs[i]
+    local o0, o1 = at(prev, pr[1]), at(blk, pr[1])
+    local w0, w1 = at(prev, pr[2]), at(blk, pr[2])
+    if o0 ~= nil and o1 ~= nil and w0 ~= nil and w1 ~= nil then
+      local ok = false
+      if filling then
+        -- The oldest sits still and the write advances exactly one record.
+        ok = (o1 == o0) and (w1 == w0 + sv)
+      else
+        -- Full: both advance one record, and the pair is still only separable if the oldest
+        -- can be told from the write some other way. It cannot, so this regime narrows the
+        -- field without ever settling it.
+        ok = (o1 == o0 + sv) and (w1 == w0 + sv)
+      end
+      if ok then
+        nk = nk + 1
+        keep[nk] = pr
+      end
+    end
+  end
+  g.h_pairs = keep
+  if nk == 0 then
+    g.h_why = 'no cursor pair behaved like one across the append'
+    return false
+  end
+  if nk > 1 or not filling then
+    g.h_why = tostring(nk) .. ' pair(s) still fit'
+    if not filling then g.h_why = g.h_why .. ' and the ring is full, so neither cursor is idle' end
+    return false
+  end
+  -- THE GUARD, AND IT IS WHAT MAKES TRYING THIS ON A 6500 SAFE.
+  --
+  -- Where the offsets are known from the model's own image, a derived triple that disagrees
+  -- with them is wrong by definition, and what it would do next is write four bytes into the
+  -- wrong word of a live trace object. So it is refused and counted, the candidate is dropped,
+  -- and the operator sees differ= climb on the About page.
+  --
+  -- On a model whose offsets were never measured there is nothing to compare against and the
+  -- guard does not apply: there, the cause test and px_map's 510 frequency matches are the
+  -- whole of the evidence.
+  if nl.hdr_known and (keep[1][1] ~= nl.HDR_OLD or keep[1][2] ~= nl.HDR_WRITE
+                       or g.h_cnt ~= nl.HDR_COUNT) then
+    nl.hdr_differ = (nl.hdr_differ or 0) + 1
+    nl.hdr_why = string.format('cause gave %d/%d/%d, this model measures %d/%d/%d',
+                               keep[1][1], keep[1][2], g.h_cnt,
+                               nl.HDR_OLD, nl.HDR_WRITE, nl.HDR_COUNT)
+    g.h_why = nl.hdr_why
+    return false
+  end
+  g.h_old, g.h_wr = keep[1][1], keep[1][2]
+  g.h_why = nil
+  nl.hdr_resolved = (nl.hdr_resolved or 0) + 1
+  if nl.hdr_known then nl.hdr_agree = (nl.hdr_agree or 0) + 1 end
+  return true
+end
+
+-- This geometry's cursor offsets, or the measured constants when it carries none. One place,
+-- so every reader of the header agrees with whatever the candidate was found with.
+function fftsa.nl.hdr_offs(g)
+  local nl = fftsa.nl
+  if type(g) == 'table' and g.h_old ~= nil and g.h_wr ~= nil and g.h_cnt ~= nil then
+    return g.h_old, g.h_wr, g.h_cnt
+  end
+  return nl.HDR_OLD, nl.HDR_WRITE, nl.HDR_COUNT
+end
+
+-- Which values the path USES. False on a DMM6500, where they are known and measured, and the
+-- mechanism that works there is left alone. nl_bind sets it from the model.
+fftsa.nl.PX_HDR_DERIVE = false
+
+-- SHADOW MODE, which is how the derivation earns the right to replace the constants.
+--
+-- On a 6500 the answer is known, so the derivation can be run beside the constants and the two
+-- compared on every candidate, on real hardware, with nothing depending on the result. Agreement
+-- over many launches is the evidence that would let PX_HDR_DERIVE become the only path and the
+-- three constants go; a single disagreement says exactly which object it failed on.
+--
+-- It costs no reads: the words are already in the window px_from_name has read.
+fftsa.nl.PX_HDR_CHECK = true
+fftsa.nl.hdr_agree, fftsa.nl.hdr_differ = 0, 0
+fftsa.nl.hdr_why = nil
+
+-- THE ROLES, AS A COUNT OFFSET AND A SHORTLIST OF CURSOR PAIRS.
+--
+-- What one frame's words can honestly say. The count is a single offset in practice -- the only
+-- word holding a plausible record count -- and the two cursors are any ordered pair of
+-- record-aligned pointers into the ring, of which the 6500 yields four. px_hdr_resolve then
+-- settles the pair by appending a reading and watching.
+--
+-- Returns nil when the count is not unique: without it the regime cannot be read and the whole
+-- test loses its clock.
+function fftsa.nl.px_hdr_roles(rd, lo, hi, sv, n)
+  local nl = fftsa.nl
+  local ptrs, cnts, np, nc = {}, {}, 0, 0
+  local o
+  -- Offsets 0 and 4 are the bounds pair this header was found BY, so they are known and are
+  -- not cursor candidates. Leaving them in is not harmless: the low bound is a record-aligned
+  -- pointer into the ring that never moves, which is exactly what an idle oldest cursor looks
+  -- like, so it pairs with the real write cursor and makes the answer ambiguous for ever.
+  for o = 8, nl.PX_HDR_SCAN, 4 do
+    local v = rd(o)
+    if v ~= nil then
+      if v >= lo and v <= hi and math.mod(v - lo, sv) == 0 then
+        np = np + 1
+        ptrs[np] = o
+      end
+      if v >= 1 and v <= n then
+        nc = nc + 1
+        cnts[nc] = o
+      end
+    end
+  end
+  -- One count offset, or the regime cannot be read. A pointer-shaped word is never also a
+  -- plausible count on this firmware -- the ring lives far above n -- so the two sets are
+  -- disjoint and a word cannot hold both roles.
+  if nc ~= 1 then return nil end
+  local pairs2, npair, a, b = {}, 0, nil, nil
+  for a = 1, np do
+    for b = 1, np do
+      if ptrs[b] > ptrs[a] and ptrs[a] ~= cnts[1] and ptrs[b] ~= cnts[1] then
+        npair = npair + 1
+        pairs2[npair] = { ptrs[a], ptrs[b] }
+      end
+    end
+  end
+  if npair == 0 then return nil end
+  return cnts[1], pairs2
+end
+
+-- lo, hi, sv and n are the ring this header must describe; rd(off) reads a word at an offset
+-- from the bounds pair. Returns the three offsets, or nil and a reason.
+function fftsa.nl.px_hdr_derive(rd, lo, hi, sv, n)
+  local nl = fftsa.nl
+  local olds, wrs, cnts, no, nw, nc = {}, {}, {}, 0, 0, 0
+  local o
+  for o = 0, nl.PX_HDR_SCAN, 4 do
+    local v = rd(o)
+    if v ~= nil then
+      -- A record-aligned pointer inside the ring is the oldest-record cursor; the write cursor
+      -- may also sit one past the end, which is how a full lap reads.
+      if v >= lo and v < hi and math.mod(v - lo, sv) == 0 then
+        no = no + 1
+        olds[no] = o
+      end
+      if v >= lo and v <= hi and math.mod(v - lo, sv) == 0 then
+        nw = nw + 1
+        wrs[nw] = o
+      end
+      -- The count, and only the count: a full ring, which it is by the time the path looks.
+      -- Any small integer would otherwise answer, and there is no shortage of those.
+      if v == n then
+        nc = nc + 1
+        cnts[nc] = o
+      end
+    end
+  end
+  if nc ~= 1 then
+    return nil, tostring(nc) .. ' offsets hold the record count'
+  end
+  -- The two cursors are the same shape, so they are told apart by order, which is what the
+  -- 6500's own layout does: oldest first, write after it.
+  local a, b
+  for a = 1, no do
+    for b = 1, nw do
+      if wrs[b] > olds[a] and olds[a] ~= cnts[1] and wrs[b] ~= cnts[1] then
+        -- A second pair would make this a guess.
+        local a2, b2, pairs2 = nil, nil, 0
+        local c, d
+        for c = 1, no do
+          for d = 1, nw do
+            if wrs[d] > olds[c] and olds[c] ~= cnts[1] and wrs[d] ~= cnts[1] then
+              pairs2 = pairs2 + 1
+              a2, b2 = olds[c], wrs[d]
+            end
+          end
+        end
+        if pairs2 ~= 1 then
+          return nil, tostring(pairs2) .. ' cursor pairs fit'
+        end
+        return a2, b2, cnts[1]
+      end
+    end
+  end
+  return nil, 'no ordered cursor pair inside the ring'
+end
+
 function fftsa.nl.find_ring_header(g)
   local nl = fftsa.nl
   nl.ring_why = nil
@@ -2035,6 +2710,7 @@ function fftsa.nl.find_ring_header(g)
     local step = 32768
     if a + step > hi then step = hi - a end
     local blk = ki.memread(hx(a), hx(step))
+    nl.rd_note(step)
     if blk ~= nil then
       local pi
       for pi = 1, np do
@@ -2115,10 +2791,11 @@ end
 function fftsa.nl.ring_header(g)
   local nl = fftsa.nl
   if g == nil or g.hdr == nil then return nil end
+  local eho, ehw, ehc = nl.hdr_offs(g)
   return { lo = nl._wg(g.hdr), hi = nl._wg(g.hdr + 4),
-           oldest = nl._wg(g.hdr + nl.HDR_OLD),
-           write = nl._wg(g.hdr + nl.HDR_WRITE),
-           count = nl._wg(g.hdr + nl.HDR_COUNT) }
+           oldest = nl._wg(g.hdr + eho),
+           write = nl._wg(g.hdr + ehw),
+           count = nl._wg(g.hdr + ehc) }
 end
 
 -- ---------------------------------------------------------------------------
@@ -2162,14 +2839,142 @@ end
 
 -- Bytes a frame sweeps while seeking. 25 MB/s measured on the instrument's own clock, so this
 -- is about 10 ms of a 100 ms frame: the search costs a tenth of the frame rate while it runs
--- and nothing once it answers. Every window the ladder offers plus one pass over the backstop
--- is 274 MB, so the worst case is about two minutes of frames and the measured cases are a
--- second or two.
+-- and nothing once it answers.
 fftsa.nl.PX_BUDGET = 262144
+
+-- AND THE SAME TEN MILLISECONDS IN BYTES WHEN THE IMAGE IS DOING THE SEARCHING, which is a
+-- different number and nothing in this tree knows which.
+--
+-- PX_BUDGET is 256 KB because ki.memread manages 25 MB/s through the firmware's read path. The
+-- image does not use that path: it loads DRAM directly from a register-based loop. So the same
+-- slice costs a different time, and charging the image's bytes against a Lua read's allowance
+-- made the search a tenth as fast as the hardware it runs on.
+--
+-- It is not guessed. The slice starts at the Lua figure and is TIMED: px_nb_note takes the
+-- bytes the image reported scanned and the clock either side, and sizes the next slice to land
+-- on PX_NMS. A slice too fast for os.clock to resolve is itself evidence -- the budget doubles
+-- until one is slow enough to measure -- and the ceiling is a slice that would still cost only
+-- 40 ms if the image turned out no faster than ki.memread, so being wrong in either direction
+-- costs part of one frame.
+--
+-- Three megabytes is the instance window. At the ceiling that is three frames.
+-- The time a slice may cost. IT MUST EXCEED THE FIXED OVERHEAD or the controller saturates
+-- again: at 10 ms, with the round trip alone measuring around 20, (target - overhead) is
+-- negative and every slice collapses to the floor. 30 ms of a 66 ms frame, while searching
+-- only and for under a second, buys engagement in a handful of frames instead of thirty-odd --
+-- and the app is on the append path the whole time anyway.
+--
+-- The ceiling stays 1 MB and is now safe by construction rather than by guess: the slice is
+-- sized from a MEASURED rate, so a megabyte is only ever asked for when a megabyte fits in the
+-- room the target leaves.
+fftsa.nl.PX_NMS = 0.030
+fftsa.nl.PX_NBUDGET_MIN = 262144
+-- THE CEILING MAY NOT BE THE BINDING CONSTRAINT, or the fit above is decorative.
+--
+-- Measured on the glass at 9.13: `nb=1024KB @72MB/s oh=2.9ms`. A 30 ms target less 2.9 ms of
+-- overhead at 72 MB/s is 1.95 MB, and the slice was pinned at 1024 KB -- so the clock had
+-- measured a slice twice the size of the one the path was allowed to ask for, and half the
+-- hardware's speed was being left on the floor by a figure in the tree. That is exactly the
+-- defect timing the slice was meant to remove.
+--
+-- Two megabytes: it clears the 1.95 MB the measurement asks for, and it keeps the worst case
+-- a frame cannot be interrupted for at about 28 ms at the measured rate. PX_NMS is the bound
+-- now, which is the one that knows what a frame can afford.
+fftsa.nl.PX_NBUDGET_MAX = 2097152
+-- Bytes a frame must have scanned before its timing is believed. Below this the clock reads
+-- mostly the round trip and the adjudication, not the scan.
+fftsa.nl.PX_NB_SAMPLE = 65536
+fftsa.nl.px_nbudget = 262144
+
+-- The slice size for this frame: the image's if there is one, otherwise the read path's.
+function fftsa.nl.px_budget()
+  local nl = fftsa.nl
+  if nl.NFIND and nl.ready and nl.nfind ~= nil then
+    return nl.px_nbudget or nl.PX_NBUDGET_MIN
+  end
+  return nl.PX_BUDGET
+end
+
+-- A SLICE COSTS AN OVERHEAD PLUS A RATE, AND TREATING IT AS A RATE ALONE PINNED THE BUDGET.
+--
+-- Measured on the glass at 8.99 and again at 9.01: nb=256KB @13MB/s, the budget sitting on its
+-- floor while the search swept 9 to 11 MB -- thirty-odd frames, and most of the time to engage.
+--
+-- 13 MB/s is not a scan rate. Native code loading DRAM directly cannot be slower than
+-- ki.memread's 25 MB/s through the firmware's own read path. It is the average of a fixed cost
+-- and a fast scan, and 256 KB at that average is 21 ms against a 10 ms target -- so the
+-- controller was SATURATED. Every slice overshot, it could only ever ask for less, the floor
+-- was the one thing holding the budget up, and it could never try a bigger slice and so never
+-- discover that a bigger slice is nearly free.
+--
+--   t = overhead + bytes / rate
+--
+-- Two slice sizes solve that, and the search provides them for nothing: until two distinct
+-- sizes have been timed the budget alternates between the floor and twice the floor. After
+-- that the slice is (target - overhead) * rate, so the fixed cost is paid once a frame instead
+-- of being charged against the bytes.
+--
+-- If the overhead alone exceeds the target, no slice size helps and the floor is the answer.
+fftsa.nl.px_nb_a, fftsa.nl.px_nb_b = nil, nil     -- two (bytes, secs) samples, distinct sizes
+
+function fftsa.nl.px_nb_note(bytes, secs)
+  local nl = fftsa.nl
+  if type(bytes) ~= 'number' or bytes < nl.PX_NB_SAMPLE then return end
+  if type(secs) ~= 'number' or secs < 0 then return end
+  -- Two samples, kept only if their byte counts differ enough to separate the fixed cost from
+  -- the rate. The forced alternation below makes that a factor of two.
+  local a = nl.px_nb_a
+  if a == nil then
+    nl.px_nb_a = { bytes, secs }
+  elseif bytes > a[1] * 1.1 or bytes < a[1] * 0.9 then
+    nl.px_nb_b = { bytes, secs }
+  else
+    nl.px_nb_a = { bytes, secs }
+  end
+  local b = nil
+  local p, q = nl.px_nb_a, nl.px_nb_b
+  if p ~= nil and q ~= nil and q[1] ~= p[1] then
+    -- The rate comes from the SLOPE: the part of the cost the bytes are responsible for.
+    local dt, db = q[2] - p[2], q[1] - p[1]
+    if db < 0 then
+      db, dt = -db, -dt
+    end
+    if dt > 0 then
+      local rate = db / dt
+      local oh = p[2] - p[1] / rate
+      if oh < 0 then oh = 0 end
+      nl.px_nrate, nl.px_nover = rate, oh
+      local room = nl.PX_NMS - oh
+      if room <= 0 then
+        b = nl.PX_NBUDGET_MIN
+      else
+        b = math.floor(room * rate)
+      end
+    end
+  end
+  if b == nil then
+    -- Not enough to fit yet, so alternate the size and let the next frame give the second
+    -- point. Nothing is inferred from one sample, because one sample cannot tell a fixed cost
+    -- from a slow scan -- which is exactly the mistake this replaces.
+    local cur = nl.px_nbudget or nl.PX_NBUDGET_MIN
+    if cur > nl.PX_NBUDGET_MIN then
+      b = nl.PX_NBUDGET_MIN
+    else
+      b = nl.PX_NBUDGET_MIN * 2
+    end
+  end
+  if b < nl.PX_NBUDGET_MIN then b = nl.PX_NBUDGET_MIN end
+  if b > nl.PX_NBUDGET_MAX then b = nl.PX_NBUDGET_MAX end
+  nl.px_nbudget = b
+end
 -- A window wider than this is left to the one backstop pass at the end of the ladder, which
 -- covers it anyway. scan_windows ends with three overlapping wide stages; sweeping all of them
 -- would read 60 MB twice over on the boots where the tight windows miss.
 fftsa.nl.PX_WIN_MAX = 4194304
+-- A window at or under this is one frame's slice, so it is tried before anything that has to
+-- justify itself on where the ring is likely to be. Trying it and being wrong has cost a frame,
+-- which is below the resolution of the thing being optimised.
+fftsa.nl.PX_WIN_CHEAP = 1048576
 -- The fit has to span this many decibels before it is believed. Pixels are integers, so a
 -- narrow span fits a slope badly and the unfitted points still agree: a 3 dB spread once fitted
 -- 1.667 px/dB against a true 2, and the points left out predicted within 0.67 px. A span test
@@ -2228,8 +3033,39 @@ fftsa.nl.PX_SLIP_MAX = 8
 -- be derived from. Measured 2026-11-09: a re-map straight after a drop refused with "no value
 -- field the y triple is affine in", every time.
 fftsa.nl.PX_HOLD = 4
+-- Consecutive refused cursor calls before the path is torn down rather than the frame skipped.
+-- The repaint is a synchronous call into the GUI task, so a busy task can refuse one; losing
+-- the whole map over that is what makes a frame rate oscillate instead of settling.
+fftsa.nl.PX_CURSOR_RUN = 5
 
 fftsa.nl.px = { state = 'idle' }
+
+-- HOW LONG IT TOOK TO ENGAGE, measured on the instrument's own clock.
+--
+-- Every figure for this so far has come off a stopwatch -- "8 seconds", "13 seconds", "about 2"
+-- -- against a frame rate that is itself changing while the search runs. That is not accurate
+-- enough to tell a fix from noise, and two of the last three changes were judged on it.
+--
+-- So: the clock at the first frame the path ever sees, and the elapsed time and frame count at
+-- the first engage. Kept on the module rather than on px, because px_clear runs on every
+-- restart and the question is "how long from launch", not "how long since the last restart".
+-- The LAST engage is kept too: a re-engage after a size change is a different measurement and
+-- the two were being conflated.
+fftsa.nl.t_first, fftsa.nl.pre_frames = nil, 0
+fftsa.nl.eng_secs, fftsa.nl.eng_frames = nil, nil
+fftsa.nl.eng_last, fftsa.nl.eng_lastf = nil, nil
+
+function fftsa.nl.px_engaged()
+  local nl = fftsa.nl
+  if nl.t_first == nil then return end
+  local el = os.clock() - nl.t_first
+  local fr = nl.pre_frames or 0
+  if nl.eng_secs == nil then
+    nl.eng_secs, nl.eng_frames = el, fr
+  end
+  -- Since the last restart, which is what a size change costs.
+  nl.eng_last, nl.eng_lastf = el - (nl.t_restart_el or 0), fr - (nl.pre_at_restart or 0)
+end
 
 function fftsa.nl.px_clear()
   local p = fftsa.nl.px
@@ -2238,7 +3074,16 @@ function fftsa.nl.px_clear()
   p.yoff, p.xoff, p.ov, p.ox, p.nseg = nil, nil, nil, nil, nil
   p.resid, p.span, p.hz1, p.hz2 = nil, nil, nil, nil
   p.drift, p.slot, p.slotdb, p.maptries = 0, nil, nil, 0
-  p.xcol, p.cands = nil, nil
+  p.slotprev = nil
+  p.xcol, p.cands, p.curfail = nil, nil, 0
+  p.slicehits, p.slicefrom = nil, nil
+  p.cachetries = 0
+end
+
+-- Cleared only when the path actually engages: px_clear runs on every restart, and a counter
+-- reset there would let the pointer route be retried for ever.
+function fftsa.nl.px_ptr_ok()
+  fftsa.nl.px.ptrtries = 0
 end
 
 -- Off for the rest of the session, with the reason kept for the error and About pages. The
@@ -2261,19 +3106,99 @@ function fftsa.nl.px_dropframe(why)
   return fftsa.nl.px_restart(why)
 end
 
+-- WAITING IS NOT RESTARTING, and conflating them cost fourteen seconds to engage.
+--
+-- px_restart exists for "the geometry was wrong or the plan changed", and it throws away the
+-- window ladder's cursor -- p.wins, p.wi and p.at -- because after a plan change the ladder is
+-- the wrong ladder. It also resets cachetries, so the cheap routes get their frames again.
+--
+-- Neither applies while the module is simply not ready yet. Nothing about the plan has changed
+-- and nothing about the ladder is stale: the install has not finished reattaching, or the span
+-- has not got two live addresses in it. Using px_restart there discarded the search's position
+-- on every frame it waited, so the ladder began again at window one each time and the search
+-- made no progress while the waiting lasted. Measured on the glass at 8.97: fourteen seconds
+-- from launch to the F appearing, against three to five in 8.95 where the same wait ended in
+-- px_off after thirty frames.
+--
+-- So this holds the state exactly as it is and only records why.
+function fftsa.nl.px_wait(why)
+  local nl = fftsa.nl
+  nl.px.state = 'idle'
+  nl.px.why = why
+  nl.px.waits = (nl.px.waits or 0) + 1
+  return nil
+end
+
 -- Back to the start without giving up: the geometry was wrong or the plan changed, and the
 -- next frame begins the search again. Counters survive, so a report says how many times.
 function fftsa.nl.px_restart(why)
   local nl = fftsa.nl
   local laps = nl.px.restarts
+  -- Was it ever drawing? That is what decides whether there is anything to wait for, and it
+  -- has to be read before px_clear.
+  local drew = nl.px.state == 'on'
   nl.px_clear()
   nl.px.state = 'idle'
   nl.px.why = why
   nl.px.restarts = (laps or 0) + 1
+  -- KEPT WHERE THE ENGAGE CANNOT WIPE IT. p.why is cleared by px_map on every attempt, so by
+  -- the time an operator reads the page the reasons the path restarted are gone -- and the
+  -- restart count alone cost a day: re=4 with the ring inside the first window said the ladder
+  -- had been thrown away four times, and nothing said what did it. The last two reasons are
+  -- enough to name the mechanism without keeping a log.
+  nl.px.re_prev = nl.px.re_last
+  nl.px.re_last = why
+  if nl.t_first ~= nil then
+    nl.t_restart_el = os.clock() - nl.t_first
+    nl.pre_at_restart = nl.pre_frames or 0
+  end
+  -- PX_HOLD frames of plain appends before a map may be attempted again, and ONLY after a
+  -- session that drew. An engaged frame writes the y triples and not the values, so straight
+  -- after a drop the two no longer describe the same spectrum and nothing can be fitted from
+  -- them. A launch has never drawn -- sg_bind restarts the path while building the screen --
+  -- so holding there waits four frames for a divergence that cannot exist.
+  nl.px.hold = 0
+  if drew then nl.px.hold = nl.PX_HOLD end
   nl.px.wins, nl.px.wi, nl.px.at = nil, nil, nil
+  -- backstop_done is NOT cleared: it records that the whole of DRAM has been walked once in
+  -- this session, and a plan change is no reason to do it again.
   -- The name is tried again from scratch. noname is only a record of one ladder having been
   -- swept without finding it, and a restart means the plan or the traces changed.
-  nl.px.noname = nil
+  --
+  -- AND THE COUNTERS THAT CONDEMN IT GO WITH IT, or the reprieve is not one.
+  --
+  -- A freed trace object keeps the buffer name, so the needle matches every corpse of every
+  -- previous run, and PX_NAME_FAIL retires it after that many hits that produce no candidate.
+  -- Clearing the flag here while leaving namehits and ncand cumulative gave the retirement a
+  -- SESSION's lifetime and the reprieve a PASS's: the needle was revived by every restart and
+  -- then re-condemned by corpses counted in the passes before it.
+  --
+  -- Measured on the glass at 9.14 from a clean boot: re=4, nh=69, namedead=69, noname=1,
+  -- by=freq, win=13/17, swept=27MB, eng=10.6s. Sixty-nine hits over four passes is about
+  -- seventeen a pass, so no single pass came near the bound that was applied -- and the pass
+  -- that mattered, the one after the last rebind with the live trace object in memory, ran
+  -- without the only needle that can say WHICH trace. The ring was at inst+5.25 MB, inside the
+  -- instance band the ladder tries third, and the name would have named it there.
+  --
+  -- The session total is kept, both for the report and because it still bounds the thing
+  -- PX_NAME_FAIL was added for: a path that restarted every frame would otherwise revive the
+  -- needle every frame and never retire it at all.
+  nl.px.nhall = (nl.px.nhall or 0) + (nl.px.namehits or 0)
+  nl.px.noname, nl.px.namehits, nl.px.ncand = nil, 0, 0
+  nl.px.sweptpass = 0
+  -- AND THE SUBSCRIBER ROUTE'S WINDOW BUDGET, for the same reason as everything above it: a
+  -- restart means the traces were rebound, so the subscription is a NEW one and reads spent
+  -- looking for the old one say nothing about it. The cached slot address is deliberately NOT
+  -- cleared -- the table is static and the slot is re-checked with one word, so keeping it is
+  -- what makes the route cost nothing on the frames after a restart.
+  nl.px_subfinds = 0
+  nl.px.subwait = 0
+  -- AND THE WINDOW LADDER'S CURSOR, for the fourth time today the same rule: a counter that
+  -- bounds a search must not outlive the thing it is searching for. A restart means the traces
+  -- were rebound, so the compiled window is worth re-reading before the ladder is walked again.
+  -- Left to run on, it spent itself during the first pass and every later pass reported "the
+  -- ladder is spent" having read nothing.
+  nl.px_subwin = nil
   return nil
 end
 
@@ -2330,13 +3255,41 @@ fftsa.nl.PX_NAME_SCAN = 1024
 --
 -- Same shape as the record route's output, so px_map takes either without knowing which found
 -- it: lo, hi, nrec, stride, hdr.
+-- ONE READ FOR THE WHOLE NEIGHBOURHOOD, not a word at a time.
+--
+-- nl._wg is ki.peek32, which is an IPC round trip per word, and this walk is 257 of them for
+-- every hit it is given. A slice carrying tens of aligned hits is then tens of thousands of
+-- round trips inside a single frame, and the frame cannot be interrupted: measured on the
+-- glass as a 4 to 5 second stall while the search ran, and about five seconds to engage at
+-- 1024 points. The window is a kilobyte. Read it once and the walk is arithmetic in a string.
+--
+-- Clamped rather than refused at the top of DRAM, so a hit near the end still gets whatever
+-- of its window exists -- w() answers nil past what came back, which is what _wg did for an
+-- address outside the backstop.
 function fftsa.nl.px_from_name(at)
   local nl = fftsa.nl
   local out, nout = {}, 0
+  -- _wg refuses an unaligned address, so the old walk read nothing at all from an unaligned
+  -- hit. Saying so here costs one test instead of 257.
+  if type(at) ~= 'number' or at <= 0 or math.mod(at, 4) ~= 0 then return out end
+  local blo, bhi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if blo == nil or bhi == nil or blo >= bhi then blo, bhi = 0, nl.DRAM_END end
+  if at < blo then return out end
+  local want = nl.PX_NAME_SCAN + nl.HDR_COUNT + 4
+  if at + want > bhi then want = bhi - at end
+  if want < 8 then return out end
+  local blk = ki.memread(hx(at), hx(want))
+  nl.rd_note(want)
+  if blk == nil then return out end
+  local got = string.len(blk)
+  local w = function(off)
+    if off < 0 or off + 4 > got then return nil end
+    return u32_at(blk, off + 1)
+  end
   local o
   for o = 0, nl.PX_NAME_SCAN, 4 do
     local h = at + o
-    local lo, hi = nl._wg(h), nl._wg(h + 4)
+    local lo, hi = w(o), w(o + 4)
     if lo ~= nil and hi ~= nil and hi > lo then
       local span = hi - lo
       -- The ring sits inside this very object, just past its own bounds words, so a pair that
@@ -2347,16 +3300,68 @@ function fftsa.nl.px_from_name(at)
           if math.mod(span, sv) == 0 then
             local n = span / sv
             if n >= nl.RING_MIN and n <= nl.RING_MAX then
-              local old = nl._wg(h + nl.HDR_OLD)
-              local wr = nl._wg(h + nl.HDR_WRITE)
-              local cnt = nl._wg(h + nl.HDR_COUNT)
-              if old ~= nil and wr ~= nil and cnt ~= nil
-                 and old >= lo and old < hi and math.mod(old - lo, sv) == 0
-                 and wr >= lo and wr <= hi and math.mod(wr - lo, sv) == 0
-                 and cnt >= 1 and cnt <= n then
-                nout = nout + 1
-                out[nout] = { lo = lo, hi = hi, nrec = n, stride = sv, hdr = h,
-                              name_at = at, name_off = o }
+              -- The cursor offsets: the 6500's measured constants, or derived for a model they
+              -- have never been read off. Shadow mode runs the derivation either way and only
+              -- records whether it agreed, which is what will decide whether the constants are
+              -- needed at all.
+              local ho, hw, hc = nl.HDR_OLD, nl.HDR_WRITE, nl.HDR_COUNT
+              local rd = function(x) return w(o + x) end
+              -- A DERIVING MODEL TAKES THE ROLES UNRESOLVED and settles them by cause in the
+              -- map state, where there are frames and an append between them. All that is
+              -- wanted here is the count offset and the pairs worth testing.
+              local pend = nil
+              if nl.PX_HDR_DERIVE then
+                local cands, pairs = nl.px_hdr_roles(rd, lo, hi, sv, n)
+                if cands ~= nil then
+                  hc, pend = cands, pairs
+                  ho, hw = nil, nil
+                end
+              end
+              if nl.PX_HDR_CHECK or (nl.PX_HDR_DERIVE and pend == nil) then
+                local do_, dw, dc = nl.px_hdr_derive(rd, lo, hi, sv, n)
+                if do_ == nil then
+                  -- Counted either way. A refusal is a result: it is what says the single-frame
+                  -- shape is not enough on this object, which is the figure that decides
+                  -- whether the derivation can ever replace the constants.
+                  nl.hdr_differ = nl.hdr_differ + 1
+                  nl.hdr_why = tostring(dw)
+                else
+                  if do_ == nl.HDR_OLD and dw == nl.HDR_WRITE and dc == nl.HDR_COUNT then
+                    nl.hdr_agree = nl.hdr_agree + 1
+                    nl.hdr_why = nil
+                  else
+                    nl.hdr_differ = nl.hdr_differ + 1
+                    nl.hdr_why = string.format('derived %d/%d/%d, constants %d/%d/%d',
+                                               do_, dw, dc, nl.HDR_OLD, nl.HDR_WRITE,
+                                               nl.HDR_COUNT)
+                  end
+                  if nl.PX_HDR_DERIVE then ho, hw, hc = do_, dw, dc end
+                end
+              end
+              if pend ~= nil then
+                -- Unresolved: the count is known, the cursors are a short list. The checks the
+                -- resolved branch makes below are exactly what px_hdr_resolve will make, one
+                -- append apart, so nothing is lost by not making them here.
+                local cnt = w(o + hc)
+                if cnt ~= nil and cnt >= 1 and cnt <= n then
+                  nout = nout + 1
+                  out[nout] = { lo = lo, hi = hi, nrec = n, stride = sv, hdr = h,
+                                name_at = at, name_off = o,
+                                h_cnt = hc, h_pairs = pend }
+                end
+              else
+                local old = w(o + ho)
+                local wr = w(o + hw)
+                local cnt = w(o + hc)
+                if old ~= nil and wr ~= nil and cnt ~= nil
+                   and old >= lo and old < hi and math.mod(old - lo, sv) == 0
+                   and wr >= lo and wr <= hi and math.mod(wr - lo, sv) == 0
+                   and cnt >= 1 and cnt <= n then
+                  nout = nout + 1
+                  out[nout] = { lo = lo, hi = hi, nrec = n, stride = sv, hdr = h,
+                                name_at = at, name_off = o,
+                                h_old = ho, h_wr = hw, h_cnt = hc }
+                end
               end
             end
           end
@@ -2370,22 +3375,1040 @@ function fftsa.nl.px_from_name(at)
   return out
 end
 
-function fftsa.nl.px_windows(buf)
+-- ---------------------------------------------------------------------------
+-- THE RING BY POINTER, WHICH IS WHAT A SCAN SHOULD NEVER HAVE BEEN DOING.
+--
+-- notes/firmware/graph/GRAPH.md gives the whole chain, statically recovered from the image:
+-- the GUI object table is indexed by the same id Lua holds as a display handle, the graph
+-- widget keeps its traces in a null-terminated pointer array at +0x3EC, and a trace object
+-- carries its buffer name at +0x08, the ring bounds at +0x1F0 and the ring itself at +0x220.
+-- So from fftsa.sg_graph the ring is three reads, and the sweep this module has been paying
+-- -- tens of megabytes and half a minute per launch -- buys nothing the table does not give.
+--
+-- NO ADDRESS IS CARRIED. Only distances within structures, each used for one step of a walk
+-- that is checked at every step, and the table's own base is DERIVED from a ring the search
+-- has already confirmed: trace is ring-0x220, the word holding trace is graph+0x3EC, the word
+-- holding graph is the table entry, and the entry is base+id*0x260. Two four-byte sweeps, once
+-- per boot, against one content sweep per launch.
+--
+-- The forward walk re-validates rather than trusts the cache: the name has to be this app's
+-- buffer, the bounds pair has to bracket the ring at the documented distance, and the cursors
+-- have to be consistent with both. A base that has gone stale therefore refuses and the
+-- content route runs, which is also what happens on a build whose layout differs.
+fftsa.nl.PX_TRACE_RING  = 544        -- 0x220, the ring, within the trace object
+fftsa.nl.PX_TRACE_NAME  = 8          -- 0x08, buffer name, 32 bytes
+fftsa.nl.PX_TRACE_BNDS  = 496        -- 0x1F0, ring base and end
+fftsa.nl.PX_GRAPH_TRACE = 1004       -- 0x3EC, the widget's null-terminated trace array
+fftsa.nl.PX_OBJ_STRIDE  = 608        -- 0x260, GUI object table stride
+-- THE WIDGET POINTER IS NOT THE FIRST WORD OF THE ENTRY. notes/firmware/graph/GRAPH.md:178:
+-- the table is `0x00D17BE0 + id*0x260`, with the widget pointer at `+0x50`, the parameter
+-- block at `+0x20`, the type byte at `+8`. Reading the entry's first word, which is what this
+-- did, is why the pointer route never engaged: the derivation that followed then searched for
+-- whatever word held the widget and found an arbitrary one in the heap, and its forward check
+-- could not tell -- it reads back the very word the base came from, so `base + id*stride` is
+-- that word by construction whatever it was.
+fftsa.nl.PX_OBJ_WIDGET  = 80         -- 0x50, the widget pointer inside a table entry
+
+-- THE FIRMWARE KEEPS A STATIC TABLE OF BUFFER SUBSCRIPTIONS, INDEXED BY THE BUFFER NAME WE
+-- CHOSE OURSELVES, AND IT REACHES THE TRACE OBJECT IN THREE READS.
+--
+-- This replaces searching DRAM for the ring. Measured on the glass at 9.16, clean boot:
+-- eng=3.1s/21f with swept=27MB, the name needle finally surviving long enough to name the ring.
+-- The route below reads 64 KB once and dereferences three pointers.
+--
+-- How it works, read off the decompiled firmware and then confirmed on the instrument:
+--
+--   graph_trace_add (0x0002D3C4) creates the 0x14220-byte trace object, stores it in the
+--   widget's trace array, and calls
+--
+--       bufsub_subscribe(0x407F, graph, trace+0x08, &routing_element)   (0x000B4708)
+--
+--   which allocates a slot in a STATIC table and -- before its switch on the kind -- copies the
+--   NAME to slot+0x08, the graph to slot+0x34 and the routing element's ADDRESS to slot+0x40.
+--   So slot+0x40 is not an index: one dereference gives the array element, a second gives the
+--   trace object.
+--
+-- Measured on a DMM6500 at 1.7.17a with the app running at 2048 points:
+--
+--   slot 00D67CD0   kind 0000407F   graph 03134A28   p4 03134EC0
+--   *(p4)       = 0352D4B0          the trace object
+--   trace+0x08  = FFTSA_TRACE       the name again
+--   trace+0x00  = 03134A28          the graph, matching slot+0x34
+--   trace+0x30  = 00D67CD0          the subscription handle, matching the slot
+--   trace+0x1F0 = 0352D6D0..03537488 count 510, and 0352D6D0 is trace+0x220
+--
+-- Every link confirms another, which is what makes this safe to dereference. The ring address
+-- is the one the search spends 27 MB finding.
+--
+-- NO TABLE BASE IS NEEDED. The slot is name_address - 8, so a hit anywhere in the window names
+-- its own slot and the base, the stride and the slot count all stop mattering. That is what
+-- makes this survive a firmware change: measured, 1.7.17a has the table at 0x00D67708 and
+-- 1.7.18a at 0x00D67A48 -- the same 0x340 .bss delta as the GUI object table -- and this route
+-- does not care which.
+--
+-- A WINDOW, NOT AN ADDRESS, and it is the only firmware figure here. Under the operator's rule
+-- of 2026-11-10 a start address may be compiled in where being wrong costs performance and
+-- never correctness: this one only decides where to look for a string, a wrong window costs one
+-- 64 KB read, and nothing is believed until the chain above closes on itself and px_map has
+-- matched 510 float32 frequencies of this app's own axis.
+fftsa.nl.PX_SUB = true
+-- 0x00D60000 .. 0x00D70000. The two measured tables sit at 0x00D67708 (1.7.17a) and
+-- 0x00D67A48 (1.7.18a), 64 slots of 296 bytes reach 0x00D6C448, and the c2c decoy is at
+-- 0x00D67598 -- so this covers every one of them with room either side. The first figure
+-- written here was 13893632, which is 0x00D40000 and covers NONE of it; the firmware-address
+-- gate refused it for being an undeclared DRAM literal and that is how the miss was caught
+-- rather than by a run on the instrument that found nothing.
+fftsa.nl.PX_SUB_LO    = 14024704     -- 0x00D60000, the DMM6500
+fftsa.nl.PX_SUB_BYTES = 65536        -- 64 KB
+-- AND THE DMM7510'S, read out of its own image rather than guessed.
+--
+-- Its display code is a separate payload: rom/rom7519.zx, S-record header `disp7510_r`. The
+-- loader's section table at flash 0xFF702E00 maps the application sections by subtracting
+-- 0xFF200000, so RAM address equals flattened-image offset -- the same relation the DMM6500
+-- has, confirmed there against four strings whose RAM addresses are independently known.
+--
+-- In those terms, at 1.7.16a: the subscribe function is at 0x00043A0C, its table at 0x005189C8
+-- with the count 0x50 below at 0x00518978, 64 slots, and a stride of 0x100 rather than the
+-- 6500's 0x128 -- expressed in the code as both `addi 256` and `slwi 8`. The stride does not
+-- matter to this route, which takes the slot from the name hit; what matters is that the NAME,
+-- the GRAPH and the ROUTING POINTER sit at +0x08, +0x34 and +0x40 exactly as on the 6500, and
+-- the graph-trace kind is the same 0x407F. The eight trace and widget offsets this route and
+-- px_from_trace use are unchanged too.
+--
+-- So a DMM7510 needs a different window and nothing else. 0x00510000 for 64 KB holds the table
+-- and all 64 of its slots, and lies wholly inside that build's .bss (0x004FFDC0..0x005E9C10).
+fftsa.nl.PX_SUB_LO_7510 = 5308416    -- 0x00510000
+-- AND A LADDER OF WIDER WINDOWS FOR A MODEL WHOSE TABLE IS SOMEWHERE ELSE.
+--
+-- The window above is where a DMM6500 keeps it, and on that model the first read answers. On a
+-- model with no measured address the table is still STATIC -- below the heap, in .bss -- so it
+-- is reachable by reading that region and searching the bytes for a name this app chose. One
+-- megabyte a frame is a 40 ms read at the measured 25 MB/s, the cursor is kept across frames,
+-- and it happens once a launch.
+--
+-- This is not the abandoned Lua sweep. That swept the HEAP, hundreds of megabytes, for a
+-- needle that moved between launches. This reads a bounded static region for a string whose
+-- presence does not depend on where any allocation went, and it stops at the first hit that
+-- validates.
+--
+-- A DMM7510's display code is a separate payload: rom/rom7519.zx, S-record header `disp7510_r`,
+-- flattening to RAM 0..0xD03000 with the subscription tags present -- S$BE at 0x00170F30, S$BA
+-- at 0x00171520, S$BB at 0x00171528, PEG Main at 0x0016E398, defbuffer1 beside them at
+-- 0x00171034. So the mechanism is there and only its addresses are unknown, which is what this
+-- ladder is for.
+-- Derive the slot's field offsets when the compiled ones do not close the chain. Off on a
+-- DMM6500, where they are read off the firmware and measured on the glass; on by default
+-- elsewhere, because the alternative is having no route at all on a model nobody can measure.
+fftsa.nl.PX_SUB_DERIVE = false
+-- Walk a ladder of wider windows when the compiled one misses. Off on a DMM6500 for the reason
+-- in px_sub_slot; on elsewhere, where there is no measured address to compile in.
+fftsa.nl.PX_SUB_LADDER = false
+-- Accept a slot whose kind word is not PX_SUB_KIND, provided everything else closes.
+--
+-- 0x407F is the DMM6500's graph-trace subscription kind and the kind word is the cheap liveness
+-- filter -- unsubscribe clears it, so it rejects corpses in one read. On a model whose constant
+-- is unknown that filter cannot be applied, and the route would simply never start. Dropping it
+-- is safe because it is not what makes the chain believable: a candidate still has to reach an
+-- object carrying this app's buffer name, present a ring whose base word equals its own +0x220,
+-- and match 510 float32 frequencies of this app's axis in px_map before a byte is written -- and
+-- a freed ring holds zeros, so it can match none of them.
+fftsa.nl.PX_SUB_ANYKIND = false
+fftsa.nl.PX_SUB_STEP  = 1048576      -- 1 MB a frame
+fftsa.nl.PX_SUB_FROM  = 1048576      -- 0x00100000, clear of .text's start
+fftsa.nl.PX_SUB_TO    = 16777216     -- 0x01000000, the 6500's heap floor and well past .bss
+fftsa.nl.PX_SUB_KIND  = 16511        -- 0x407F, a graph-trace subscription
+fftsa.nl.PX_SUB_NAME  = 8            -- 0x08, the name within a slot
+fftsa.nl.PX_SUB_GRAPH = 52           -- 0x34, the graph widget
+fftsa.nl.PX_SUB_P4    = 64           -- 0x40, the ADDRESS of the widget's routing element
+-- The routing array the element must lie in, as offsets within the widget. 40 elements, written
+-- at the cursor in graph+0x538 and wrapping, so the index says nothing -- but the RANGE
+-- cross-checks slot+0x40 against slot+0x34, and the two came from different firmware stores.
+fftsa.nl.PX_ROUTE_LO  = 1176         -- 0x498
+fftsa.nl.PX_ROUTE_HI  = 1332         -- 0x534
+fftsa.nl.PX_TR_GRAPH  = 0            -- trace+0x00, the trace's own graph back-pointer
+fftsa.nl.PX_TR_SUB    = 48           -- trace+0x30, the subscription handle: the slot address
+-- Name hits to examine. The window holds at least one DECOY: the c2c request record at
+-- DAT_00d678d0/0xd8 carries both a copy of the name and a pointer to the current slot, and it
+-- sits BELOW the table -- so it is found FIRST by a forward search. Measured: two hits, the
+-- first at 00D67598 whose "kind" word read back 00D67CD0, which is the live slot's address.
+-- Taking the first hit would have followed the decoy.
+fftsa.nl.PX_SUB_HITS  = 12
+-- Window reads a launch. The slot address is kept once found and re-checked with ONE word, so
+-- this bounds only the case where the name is not in the window at all -- a model whose table
+-- is elsewhere, where re-reading 64 KB every frame for the whole session would be the cost of
+-- being wrong rather than one read.
+fftsa.nl.PX_SUB_FINDS = 32
+-- Frames to wait for a known slot's ring to fill before sweeping anyway. The ring fills from
+-- the app's own appends, so this is a couple of frames in practice; the bound exists for a
+-- build where a slot reads as live and the chain behind it means something else. Reset by
+-- px_restart, because a rebind makes a new subscription and the frames spent on the old one
+-- say nothing about it.
+fftsa.nl.PX_SUB_WAIT = 24
+
+-- The subscriber slot for this app's trace buffer, or nil. One bounded read and a string
+-- search, both of which happen once: the slot address is kept and re-validated by the caller.
+--
+-- A CORPSE KEEPS ITS NAME. Unsubscribing clears a slot's KIND but does not erase the name or
+-- slot+0x40, and removing one of several equivalent subscribers can leave -2 in the kind rather
+-- than zero. So liveness is kind == 0x407F exactly, never "non-zero" -- the same trap the ring's
+-- name needle fell into with 87 corpses in a single pass.
+function fftsa.nl.px_sub_slot()
   local nl = fftsa.nl
-  local all = nl.scan_windows(buf, nil)
-  local out, n = {}, 0
-  local i
-  for i = 1, table.getn(all) do
-    if all[i][2] - all[i][1] <= nl.PX_WIN_MAX then
-      n = n + 1
-      out[n] = all[i]
+  local want = nl.PX_NAME .. string.char(0)
+  -- The slot this launch already found, re-checked rather than re-searched.
+  if nl.px_subslot ~= nil then
+    -- RE-CHECKED AGAINST THE KIND IT WAS ACCEPTED WITH, not against the compiled one. On a
+    -- DMM6500 those are the same word. On a model whose constant is unknown they are not, so
+    -- re-checking against 0x407F threw the slot away on the frame after it was found and sent
+    -- the ladder round again -- measured offline as the name being found on try 4 and the route
+    -- still reporting "none a live graph trace" on try 5.
+    local wantk = nl.sub_kind or nl.PX_SUB_KIND
+    if nl._wg(nl.px_subslot) == wantk then return nl.px_subslot end
+    nl.px_subslot, nl.sub_trace = nil, nil
+    nl.sub_why = 'the slot stopped reading as the kind it was found with'
+  end
+  nl.px_subfinds = (nl.px_subfinds or 0) + 1
+  if nl.px_subfinds > nl.PX_SUB_FINDS then
+    nl.sub_why = 'the name is not in the window, ' .. tostring(nl.PX_SUB_FINDS)
+                 .. ' reads spent'
+    return nil
+  end
+  -- WHICH WINDOW THIS FRAME. The compiled one first, then the ladder, one a frame, resuming
+  -- where it left off -- so a model whose table is elsewhere is not charged a 15 MB read in a
+  -- single uninterruptible frame.
+  local wlo, wn = nl.PX_SUB_LO, nl.PX_SUB_BYTES
+  if nl.px_subwin ~= nil then
+    -- THE LADDER IS FOR A MODEL WITH NO MEASURED ADDRESS, and only for one.
+    --
+    -- On a DMM6500 the compiled window is where the table is on both builds that have been
+    -- read, and a later build moves it by a .bss delta of a few hundred bytes -- well inside
+    -- 64 KB. Walking 15 MB behind that window there would cost fifteen frames of 1 MB reads
+    -- before the search got going, which the offline suite measured as the search engaging
+    -- after fifteen frames instead of under eight. So the 6500 reads its one window, and if
+    -- that misses, sub_why says so and the search carries the job as it always did.
+    if not nl.PX_SUB_LADDER then
+      nl.sub_why = 'the name is not in the compiled window'
+      return nil
+    end
+    wlo, wn = nl.px_subwin, nl.PX_SUB_STEP
+    if wlo >= nl.PX_SUB_TO then
+      nl.sub_why = 'the ladder is spent: no name anywhere in the static region'
+      return nil
     end
   end
-  local lo, hi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
-  if lo == nil or hi == nil or lo >= hi then lo, hi = 0, nl.DRAM_END end
-  n = n + 1
-  out[n] = { lo, hi }
+  nl.sub_at = wlo
+  local blob = nil
+  local ok = pcall(function()
+    blob = ki.memread(hx(wlo), hx(wn))
+  end)
+  nl.rd_note(wn)
+  -- Advance the ladder whatever happened, so a region the firmware refuses does not stall it.
+  if nl.px_subwin == nil then
+    nl.px_subwin = nl.PX_SUB_FROM
+  else
+    nl.px_subwin = wlo + wn
+  end
+  if not ok or type(blob) ~= 'string' then
+    nl.sub_why = 'the read at ' .. hx(wlo) .. ' was refused'
+    return nil
+  end
+  nl.sub_len, nl.sub_want = string.len(blob), wn
+  -- EVERY HIT, EXACT KIND FIRST, AND ONLY THEN ANYTHING LOOSER.
+  --
+  -- The window holds a DECOY: the c2c request record carries a copy of the name with a pointer
+  -- to the current slot eight bytes before it, so it has a slot's shape and it sits BELOW the
+  -- table -- found first by a forward search. On the 6500 the exact kind rejects it in one read.
+  -- Under PX_SUB_ANYKIND a plausible non-zero word is enough, and the decoy's word is a slot
+  -- ADDRESS, which is plausible -- so a single pass that accepted the looser test on the first
+  -- hit would select the decoy, cache it, and never reach the genuine slot behind it. Measured
+  -- on the 6500: two hits, the decoy first, its first word reading back the live slot's address.
+  --
+  -- So the hits are collected, then tried in two rounds. The 7510's kind is known to be the
+  -- same 0x407F, so the loose round is a fallback for a build that changed it and never a
+  -- shortcut past a slot that would have matched exactly.
+  local at, seen = 1, 0
+  local hits, nh = {}, 0
+  nl.sub_hits = nl.sub_hits or 0
+  while seen < nl.PX_SUB_HITS do
+    local f = string.find(blob, want, at, true)
+    if f == nil then break end
+    seen = seen + 1
+    at = f + 1
+    nh = nh + 1
+    hits[nh] = wlo + f - 1
+    nl.sub_hits = (nl.sub_hits or 0) + 1
+    if nl.sub_first == nil then nl.sub_first = hits[nh] end
+  end
+  nl.sub_wincap = seen >= nl.PX_SUB_HITS
+  local round
+  for round = 1, 2 do
+    if round == 2 and not nl.PX_SUB_ANYKIND then break end
+    local hi2
+    for hi2 = 1, nh do
+      local na = hits[hi2]
+      local d
+      for d = 1, table.getn(nl.PX_SUB_NAMEOFFS) do
+        local slot = na - nl.PX_SUB_NAMEOFFS[d]
+        local kw = nil
+        if slot > 0 and math.mod(slot, 4) == 0 then kw = nl._wg(slot) end
+        local livekind = kw == nl.PX_SUB_KIND
+        if round == 2 and (not livekind) and kw ~= nil and kw ~= 0
+           and kw ~= 4294967294 and kw < nl.DRAM_END then
+          livekind = true
+        end
+        if livekind then
+          nl.px_subslot = slot
+          nl.sub_nameoff = nl.PX_SUB_NAMEOFFS[d]
+          nl.sub_kind = kw
+          nl.sub_loose = round == 2
+          nl.sub_why = nil
+          return slot
+        end
+      end
+    end
+  end
+  -- No hit was a slot: keep the first one's neighbourhood for the report, because on a model
+  -- whose layout differs that dump is what settles the offsets without another run.
+  if nl.sub_map == nil and nh > 0 then nl.sub_map = nl.px_sub_dump(hits[1]) end
+  nl.sub_why = tostring(nl.sub_hits) .. ' name hit(s) through ' .. hx(nl.px_subwin)
+               .. ', none a live graph trace'
+  return nil
+end
+
+-- Offsets of the name within a slot to try, in order. 8 is the DMM6500's, read off
+-- bufsub_subscribe. The others cost one guarded read each and cover a model that moved the
+-- field, which is cheaper than being unable to start at all.
+fftsa.nl.PX_SUB_NAMEOFFS = { 8, 12, 16, 4, 20, 24, 32, 40, 48, 52, 56, 64 }
+
+-- WHAT IS AROUND A NAME HIT THAT DID NOT VALIDATE, as offset:value pairs for the report.
+--
+-- This is the diagnostic that is meant to make ONE report from a DMM7510 enough. The chain is
+-- kind at slot+0, name at slot+8, graph at slot+0x34 and a pointer to the widget's routing
+-- element at slot+0x40 -- all DMM6500 figures. If a 7510 report shows the name found but no
+-- slot, these words are what say where its fields really are: the same arithmetic that settled
+-- the 6500 from one grab, where the name sitting exactly five strides plus eight above a
+-- candidate base confirmed the stride, the field offset and the inter-build delta at once.
+--
+-- Only words that could be pointers are kept, so the line stays short enough to read off a
+-- photograph of the screen.
+fftsa.nl.PX_SUB_DUMP = 10
+function fftsa.nl.px_sub_dump(na)
+  local nl = fftsa.nl
+  local out, n = '', 0
+  local d
+  for d = -64, 192, 4 do
+    if n >= nl.PX_SUB_DUMP then break end
+    local a = na + d
+    if a > 0 and math.mod(a, 4) == 0 then
+      local w = nl._wg(a)
+      if w ~= nil and w > 65536 and w < nl.DRAM_END then
+        n = n + 1
+        out = out .. ' ' .. tostring(d) .. ':' .. hx(w)
+      end
+    end
+  end
+  return hx(na) .. out
+end
+
+-- WHICH WORDS OF A SLOT HOLD THE GRAPH AND THE ROUTING POINTER, derived rather than assumed.
+--
+-- +0x34 and +0x40 are DMM6500 figures, read off bufsub_subscribe. A model that moved them makes
+-- the whole route unavailable, and there is no DMM7510 on the bench to measure -- so when the
+-- compiled pair does not close the chain, the slot's own words are tried until one pair does.
+--
+-- What makes this safe without knowing anything is that the TEST is the chain closing on itself:
+-- a candidate p4 has to point at a word that points at an object whose +0x08 carries THIS app's
+-- buffer name, and that object then has to present a ring whose base word equals its own +0x220
+-- and match 510 float32 frequencies of this app's axis in px_map before a byte is written. A
+-- wrong pair cannot pass those; it costs three guarded reads to reject.
+--
+-- Bounded per frame by the walk's own share of the read allowance, with the cursor kept, so a
+-- model that needs the whole range does not spend an uninterruptible frame on it.
+fftsa.nl.PX_SUB_WALK = 128           -- bytes of a slot to consider, from 0
+function fftsa.nl.px_sub_pairs(slot)
+  local nl = fftsa.nl
+  local want = nl.PX_NAME .. string.char(0)
+  local at = nl.sub_walkat or 0
+  while at <= nl.PX_SUB_WALK do
+    local p4 = nl._wg(slot + at)
+    at = at + 4
+    if p4 ~= nil and p4 > 65536 and p4 < nl.DRAM_END and math.mod(p4, 4) == 0 then
+      -- Two levels, which is what the DMM6500 does: slot+0x40 holds the ADDRESS of the
+      -- widget's routing element, and that element holds the trace. One level is tried too, for
+      -- a model that stores the trace pointer itself.
+      local k
+      for k = 1, 2 do
+        local t = p4
+        -- _wg GUARDS ALIGNMENT AND RANGE, NOT MAPPED-NESS, and that distinction is a
+        -- bluescreen here. ki.peek32 is an lwz with no validation, so an address inside DRAM
+        -- that nothing has mapped is a precise data storage interrupt -- which ki.reboot cannot
+        -- recover. Every other route dereferences pointers the firmware handed us; this one
+        -- walks a slot's BYTES, so each word is arbitrary until proven. px_live is the proof:
+        -- the address has to lie in a span this module has already read successfully.
+        if k == 2 then t = nl._rdw(p4) end
+        -- And the WHOLE range px_from_name will read, not just the name field: it walks
+        -- PX_NAME_SCAN bytes forward looking for a bounds pair, and proving only through the
+        -- name would leave that walk reading on an exploratory candidate's authority.
+        if t ~= nil and t > 65536 and t < nl.DRAM_END and math.mod(t, 4) == 0 then
+          local got = nil
+          pcall(function()
+            got = ki.memread(hx(t + nl.PX_TRACE_NAME), hx(string.len(want)))
+          end)
+          nl.rd_note(string.len(want))
+          if got == want then
+            nl.sub_walkat = 0
+            nl.sub_p4off = at - 4
+            nl.sub_levels = k
+            -- The name read succeeded, so the region is mapped and it is ours.
+            nl.sub_trace_ok = t
+            nl._map_age = nl.MAP_REFRESH
+            nl.map_lo, nl.map_hi = nil, nil
+            return t
+          end
+        end
+      end
+    end
+    if nl.px_obj_over() then
+      nl.sub_walkat = at
+      return nil
+    end
+  end
+  nl.sub_walkat = 0
+  nl.sub_walkdone = true
+  return nil
+end
+
+-- The trace object through the subscriber slot. Three reads, each checked against something the
+-- firmware wrote somewhere else, then the ordinary name and geometry validation.
+function fftsa.nl.px_from_bufsub()
+  local nl = fftsa.nl
+  if nl.PX_SUB == false then
+    nl.sub_why = 'not attempted on this model'
+    return {}
+  end
+  -- NOT CACHED PER FRAME, deliberately. This is called from the top of the seek arm and again
+  -- from px_seek, so a frame where both run walks the chain twice -- eight guarded reads, which
+  -- rd_note accounts for and RD_MAX_CALLS bounds. A once-a-frame cache keyed on the read
+  -- stamp saved those eight reads and introduced a way to wedge: any caller that does not
+  -- advance the stamp gets the first answer for ever, and the offline suite -- which calls this
+  -- directly, several times, within one stamp -- is exactly that caller. The window read, which
+  -- is the cost worth avoiding, is already cached by px_sub_slot.
+  nl.sub_tries = (nl.sub_tries or 0) + 1
+  local slot = nl.px_sub_slot()
+  if slot == nil then return {} end
+  local tr = nl.px_sub_fixed(slot)
+  if tr == nil then
+    -- THE COMPILED OFFSETS DID NOT CLOSE THE CHAIN, so derive the pair from the slot's own
+    -- words. On a DMM6500 this never runs. On a model that moved the fields it is the
+    -- difference between the route working and the route being unavailable, and the test is
+    -- the chain closing on this app's own buffer name rather than on any figure from an image.
+    if nl.PX_SUB_DERIVE and not nl.sub_walkdone then
+      tr = nl.px_sub_pairs(slot)
+      if tr ~= nil then nl.sub_derived = true end
+    end
+    if tr == nil then return {} end
+  end
+  local g = nl.px_from_trace(tr)
+  if table.getn(g) == 0 then
+    -- THE REASON px_from_trace GAVE, not a presumed one. An empty ring is the usual cause on
+    -- the early frames -- px_from_name's last test is cnt >= 1, the corpse test, right for a
+    -- heap search and wrong for a chain that has already closed on itself -- but it is not the
+    -- only one, and reporting it as though it were would send a reader after the wrong thing.
+    -- The count is named only when it was actually read and is actually zero.
+    local cnt = nl._wg(tr + nl.PX_TRACE_BNDS + nl.HDR_COUNT)
+    local tail = ' after ' .. tostring(nl.sub_tries) .. ' try/tries'
+    if cnt == 0 then
+      nl.sub_why = 'trace ' .. hx(tr) .. ' ring is empty' .. tail
+    else
+      nl.sub_why = 'trace ' .. hx(tr) .. ' ring count ' .. hxn(cnt) .. ', '
+                   .. tostring(nl.ptr_why) .. tail
+    end
+    nl.sub_lastwhy = nl.sub_why
+    return {}
+  end
+  local k
+  for k = 1, table.getn(g) do
+    g[k].via_ptr = true
+    g[k].via_sub = true
+  end
+  nl.sub_why = nil
+  nl.sub_trace = tr
+  return g
+end
+
+-- The trace from a slot using the offsets read off the DMM6500's bufsub_subscribe, with every
+-- cross-check the firmware's own stores make available. nil means this pair does not close.
+function fftsa.nl.px_sub_fixed(slot)
+  local nl = fftsa.nl
+  local graph = nl._rdw(slot + nl.PX_SUB_GRAPH)
+  local p4 = nl._rdw(slot + nl.PX_SUB_P4)
+  if graph == nil or p4 == nil or graph <= 0 or p4 <= 0 then
+    nl.sub_why = 'slot ' .. hx(slot) .. ' has no graph or no routing pointer'
+    return nil
+  end
+  -- THE CROSS-CHECK THAT MAKES THE SECOND DEREFERENCE SAFE. slot+0x40 has to point inside the
+  -- routing array of the very widget named by slot+0x34, and those two words were written by
+  -- different stores in the firmware. A slot holding anything else is refused unread.
+  if p4 < graph + nl.PX_ROUTE_LO or p4 > graph + nl.PX_ROUTE_HI
+     or math.mod(p4, 4) ~= 0 then
+    nl.sub_why = hxn(p4) .. ' is not inside the routing array of ' .. hxn(graph)
+    return nil
+  end
+  -- READ, NOT PROVEN-THEN-READ. See _rdw: memread validates and refuses, where peek32 faults,
+  -- and px_live's span is the app's own allocations rather than a map of what is mapped.
+  local tr = nl._rdw(p4)
+  if tr == nil or tr == 0 then
+    nl.sub_why = 'the routing element at ' .. hxn(p4) .. ' is ' .. tostring(tr)
+    return nil
+  end
+  -- And the trace has to point back at both of them. Either failing means the slot and the
+  -- trace disagree -- a torn read while the display task removes a trace, or a corpse whose
+  -- kind has not been cleared yet -- and nothing is believed on a name alone.
+  local back = nl._rdw(tr + nl.PX_TR_GRAPH)
+  local sub = nl._rdw(tr + nl.PX_TR_SUB)
+  if back ~= graph then
+    nl.sub_why = 'trace ' .. hx(tr) .. ' names graph ' .. hxn(back) .. ', not ' .. hx(graph)
+    return nil
+  end
+  if sub ~= slot then
+    nl.sub_why = 'trace ' .. hx(tr) .. ' names subscription ' .. hxn(sub)
+                 .. ', not ' .. hx(slot)
+    return nil
+  end
+  -- Three mutual confirmations and a successful read: the span may now include it, which is
+  -- what lets px_from_trace read the name and px_from_name walk to the bounds.
+  if nl.sub_trace_ok ~= tr then
+    nl.sub_trace_ok = tr
+    nl._map_age = nl.MAP_REFRESH
+    nl.map_lo, nl.map_hi = nil, nil
+  end
+  return tr
+end
+
+-- A COMPILED-IN HINT FOR THE TABLE BASE, under the operator's rule of 2026-11-10: a start
+-- address may be compiled in as long as being wrong costs "a small bit of performance. Never
+-- correctness."
+--
+-- It costs six reads to be wrong here, and that holds by construction rather than by care.
+-- Nothing is believed on the hint's authority: the entry has to hold a plausible pointer, the
+-- widget's trace array has to lead to a trace object, that trace has to carry THIS app's
+-- buffer name, its bounds have to bracket a ring whose cursors agree, and px_map still has to
+-- match 510 exact float32 frequencies of this app's own axis before a byte is written. A wrong
+-- base fails at the name and the search runs exactly as it did before.
+--
+-- A LIST, BECAUSE THE TABLE MOVES WITH THE BUILD AND NOT WITH THE BOOT.
+--
+-- Both of these were read out of the firmware images rather than guessed, by finding the one
+-- `mulli` by 0x260 that has a base load beside it: image offset +53550 in both builds, one site
+-- each. 1.7.17a holds 0x00D178A0 and 1.7.18a holds 0x00D17BE0, and the 0x340 between them is
+-- exactly the .bss delta already measured between those two builds -- so the table is in .bss
+-- and this is a section shift, not a redesign.
+--
+-- That matters because the first version of this compiled in the 1.7.18a address while the
+-- instrument runs 1.7.17a, so the walk read the wrong entry, found no trace and fell through to
+-- the search every time: 40 seconds to engage, measured on the glass.
+--
+-- Trying both costs three reads for the one that is wrong, and a build in neither list falls
+-- back to the search exactly as before. Static addresses, so unlike the ring they do not move
+-- between boots, which is what makes them worth compiling in at all.
+fftsa.nl.PX_OBJTAB_HINTS = { 13727904, 13728736 }   -- 0x00D178A0 1.7.17a, 0x00D17BE0 1.7.18a
+-- Traces on one graph. The array is null-terminated, so this only bounds the walk; the app
+-- binds two, the spectrum and the markers.
+fftsa.nl.PX_TRACE_MAX   = 8
+
+-- Is this address a trace object belonging to this app's buffer? Name first, because it is
+-- the one field that says WHICH trace -- the marker trace is the same shape and carries
+-- FFTSA_MARK -- and then the geometry, through the same walk the name route uses.
+-- Is this a pointer worth dereferencing?
+--
+-- nl._wg CHECKS ALIGNMENT AND THE BACKSTOP, AND NEITHER IS A TEST OF WHETHER THE ADDRESS IS
+-- MAPPED. ki.peek32 is a plain load -- _wg's own comment says so -- so a word inside the
+-- backstop but outside real memory is a data storage interrupt and a bluescreen.
+--
+-- The table walk reads a widget pointer out of every entry it tries, and most entries are
+-- unused, so most of those words are whatever the GUI left there. Following one unguarded
+-- crashed the instrument at PC=0022D200.
+--
+-- So a pointer is only followed if it lands between addresses this module has ALREADY
+-- dereferenced successfully -- see map_bounds. That is the same bound the native search needed
+-- and the same reason: evidence, not documentation.
+function fftsa.nl.px_live(addr)
+  local nl = fftsa.nl
+  if type(addr) ~= 'number' or addr <= 0 or math.mod(addr, 4) ~= 0 then
+    nl.live_why = 'not a 4-aligned address: ' .. tostring(addr)
+    return false
+  end
+  local lo, hi = nl.map_bounds()
+  if lo == nil then
+    nl.live_why = 'no measured span: ' .. tostring(nl.map_why)
+    return false
+  end
+  if addr >= lo and addr < hi then return true end
+  -- THE REFUSAL, WITH THE SPAN IT WAS JUDGED AGAINST.
+  --
+  -- This gate is what stops the table walk following a garbage widget pointer into unmapped
+  -- memory -- PC=0022D200, three times. It is also the most likely reason the pointer route
+  -- answers nothing, because the span is derived from THIS APP's allocations and the widget
+  -- is the display task's. Those are the same heap on this bench, but a launch where the
+  -- app's allocations sit well above the GUI's would refuse every widget and say nothing.
+  nl.live_why = string.format('%s outside %s..%s', hx(addr), hx(lo), hx(hi))
+  return false
+end
+
+function fftsa.nl.px_from_trace(tr)
+  local nl = fftsa.nl
+  if type(tr) ~= 'number' or tr <= 0 or math.mod(tr, 4) ~= 0 then return {} end
+  -- The trace object itself, and the whole name field, inside proven memory.
+  if not nl.px_live(tr) or not nl.px_live(tr + nl.PX_TRACE_NAME + 32) then
+    nl.ptr_why = 'trace object not live: ' .. tostring(nl.live_why)
+    return {}
+  end
+  local at = tr + nl.PX_TRACE_NAME
+  -- The name as the firmware holds it: NUL-terminated inside a 32-byte field.
+  local want = nl.PX_NAME .. string.char(0)
+  local got = ki.memread(hx(at), hx(string.len(want)))
+  if got ~= want then
+    nl.ptr_why = 'trace at ' .. hx(tr) .. ' does not carry this buffer name'
+    return {}
+  end
+  -- And the geometry, from the bounds pair the layout puts at +0x1F0. px_from_name walks
+  -- forward from the name for a pair that stands up, which lands on exactly that word
+  -- without this having to assume it did.
+  return nl.px_from_name(at)
+end
+
+-- The graph widget's traces, by pointer. Null-terminated, so a zero ends it.
+function fftsa.nl.px_from_graph(gr)
+  local nl = fftsa.nl
+  if type(gr) ~= 'number' or gr <= 0 then
+    nl.ptr_why = 'widget pointer is ' .. tostring(gr)
+    return {}
+  end
+  -- The widget pointer came out of a table entry that may never have been used. Nothing is
+  -- read through it until it is known to be in memory something has already touched.
+  if not nl.px_live(gr) or not nl.px_live(gr + nl.PX_GRAPH_TRACE + 4 * nl.PX_TRACE_MAX) then
+    nl.ptr_why = 'widget not live: ' .. tostring(nl.live_why)
+    return {}
+  end
+  local i
+  for i = 0, nl.PX_TRACE_MAX - 1 do
+    local tr = nl._wg(gr + nl.PX_GRAPH_TRACE + i * 4)
+    if tr == nil or tr == 0 then
+      nl.ptr_why = 'trace slot ' .. tostring(i) .. ' of the widget is '
+                   .. tostring(tr) .. ', and none before it carried the name'
+      return {}
+    end
+    local g = nl.px_from_trace(tr)
+    if table.getn(g) > 0 then
+      local k
+      for k = 1, table.getn(g) do g[k].via_ptr = true end
+      return g
+    end
+  end
+  return {}
+end
+
+-- The ring from the display handle, through the cached table base. Three guarded reads and a
+-- validation, which is the whole point of having derived the base.
+-- Every table base worth trying: the one this instrument confirmed, then the compiled hint.
+function fftsa.nl.px_bases()
+  local nl = fftsa.nl
+  local out, n = {}, 0
+  if nl.px_objbase ~= nil then
+    n = n + 1
+    out[n] = nl.px_objbase
+  end
+  local hs = nl.PX_OBJTAB_HINTS
+  if type(hs) == 'table' then
+    local i
+    for i = 1, table.getn(hs) do
+      if type(hs[i]) == 'number' and hs[i] > 0 and hs[i] ~= nl.px_objbase then
+        n = n + 1
+        out[n] = hs[i]
+      end
+    end
+  end
   return out
+end
+
+-- Entries to try beyond the handle itself. An entry is a few guarded reads to reject, so the
+-- whole table is cheaper than one sweep slice -- and the walk resumes across frames, so the
+-- count costs frames rather than a frame.
+--
+-- 128 rather than 64: the handle is not the index, and the app alone creates screens, buttons,
+-- images and two graphs before the display task's own objects are counted. A table whose right
+-- entry sits above the limit reads exactly like a table with no answer in it, and the cost of
+-- being wrong that way was 41 MB of sweeping.
+fftsa.nl.PX_OBJ_SCAN = 128
+
+-- THE SHARE OF A FRAME'S READ ALLOWANCE THE WALK MAY SPEND, and the whole engage time turned
+-- on it.
+--
+-- The walk and the search run in the SAME frame: the idle arm falls through to the seek arm
+-- rather than returning, so that neither waits for the other. But the walk runs FIRST, and
+-- px_seek's loop is gated on rd_over() -- it has to be, because adjudicating a hit reads --
+-- so a walk that spent the whole allowance left the search unable to take a single slice in
+-- every frame the walk was running. The frames were not overlapped. They were taken.
+--
+-- Measured on the glass, three builds:
+--
+--   9.05   eng=2.0s/14f   a bug starved the walk to one frame
+--   9.07   eng=4.2s/23f   the walk got its frames, and PX_OBJ_SCAN went 64 to 128
+--   9.12   eng=2.9s/20f   swept=3MB, so the search was not short of range to cover
+--
+-- Sixteen of the forty-eight. The walk reaches the whole table in about three times as many
+-- frames and costs the search nothing, because a frame whose slice turns up no hit needs
+-- almost no reads at all -- the image's bytes are on their own account. The search is the
+-- route that has answered on this instrument; the walk is the route that would answer for
+-- free if it ever did. That ordering is what the share encodes.
+fftsa.nl.PX_OBJ_CALLS = 16
+
+-- Has the walk had its share of this frame? Separate from rd_over so that the two bounds
+-- cannot be confused: this one protects the search from the walk, rd_over protects the frame
+-- from both.
+function fftsa.nl.px_obj_over()
+  local nl = fftsa.nl
+  return (nl._rd_calls or 0) >= nl.PX_OBJ_CALLS or nl.rd_over()
+end
+
+-- One table entry: the widget it names, and whether that widget owns this app's trace.
+function fftsa.nl.px_entry(base, id)
+  local nl = fftsa.nl
+  local gr = nl._wg(base + id * nl.PX_OBJ_STRIDE + nl.PX_OBJ_WIDGET)
+  if gr == nil or gr == 0 then return {} end
+  return nl.px_from_graph(gr)
+end
+
+-- The ring from the display handle -- and from the neighbouring entries if the handle is not
+-- the index.
+--
+-- THE HANDLE BEING THE TABLE INDEX IS THE ONE LINK IN THIS CHAIN WITH NO EVIDENCE BEHIND IT.
+-- GRAPH.md asserts it and everything else it asserts was confirmed against this build's image:
+-- the base 0x00D178A0 from the code that loads it, the 0x260 stride from the mulli beside it,
+-- the widget at entry +0x50 from 29 field reads off a computed entry, the trace array at
+-- widget +0x3EC from 50 reads inside the graph widget's own methods. The index is the only
+-- part that cannot be read out of an image, because it is a runtime value.
+--
+-- So it is not trusted. The handle is tried first, then the table is walked, and the entry
+-- that is kept is the one whose widget owns a trace carrying THIS app's buffer name. That is
+-- a derivation rather than an assumption, it costs four reads an entry to reject, and the id
+-- it finds is remembered so later launches go straight to it.
+function fftsa.nl.px_from_ptr(gid)
+  local nl = fftsa.nl
+  local p = nl.px
+  -- NO TABLE, NO POINTER ROUTE. The bases are the 6500's .bss addresses, read off its image.
+  -- On a model without them this is three guarded reads a frame that can never answer, so it
+  -- is not attempted and the name route carries the whole job.
+  if nl.PX_PTR == false then return {} end
+  local bs = nl.px_bases()
+  local nb = table.getn(bs)
+  if nb == 0 then return {} end
+  -- The handle first, on every base: it is what the layout says should work.
+  local i
+  for i = 1, nb do
+    if type(gid) == 'number' and gid >= 0 then
+      local g = nl.px_entry(bs[i], gid)
+      if table.getn(g) > 0 then
+        p.objscan = 0
+        nl.px_objbase, nl.px_objid = bs[i], gid
+        return g
+      end
+    end
+    if nl.px_obj_over() then return {} end
+  end
+  -- THEN THE TABLE, AND IT RESUMES. One cursor over the whole (base, id) space, kept across
+  -- frames: 64 entries at a few reads each is more than one frame's allowance, so a walk that
+  -- restarted at zero every frame would try the same low ids for ever and never reach a high
+  -- one. The first form of this did exactly that, and its own comment claimed otherwise.
+  local at = p.objscan or 0
+  local total = nb * nl.PX_OBJ_SCAN
+  while at < total do
+    local bi = math.floor(at / nl.PX_OBJ_SCAN) + 1
+    local id = math.mod(at, nl.PX_OBJ_SCAN)
+    at = at + 1
+    if id ~= gid then
+      local g = nl.px_entry(bs[bi], id)
+      if table.getn(g) > 0 then
+        p.objscan = 0
+        nl.px_objbase, nl.px_objid = bs[bi], id
+        nl.px_objfound = 'id ' .. tostring(id) .. ' not the handle ' .. tostring(gid)
+        return g
+      end
+    end
+    if nl.px_obj_over() then
+      p.objscan = at
+      return {}
+    end
+  end
+  -- Spent. Back to the start, so a later launch with a different table tries again -- and
+  -- RECORDED as spent, which is what lets the caller stop waiting for it.
+  --
+  -- The cursor alone cannot say: it is zeroed both before the first entry and after the last,
+  -- so "mid-walk" and "finished" look identical. A caller that held the path in idle while the
+  -- cursor was non-zero therefore held it for ever, the walk restarting from zero each time it
+  -- completed. Caught by the offline suite rather than on the glass.
+  p.objscan = 0
+  p.objdone = true
+  return {}
+end
+
+-- THE TABLE BASE IS NOT DERIVED, AND THAT IS DELIBERATE.
+--
+-- It used to be, by searching for the word that holds the widget pointer and subtracting. Two
+-- things were wrong with it. The forward check was vacuous -- `base + id*stride` reads back the
+-- word the base was derived from, so it confirmed nothing whatever that word was -- and the
+-- search was looking in the wrong place: the table is STATIC, in low memory below the heap,
+-- about 47 MB from a ring in the GUI heap, so a bounded search near the ring could never reach
+-- it and an unbounded one is the thing that bluescreened the instrument.
+--
+-- So the base comes from PX_OBJTAB_HINT, or from this instrument's own record on the key once
+-- a base has answered. Both are validated the same way, by walking forward to a trace that
+-- carries this app's buffer name. A base that does not is simply not used, and the search runs
+-- as it did before.
+
+-- How far either side of the last confirmed ring to look before anything else.
+--
+-- An Apply frees the trace objects and takes new ones from the display task's pool of thirty
+-- 0x14220-byte objects -- one allocation run 2.4 MB wide -- so the ring moves to a NEIGHBOUR
+-- of the old one. A window this far either side of what was confirmed last therefore holds the
+-- new one, which is what turns a span or size change from a walk over the backstop into a
+-- handful of slices.
+fftsa.nl.PX_SEED_NEAR = 4194304
+-- Past this the learned span has stopped being a hint and the exact-ring windows are used
+-- instead. A span grown to tens of megabytes is not telling us anything the backstop does not.
+fftsa.nl.PX_SEED_SPAN_MAX = 16777216
+-- Bytes the NAME needle may sweep without one hit before the lap switches to the frequency
+-- series. The name says WHICH trace and keeps its precedence absolutely, but it does not get
+-- an unbounded pass: the trace object carries the name the subscription was made under, and on
+-- a launch where that was not this app's buffer the name is simply not in memory.
+fftsa.nl.PX_NAME_GIVEUP = 16777216
+-- Name hits that produce no candidate before the needle is abandoned for the frequency series.
+-- A freed trace object keeps the buffer name, so on an instrument the app has been run on this
+-- is a count of corpses -- 1424 of them measured in one boot. Sixty-four is well past any
+-- plausible number of LIVE traces carrying one buffer's name, and costs a read each.
+-- PER PASS, and a restart resets it: a restart means the traces were rebound, so the corpses
+-- counted before it say nothing about the pass ahead. The runaway this bounds -- nh=1424 in one
+-- boot, 121 frames and 58 seconds still searching -- happened WITHIN a pass, so a per-pass
+-- bound is the one that stops it. A session bound on top of this was tried and removed: it
+-- condemned the needle on a fixture that restarts often, which is the same defect in a new
+-- place, and the restart count is on the diagnostic page where a restart loop would be visible
+-- as what it is.
+-- Measured on the glass at 9.15 from a clean boot: nh=87 in ONE pass, all refused, with the
+-- live object's name sitting in window 14 of 17. Sixty-four condemned the needle before the
+-- ladder reached it. A hit costs one window read, so the bound belongs where that cost becomes
+-- real -- hundreds, not tens -- and the runaway it guards was 1424.
+-- SIXTY-FOUR, AND THE REASON 512 WAS WRONG IS WORTH KEEPING.
+--
+-- It was raised to 512 on the argument that a name hit costs one window read, so the bound
+-- belonged "in the hundreds, not the tens". That measured the cost PER HIT and never the cost
+-- PER FRAME. PX_HITS_PER_SLICE lets a single uninterruptible frame adjudicate 64 of them, and
+-- at a window read each that is about 190 ms -- so a relaunch, which is where the corpses are,
+-- went to under 3 fps at 2048 points with nh=538 and swept=126MB. A fresh boot has almost no
+-- freed trace objects and never showed it.
+fftsa.nl.PX_NAME_FAIL = 64
+-- Hits one slice may adjudicate in one frame. Each costs one read now rather than 29, but the
+-- count is the heap's to choose and a frame cannot be interrupted.
+fftsa.nl.PX_HITS_PER_SLICE = 64
+-- Frames the pointer route and the cached geometry are given before the search starts. px_map
+-- needs the ring to hold this plan's frequencies, which it cannot on the frame after a
+-- relaunch -- the trace object has only just been created and the display task lags a pass
+-- behind the appends that fill it -- so the first attempt fails whatever the address, and says
+-- nothing about whether it was right.
+fftsa.nl.PX_CACHE_TRIES = 8
+
+-- Re-point the series in place when the FFT size moves it, rather than dropping the path. On
+-- its own knob because it is the one thing here that writes a field the firmware wrote, so a
+-- single assignment from the socket puts the old drop-and-search behaviour back for a boot.
+fftsa.nl.PX_REPOINT = true
+
+-- WHERE THE RING IS, RELATIVE TO SOMETHING THIS LAUNCH ALREADY KNOWS.
+--
+-- The ring is a display-task allocation, so its address is not predictable from the last one:
+-- five confirmations sit in a band whose gaps share no factor with the 0x14220 trace object.
+-- What does place it is the trace buffer's own C++ instance, which this module already has
+-- through the buffer's metatable -- derived per launch, already dereferenced, and not specific
+-- to a model or a firmware build.
+--
+-- THE FIRST VERSION OF THIS GOT THE DIRECTION WRONG, from two samples:
+--
+--   ring 037566C8   inst 0377B628   -0.14 MB     8.78
+--   ring 036809B0   inst 03776730   -0.96 MB     8.94
+--   ring 03930960   inst 0326FE48   +7.08 MB     8.99
+--   ring 036D2E78   inst 030CA030   +6.03 MB     9.01
+--   ring 0375B9C0   inst 0352E650   +2.25 MB     9.03
+--
+-- Both of the first two were below, so the window was inst-2MB..inst+1MB, and the next two
+-- were six to seven megabytes ABOVE -- it missed outright and the ladder swept 11 MB and then
+-- 9 MB. Ordering sub-bands by where the ring was last time then put +4..+8 MB first, and the
+-- fifth launch put it at +2.25 MB, in the sub-band tried last.
+--
+-- FIVE SAMPLES SPAN -1 TO +7 MB WITH NO CLUSTER, so the offset is not predictable and ordering
+-- by recency is chasing noise. The band is inst-2MB to inst+8MB, covering all five, and it is
+-- swept in ADDRESS ORDER. It is offered as three windows because a window wider than
+-- PX_WIN_MAX is taken by px_seek for the backstop pass and deferred to last, which would throw
+-- away the precedence the band exists for.
+--
+-- What makes the band affordable is not its order but the scan rate: measured at 8 MB/s with a
+-- byte-at-a-time search, 10 MB was over a second of scanning; word-aligned and word-compared
+-- it is a fraction of that. Window placement was never the lever it looked like.
+--
+-- Being wrong costs the slices spent on it and nothing else. Like every window here it only
+-- ORDERS the ladder: whatever it turns up still has to carry this app's buffer name, present
+-- cursors that agree, and match 510 exact float32 frequencies of this app's own axis in px_map
+-- before a byte is written.
+fftsa.nl.PX_INST_WIN = true
+-- The band, as offsets from inst, in the order they are tried. Each is at most PX_WIN_MAX wide.
+fftsa.nl.PX_INST_BANDS = { { -2097152, 2097152 }, { 2097152, 6291456 }, { 6291456, 8388608 } }
+
+function fftsa.nl.px_inst_wins()
+  local nl = fftsa.nl
+  local out, n = {}, 0
+  if not nl.PX_INST_WIN then return out end
+  local a = nl.inst
+  if type(a) ~= 'number' or a <= 0 then return out end
+  local i
+  for i = 1, table.getn(nl.PX_INST_BANDS) do
+    local lo = a + nl.PX_INST_BANDS[i][1]
+    local hi = a + nl.PX_INST_BANDS[i][2]
+    if lo < 0 then lo = 0 end
+    if hi > lo then
+      n = n + 1
+      out[n] = { lo, hi }
+    end
+  end
+  return out
+end
+
+-- The last ring this app confirmed, from the geometry cache. Only its address is wanted: the
+-- rest of that record is stale the moment the trace objects are replaced, which is exactly the
+-- case this exists for.
+function fftsa.nl.px_seed()
+  local c = fftsa.nl.px_cache_get()
+  if c == nil or type(c.lo) ~= 'number' or c.lo <= 0 then return nil end
+  return c.lo
+end
+
+function fftsa.nl.px_windows(buf)
+  local nl = fftsa.nl
+  local blo, bhi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if blo == nil or bhi == nil or blo >= bhi then blo, bhi = 0, nl.DRAM_END end
+  local out, n = {}, 0
+  local add = function(x, y)
+    local w = nl._clamp_win(x, y, blo, bhi)
+    if w == nil then return end
+    local i
+    for i = 1, n do
+      if out[i][1] == w[1] and out[i][2] == w[2] then return end
+    end
+    n = n + 1
+    out[n] = w
+  end
+  -- The instance-anchored window first, because it is the only one derived from THIS launch's
+  -- allocator state rather than from a previous launch's answer. Three megabytes, and on the
+  -- two launches where both addresses were recorded the ring was inside it both times.
+  -- THE LEARNED SPAN FIRST, because it records the quantity we actually want.
+  --
+  -- The span is every ring address this instrument has confirmed, widened by PX_SEED_NEAR
+  -- either side to absorb the pool handing out a different trace object next launch. It used
+  -- to come second, behind a band anchored on the trace buffer's C++ instance, and that order
+  -- was built on two samples where inst looked like the stable one.
+  --
+  -- Seven samples say the opposite. Measured at 9.04 and 9.05, one launch apart:
+  --
+  --   ring 30B26A8   inst 30CDAD0      ring - inst =  -0.11 MB
+  --   ring 30B7920   inst 11EB6F0      ring - inst = +32.2  MB
+  --
+  -- The RING moved 21 KB. The instance moved 32 megabytes. Across every launch recorded the
+  -- ring sits in a band around 0x30B0000..0x3930000 and inst is the thing that jumps, so the
+  -- band was anchored on the less stable of the two quantities -- and each time it missed, the
+  -- width and the ordering got blamed instead of the anchor.
+  local slo, shi = nl.px_seed_learned()
+  if slo ~= nil and shi - slo <= nl.PX_SEED_SPAN_MAX then
+    add(slo - nl.PX_SEED_NEAR, shi + nl.PX_SEED_NEAR)
+  end
+  -- Then the last exact ring, upward then downward, for the span having grown too wide to be
+  -- a hint at all.
+  local seed = nl.px_seed()
+  if seed ~= nil then
+    add(seed, seed + nl.PX_SEED_NEAR)
+    add(seed - nl.PX_SEED_NEAR, seed)
+  end
+  local all = nl.scan_windows(buf, nil)
+  local i
+  for i = 1, table.getn(all) do
+    if all[i][2] - all[i][1] <= nl.PX_WIN_MAX then add(all[i][1], all[i][2]) end
+  end
+  local iw = nl.px_inst_wins()
+  local ii
+  for ii = 1, table.getn(iw) do add(iw[ii][1], iw[ii][2]) end
+  add(blo, bhi)
+  -- CHEAP WINDOWS, THEN THE INSTANCE BAND, THEN WIDTH. Two measured failures bound this
+  -- ordering from both sides, and either rule alone produces the other's failure.
+  --
+  --   9.08  eng=9.0s/41f  swept=29MB   the ring 86 KB from inst, inside a 256 KB buffer-side
+  --                                    window -- which sat behind a learned span grown to
+  --                                    23 MB. Ordered by how much each window's source was
+  --                                    trusted, a cheap window waited on an expensive one.
+  --
+  --   9.13  eng=18.6s/63f swept=35MB   the ring at inst+4.48 MB, inside instance band 2 --
+  --                                    which sorted to window 15 of 17 because it is 4 MB
+  --                                    wide. Ordered purely by width, the window most likely
+  --                                    to be right waited on fourteen that were not.
+  --
+  -- So neither trust nor width is the quantity. The quantity is expected bytes scanned before
+  -- the ring is found, and for windows tried in sequence that is minimised by ordering on
+  -- WIDTH DIVIDED BY THE CHANCE OF BEING RIGHT. Three groups come out of that:
+  --
+  --   1. Anything at or under PX_WIN_CHEAP is one slice. It costs so little that its chance
+  --      of being right hardly enters -- try them all first, narrowest first, and a wrong
+  --      guess has cost a frame.
+  --   2. The instance band. It is the only window derived from THIS launch's allocator state
+  --      rather than from a previous launch's answer, and across the launches recorded the
+  --      ring has been inside it far more often than in any single buffer-side window: at
+  --      -0.11, +2.25, +4.48 and +6 to +7 MB of eight recorded, against one at +32 MB. Ten
+  --      megabytes in address order, and at the measured rate that is a few frames.
+  --   3. Everything else by width, the backstop falling out last because it is the widest.
+  --
+  -- The learned span is still demoted by this: it only ever widens, so it leaves group 1
+  -- early and is then judged on width like any other wide window.
+  local cheap, band, rest = {}, {}, {}
+  local nc2, nb2, nr2 = 0, 0, 0
+  local inband = function(w)
+    local k
+    for k = 1, table.getn(iw) do
+      if iw[k][1] == w[1] and iw[k][2] == w[2] then return true end
+    end
+    return false
+  end
+  for i = 1, n do
+    local w = out[i]
+    if w[2] - w[1] <= nl.PX_WIN_CHEAP then
+      nc2 = nc2 + 1
+      cheap[nc2] = w
+    elseif inband(w) then
+      nb2 = nb2 + 1
+      band[nb2] = w
+    else
+      nr2 = nr2 + 1
+      rest[nr2] = w
+    end
+  end
+  local bywidth = function(a, b) return (a[2] - a[1]) < (b[2] - b[1]) end
+  table.sort(cheap, bywidth)
+  table.sort(rest, bywidth)
+  local seq, ns = {}, 0
+  local g
+  for g = 1, 3 do
+    local src = cheap
+    if g == 2 then src = band end
+    if g == 3 then src = rest end
+    local k
+    for k = 1, table.getn(src) do
+      ns = ns + 1
+      seq[ns] = src[k]
+    end
+  end
+  return seq
 end
 
 -- One budgeted slice of the search, resumable across frames.
@@ -2450,6 +4473,54 @@ end
 
 -- Four consecutive records holding four known frequencies, read as one block: a wrong stride
 -- costs one memread.
+-- EVERY CANDIDATE STRIDE OFF ONE READ.
+--
+-- px_xconfirm is one ki.memread per stride and the walk is REC_MIN..REC_MAX in fours -- 29
+-- round trips for every hit -- and the frequency needle takes as many hits in a slice as the
+-- heap happens to hold. Measured on the glass at 8.81: 0.1 fps at 2048 points, ten seconds
+-- inside a single frame, as soon as the name cap made this route run routinely instead of only
+-- after a whole ladder. The same defect as the 257 peeks in the name walk, in its sibling.
+--
+-- The widest stride needs (n-1)*REC_MAX + 8 bytes, 392 for four needles, so one read covers
+-- all of them and the test becomes arithmetic in a string.
+function fftsa.nl.px_xconfirm_all(xat, xs)
+  local nl = fftsa.nl
+  local n = table.getn(xs)
+  if type(xat) ~= 'number' or n < 2 then return {} end
+  local blo, bhi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if blo == nil or bhi == nil or blo >= bhi then blo, bhi = 0, nl.DRAM_END end
+  if xat < blo then return {} end
+  local want = (n - 1) * nl.REC_MAX + 8
+  if xat + want > bhi then want = bhi - xat end
+  if want < 8 then return {} end
+  local blk = ki.memread(hx(xat), hx(want))
+  nl.rd_note(want)
+  if blk == nil then return {} end
+  local got = string.len(blk)
+  local out, nout = {}, 0
+  local sv
+  for sv = nl.REC_MIN, nl.REC_MAX, 4 do
+    local span = (n - 1) * sv + 8
+    if span <= got then
+      local ok, i = true, nil
+      for i = 1, n do
+        local at = (i - 1) * sv + 1
+        if string.sub(blk, at, at + 7) ~= xs[i] .. xs[i] then
+          ok = false
+          break
+        end
+      end
+      if ok then
+        -- val0 is the x field and dx is zero, exactly as px_xconfirm reports it: this
+        -- confirmed on the x and nothing else, and px_map derives the value field itself.
+        nout = nout + 1
+        out[nout] = { val0 = xat, stride = sv, dx = 0, nconf = n }
+      end
+    end
+  end
+  return out
+end
+
 function fftsa.nl.px_xconfirm(xat, stride, xs)
   local n = table.getn(xs)
   local span = (n - 1) * stride + 8
@@ -2470,11 +4541,91 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
   local nl = fftsa.nl
   local p = nl.px
   local out, nout = {}, 0
-  -- The name first. It is longer, it is unique to this app, and it is in memory whatever the
+  -- THE POINTER FIRST, and it costs three reads. Once the object table's base has been
+  -- the compiled hint or this instrument's own record -- the handle the app holds leads to the
+  -- ring without sweeping anything. Re-validated on the way through, so a base that has gone
+  -- stale falls through to the sweep rather than answering wrongly.
+  -- THE SUBSCRIBER SLOT, EVERY FRAME OF THE SEARCH, and this is what the route was missing.
+  --
+  -- It is tried in the idle arm too, but the idle arm stops running once p.state latches to
+  -- 'seek' -- so the route got only the first few frames of a launch, which are exactly the
+  -- frames where it cannot succeed. px_from_name's last test is `cnt >= 1`: the ring must hold
+  -- a record. For a heap search that test IS the corpse test, and it is right -- a freed ring
+  -- holds zeros. For this route it is wrong: the slot's kind is live, the trace points back at
+  -- the graph the slot names and at the slot itself, so an empty ring means the appends have
+  -- not been through it yet, not that the object is dead.
+  --
+  -- Measured on the glass at 9.17: sub=D67CD0/2hit found the right slot and the right trace --
+  -- the ring the search went on to find 26 MB later was that trace's own +0x220 -- and the
+  -- candidate was refused on an empty ring and never offered again. eng=4.7s/23f.
+  --
+  -- Once the slot is known this costs one word to re-check and about seven more to walk, so it
+  -- can run on every frame until the ring fills.
+  do
+    local bysub = nl.px_from_bufsub()
+    if table.getn(bysub) > 0 then
+      p.via = 'sub'
+      return bysub
+    end
+  end
+  if nl.px_objbase ~= nil and p.gid ~= nil then
+    local byptr = nl.px_from_ptr(p.gid)
+    if table.getn(byptr) > 0 then
+      p.via = 'ptr'
+      return byptr
+    end
+    -- Stale: the base survives a relaunch but not a firmware change or a moved table.
+    nl.px_objbase = nil
+    p.ptr_lost = (p.ptr_lost or 0) + 1
+  end
+  -- The name next. It is longer, it is unique to this app, and it is in memory whatever the
   -- display task and the spectrum are doing -- see px_from_name. The frequency series stays as
   -- the second needle, for a build that does not keep the name where this can reach it.
+  -- THE NAME FIRST, BUT NOT TO THE END OF DRAM.
+  --
+  -- The name is the better needle -- unique to this app, present whatever the display task and
+  -- the spectrum are doing, and it says WHICH trace, which the frequencies cannot: the marker
+  -- trace is the same shape and the staging ring holds the same floats in the same order. So it
+  -- keeps its precedence absolutely and nothing is adjudicated beside it.
+  --
+  -- What it does not get is an unbounded pass. The trace object carries the name the
+  -- subscription was made under, and on a launch where that was not this app's buffer the name
+  -- is simply not in memory -- measured on the glass at 8.80, swept=276MB with laps=1 and the
+  -- frequency needle then finding the ring in the seed window almost at once. 268 MB to learn
+  -- that the first needle does not work today. PX_NAME_GIVEUP bounds that to the windows worth
+  -- trying, and the lap carries on with the other needle instead of starting over.
   local n1 = nl.PX_NAME .. string.char(0)
   local byname, xs = true, nil
+  -- PER PASS, NOT PER SESSION. p.swept is the honest cumulative total of bytes scanned and is
+  -- what the report shows; judging the needle on it condemned the needle on the FIRST slice of
+  -- every pass after the second, because by then the total already exceeded the bound whatever
+  -- the pass itself had done. Measured on the glass at 9.14: re=4, swept=27MB against a 16 MB
+  -- bound, by=freq, and the ring sitting in the instance band the ladder tries third with its
+  -- name in memory the whole time.
+  if (not p.noname) and (p.sweptpass or 0) >= nl.PX_NAME_GIVEUP
+     and (p.namehits or 0) == 0 then
+    p.noname = true
+    p.gaveup = (p.gaveup or 0) + 1
+  end
+  -- AND IT GIVES UP ON HITS THAT GO NOWHERE, not only on finding nothing.
+  --
+  -- The condition above asks whether the name is in memory at all. It is the wrong question on
+  -- an instrument the app has been run on before: a trace object that has been freed KEEPS the
+  -- buffer name, so the needle matches every corpse of every previous run. Measured on the
+  -- glass at 9.10 after many launches in one boot: nh=1424, laps=2, 121 frames and 58 seconds
+  -- still searching, every candidate refused with "header count 0" -- a zeroed ring, which is
+  -- exactly what a dead object looks like. On a fresh boot the same needle gets 2 hits.
+  --
+  -- The frequency needle cannot make that mistake. It matches the ring's CONTENT -- this
+  -- plan's own frequencies in consecutive slots -- and a freed ring holds zeros, so it can only
+  -- ever match a live one. The name says which trace and keeps its precedence while it is
+  -- earning it; once this many hits have produced no candidate at all, it is not.
+  if (not p.noname) and (p.namehits or 0) >= nl.PX_NAME_FAIL
+     and (p.ncand or 0) == 0 then
+    p.noname = true
+    p.gaveup = (p.gaveup or 0) + 1
+    p.namedead = p.namehits
+  end
   if p.noname then
     local j
     xs, j = nl.px_xneedle(hz, nseg)
@@ -2491,17 +4642,28 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
     p.wi, p.at, p.swept = 1, p.wins[1][1], p.swept or 0
   end
   local left = budget
-  while left > 0 do
+  while left > 0 and not nl.rd_over() do
     local w = p.wins[p.wi]
     if w == nil then
       -- The ladder is spent. The name found nothing, so the next lap uses the other needle --
       -- and if that fails too, laps simply counts how many times round it has been.
       p.wins, p.wi, p.at = nil, nil, nil
       p.laps = (p.laps or 0) + 1
-      if byname then p.noname = true end
+      -- A record of the name having been absent for a whole ladder, for the report. It no
+      -- longer gates anything: both needles run on every slice now.
+      if (p.namehits or 0) == 0 then p.noname = true end
       return out
     end
-    if p.at == nil or p.at < w[1] or p.at + 8 > w[2] then
+    -- THE ONE LONG SCAN HAPPENS ONCE A SESSION. The ladder's last window is the backstop --
+    -- the whole of DRAM -- and a restart used to rewind to the start of the ladder, so every
+    -- plan change paid it again. It is offered until it has been walked through once and never
+    -- after: the seed and buffer-side windows are small and worth re-trying, that one is not.
+    if w[2] - w[1] > nl.PX_WIN_MAX and p.backstop_done then
+      p.wi = p.wi + 1
+      p.at = nil
+      if p.wins[p.wi] ~= nil then p.at = p.wins[p.wi][1] end
+    elseif p.at == nil or p.at < w[1] or p.at + 8 > w[2] then
+      if w[2] - w[1] > nl.PX_WIN_MAX and p.at ~= nil then p.backstop_done = true end
       p.wi = p.wi + 1
       p.at = nil
       if p.wins[p.wi] ~= nil then p.at = p.wins[p.wi][1] end
@@ -2509,16 +4671,25 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
       local lo = p.at
       local hi = lo + left
       if hi > w[2] then hi = w[2] end
-      local h = nl.FINDS(lo, hi, n1)
-      p.swept = p.swept + (hi - lo)
-      left = left - (hi - lo)
-      -- Overlap by the needle's tail, or a record straddling a slice edge is never matched.
-      -- Past the window's end this leaves at+8 above w[2], which advances the window above.
-      p.at = hi - 7
+      -- HITS CARRIED OVER FROM A SLICE A FRAME COULD NOT FINISH, consumed before any new read.
+      -- Re-walking the slice to find them again is exactly the repeat this must never do: the
+      -- first form of this reset the slice cursor instead of keeping the hits, so a dense slice
+      -- was swept, abandoned and swept again for ever -- 0.8 fps and no progress, measured.
+      local h, hfrom = p.slicehits, p.slicefrom or 1
+      if h == nil then
+        h, hfrom = nl.FINDS(lo, hi, n1), 1
+        p.swept = p.swept + (hi - lo)
+        p.sweptpass = (p.sweptpass or 0) + (hi - lo)
+        left = left - (hi - lo)
+        -- Overlap by the needle's tail, or a record straddling a slice edge is never matched.
+        -- Past the window's end this leaves at+8 above w[2], which advances the window above.
+        p.at = hi - 7
+      end
       local k, sv
-      for k = 1, table.getn(h) do
+      for k = hfrom, table.getn(h) do
         p.hits = (p.hits or 0) + 1
         if byname then
+          p.namehits = (p.namehits or 0) + 1
           -- One hit, every geometry it could be, by arithmetic. No header to go looking for:
           -- the bounds come out of a bounded walk forward from the name.
           local gs = nl.px_from_name(h[k])
@@ -2528,15 +4699,23 @@ function fftsa.nl.px_seek(hz, nseg, budget, buf)
             out[nout] = gs[gi]
           end
         else
-          for sv = nl.REC_MIN, nl.REC_MAX, 4 do
-            local g = nl.px_xconfirm(h[k], sv, xs)
-            if g ~= nil then
-              nout = nout + 1
-              out[nout] = g
-            end
+          local gs = nl.px_xconfirm_all(h[k], xs)
+          local gi
+          for gi = 1, table.getn(gs) do
+            nout = nout + 1
+            out[nout] = gs[gi]
           end
         end
+        -- A SLICE MAY NOT COST AN UNBOUNDED NUMBER OF READS. Both routes are one read per hit
+        -- now, but the hit count is whatever the heap holds and a frame cannot be interrupted.
+        -- The remaining hits are KEPT, not rediscovered.
+        if (k - hfrom + 1) >= nl.PX_HITS_PER_SLICE or nl.rd_over() then
+          p.slicehits, p.slicefrom = h, k + 1
+          p.hitcap = (p.hitcap or 0) + 1
+          return out
+        end
       end
+      p.slicehits, p.slicefrom = nil, nil
       -- Returned as soon as this slice has anything, so the header tries start on the next
       -- frame rather than after the rest of the budget.
       if nout > 0 then return out end
@@ -2712,8 +4891,9 @@ function fftsa.nl.px_map(g, db, hz, nseg)
   -- the trace buffer is FILL_CONTINUOUS at a capacity of exactly one pass, so the cursor
   -- returns to slot 1 every pass and the task mirrors it. The 211 records past the count have
   -- never been written and mapping them finds no frequency in them. Measured 2026-11-09.
-  local lo = nl._wg(g.hdr + nl.HDR_OLD)
-  local cnt = nl._wg(g.hdr + nl.HDR_COUNT)
+  local gho, ghw, ghc = nl.hdr_offs(g)
+  local lo = nl._wg(g.hdr + gho)
+  local cnt = nl._wg(g.hdr + ghc)
   if lo == nil or cnt == nil or cnt < nl.RING_MIN or cnt > g.nrec then
     p.why = 'header count ' .. tostring(cnt) .. ' is not 8..' .. tostring(g.nrec)
     return false
@@ -2735,6 +4915,7 @@ function fftsa.nl.px_map(g, db, hz, nseg)
     return false
   end
   local blk = ki.memread(hx(lo), hx(span))
+  nl.rd_note(span)
   if blk == nil or string.len(blk) ~= span then
     p.why = 'window read gave ' .. tostring(blk ~= nil and string.len(blk) or 0)
             .. ' of ' .. tostring(span)
@@ -2799,6 +4980,7 @@ function fftsa.nl.px_map(g, db, hz, nseg)
   local need = nl.PX_FIT_FRAC * cnt
   local tr = nl.px_triples_common(blk, cnt, stride, 8)
   local xoff, yoff, nleft = nil, nil, 0
+  local xa, xb = nil, nil
   local best, second = 0, 0
   local rep, i = '', nil
   for i = 1, table.getn(tr) do
@@ -2816,6 +4998,13 @@ function fftsa.nl.px_map(g, db, hz, nseg)
         second = best
         best = rng
         xoff = tr[i]
+        -- KEPT, because it is the frequency axis itself and it was being thrown away.
+        --
+        -- This fit is pixel = a * frequency + b over every slot in the drawn window, which is
+        -- the firmware's own x axis as a formula. With it the path can place a frequency it
+        -- has never drawn, which is what lets an FFT size change re-point the series in place
+        -- instead of dropping the path and searching again.
+        xa, xb = a, b
       elseif rng > second then
         second = rng
       end
@@ -2901,7 +5090,151 @@ function fftsa.nl.px_map(g, db, hz, nseg)
   p.hz1, p.hz2 = hz[1], hz[2]
   p.ay, p.by, p.resid, p.span = ay, by, resid, dbspan
   p.idx, p.ytab, p.T, p.yb = idx, ytab, T, {}
-  p.drift, p.slot, p.slotdb = 0, nil, nil
+  p.drift, p.slot, p.slotdb, p.slotprev = 0, nil, nil, nil
+  -- The frequency axis as a formula, and the range it was fitted over. px_repoint will only
+  -- interpolate inside that range: outside it the fit is an extrapolation of a line nothing
+  -- measured there, and the axis could have been retuned rather than the series re-gridded.
+  p.axf, p.bxf = xa, xb
+  local fmin, fmax = nil, nil
+  for s = 1, cnt do
+    local v = xv[s]
+    if v ~= nil then
+      if fmin == nil or v < fmin then fmin = v end
+      if fmax == nil or v > fmax then fmax = v end
+    end
+  end
+  p.fmin, p.fmax = fmin, fmax
+  if xa ~= nil and fmin ~= nil then
+    local a1 = xa * fmin + xb
+    local a2 = xa * fmax + xb
+    if a1 <= a2 then
+      p.xpmin, p.xpmax = math.floor(a1), math.floor(a2 + 0.5)
+    else
+      p.xpmin, p.xpmax = math.floor(a2), math.floor(a1 + 0.5)
+    end
+  end
+  return true
+end
+
+-- Patch bytes into one record of the held image, outside the y triple.
+--
+-- The image in p.T is three pieces a record: the prefix the app's own write left, the y triple
+-- a frame rewrites, and the suffix. The x pixel and the x float both live in a piece this does
+-- not own, so re-pointing the series means editing those pieces rather than the ring.
+--
+-- A field straddling the y triple is refused rather than split. None does on this firmware --
+-- the triples are 4-aligned and so are the fields -- and a half-written float is the kind of
+-- thing that draws a point at the wrong place in a way no check downstream would catch.
+function fftsa.nl.px_putrec(s, off, bytes)
+  local p = fftsa.nl.px
+  if p.T == nil or p.yoff == nil or p.stride == nil then return false end
+  local n = string.len(bytes)
+  local yoff, stride = p.yoff, p.stride
+  if type(off) ~= 'number' or off < 0 or off + n > stride then return false end
+  if off + n <= yoff then
+    local i = 3 * s - 2
+    local cur = p.T[i]
+    if cur == nil or string.len(cur) ~= yoff then return false end
+    p.T[i] = string.sub(cur, 1, off) .. bytes .. string.sub(cur, off + n + 1)
+    return true
+  end
+  if off >= yoff + 12 then
+    local i = 3 * s
+    local cur = p.T[i]
+    if cur == nil then return false end
+    local base = off - (yoff + 12)
+    if base + n > string.len(cur) then return false end
+    p.T[i] = string.sub(cur, 1, base) .. bytes .. string.sub(cur, base + n + 1)
+    return true
+  end
+  return false
+end
+
+-- A pixel as the firmware stores one: the same word three times over.
+function fftsa.nl.px_triple(v)
+  local c, fl, md = string.char, math.floor, math.mod
+  local w = c(md(fl(v / 16777216), 256), md(fl(v / 65536), 256),
+              md(fl(v / 256), 256), md(v, 256))
+  return w .. w .. w
+end
+
+-- RE-POINT THE SERIES INSTEAD OF DROPPING THE PATH.
+--
+-- An FFT size change moves every plotted frequency, because the column frequencies come off
+-- the bin width. Nothing else moves: the graph, the widget, the trace object, the ring, the
+-- span and both axes are the same, and so is the column count. The slot map is a permutation
+-- of the series, so the old form of this dropped the path and searched again -- seconds of
+-- appending for a graph that was, as the operator put it, displaying a line at the same scale.
+--
+-- What actually has to change is the two fields that say WHERE a slot is: the x float the slot
+-- map keys on, and the x pixel the widget draws at. Both are this code's to write -- they sit
+-- in the held image either side of the y triple -- and the frequency axis kept at map time
+-- turns a frequency into its pixel. So the series is re-pointed in place: no search, no hold,
+-- no frame of appending, and the permutation is untouched, which keeps the fold's geometry.
+--
+-- Refused, leaving the caller to drop, when anything beyond the series has moved: a different
+-- column count is a different permutation, and a frequency outside the fitted range means the
+-- axis itself was retuned and the fit no longer describes it.
+function fftsa.nl.px_repoint(hz, nseg)
+  local nl = fftsa.nl
+  local p = nl.px
+  p.rp_why = nil
+  if not nl.PX_REPOINT then
+    p.rp_why = 're-pointing is switched off'
+    return false
+  end
+  if p.nseg ~= nseg or p.nrec == nil then
+    p.rp_why = 'the column count moved, so the permutation is not this one'
+    return false
+  end
+  if p.axf == nil or p.ox == nil or p.xoff == nil or p.idx == nil or p.T == nil then
+    p.rp_why = 'no frequency axis kept from the map'
+    return false
+  end
+  local f1, fn = hz[1], hz[nseg]
+  if type(f1) ~= 'number' or type(fn) ~= 'number' then
+    p.rp_why = 'the series has no ends'
+    return false
+  end
+  -- Inside the fitted axis, give or take one column.
+  --
+  -- Containment with no margin refuses the very case this exists for: a finer bin grid moves
+  -- the end columns by a fraction of a column, and either end can land just outside the range
+  -- the fit was measured over. One column of extrapolation on a line fitted across every slot
+  -- in the window is bounded and harmless, and the pixel is clamped to the measured ends
+  -- regardless. Anything further than that is a retuned axis, not a re-gridded series.
+  if p.fmin == nil or p.fmax == nil then
+    p.rp_why = 'no fitted axis range'
+    return false
+  end
+  local marg = 0
+  if nseg > 1 then marg = (p.fmax - p.fmin) / (nseg - 1) end
+  if f1 < p.fmin - marg or fn > p.fmax + marg then
+    p.rp_why = 'the new series runs outside the axis the fit was measured over'
+    return false
+  end
+  local fl = math.floor
+  local s
+  for s = 1, p.nrec do
+    local k = p.idx[s]
+    local f = nil
+    if k ~= nil then f = hz[k] end
+    if f == nil then
+      p.rp_why = 'slot ' .. tostring(s) .. ' maps to no column'
+      return false
+    end
+    local xp = fl(p.axf * f + p.bxf + 0.5)
+    if xp < p.xpmin then xp = p.xpmin end
+    if xp > p.xpmax then xp = p.xpmax end
+    if not nl.px_putrec(s, p.ox, nl._f32_pack(f))
+       or not nl.px_putrec(s, p.xoff, nl.px_triple(xp)) then
+      p.rp_why = 'the x fields do not fit the held image at slot ' .. tostring(s)
+      return false
+    end
+  end
+  p.hz1, p.hz2 = hz[1], hz[2]
+  p.repoints = (p.repoints or 0) + 1
+  p.rp_why = nil
   return true
 end
 
@@ -2913,12 +5246,19 @@ end
 -- after the write it was meant to cover.
 function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   local nl = fftsa.nl
+  nl.rd_frame(t)
   local p = nl.px
   if p.nseg ~= nseg then
     return nl.px_dropframe('nseg moved from ' .. tostring(p.nseg) .. ' to ' .. tostring(nseg))
   end
   if p.hz1 ~= hz[1] or p.hz2 ~= hz[2] then
-    return nl.px_dropframe('the frequency series moved under the slot map')
+    -- An FFT size change moves every column frequency and nothing else. Re-point the two x
+    -- fields in place and keep drawing; drop only if something beyond the series moved.
+    if not nl.px_repoint(hz, nseg) then
+      local w = 'the frequency series moved under the slot map'
+      if p.rp_why ~= nil then w = w .. ': ' .. tostring(p.rp_why) end
+      return nl.px_dropframe(w)
+    end
   end
   local stride, nrec, lo = p.stride, p.nrec, p.lo
   -- The cursor, which says where the repaint's own append will land. Read rather than tracked:
@@ -2946,7 +5286,10 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   -- leaves there is never drawn, so its value cannot perturb the picture, and it is the one
   -- record in the ring this code never overwrites -- which is what makes it a clean place to
   -- read the firmware's own pixel back from and check the map against.
-  local old0, cnt0 = u32_at(h, nl.HDR_OLD + 1), u32_at(h, nl.HDR_COUNT + 1)
+  -- This geometry's cursor offsets. The 6500's constants unless the candidate carried derived
+  -- ones, which is what lets a model they were never measured on take the same frame path.
+  local h_old, h_wr, h_cnt = nl.hdr_offs(p.g)
+  local old0, cnt0 = u32_at(h, h_old + 1), u32_at(h, h_cnt + 1)
   local slip = (old0 - lo) / stride
   if slip < 0 then slip = -slip end
   if slip > nl.PX_SLIP_MAX or math.mod(old0 - lo, stride) ~= 0
@@ -2963,19 +5306,35 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
                             math.mod(want, 256)))
   end
   if old0 ~= lo or cnt0 ~= nrec then
-    putback(nl.HDR_OLD, lo)
-    putback(nl.HDR_COUNT, nrec)
+    putback(h_old, lo)
+    putback(h_cnt, nrec)
     p.restored = (p.restored or 0) + 1
   end
-  putback(nl.HDR_WRITE, wr)
+  putback(h_wr, wr)
   -- THE MAP, CHECKED AGAINST THE FIRMWARE'S OWN ANSWER. The previous frame appended a decibel
   -- this code knows into a slot it knows, and the firmware wrote the pixel. Read it back before
   -- the block write covers it.
   if p.slot ~= nil and p.slotdb ~= nil then
     local pv = ki.memread(hx(lo + (p.slot - 1) * stride + p.yoff), hx(4))
     if pv ~= nil and string.len(pv) >= 4 then
-      local e = p.ay * p.slotdb + p.by - u32_at(pv, 1)
+      -- AGAINST EITHER PASS, because the display task lags a pass behind the appends: the
+      -- pixel here is the firmware's answer for this frame's append or for the one before,
+      -- and which it is cannot be read from the record. So both are tried and the smaller
+      -- error stands. A map that is genuinely stale is out on BOTH; a lag is out on one.
+      --
+      -- Without this the check measured the spectrum instead of the map. Measured over 20 s
+      -- with the path engaged: the firmware's own scale block at trace+0x140..0x1D0 did not
+      -- move one word and the fitted map moved 0.0013 px a dB, while this reported 0.21 to
+      -- 14.48 px frame to frame -- which is 1.86 px a dB times a noise floor wobbling a few
+      -- dB a frame, and nothing to do with the map.
+      local pix = u32_at(pv, 1)
+      local e = p.ay * p.slotdb + p.by - pix
       if e < 0 then e = -e end
+      if p.slotprev ~= nil then
+        local e2 = p.ay * p.slotprev + p.by - pix
+        if e2 < 0 then e2 = -e2 end
+        if e2 < e then e = e2 end
+      end
       p.lastdrift = e
       if e > nl.PX_DRIFT_MAX then
         p.drift = (p.drift or 0) + 1
@@ -3011,8 +5370,83 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   local slot = (wr - lo) / stride + 1
   local k = idx[slot]
   if k == nil then k = 1 end
+  -- A CONSTANT DECIBEL, NOT THIS FRAME'S. The display task lags a pass behind the appends, so
+  -- the pixel read back next frame can be the one the firmware wrote for an earlier append --
+  -- and with a spectrum value there, "earlier" means a different decibel. Against a noise
+  -- floor that moves a few dB a frame, at 1.86 px a dB, that is several pixels of pure signal
+  -- noise, and the drift check read it as the map going stale.
+  --
+  -- Measured 2026-11-09 over 20 s with the path engaged: every word of the firmware's own
+  -- scale block at trace+0x140..0x1D0 was CONSTANT and the fitted map moved by 0.0013 px a dB,
+  -- while this check reported 0.21 to 14.48 px frame to frame. It was measuring the spectrum,
+  -- not the map.
+  --
+  -- The first frame's value at this slot, kept: a real spectrum value, so it is inside the
+  -- axis and can never be clamped, and the same one every frame after, so which append the
+  -- firmware's pixel came from stops mattering.
+  --
+  -- THE CURSOR, NOT AN APPEND, when sg_pix_repaint says so.
+  --
+  -- The append exists only to make the display task repaint. It is also the one thing that
+  -- MOVES the task's oldest-record cursor, and that is what makes the trace wrong: the widget
+  -- draws in storage order and the x pixels are the firmware's, so a window starting at slot
+  -- j runs x[j]..x[n] then x[1].. and the line doubles back across the plot. Measured on the
+  -- glass at 8.72: correct about one frame in three. Restoring the cursor at the top of the
+  -- next frame loses the race with the task.
+  --
+  -- display.graph.cursor sets a cursor position and is SYNCHRONOUS -- it waits for the GUI
+  -- task to acknowledge -- so it is a repaint provocation that touches no record. The value is
+  -- the firmware's own OFF sentinel for a cursor (notes/firmware/graph/GRAPH.md 4.5: "a value
+  -- >= 9e37 switches that cursor off"), so it draws nothing and is a legal value rather than
+  -- an out-of-range one, which on a graph parameter would be a modal dialog.
+  --
+  -- 9.9e37 and not 9e37, which is the threshold itself: a double rounded into a float32 can
+  -- land either side of a bound it sits exactly on, and on the low side this is a cursor at
+  -- 9e37 rather than a cursor switched off. 9.9e37 clears the test from above with the whole
+  -- float32 range to spare, and it is the sentinel the rest of the app already uses.
+  --
+  -- With no append the ring's cursors never move, so there is no race to lose and nothing to
+  -- restore. The drift check goes with it: it needs a pixel the firmware wrote for a decibel
+  -- this code chose, and without an append there is no such pixel. What still guards the map
+  -- is what identified the ring in the first place -- 510 exact float matches of the x field
+  -- against this app's own axis.
+  if fftsa.sg_pix_repaint == 'cursor' and p.gid ~= nil then
+    local ok = pcall(function()
+      display.graph.cursor(p.gid, display.CURSOR_VERTICAL, 9.9e37, 9.9e37)
+    end)
+    if not ok then
+      -- A REFUSAL IS NOT A REASON TO TEAR THE PATH DOWN. The pixels for this pass are already
+      -- in the ring; what failed is the provocation to show them, so the glass keeps the
+      -- previous picture for a frame and the next cursor shows both. Restarting instead costs
+      -- a re-map and the frames of appending that go with it, and a transient refusal would
+      -- then read as a frame rate that will not settle.
+      --
+      -- Only a RUN of them means the GUI is not going to answer, and that is worth a restart.
+      p.curfail = (p.curfail or 0) + 1
+      if p.curfail < nl.PX_CURSOR_RUN then
+        p.frames = (p.frames or 0) + 1
+        return nseg
+      end
+      return nl.px_dropframe('display.graph.cursor refused ' .. tostring(p.curfail)
+                             .. ' times running on handle ' .. tostring(p.gid))
+    end
+    p.curfail = 0
+    p.slot, p.slotdb, p.slotprev = nil, nil, nil
+    p.frames = (p.frames or 0) + 1
+    p.repaints = (p.repaints or 0) + 1
+    return nseg
+  end
+  --
+  -- THE VALUE MUST BE THE ONE THE SLOT WOULD DRAW. A constant was tried here to steady the
+  -- drift check below and it DREW: the parked record is outside the window this code restores,
+  -- but the window the task draws from can include it for a frame, and a constant decibel at
+  -- that frequency is then a visible wrong point with a line running back to it -- a wrap
+  -- across the plot. Measured on the glass at 8.72.
+  --
+  -- So the append carries what the spectrum has there, and the lag is handled where it
+  -- actually bites, in the check.
   buffer.write.reading(tb, db[k], hz[k], t, 0)
-  p.slot, p.slotdb = slot, db[k]
+  p.slotprev, p.slot, p.slotdb = p.slotdb, slot, db[k]
   p.frames = (p.frames or 0) + 1
   return nseg
 end
@@ -3022,9 +5456,309 @@ end
 -- the same boot usually gets the same one back. px_map re-validates it from content before a
 -- byte is written -- 721 exact float32 matches against the app's own axis -- so a stale cache
 -- costs one ring read and falls through to the search.
+-- WHERE THIS INSTRUMENT ACTUALLY PUTS THE RING, learned and kept across power cycles.
+--
+-- No address is in the tree and none could be: the file holds what a search already confirmed
+-- on this machine, and anything read back out of it is validated by px_map -- 510 exact float32
+-- matches of the x field against this app's own axis -- before a byte is written. A stale or
+-- wrong file therefore costs one 28 KB read and falls through to the search, which is the same
+-- cost as having no file at all.
+--
+-- Two things are kept. The exact geometry, which is worth trying directly and is usually
+-- right across a relaunch. And the SPAN of every ring address ever confirmed, widened by each
+-- new one, which is what survives the trace objects moving: the display task hands out a pool
+-- of thirty, so the address varies between launches, and across this bench it has varied over
+-- about 2 MB. The span plus PX_SEED_NEAR either side is the first window the ladder tries.
+-- THE KEY FILE IS OFF BY DEFAULT, and it is off because of what it cost on the glass.
+--
+-- 8.80 shipped it on. io.open for read on a file that does not exist -- which is every first
+-- launch -- POSTS event 2203, and a posted event is a modal dialog over the running app that
+-- stops the frames and blocks the socket. pcall was no defence: the file API posts rather than
+-- raises. Clearing it took a trip to the options screen and back.
+--
+-- The existence test is settled now -- the directory is listed rather than the file opened --
+-- and the record is what makes a cold boot avoid scanning at all, which is the whole point. So
+-- it is on. Still a live knob, so it can be taken out of the picture from the socket on one
+-- boot rather than a rebuild.
+fftsa.nl.PX_CACHE_KEY = true
+
+-- ---------------------------------------------------------------------------
+-- WHAT POINTS AT THE RING.
+--
+-- Operator's idea, 2026-11-13: "If we know where the data is, we can look for a pointer to it.
+-- If that pointer is in a predictable place, we win."
+--
+-- It inverts the whole problem. Six launches put the ring at effectively random addresses
+-- across a 15 MB band, so no window is narrow and every search costs ten frames or more. But
+-- the ring is not floating free: the display task reached it somehow, so SOMETHING holds its
+-- address. Find the words equal to it and one of them is that something.
+--
+-- What makes this worth doing now is the scan rate. A 4-byte needle over the measured span at
+-- the rate the image manages since the step and word-compare went in is a fraction of a second,
+-- spread over frames at the same budget the ring search uses.
+--
+-- This is an EXPERIMENT and it is off by default: it runs once per session when armed, after
+-- the path has engaged and the ring address is therefore known and validated. The hits go to
+-- the About page and to their own file on the key, so the addresses from several launches can
+-- be compared -- a hit at the same address twice is a static location and the end of searching;
+-- a hit at the same offset from inst, or from the object table, is nearly as good.
+--
+-- Nothing is read or written through anything it finds. It only records.
+fftsa.nl.PX_PTRHUNT = false
+-- Hits one level of the hunt may record. Twenty-four filled up on the first run and truncated
+-- the scan at 53 MB, so the holders above that were never seen -- and the whole value of this
+-- is comparing the full set between launches.
+fftsa.nl.PTRHUNT_MAX = 96
+fftsa.nl.PTRHUNT_FILE = '/usb1/FFTSA_PTR.txt'
+
+-- WHICH ADDRESS TO HUNT, AND WHY IT IS NOT THE RING.
+--
+-- The chain the pointer route walks is known and three links long: the object table entry holds
+-- the widget, the widget's array holds the trace objects, and the trace object holds the ring.
+-- The last link is read on every engage -- px_from_name finds the name and walks forward to the
+-- bounds pair, which IS the ring address. So hunting the ring would rediscover the link we
+-- already have.
+--
+-- The broken link is the first one. This launch neither the handle's entry nor any of 256 ids
+-- held a widget owning our trace, so the table is not being indexed the way the code assumes.
+--
+-- Hunting the TRACE OBJECT is what repairs that. A word equal to the trace object's address is
+-- a slot in some widget's array, and the widget is then that address minus the array offset and
+-- a slot -- which gives a widget address to hunt in turn, whose holder is the table entry. Two
+-- hunts, and the second one yields base + id*stride + 0x50 directly: enough to say what the
+-- real base and id are, or that the table is not how our graph is reached at all.
+--
+-- The ring is hunted too, second, because it costs one more pass and answers the operator's
+-- original question -- whether anything outside the trace object holds it.
+function fftsa.nl.px_hunt_target()
+  local nl = fftsa.nl
+  local p = nl.px
+  -- The trace object, from the name hit that found it: the name sits at a known offset inside
+  -- the object, so the object's base is the hit minus that offset.
+  if nl.ph_level ~= 2 and p.g ~= nil and p.g.name_at ~= nil then
+    return p.g.name_at - nl.PX_TRACE_NAME, 'trace'
+  end
+  return p.lo, 'ring'
+end
+
+function fftsa.nl.px_ptrhunt()
+  local nl = fftsa.nl
+  local p = nl.px
+  if not nl.PX_PTRHUNT or nl.ph_done then return end
+  if p.state ~= 'on' or p.lo == nil then return end
+  local mlo, mhi = nl.map_bounds()
+  if mlo == nil then return end
+  local want, kind = nl.px_hunt_target()
+  if want == nil then return end
+  if nl.ph_at == nil then
+    nl.ph_at, nl.ph_hits, nl.ph_n, nl.ph_ring = mlo, {}, 0, want
+    nl.ph_kind = kind
+  end
+  -- The target moved under us, so the hits collected so far are about a different address.
+  if nl.ph_ring ~= want then
+    nl.ph_at, nl.ph_hits, nl.ph_n, nl.ph_ring = mlo, {}, 0, want
+    nl.ph_kind = kind
+  end
+  -- One slice a frame, the same budget the ring search uses, and the same read accounting.
+  local lo = nl.ph_at
+  local hi = lo + nl.px_budget()
+  if hi > mhi then hi = mhi end
+  if hi <= lo then
+    nl.ph_done = true
+    pcall(nl.px_ptrhunt_save)
+    return
+  end
+  local got = nl.FINDS(lo, hi, u32_pack(nl.ph_ring))
+  if got ~= nil then
+    local i
+    for i = 1, table.getn(got) do
+      -- Not inside the ring's own storage: a record that happened to hold the base would
+      -- answer here and mean nothing.
+      local rhi = p.hi or (p.lo + p.nrec * p.stride)
+      if got[i] < p.lo or got[i] >= rhi then
+        if nl.ph_n < nl.PTRHUNT_MAX then
+          nl.ph_n = nl.ph_n + 1
+          nl.ph_hits[nl.ph_n] = got[i]
+        end
+      end
+    end
+  end
+  nl.ph_at = hi
+  if hi >= mhi then
+    pcall(nl.px_ptrhunt_save)
+    -- Level one was the trace object; level two is the ring, which answers whether anything
+    -- outside the trace object holds it. After that there is nothing further to ask here.
+    if nl.ph_level ~= 2 then
+      nl.ph_level, nl.ph_at = 2, nil
+    else
+      nl.ph_done = true
+    end
+  end
+end
+
+-- Appended, not overwritten: the whole point is comparing launches.
+function fftsa.nl.px_ptrhunt_save()
+  local nl = fftsa.nl
+  if nl.ph_hits == nil then return false end
+  local body = tostring(nl.ph_kind or '?') .. '=' .. hx(nl.ph_ring or 0)
+               .. ' ring=' .. hx(nl.px.lo or 0) .. ' inst=' .. hx(nl.inst or 0)
+               .. ' gid=' .. tostring(nl.px.gid) .. ' at='
+  local i
+  for i = 1, nl.ph_n do
+    if i > 1 then body = body .. ',' end
+    body = body .. hx(nl.ph_hits[i])
+  end
+  body = body .. '\n'
+  return pcall(function()
+    if file.usbdriveexists() ~= 1 then error('no key', 0) end
+    local fh = io.open(nl.PTRHUNT_FILE, 'a')
+    if fh == nil then error('open refused', 0) end
+    fh:write(body)
+    fh:close()
+  end)
+end
+
+fftsa.nl.PX_CACHE_DIR  = '/usb1'
+fftsa.nl.PX_CACHE_NAME = 'FFTSA_PX.txt'
+fftsa.nl.PX_CACHE_FILE = '/usb1/FFTSA_PX.txt'
+
+-- WHERE TO LOOK FIRST ON AN INSTRUMENT THAT HAS NEVER TOLD US is not a compiled-in address.
+--
+-- It was two, the span this bench's ring had occupied -- 0x3600000 to 0x3800000 -- allowed
+-- under the operator's rule that a start address may be compiled in as long as being wrong
+-- costs "a small bit of performance. Never correctness." They are gone because px_inst_win
+-- does the same job better: it is derived from the trace buffer's own instance every launch,
+-- so it holds on a machine this bench has never seen, needs no exception to the no-firmware-
+-- addresses rule, and is 3 MB rather than 2 MB of guess plus the whole ladder behind it.
+--
+-- So the span below is this instrument's own record and nothing else. With no record, there is
+-- no span, and the instance window is the first thing tried.
+
+-- The learned span, as the two numbers that bound it.
+function fftsa.nl.px_seed_span()
+  if type(FFTSA_PXSEED) ~= 'string' then return nil end
+  local f, n = {}, 0
+  local w
+  for w in string.gfind(FFTSA_PXSEED, '[0-9]+') do
+    n = n + 1
+    f[n] = tonumber(w)
+  end
+  if n ~= 2 or f[1] == nil or f[2] == nil or f[1] <= 0 or f[2] < f[1] then return nil end
+  return f[1], f[2]
+end
+
+-- What this instrument has actually confirmed. The same numbers as px_seed_span, under the
+-- name the window ladder and the key file use, so that "learned" stays a distinct idea from
+-- "derived": the span is a record of past answers and px_inst_win is a measurement of this
+-- launch.
+function fftsa.nl.px_seed_learned()
+  return fftsa.nl.px_seed_span()
+end
+
+-- Widen it with a ring that has just been confirmed.
+function fftsa.nl.px_seed_note(lo)
+  if type(lo) ~= 'number' or lo <= 0 then return end
+  local a, b = fftsa.nl.px_seed_learned()
+  if a == nil then a, b = lo, lo end
+  if lo < a then a = lo end
+  if lo > b then b = lo end
+  FFTSA_PXSEED = string.format('%d,%d', a, b)
+end
+
+-- Eight numbers on one line: the six of the geometry then the two of the span. Read back with
+-- gfind rather than a read format, because the only read form this firmware is known to take
+-- is a byte count.
+function fftsa.nl.px_cache_save()
+  local nl = fftsa.nl
+  if not nl.PX_CACHE_KEY then return false end
+  -- LEARNED only. Writing the built-in hint to the key would promote a guess about an unknown
+  -- machine into this machine's own record, and the next boot would read it back as fact.
+  local a, b = nl.px_seed_learned()
+  if type(FFTSA_PXRING) ~= 'string' or a == nil then return false end
+  local body = FFTSA_PXRING .. ',' .. tostring(a) .. ',' .. tostring(b) .. '\n'
+  -- Written only when it changed. A confirmed geometry is re-put on every engage and the key
+  -- is flash.
+  if body == nl._px_saved then return false end
+  local ok = pcall(function()
+    -- The one file.* call that is documented to work, and the key can be out of the slot: a
+    -- write with no key posts event 2203 over the running app.
+    if file.usbdriveexists() ~= 1 then error('no key', 0) end
+    local fh = io.open(nl.PX_CACHE_FILE, 'w')
+    if fh == nil then error('open refused', 0) end
+    fh:write(body)
+    fh:close()
+  end)
+  if ok then nl._px_saved = body end
+  nl.px_cache_why = nil
+  if not ok then nl.px_cache_why = 'save refused' end
+  return ok
+end
+
+-- Once per launch, and only into globals that are absent: a relaunch in the same boot already
+-- has better information in memory than the file can hold.
+function fftsa.nl.px_cache_load()
+  local nl = fftsa.nl
+  if nl._px_loaded then return false end
+  nl._px_loaded = true
+  if not nl.PX_CACHE_KEY then return false end
+  local got = false
+  pcall(function()
+    -- OPENING A FILE THAT IS NOT THERE POSTS 2203 ON THE GLASS, and the first launch on any
+    -- instrument is exactly that case: there is no record to read until one has been written.
+    -- pcall is no defence, because the file API posts rather than raises -- so the existence
+    -- has to be settled without an open.
+    --
+    -- fs.readdir on a directory that exists costs no events, which is why it is the test here
+    -- and fs.is_file is not: is_file on an absent path is unmeasured, and the whole point is
+    -- to not find out the expensive way. The table is 0-BASED, so pairs and not getn.
+    if file.usbdriveexists() ~= 1 then
+      nl.px_cache_why = 'no key in the slot'
+      return
+    end
+    local t = fs.readdir(nl.PX_CACHE_DIR)
+    if t == nil then
+      nl.px_cache_why = 'cannot list ' .. tostring(nl.PX_CACHE_DIR)
+      return
+    end
+    local there, k, v = false, nil, nil
+    for k, v in pairs(t) do
+      if tostring(v) == nl.PX_CACHE_NAME then there = true end
+    end
+    if not there then
+      nl.px_cache_why = 'no record on the key yet'
+      return
+    end
+    local fh = io.open(nl.PX_CACHE_FILE, 'r')
+    if fh == nil then
+      nl.px_cache_why = 'open for read refused'
+      return
+    end
+    local body = fh:read(256)
+    fh:close()
+    if type(body) ~= 'string' then return end
+    local f, n = {}, 0
+    local w
+    for w in string.gfind(body, '[0-9]+') do
+      n = n + 1
+      f[n] = tonumber(w)
+    end
+    if n < 8 then return end
+    if FFTSA_PXRING == nil then
+      FFTSA_PXRING = string.format('%d,%d,%d,%d,%d,%d', f[1], f[2], f[3], f[4], f[5], f[6])
+    end
+    if FFTSA_PXSEED == nil and f[7] > 0 and f[8] >= f[7] then
+      FFTSA_PXSEED = string.format('%d,%d', f[7], f[8])
+    end
+    got = true
+  end)
+  return got
+end
+
 function fftsa.nl.px_cache_put(g)
   FFTSA_PXRING = string.format('%d,%d,%d,%d,%d,%d',
                                g.lo, g.hi, g.nrec, g.stride, g.ox, g.hdr)
+  fftsa.nl.px_seed_note(g.lo)
+  pcall(fftsa.nl.px_cache_save)
 end
 
 function fftsa.nl.px_cache_get()
@@ -3043,25 +5777,285 @@ end
 
 -- The whole path, driven one frame at a time. Returns the points drawn, or nil when the
 -- caller still has to append.
-function fftsa.nl.px_try(db, hz, nseg, tb, t)
+-- gid is the app's OBJ_GRAPH display handle, and the buffer is the trace buffer. Both are
+-- the caller's to supply: they are what the pointer route needs and this module has no way
+-- to know either. Passed every call rather than stashed once, so a relaunch's new handle
+-- arrives without anything having to invalidate the old one.
+function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
   local nl = fftsa.nl
+  nl.rd_frame(t)
   local p = nl.px
   local st = p.state
+  -- The launch clock, and the frames spent not yet drawing. Both are the module's, so a
+  -- restart does not reset them: the figure wanted is from the first frame of the app.
+  if nl.t_first == nil then nl.t_first = os.clock() end
+  if st ~= 'on' then nl.pre_frames = (nl.pre_frames or 0) + 1 end
   if st == 'off' then return nil end
+  nl.px_buf = tb
+  if type(gid) == 'number' then
+    -- A handle that has changed takes the derived base with it: the table is indexed by id,
+    -- so an entry read at the wrong one is some other object.
+    if p.gid ~= nil and p.gid ~= gid then
+      nl.px_objbase = nil
+      -- And the walk is worth repeating: a new handle means the objects behind the table
+      -- changed, which is the one event that can put this app's trace under a different entry.
+      p.objdone, p.objscan = nil, 0
+    end
+    p.gid = gid
+  end
   if st == 'on' then return nl.px_frame(db, hz, nseg, tb, t) end
   if nseg == nil or nseg < 8 then return nil end
   if st == 'idle' then
-    local c = nl.px_cache_get()
-    if c ~= nil and nl.px_map(c, db, hz, nseg) then
-      p.state = 'on'
-      p.from = 'cache'
-      return nl.px_frame(db, hz, nseg, tb, t)
+    -- The hold, counted in frames that have appended: px_try runs after the fill, so one call
+    -- is one pass of appends through the ring. Until it is spent, every frame appends and
+    -- nothing is mapped -- which is what puts the values and the pixels back in step.
+    if (p.hold or 0) > 0 then
+      p.hold = p.hold - 1
+      return nil
     end
-    p.state = 'seek'
-    return nil
+    -- The key's record, once per launch: a power cycle loses every global, and without this
+    -- the first search of a boot starts at the bottom of the ladder with nothing learned.
+    pcall(nl.px_cache_load)
+    -- THE CACHE GETS MORE THAN ONE FRAME, and that is the difference between a relaunch
+    -- engaging at once and sweeping tens of megabytes.
+    --
+    -- px_map requires every slot of the drawn window to carry a frequency this plan has. On a
+    -- relaunch the trace object has only just been created, so the ring holds nothing of this
+    -- plan until the appends have been through it -- and the display task lags a pass behind
+    -- those. So the cached geometry is certain to fail on the first frame, whether or not it is
+    -- still the right address. Trying it once and dropping to the sweep threw away the one
+    -- answer that costs no reading: measured on the glass, a relaunch took 20 seconds and
+    -- about 50 MB to find a ring the cache could have named.
+    --
+    -- A retry is one window read and a slot walk, and the fill below is running the whole time,
+    -- so each attempt is better informed than the last.
+    -- THE POINTER FIRST, THEN THE CACHE, AND NEITHER COSTS A SCAN.
+    --
+    -- px_from_ptr is three guarded reads per table base and the bases are the one this
+    -- instrument confirmed and the compiled hint. The cached geometry is one window read. Both
+    -- are name-validated on the way through, and both are worth retrying for a few frames
+    -- rather than once, because px_map needs the ring to hold THIS plan's frequencies and on
+    -- the frame after a relaunch it cannot: the trace object has only just been created and the
+    -- display task lags a pass behind the appends that fill it.
+    --
+    -- Only when both have been given their frames does the sweep start. That is the difference
+    -- between engaging in three frames and scanning tens of megabytes, measured as 35 to 45
+    -- seconds on the glass at 2048 points.
+    local tried = false
+    local cands, nc = {}, 0
+    -- THE SUBSCRIBER TABLE FIRST, because it needs nothing from this app but the buffer name it
+    -- chose, and it reaches the trace in one 64 KB read and three dereferences that each confirm
+    -- another. It does not need the display handle, which is what every other pointer route has
+    -- waited on and what has never been the table index.
+    do
+      local bs = nl.px_from_bufsub()
+      local bi
+      for bi = 1, table.getn(bs) do
+        nc = nc + 1
+        cands[nc] = { g = bs[bi], from = 'sub' }
+      end
+    end
+    if p.gid ~= nil then
+      local bp = nl.px_from_ptr(p.gid)
+      local bi
+      for bi = 1, table.getn(bp) do
+        nc = nc + 1
+        cands[nc] = { g = bp[bi], from = 'ptr' }
+      end
+    end
+    local c = nl.px_cache_get()
+    if c ~= nil then
+      nc = nc + 1
+      cands[nc] = { g = c, from = 'cache' }
+    end
+    local ci
+    for ci = 1, nc do
+      tried = true
+      local g = cands[ci].g
+      -- The pointer route reports bounds and a header but never looked at a record, so the x
+      -- field is px_map's to derive. The cache carries one and px_map keeps it.
+      if cands[ci].from == 'ptr' or cands[ci].from == 'sub' then g.ox = nil end
+      if nl.px_map(g, db, hz, nseg) then
+        p.state = 'on'
+        nl.px_engaged()
+        p.from = cands[ci].from
+        -- PROVEN ONLY WHEN IT HAS DRAWN. This retires the sweep for the session, so setting it
+        -- where the chain merely produced geometry let a candidate that never mapped retire it:
+        -- a freed trace keeps its name AND its back-pointers, so a corpse pair can be
+        -- self-consistent and yield plausible geometry. px_map refusing a zeroed ring is what
+        -- separates them, so this belongs on the far side of px_map and nowhere earlier.
+        if cands[ci].from == 'sub' then nl.px_subok = true end
+        if g.name_at ~= nil then p.needle = 'name' end
+        nl.px_ptr_ok()
+        nl.px_cache_put(g)
+        return nl.px_frame(db, hz, nseg, tb, t)
+      end
+    end
+    -- AND THE SEARCH RUNS IN THE SAME FRAMES, which is the difference between adding these
+    -- costs up and overlapping them.
+    --
+    -- The cheap routes are worth several frames each: the cached geometry because px_map needs
+    -- the ring to hold this plan's frequencies and cannot on the frame after a relaunch, and
+    -- the table walk because it is more entries than a frame's reads. But they were spent
+    -- BEFORE the search started, so their frames were pure latency when they failed.
+    --
+    -- Measured on the glass at 9.07: eng=4.2s/23f, of which about eight frames were a table
+    -- walk that ran all 256 entries and found nothing, then eleven were the search. Nothing
+    -- about them conflicts -- the walk spends the read allowance, the search spends the image's
+    -- own byte budget, and both are already bounded per frame -- so `st` falls through to the
+    -- seek arm below rather than returning, and p.state stays 'idle' so the cheap routes are
+    -- retried next frame. Whichever answers first wins, and neither waits for the other.
+    if tried then
+      p.cachetries = (p.cachetries or 0) + 1
+      if p.cachetries < nl.PX_CACHE_TRIES then st = 'seek' end
+    elseif p.gid ~= nil and nl.PX_PTR ~= false and not p.objdone then
+      -- THE TABLE WALK IS MID-FLIGHT, SO LET IT FINISH.
+      --
+      -- px_from_ptr walks the whole (base, id) space with a cursor kept across frames, because
+      -- 128 entries at a few guarded reads each is more than one frame's allowance. But `tried`
+      -- is only true when a candidate already EXISTS, so a clean start -- no cached geometry,
+      -- and the walk not yet at the right entry -- fell straight through to the search on the
+      -- FIRST frame. The resumable walk got exactly one frame and its cursor was then never
+      -- looked at again.
+      --
+      -- Measured on the glass at 9.06: eng=11.6s/72f, swept=41MB, window 12 of 17, and
+      -- ptrwhy='trace slot 1 of the widget is 0, and none before it carried the name' -- the
+      -- handle's entry was the wrong widget, which is the case the walk exists for.
+      --
+      -- Guarded on the route EXISTING, not just on the walk being unfinished. Without a
+      -- display handle px_from_ptr is never called, so the walk can never start and never
+      -- finish -- and holding on "not finished" held for ever. The offline suite drives px_try
+      -- with no handle, which is exactly that case, and caught it.
+      --
+      -- A walk still owing entries means the frame is spent on them. The
+      -- whole walk is a few hundred reads against a search that was sweeping tens of
+      -- megabytes, and when it answers it answers with no scanning at all -- and the base it
+      -- finds is remembered and written to the key, so later launches skip even the walk.
+      st = 'seek'
+    end
+    if st ~= 'seek' then
+      -- Both cheap routes are spent, so this is the search's state from here on.
+      p.state = 'seek'
+      st = 'seek'
+    end
   end
   if st == 'seek' then
-    local c = nl.px_seek(hz, nseg, nl.PX_BUDGET, tb)
+    -- THE LUA RING SWEEP IS ABANDONED, by decision on 2026-11-11: unusably slow and it will
+    -- never ship. 25 MB/s over ki.memread is 800 frames for one pass of the backstop, and a
+    -- day of tuning its ladder, hints and caps never made the time to engage predictable.
+    --
+    -- So engagement is the pointer route or the cached geometry, both of which dereference a
+    -- handful of addresses and scan nothing. If neither answers, the path does not engage and
+    -- the fill below appends -- correct, and only slower. The sweep below stays in the file
+    -- because the bind-time descriptor discovery shares it; nothing in the pixel path calls it.
+    -- NATIVE OR NOTHING. The Lua sweep is abandoned, so if the image cannot search -- no
+    -- install, or no span of proven memory to search in -- the path switches off and the fill
+    -- appends. That is correct and only slower, and it is the honest answer rather than
+    -- eighty seconds of scanning.
+    -- NOT OFF -- RETRY. Measured on the glass: px_from_ptr answers correctly once the app is
+    -- warm (base 0x00D178A0, id 52, ring 0x03680BD0, twelve live addresses) and refuses on the
+    -- first frames, because px_live needs a span of already-dereferenced addresses and there
+    -- are not yet enough of them. Switching the path off for the session over that threw away
+    -- a route that was about to work: the app ran the whole session on the append path with
+    -- why='no pointer and no usable cache'.
+    --
+    -- So the span is dropped and re-derived -- it is a few reads, and it widens as the app
+    -- allocates -- and the path goes back to idle to try the pointer again next frame.
+    -- THE SUBSCRIBER SLOT BEFORE THE SEARCH'S READINESS GATE, because it needs none of what
+    -- that gate waits for.
+    --
+    -- Below, a frame with no native image returns px_wait and never reaches px_seek -- so the
+    -- route that walks three pointers from a static table was being held behind the reattach of
+    -- an image it does not use. Measured on the glass at 9.18: via=sub engaged, correctly, after
+    -- sixteen frames and 10 MB of scanning, with the slot and the trace both right from the
+    -- start. The scanning was not how it was found; it was what it was waiting behind.
+    do
+      local bysub = nl.px_from_bufsub()
+      if table.getn(bysub) > 0 then
+        p.via = 'sub'
+        p.cands, p.state = bysub, 'hdr'
+        p.ncand = (p.ncand or 0) + table.getn(bysub)
+        return nil
+      end
+      -- AND IF THE SLOT IS KNOWN, DO NOT SWEEP. Waiting is the whole answer here.
+      --
+      -- A slot that reads as a live graph trace is the firmware's own statement of where this
+      -- app's trace object is. If the chain behind it has not yielded geometry yet, the reason
+      -- is in sub_why and it is always the same one: the ring has no records in it, because the
+      -- appends have not been through it. Scanning DRAM cannot make that true sooner, and
+      -- whatever it finds is the same object.
+      --
+      -- Measured on the glass at 9.19, clean boot: eng=2.9s/17f with last=1.2s/5f and
+      -- swept=10MB/0pass. The pass that engaged swept NOTHING -- the route answered with no
+      -- scanning at all -- and the 10 MB was spent in the frames before the last rebind, on an
+      -- object that was then freed. re=5, the reasons reading "the drawn window moved from
+      -- 368C938+510 to 368C938+59" after "traces rebound": the app rebinds its traces while it
+      -- builds its screens, so the search was racing a target that kept moving and every
+      -- megabyte of it was discarded.
+      --
+      -- Bounded, because "wait for a ring that never fills" must not be forever: after
+      -- PX_SUB_WAIT frames the sweep runs anyway, which is what a build whose slot means
+      -- something else would need.
+      if nl.px_subslot ~= nil then
+        p.subwait = (p.subwait or 0) + 1
+        -- NO BOUND ONCE THE ROUTE HAS ANSWERED. The bound exists for a build where a slot
+        -- reads as a live graph trace and the chain behind it means something else -- on an
+        -- instrument where the chain has closed, waiting is strictly better than sweeping,
+        -- because whatever a sweep finds is the object the slot already names. This is what
+        -- makes "no scans once it is in fast mode" hold across a drop and not just while
+        -- engaged: a rebind sends the path back to idle, and from there it walks the slot
+        -- again rather than searching.
+        if nl.px_subok or p.subwait <= nl.PX_SUB_WAIT then
+          return nl.px_wait('the subscriber slot is known, waiting for its ring: '
+                            .. tostring(nl.sub_why))
+        end
+      end
+    end
+    local mlo = nl.map_bounds()
+    if not ((nl.NFIND and mlo ~= nil and nl.ready) or nl.PX_SWEEP) then
+      -- No search available. Retry the POINTER rather than giving up: it answers once the app
+      -- is warm, and the span px_live needs widens as the app allocates. The span is dropped
+      -- so it is re-derived from whatever is live now.
+      nl.map_lo, nl.map_hi = nil, nil
+      p.ptrtries = (p.ptrtries or 0) + 1
+      if p.ptrtries < nl.PX_PTR_TRIES then
+        return nl.px_wait('no pointer yet, try ' .. tostring(p.ptrtries))
+      end
+      -- AND IT DOES NOT GIVE UP, because what it is waiting for arrives late.
+      --
+      -- This switched the path off for the session after PX_PTR_TRIES frames. Measured on the
+      -- glass at 8.96: px=off, re=33, why='no pointer, no cache, and no native search' -- and
+      -- on the SAME diagnostic line, ready=true with a live entry. The image was installed and
+      -- the span derived fine (no reason appended, so map_why was nil); both simply became
+      -- true after the thirty frames this had already spent. The path was off for a session
+      -- whose search was available the whole time bar the first second.
+      --
+      -- Thirty frames is a guess about how long the app takes to warm up. Switching off
+      -- permanently on a guess is the one thing that cannot be recovered from, and staying
+      -- idle costs three guarded reads a frame and a fill that appends -- which is what the
+      -- app did for its whole life before this path existed. So it keeps trying, and the
+      -- counter becomes a report rather than a deadline.
+      p.ptrcap = (p.ptrcap or 0) + 1
+      local w = 'no pointer, no cache, and no native search yet, waiting '
+                .. tostring(p.ptrtries)
+      if nl.map_why ~= nil then w = w .. ': ' .. tostring(nl.map_why) end
+      return nl.px_wait(w)
+    end
+    nl.FINDS_NATIVE_ONLY = not nl.PX_SWEEP
+    -- Timed, so the next slice is sized by what this one cost rather than by what a Lua read
+    -- would have cost. The bytes are the image's own report of what it scanned.
+    local b0, s0 = nl._nf_bytes or 0, nl._nf_secs or 0
+    local c = nl.px_seek(hz, nseg, nl.px_budget(), tb)
+    nl.px_nb_note((nl._nf_bytes or 0) - b0, (nl._nf_secs or 0) - s0)
+    nl.FINDS_NATIVE_ONLY = false
+    if c == nil then
+      -- Not off for the session, for the same reason as the gate above: a refusal here is the
+      -- image having no find block reserved or no span to search, and on a run that REATTACHED
+      -- to the install a previous launch made -- one install per boot -- those arrive when the
+      -- reattach finishes, not when the first frame runs.
+      p.nrefuse = (p.nrefuse or 0) + 1
+      return nl.px_restart('the native search refused: ' .. tostring(nl.find_why))
+    end
     if c == nil or table.getn(c) == 0 then return nil end
     p.cands, p.state = c, 'hdr'
     p.ncand = (p.ncand or 0) + table.getn(c)
@@ -3083,6 +6077,11 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t)
     table.remove(c)
     -- A name-derived geometry already has its bounds and its header; only the record route
     -- has to go looking for one.
+    -- Which needle this candidate came from. px_from_name stamps name_at; px_xconfirm does
+    -- not. Reported, because "engaged on the name" and "engaged on the frequencies" are
+    -- different confidences in the same answer.
+    p.needle = 'freq'
+    if g.name_at ~= nil then p.needle = 'name' end
     if g.hdr ~= nil and g.lo ~= nil then
       g.ox = nil
       p.g, p.state, p.maptries = g, 'map', 0
@@ -3099,9 +6098,35 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t)
     return nil
   end
   if st == 'map' then
+    -- THE CURSOR OFFSETS, BY CAUSE, before anything is mapped or written.
+    --
+    -- A candidate from a deriving model arrives with its count offset and a list of cursor
+    -- pairs that fit the shape, because shape cannot separate the two cursors -- measured
+    -- against the 6500, four pairs fit. What separates them is what each one DOES when a
+    -- reading is appended, and the fill is appending on every one of these frames.
+    --
+    -- Spent here rather than in px_from_name because it needs two frames, and this state
+    -- already has frames to spend: the map cannot be fitted until the ring holds this plan's
+    -- frequencies anyway.
+    if p.g ~= nil and p.g.h_pairs ~= nil and p.g.h_old == nil then
+      if nl.px_hdr_resolve(p.g) then
+        p.maptries, p.hdrtries = 0, 0
+        return nil
+      end
+      p.hdrtries = (p.hdrtries or 0) + 1
+      if p.hdrtries >= nl.PX_HDR_TRIES then
+        -- The ring is not saying which word is which. Nothing is written on a guess, so this
+        -- candidate is abandoned and the next one gets its turn.
+        p.why = 'the cursor offsets did not resolve: ' .. tostring(p.g.h_why)
+        p.g, p.state, p.hdrtries = nil, 'hdr', 0
+      end
+      return nil
+    end
     if nl.px_map(p.g, db, hz, nseg) then
       p.state = 'on'
-      p.from = 'search'
+      nl.px_engaged()
+      p.from = p.via or 'search'
+      if p.from == 'sub' then nl.px_subok = true end
       nl.px_cache_put(p.g)
       return nl.px_frame(db, hz, nseg, tb, t)
     end
@@ -3122,20 +6147,178 @@ function fftsa.nl.px_str()
   local nl = fftsa.nl
   local p = nl.px
   local o = 'px=' .. tostring(p.state)
+  -- WHICH PATH IS IN FORCE, UNCONDITIONALLY, and that is the point of it being here.
+  --
+  -- Everything below that describes a candidate is gated on there being one. On the model this
+  -- was written for there always is, so it never mattered; on a model where the path never
+  -- engages, every one of those fields is absent and the page says nothing about why -- which
+  -- is exactly the case that cannot be debugged any other way. An operator on a DMM7510 can
+  -- only send back what is on the glass.
+  --
+  -- So the configuration comes first and always: the model the module decided it is, whether
+  -- the pointer route is available, whether the offsets are being derived, and whether the
+  -- caller is arming the path at all. A 7510 report that opens 'px=off m=7510 ptr=0 der=1
+  -- arm=1' has already answered four questions.
+  if nl.model_7510 ~= nil then
+    o = o .. ' m='
+    if nl.model_7510 then o = o .. '7510' else o = o .. '6500' end
+  end
+  if nl.eng_secs ~= nil then
+    o = o .. string.format(' eng=%.1fs/%df', nl.eng_secs, nl.eng_frames or 0)
+    if nl.eng_last ~= nil and nl.eng_last < nl.eng_secs - 0.05 then
+      o = o .. string.format(' last=%.1fs/%df', nl.eng_last, nl.eng_lastf or 0)
+    end
+  elseif nl.pre_frames ~= nil and nl.pre_frames > 0 then
+    -- Not engaged yet: how long it has been trying, which is the figure to read while it is
+    -- still going rather than after it gives up.
+    o = o .. string.format(' trying=%.1fs/%df',
+                           os.clock() - (nl.t_first or os.clock()), nl.pre_frames)
+  end
+  if nl.PX_PTR == false then o = o .. ' ptr=0' end
+  if nl.PX_HDR_DERIVE then o = o .. ' der=1' end
+  if fftsa.sg_pix_armed ~= nil then
+    local ok, armed = pcall(fftsa.sg_pix_armed)
+    if ok then
+      o = o .. ' arm='
+      if armed then o = o .. '1' else o = o .. '0' end
+    end
+  end
   if p.lo ~= nil then
     o = o .. ' ring=' .. hx(p.lo) .. '/' .. tostring(p.nrec) .. 'x' .. tostring(p.stride)
         .. ' x@' .. tostring(p.xoff) .. ' y@' .. tostring(p.yoff)
         .. ' v@' .. tostring(p.ov) .. ' xf@' .. tostring(p.ox)
   end
+  if p.needle ~= nil then o = o .. ' by=' .. tostring(p.needle) end
   if p.xcol ~= nil then o = o .. ' col=' .. tostring(p.xcol) end
   if p.ay ~= nil then
     o = o .. string.format(' map=%.4f*db%+.2f r=%.2f sp=%.0f', p.ay, p.by, p.resid, p.span)
   end
   if p.frames ~= nil then o = o .. ' n=' .. tostring(p.frames) end
   if p.from ~= nil then o = o .. ' via=' .. tostring(p.from) end
-  if p.swept ~= nil then
-    o = o .. ' swept=' .. tostring(math.floor(p.swept / 1048576)) .. 'MB'
+  -- The derived table base, and why it is absent. This is the figure that turns a sweep per
+  -- launch into three reads, so whether it was derived is the thing to read off the glass.
+  if nl.px_objbase ~= nil then
+    o = o .. ' obj=' .. hx(nl.px_objbase) .. '+' .. tostring(nl.px_objid) .. 'x'
+        .. tostring(nl.PX_OBJ_STRIDE)
+    if nl.px_objfound ~= nil then o = o .. '[' .. tostring(nl.px_objfound) .. ']' end
   end
+  if p.gid ~= nil then o = o .. ' gid=' .. tostring(p.gid) end
+  if p.ptr_lost ~= nil then o = o .. ' ptrlost=' .. tostring(p.ptr_lost) end
+  -- WHY THE POINTER ROUTE ANSWERED NOTHING. It is O(1) and independent of where the ring
+  -- sits, so when it works the search never runs; when it does not, the page has to say which
+  -- step gave up. Absent obj= with no reason beside it cost a day of looking at the search.
+  if nl.px_objbase == nil and nl.ptr_why ~= nil then
+    o = o .. ' ptrwhy=' .. tostring(nl.ptr_why)
+    -- How far the table walk got. Zero after a walk that found nothing means it finished and
+    -- the table really has no entry owning this app's trace; a number mid-range means it is
+    -- still going, which is a completely different thing to read off the glass.
+    o = o .. ' objscan=' .. tostring(p.objscan or 0) .. '/'
+        .. tostring(table.getn(nl.px_bases()) * nl.PX_OBJ_SCAN)
+  end
+  o = o .. ' ' .. nl.rd_str()
+  -- Unconditional, both of them. A path that never engaged is the case that needs these most:
+  -- how far the search got, and whether the window it is in is the instance band or the
+  -- backstop. Without the window there is no telling a search still working through a narrow
+  -- band from one that has fallen through to 268 MB.
+  -- THE SESSION'S TOTAL AND THIS PASS'S, as two figures. swept is cumulative across restarts,
+  -- which is what made 34 MB look like a search problem when the ladder had been thrown away
+  -- four times -- and worse, what condemned the name needle on the first slice of every later
+  -- pass. A reader cannot tell those apart from one number.
+  o = o .. ' swept=' .. tostring(math.floor((p.swept or 0) / 1048576)) .. 'MB'
+  o = o .. '/' .. tostring(math.floor((p.sweptpass or 0) / 1048576)) .. 'pass'
+  if p.wins ~= nil and p.wi ~= nil then
+    local w = p.wins[p.wi]
+    o = o .. ' win=' .. tostring(p.wi) .. '/' .. tostring(table.getn(p.wins))
+    if w ~= nil then
+      o = o .. '[' .. hx(w[1]) .. '+' .. tostring(math.floor((w[2] - w[1]) / 1048576)) .. 'MB]'
+    end
+    if p.at ~= nil then o = o .. ' at=' .. hx(p.at) end
+    -- WHERE THE INSTANCE BAND ACTUALLY IS IN THE LADDER THIS LAUNCH BUILT, and where the ring
+    -- turned out to be relative to inst. Three launches were spent inferring both from win= and
+    -- an address, and the inference was wrong at least once: the ladder is ordered to put the
+    -- band third, and the only way to know it did is to read it off the instrument.
+    --
+    -- Printed as the band's positions and the ring's offset in megabytes, so "the band was
+    -- never in the ladder", "the band was there and the ring was not in it" and "the band was
+    -- there, held the ring, and was swept too early" are three different lines rather than
+    -- three readings of the same one.
+    local iw = nl.px_inst_wins()
+    local bpos, nbp = '', 0
+    local bi2
+    for bi2 = 1, table.getn(p.wins) do
+      local k2
+      for k2 = 1, table.getn(iw) do
+        if iw[k2][1] == p.wins[bi2][1] and iw[k2][2] == p.wins[bi2][2] then
+          nbp = nbp + 1
+          if nbp > 1 then bpos = bpos .. ',' end
+          bpos = bpos .. tostring(bi2)
+        end
+      end
+    end
+    if nbp == 0 then bpos = 'none' end
+    o = o .. ' band=' .. bpos .. '/' .. tostring(table.getn(iw))
+    if p.lo ~= nil and nl.inst ~= nil then
+      local d = p.lo - nl.inst
+      local sg = '+'
+      if d < 0 then
+        sg = '-'
+        d = -d
+      end
+      o = o .. ' ring@inst' .. sg .. string.format('%.2fMB', d / 1048576)
+    end
+  end
+  if nl.inst ~= nil then o = o .. ' inst=' .. hx(nl.inst) end
+  -- THE SUBSCRIBER ROUTE, ALWAYS, because it is the route that should make the search
+  -- unnecessary and a path that fell back to scanning has to say why it could not use it.
+  o = o .. ' sub='
+  if nl.px_subslot ~= nil then
+    o = o .. hx(nl.px_subslot)
+    if nl.sub_trace ~= nil then o = o .. '>' .. hx(nl.sub_trace) end
+  else
+    o = o .. '0'
+  end
+  if nl.sub_hits ~= nil then o = o .. '/' .. tostring(nl.sub_hits) .. 'hit' end
+  if (nl.sub_tries or 0) > 0 then o = o .. '/' .. tostring(nl.sub_tries) .. 'try' end
+  -- The live reason, or the last one that stood before it engaged. A route that succeeded on
+  -- its fifteenth attempt has to be able to say what the first fourteen were waiting for.
+  -- /chain means the chain closed and handed over geometry. /mapped means px_map accepted it
+  -- and the path drew. They are different claims and a report that conflates them says the
+  -- route worked on a launch where the frequencies never matched.
+  if nl.px_subok then o = o .. '/chain' end
+  if nl.px.from == 'sub' or nl.px.via == 'sub' then o = o .. '/mapped' end
+  -- WHICH PROFILE AND WHICH WINDOW. A 7510 report reading 0hit cannot otherwise show that the
+  -- 7510 window was the one actually read.
+  o = o .. ' subcfg=' .. tostring(nl.sub_profile or '?') .. '@' .. hx(nl.PX_SUB_LO)
+      .. '+' .. tostring(math.floor(nl.PX_SUB_BYTES / 1024)) .. 'KB'
+  -- And what the read actually returned, because a short read with no hits and a full read with
+  -- no hits are different findings.
+  -- Against the window ACTUALLY READ. A ladder window is 1 MB and the compiled one 64 KB, so
+  -- comparing every read against the compiled size reported each full ladder read as short --
+  -- in the one line whose job is to say whether the read was complete.
+  if nl.sub_len ~= nil and nl.sub_want ~= nil and nl.sub_len ~= nl.sub_want then
+    o = o .. ' short=' .. tostring(nl.sub_len) .. '/' .. tostring(nl.sub_want)
+  end
+  -- And whether THIS window hit the cap, not whether the launch's running total has passed it.
+  if nl.sub_wincap then o = o .. ' hitcap' end
+  if nl.sub_loose then o = o .. ' loosekind' end
+  -- WHAT A REPORT FROM A MODEL THIS HAS NEVER RUN ON HAS TO CARRY. Where it looked, what it
+  -- found, which offsets it ended up using, and -- if the name was there but no slot was -- the
+  -- pointer-like words around the first hit, which is what settles the layout without another
+  -- run. The 6500's whole layout came out of one grab by exactly this arithmetic.
+  if nl.px_subwin ~= nil then o = o .. ' subw=' .. hx(nl.sub_at or 0) .. '>' ..
+                                   hx(nl.px_subwin) end
+  if nl.sub_nameoff ~= nil and nl.sub_nameoff ~= nl.PX_SUB_NAME then
+    o = o .. ' nameoff=' .. tostring(nl.sub_nameoff)
+  end
+  if nl.sub_kind ~= nil and nl.sub_kind ~= nl.PX_SUB_KIND then
+    o = o .. ' kind=' .. hx(nl.sub_kind)
+  end
+  if nl.sub_derived then
+    o = o .. ' derived=' .. tostring(nl.sub_p4off) .. '/' .. tostring(nl.sub_levels) .. 'lv'
+  end
+  local sw = nl.sub_why or nl.sub_lastwhy
+  if sw ~= nil then o = o .. '[' .. tostring(sw) .. ']' end
+  if nl.sub_map ~= nil and not nl.px_subok then o = o .. ' submap=' .. nl.sub_map end
   -- Hits and candidates, because without them a search that finds the ring and rejects it
   -- reads exactly like a search that never reached it. That is how the staging-ring stride
   -- came to look like 981 MB of absence.
@@ -3144,17 +6327,59 @@ function fftsa.nl.px_str()
   if p.cands ~= nil then o = o .. '/' .. tostring(table.getn(p.cands)) .. 'left' end
   if p.degen ~= nil then o = o .. ' flat=' .. tostring(p.degen) end
   if p.lastdrift ~= nil then o = o .. string.format(' d=%.1f', p.lastdrift) end
+  -- THE NAME, which is the first question on a new model: if this app's buffer name is not in
+  -- memory the trace object is not laid out as assumed and nothing downstream can work. Zero
+  -- hits with a swept figure behind it is a completely different fault from hits that are all
+  -- rejected, and the two read identically without this.
+  -- THIS PASS'S HITS AND THE SESSION'S, as two figures. One number cannot say whether the
+  -- needle was condemned by what this pass found or by what earlier passes did, and that is the
+  -- distinction that cost ten seconds to engage: nh=69 across four passes read as a pass that
+  -- had had its chances, when no pass had seen more than about seventeen.
+  if p.namehits ~= nil then o = o .. ' nh=' .. tostring(p.namehits) end
+  if (p.nhall or 0) > 0 then o = o .. '/' .. tostring(p.nhall) .. 'all' end
+  if p.namedead ~= nil then o = o .. ' namedead=' .. tostring(p.namedead) end
+  if p.noname then o = o .. ' noname=1' end
+  -- The cursor-offset derivation, ALWAYS, because on a deriving model this is the mechanism
+  -- most likely to be what stopped. agree/differ/resolved, then what the last one was waiting
+  -- for, then how many cursor pairs the candidate in hand still has in play.
+  if (nl.hdr_agree or 0) + (nl.hdr_differ or 0) + (nl.hdr_resolved or 0) > 0
+     or nl.PX_HDR_DERIVE then
+    o = o .. string.format(' hdr=%d/%d/%d', nl.hdr_agree or 0, nl.hdr_differ or 0,
+                           nl.hdr_resolved or 0)
+  end
+  if p.hdrtries ~= nil then o = o .. ' ht=' .. tostring(p.hdrtries) end
+  if p.g ~= nil and p.g.h_pairs ~= nil then
+    o = o .. ' hp=' .. tostring(table.getn(p.g.h_pairs))
+    if p.g.h_why ~= nil then o = o .. ' hpwhy=' .. tostring(p.g.h_why) end
+  end
+  if nl.hdr_why ~= nil then o = o .. ' hdrwhy=' .. tostring(nl.hdr_why) end
   if p.hdr ~= nil then
     local h = ki.memread(hx(p.hdr), hx(24))
     if h ~= nil and string.len(h) >= 24 then
-      o = o .. ' hdr[old=' .. hx(u32_at(h, nl.HDR_OLD + 1))
-          .. ' wr=' .. hx(u32_at(h, nl.HDR_WRITE + 1))
-          .. ' n=' .. tostring(u32_at(h, nl.HDR_COUNT + 1)) .. ']'
+      local so, sw, sc = nl.hdr_offs(p.g)
+      o = o .. string.format(' hdrd=%d/%d/%d', so, sw, sc)
+      o = o .. ' hdr[old=' .. hx(u32_at(h, so + 1))
+          .. ' wr=' .. hx(u32_at(h, sw + 1))
+          .. ' n=' .. tostring(u32_at(h, sc + 1)) .. ']'
+    end
+  end
+  if nl.ph_hits ~= nil then
+    o = o .. ' hunt' .. tostring(nl.ph_level or 1) .. '='
+        .. tostring(nl.ph_kind or '?') .. '/' .. tostring(nl.ph_n or 0)
+    if not nl.ph_done then o = o .. '@' .. hx(nl.ph_at or 0) end
+    local i
+    for i = 1, nl.ph_n do
+      o = o .. ' ' .. hx(nl.ph_hits[i])
     end
   end
   if p.whyframe ~= nil then o = o .. ' frame=' .. tostring(p.whyframe) end
   if p.laps ~= nil then o = o .. ' laps=' .. tostring(p.laps) end
-  if p.restarts ~= nil then o = o .. ' re=' .. tostring(p.restarts) end
+  if p.restarts ~= nil then
+    o = o .. ' re=' .. tostring(p.restarts)
+    if p.re_last ~= nil then o = o .. '[' .. tostring(p.re_last) end
+    if p.re_prev ~= nil then o = o .. ' <- ' .. tostring(p.re_prev) end
+    if p.re_last ~= nil then o = o .. ']' end
+  end
   if p.why ~= nil then o = o .. ' why=' .. tostring(p.why) end
   return o
 end
@@ -3204,6 +6429,11 @@ function fftsa.nl.write_params(t)
     -- well, and zero, because that is what keeps a line from the PREVIOUS call being read as
     -- this one's; a caller has no reason to set it.
     t.fail_at or 0,
+    -- The find block, for DSPN_MODE_FIND. A pointer and not the block itself: the block is
+    -- forty-two words of search state and this struct is packed on every frame, most of which
+    -- do no searching. Zero when the caller has none, which the image treats as a refusal
+    -- rather than reading address zero.
+    t.find_addr or 0,
   }
   if table.getn(w) ~= fftsa.nl.PARAM_WORDS then return false end
   local parts = {}
@@ -3351,6 +6581,54 @@ end
 -- ---------------------------------------------------------------------------
 function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg)
   local nl = fftsa.nl
+
+  -- WHICH MODEL'S PIXEL PATH. Settled here, once, because this is the one entry point the app
+  -- calls at start and the model cannot change under a running app.
+  --
+  -- A DMM6500 keeps the mechanism that works there: the measured cursor offsets, and the
+  -- pointer route through the GUI object table. A DMM7510 has neither -- its object is a
+  -- different size and its table is not in reach of the scan that found the 6500's -- so it
+  -- takes the name route with the offsets derived, which is the one route whose every other
+  -- term is already searched for rather than assumed.
+  --
+  -- The shadow check runs on both. On a 6500 it compares the derivation against the known
+  -- constants with nothing depending on the result, which is how the derivation earns the right
+  -- to replace them.
+  nl.model_7510 = false
+  if localnode ~= nil and localnode.model ~= nil then
+    nl.model_7510 = string.find(tostring(localnode.model), '7510', 1, true) ~= nil
+  end
+  nl.PX_HDR_DERIVE = nl.model_7510
+  nl.PX_PTR = not nl.model_7510
+  -- EVERY DMM6500 FIGURE IS MEASURED; EVERY DMM7510 FIGURE IS UNKNOWN. So the 6500 uses the
+  -- compiled offsets and the compiled kind and nothing else, and another model is allowed to
+  -- derive both -- the chain still has to close on this app's own buffer name and px_map still
+  -- has to match 510 frequencies, so a wrong derivation costs reads and never correctness.
+  -- The window is per model and measured on both. The three fallbacks below stay ON for a
+  -- 7510 and OFF for a 6500: on the 6500 every figure is confirmed on the glass, so a
+  -- derivation could only be slower or less certain, while on a model nobody can measure they
+  -- are what turns "the compiled window moved in a later build" from a dead route into a
+  -- slower one. None of them runs while the compiled window answers.
+  if nl.model_7510 then nl.PX_SUB_LO = nl.PX_SUB_LO_7510 end
+  nl.sub_profile = '6500'
+  if nl.model_7510 then nl.sub_profile = '7510' end
+  nl.PX_SUB_DERIVE = nl.model_7510
+  nl.PX_SUB_ANYKIND = nl.model_7510
+  nl.PX_SUB_LADDER = nl.model_7510
+  -- Whether this model's cursor offsets are known from its own image. The 6500's are; nothing
+  -- else's is. The guard in px_hdr_resolve rests on this, and it is what makes trying the
+  -- derived route on a 6500 safe to do at all.
+  nl.hdr_known = not nl.model_7510
+  -- OVERRIDABLE, AND A GLOBAL SO IT SURVIVES AN APPLY. This function runs on every Apply, so a
+  -- knob kept in nl would be put back to the model default by the next one -- and the point of
+  -- trying the derived route on a 6500 is to turn it on from the socket mid-session, and off
+  -- again, without a rebuild.
+  --
+  --   FFTSA_HDRDERIVE = true    derive on this instrument, whatever the model
+  --   FFTSA_HDRDERIVE = false   use the measured constants
+  --   FFTSA_HDRDERIVE = nil     the model decides, which is what ships
+  if FFTSA_HDRDERIVE ~= nil then nl.PX_HDR_DERIVE = FFTSA_HDRDERIVE end
+  if FFTSA_PTRHUNT ~= nil then nl.PX_PTRHUNT = FFTSA_PTRHUNT end
 
   -- One install per boot, and a module field cannot enforce it: fftsa.start() calls this on
   -- every app start and a stop/restart with no power cycle reloads the script, so any flag
@@ -3741,9 +7019,14 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- because it reads and writes it as doubles: red_host is 32-aligned and both arrays are
   -- a whole number of dsp_real, so the sum is.
   local res_addr = red_hz + want_nseg * nl.SIZEOF_REAL
-  if (res_addr - payload[nseg + 2]) + res_bytes > nl.CHUNK_BYTES then
+  -- And the find block after it, for MODE_FIND. Words, so 4-aligned is enough, and res_bytes
+  -- is a whole number of doubles so the sum stays 8-aligned for anything that follows.
+  local find_bytes = (nl.FIND_WORDS or 0) * 4
+  local find_addr = res_addr + res_bytes
+  if (res_addr - payload[nseg + 2]) + res_bytes + find_bytes > nl.CHUNK_BYTES then
     return fftsa.nl._abort(cb, pb, 'reduction arrays plus a ' .. tostring(res_bytes)
-                           .. '-byte results block will not fit a chunk')
+                           .. '-byte results block and a ' .. tostring(find_bytes)
+                           .. '-byte find block will not fit a chunk')
   end
 
   -- The segment vector itself, in the code buffer above the params struct.
@@ -3794,6 +7077,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.red_db    = red_db
   nl.red_hz    = red_hz
   nl.res_addr  = res_addr
+  nl.find_addr = find_addr
   nl.nseg_max  = want_nseg
   nl.kind      = kind or 1
   nl.beta      = beta or 0
@@ -4050,6 +7334,113 @@ function fftsa.nl.call_dsp(cap, out, red)
   nl.last_rc = r
   if type(r) ~= 'number' or r < 0 then return nil end
   return r
+end
+
+-- ---------------------------------------------------------------------------
+-- THE SEARCH, IN THE IMAGE.
+--
+-- Returns the hit addresses and where to resume, or nil. One memwrite of the request, one
+-- call, one memread of the answer -- against ki.memread per 32 KB block and a string.find per
+-- block in Lua, which is what makes a sweep cost 800 frames instead of one.
+--
+-- cap bounds the bytes this call scans, so a frame stays a frame: the image is fast but it
+-- still runs to completion before the Lua thread resumes, and a frame cannot be interrupted.
+-- Zero means the whole range. The resume address comes back either way, so a caller walks a
+-- large range across frames the same way px_seek already walks its ladder.
+--
+-- The range is CLAMPED to the backstop inside the image rather than refused. ki.memread goes
+-- through a firmware path that validates; a load from the image does not, and an unmapped
+-- address is a data storage interrupt and a bluescreen -- so the clamp is what lets a caller
+-- hand over a window that runs off the end of DRAM.
+-- ---------------------------------------------------------------------------
+fftsa.nl.NFIND_PAT_MAX = 16
+-- Bytes the image steps between comparisons. Four, because every needle this module uses is a
+-- 4-aligned record field -- see nfind. One would be correct and four times slower; the image
+-- refuses anything that is not 1, 2 or 4 rather than rounding it.
+fftsa.nl.NFIND_STEP = 4
+fftsa.nl._nf_mul = { 16777216, 65536, 256, 1 }
+
+function fftsa.nl.nfind(lo, hi, pat, cap)
+  local nl = fftsa.nl
+  nl.find_why = nil
+  if not nl.ready or nl.entry == nil or nl.entry == 0 then
+    nl.find_why = 'no native image'
+    return nil
+  end
+  if nl.find_addr == nil or nl.find_addr == 0 or (nl.FIND_WORDS or 0) == 0 then
+    nl.find_why = 'no find block reserved'
+    return nil
+  end
+  if type(pat) ~= 'string' then
+    nl.find_why = 'needle is not a string'
+    return nil
+  end
+  local plen = string.len(pat)
+  if plen < 1 or plen > nl.NFIND_PAT_MAX then
+    nl.find_why = 'needle is ' .. tostring(plen) .. ' bytes, not 1..'
+                  .. tostring(nl.NFIND_PAT_MAX)
+    return nil
+  end
+  if type(lo) ~= 'number' or type(hi) ~= 'number' or hi <= lo then
+    nl.find_why = 'range is not lo < hi'
+    return nil
+  end
+  -- The needle as four big-endian words, first byte in the top of the first. Multiplication
+  -- and not a shift: Lua 5.0 has no shift operator and bit.* is the firmware's, not this
+  -- module's to depend on here.
+  local pw, i = { 0, 0, 0, 0 }, nil
+  for i = 1, plen do
+    local wi = math.floor((i - 1) / 4) + 1
+    pw[wi] = pw[wi] + string.byte(pat, i) * nl._nf_mul[math.mod(i - 1, 4) + 1]
+  end
+  -- THE STEP, STATED, because the image will not assume it.
+  --
+  -- Every needle this module searches for is a field of a record at lo + k*stride + ox, and
+  -- both stride and ox are multiples of four wherever they are derived -- REC_MIN..REC_MAX
+  -- steps by 4 and the x field is found on a 4-aligned scan. So a match can only begin
+  -- word-aligned, and saying so is worth four times the scan rate.
+  --
+  -- A needle that is not known to be aligned must pass 1, and an unaligned LO is refused by
+  -- the image rather than rounded: rounding would move the start past bytes the caller thinks
+  -- were searched, which is the same defect as a short read reported as an absence.
+  local step = nl.NFIND_STEP or 1
+  if step == 4 and math.mod(lo, 4) ~= 0 then
+    -- Align upward and tell the caller where it really started, by returning that as `next`
+    -- on an empty result. Rounding silently is what this must never do.
+    local up = lo + (4 - math.mod(lo, 4))
+    if up + plen > hi then
+      nl.find_why = 'range too short to align'
+      return {}, hi
+    end
+    lo = up
+  end
+  ki.memwrite(hx(nl.find_addr),
+              u32_pack(lo) .. u32_pack(hi) .. u32_pack(cap or 0)
+              .. u32_pack(plen + step * 65536)
+              .. u32_pack(pw[1]) .. u32_pack(pw[2]) .. u32_pack(pw[3]) .. u32_pack(pw[4]))
+  if not nl.write_params({ mode = nl.MODE_FIND, find_addr = nl.find_addr }) then
+    nl.find_why = 'write_params refused'
+    return nil
+  end
+  local n = nl.call_native(nl.entry)
+  if type(n) ~= 'number' or n < 0 then
+    nl.find_why = 'rc=' .. tostring(n) .. ' at line ' .. tostring(nl.fail_at)
+    return nil
+  end
+  if n > (nl.FIND_MAX or 0) then
+    nl.find_why = 'image reported ' .. tostring(n) .. ' hits, over FIND_MAX'
+    return nil
+  end
+  -- next and the hits, in one read: word 8 of the block onward.
+  local got = ki.memread(hx(nl.find_addr + 32), hx(8 + n * 4))
+  if got == nil or string.len(got) < 8 then
+    nl.find_why = 'could not read the answer back'
+    return nil
+  end
+  local out, k = {}, nil
+  for k = 1, n do out[k] = u32_at(got, 9 + (k - 1) * 4) end
+  nl.nfind_calls = (nl.nfind_calls or 0) + 1
+  return out, u32_at(got, 1)
 end
 
 -- ---------------------------------------------------------------------------

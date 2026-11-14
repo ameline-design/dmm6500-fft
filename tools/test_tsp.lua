@@ -2119,6 +2119,139 @@ check('a pan on X alone writes X alone', (function()
          string.format('pins %d/%d ypins %d/%d xmin=%s', (OBJ[gh].pins or 0), p,
                        (OBJ[gh].ypins or 0), yp, tostring(OBJ[gh].xmin))
 end)())
+-- THE F SAYS WHETHER THE FAST PATH IS CARRYING THE FRAME, and it is a diagnostic as much as a
+-- label: a frame rate that dips for a second or two says nothing about why on its own, and an F
+-- that goes with the dip says the path dropped while an F that stays says the time went
+-- somewhere else. It must therefore follow px.state exactly, and absent nl must read as not
+-- fast rather than raising -- the app ran without the module for its whole life before this.
+check('the settings line carries an F only while the pixel path is engaged', (function()
+  local keepnl = fftsa.nl
+  local got = {}
+  fftsa.nl = { px = { state = 'on' } }
+  got.on = fftsa.sg_fast_text()
+  local line = fftsa.sg_xunit_text()
+  fftsa.nl.px.state = 'seek'
+  got.seek = fftsa.sg_fast_text()
+  fftsa.nl.px.state = 'off'
+  got.off = fftsa.sg_fast_text()
+  fftsa.nl = nil
+  got.nonl = fftsa.sg_fast_text()
+  fftsa.nl = { }
+  got.nopx = fftsa.sg_fast_text()
+  fftsa.nl = keepnl
+  return got.on == 'F ' and got.seek == '' and got.off == '' and got.nonl == ''
+         and got.nopx == '' and string.sub(line, 1, 2) == 'F ',
+         string.format('on=%q seek=%q off=%q no-nl=%q no-px=%q line=%q', got.on, got.seek,
+                       got.off, got.nonl, got.nopx, string.sub(line, 1, 12))
+end)())
+
+-- THE PIXEL PATH IS ARMED ON EVERY MODEL, AND THE SEARCH AND DRAW SIDES ASK THE SAME QUESTION.
+--
+-- It used to be off on a DMM7510, because the heap search refused there every frame for the
+-- life of the session and refusing is not free. Two things changed that.
+--
+-- The route no longer searches the heap. It reads the firmware's static buffer-subscriber
+-- table, and the DMM7510 has one: in its own display payload at 0x005189C8, with the name,
+-- graph and routing pointer at the same +0x08, +0x34 and +0x40, the same 0x407F graph-trace
+-- kind, and the same eight trace and widget offsets. It needs a different search window and
+-- nothing else, and if that window is wrong on some build the route refuses once and says so
+-- on the About page.
+--
+-- And the exclusion was not actually being honoured. The draw side asked sg_pix_armed; the two
+-- search call sites asked sg_pix alone -- so a stock 7510 ran the whole search, could reach
+-- state 'on', and never drew. sg_fast_text shows the F on state alone, so the bottom line
+-- would have claimed a fast path the frame was not using. A false F is worse than no F: it is
+-- the one indicator the manual tells a user to report by.
+--
+-- So this now pins the opposite policy, and the knob still switches the whole thing off.
+check('the pixel path is armed on every model, and the knob still switches it off', (function()
+  local keepm, keepany, keeppix = fftsa.model_str, fftsa.sg_pix_any, fftsa.sg_pix
+  local function armed(model, any, pix)
+    fftsa.model_str, fftsa.sg_pix_any, fftsa.sg_pix = model, any, pix
+    return fftsa.sg_pix_armed()
+  end
+  local on6500 = armed('DMM6500', false, true)
+  local on7510 = armed('DMM7510', false, true)
+  local forced = armed('DMM7510', true, true)
+  local offknob = armed('DMM6500', true, false)
+  fftsa.model_str, fftsa.sg_pix_any, fftsa.sg_pix = keepm, keepany, keeppix
+  return on6500 == true and on7510 == true and forced == true and offknob == false,
+         string.format('6500=%s 7510=%s forced=%s knob off=%s', tostring(on6500),
+                       tostring(on7510), tostring(forced), tostring(offknob))
+end)())
+
+-- THE POINTER HUNT RUNS FROM THE HALF OF THE FRAME THAT ACTUALLY RUNS.
+--
+-- When the path is engaged, sg_pix_draw does the work and px_try's engaged arm is never
+-- reached -- so a hook placed there never ran at all. Measured on the glass at 9.11: px.state
+-- 'on' with the hunt armed and its hit table still nil after twenty seconds of frames, and it
+-- had to be driven by hand over the socket to get any data.
+check('an armed pointer hunt is reached from the engaged frame', (function()
+  local keepnl = fftsa.nl
+  local hunts = 0
+  local px = { state = 'on', lo = 1024, hi = 2048, nrec = 8, stride = 56 }
+  fftsa.nl = { px = px, PX_PTRHUNT = true, px_restart = function() end,
+               px_frame = function() return 0 end,
+               px_ptrhunt = function() hunts = hunts + 1 end }
+  local ok, err = pcall(fftsa.sg_pix_draw, { -50 }, { 100 }, 1, 'TB')
+  fftsa.nl = keepnl
+  if not ok then return false, 'raised: ' .. tostring(err) end
+  return hunts == 1, string.format('%d hunt slice(s) from one engaged frame', hunts)
+end)())
+
+-- A MOVED AXIS DROPS THE PIXEL PATH, both axes, lock or no lock.
+--
+-- The path writes plot columns and y pixels worked out from the axis as it stood when the map
+-- was fitted. An axis that has moved makes every one of them wrong, and unlocked the settle
+-- deliberately waits for the finger to stop -- so without this every frame of a drag is drawn
+-- against an axis that is no longer there. The cost of dropping it is the hold and a re-map
+-- from the cached geometry.
+-- native_link is not one of this suite's modules, so the link is stubbed down to what
+-- sg_pix_stop actually uses. What is under test is this module's side of the contract: that a
+-- settled gesture reaches px_restart with a reason. The far side -- what px_restart then does
+-- to the map and the hold -- is test_nl_reattach's.
+check('a gesture on either axis drops the pixel path', (function()
+  local keepnl = fftsa.nl
+  local px = { state = 'on' }
+  fftsa.nl = { px = px, px_restart = function(why)
+    px.state, px.why = 'idle', why
+    return nil
+  end }
+  -- A SEARCHING PATH IS NOT DROPPED BY A GESTURE, which is the half that cost the time: a
+  -- moved axis invalidates pixels already written, and a path that has not engaged has written
+  -- none. Dropping it there threw away the ladder, its cursor and its cache retries.
+  local seeking = { state = 'seek' }
+  local hit = false
+  fftsa.nl = { px = seeking, px_restart = function() hit = true return nil end }
+  OBJ[gh].xmin = wx0 + (wx1 - wx0) * 0.4
+  fftsa.sg_ev = 1
+  tick_due()
+  fftsa.frame_body()
+  local kept = (hit == false and seeking.state == 'seek')
+  fftsa.nl = { px = px, px_restart = function(why)
+    px.state, px.why = 'idle', why
+    return nil
+  end }
+  local function panned(field, to)
+    px.state, px.why = 'on', nil
+    OBJ[gh][field] = to
+    fftsa.sg_ev = 1
+    tick_due()
+    fftsa.frame_body()
+    return px.state, px.why
+  end
+  local okx, xs, xw = pcall(panned, 'xmin', wx0 + (wx1 - wx0) * 0.25)
+  local oky, ys, yw = pcall(panned, 'ymin', fftsa.sg_dbmin + 20)
+  fftsa.nl = keepnl
+  if not okx then return false, 'x raised: ' .. tostring(xs) end
+  if not oky then return false, 'y raised: ' .. tostring(ys) end
+  return xs ~= 'on' and ys ~= 'on' and kept
+         and string.find(tostring(xw), 'frequency axis moved', 1, true) ~= nil
+         and string.find(tostring(yw), 'dB axis moved', 1, true) ~= nil,
+         string.format('x -> %s (%s), y -> %s (%s), a seeking path survived=%s',
+                       tostring(xs), tostring(xw), tostring(ys), tostring(yw), tostring(kept))
+end)())
+
 -- The tolerance has to survive a narrow window a long way from DC. A span-relative test
 -- alone goes to nothing there: Start 498999.9 / Stop 499010 is a 10.1 Hz span on 499 kHz
 -- endpoints, reachable from the form, where the rounding on an endpoint is larger than
@@ -5154,6 +5287,63 @@ check('a long delivered gap does not ratchet the period, and converged periods s
   return ok, why
 end)())
 
+-- A MODELLED PERIOD IS CORRECTED AT ONCE, AND A CONVERGED ONE IS NOT.
+--
+-- frame_estimate is a model, and the deadband used to gate the first correction after it. The
+-- asymmetry made that worst in the direction that hurts: a model short of the truth by less
+-- than tick_rise was never corrected, so the timer fired into a frame still running, the tick
+-- was dropped, and the cadence was uneven at an effectively halved rate. Measured on the glass
+-- at 8.97 in both directions of a size change -- several seconds of slow, uneven frames with
+-- the F lit throughout, so the fast path was carrying every one of them.
+--
+-- The re-arm count is the assertion and not the period, because what the period converges to
+-- depends on this harness's stubbed clock. A re-arm while modelled, none while converged.
+check('a modelled period is corrected in one window; a converged one holds', (function()
+  fftsa.start()
+  local realclock, realarm = os.clock, fftsa.arm
+  local arms = 0
+  fftsa.arm = function(p) arms = arms + 1 return realarm(p) end
+  local t = 0
+  os.clock = function()
+    t = t + 0.001
+    return t
+  end
+  local i
+  -- Converge, so what follows starts from a measured period and not a modelled one.
+  for i = 1, 40 do
+    t = t + 0.300
+    fftsa.frame()
+  end
+  local base = fftsa.period
+  -- BELOW the truth by less than tick_rise, which is the move the deadband refuses: raising
+  -- needs tick_rise where dropping needs one grid step, so this is the direction that stalls.
+  local short = (base or 0.05) - fftsa.tick_rise * 0.5
+  if short < 0.005 then short = 0.005 end
+  -- Converged: left alone, which is what stops a converged period chasing jitter.
+  fftsa.period, fftsa.period_modelled, fftsa.work_seen = short, false, 0
+  local a0 = arms
+  for i = 1, 16 do
+    t = t + 0.300
+    fftsa.frame()
+  end
+  local held = arms - a0
+  -- Modelled: adopted, in the same direction and by the same amount.
+  fftsa.period, fftsa.period_modelled, fftsa.work_seen = short, true, 0
+  local a1 = arms
+  for i = 1, 16 do
+    t = t + 0.300
+    fftsa.frame()
+  end
+  local corrected = arms - a1
+  os.clock, fftsa.arm = realclock, realarm
+  local ok = held == 0 and corrected > 0 and base ~= nil
+  local why = string.format('from %s set to %s: converged re-armed %d, modelled re-armed %d',
+                            tostring(base), tostring(short), held, corrected)
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
+end)())
+
 check('every frame length keeps the idle floor, and the long ones do not overpay',
       (function()
   local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}
@@ -5675,10 +5865,48 @@ check('every place that frees a trace stops the pixel path before it does', (fun
                        tostring(stops['destroy']), tostring(not madeok), tostring(not destok))
 end)())
 
--- The shipped default, pinned where a change to it cannot be silent. The pixel path writes
--- into an address it derived at runtime, so it is switched on deliberately and not by drift.
-check('the shipped default for the pixel path is recorded here', (function()
-  return fftsa.sg_pix == false, string.format('sg_pix=%s', tostring(fftsa.sg_pix))
+-- The shipped defaults for the pixel path, pinned where a change to either cannot be silent.
+-- ON, and the repaint by cursor. Measured on the glass: it engages by pointer and draws the
+-- same spectrum, for 56.8 ms a frame against the fill's 93.2. The append fill stays as the
+-- fallback and every refusal returns to it, which is what makes the default safe rather than
+-- the path being incapable of failing. The repaint mode is the other half: 'append' wraps the
+-- trace two frames in three, so shipping ON is only defensible with 'cursor'.
+-- THE SERIES THE TRACE IS WRITTEN FROM HAS TO BE BIT-STABLE. measure_fs is (n-1)/(tN-t1) off
+-- each capture's own timestamps, so it moves in the last bits every frame, and the pixel path
+-- keys its slot map on the frequencies the firmware stored when the appends ran -- a series
+-- that moves at all invalidates the map. Measured on the instrument as the drop reason "the
+-- frequency series moved under the slot map", 556 MB swept recovering from it fifteen times.
+check('the bin width is held against jitter and adopts a rate that really moved', (function()
+  local keepm, keepn = fftsa.measure_fs, fftsa.n
+  local keeppin, keeprp = fftsa.binhz_pin, fftsa.binhz_repins
+  local rate = 100000
+  fftsa.n = 2048
+  fftsa.binhz_pin, fftsa.binhz_repins = nil, 0
+  fftsa.measure_fs = function() return rate end
+  local first = fftsa.binhz_hold(nil)
+  local i, same = nil, true
+  for i = 1, 20 do
+    -- A different number every frame, alternating sign, all well inside BINHZ_REPIN.
+    local sign = 1
+    if math.mod(i, 2) == 0 then sign = -1 end
+    rate = 100000 * (1 + sign * 1e-5 * i)
+    if fftsa.binhz_hold(nil) ~= first then same = false end
+  end
+  local heldrp = fftsa.binhz_repins
+  rate = 100000 * 1.01
+  local moved = fftsa.binhz_hold(nil)
+  local movedrp = fftsa.binhz_repins
+  fftsa.measure_fs, fftsa.n = keepm, keepn
+  fftsa.binhz_pin, fftsa.binhz_repins = keeppin, keeprp
+  return same and heldrp == 0 and moved ~= first and movedrp == 1,
+         string.format('held=%s over 20 jittered frames (repins=%d), then %g -> %g (repins=%d)',
+                       tostring(same), heldrp, first, moved, movedrp)
+end)())
+
+check('the shipped defaults for the pixel path are recorded here', (function()
+  return fftsa.sg_pix == true and fftsa.sg_pix_repaint == 'cursor',
+         string.format('sg_pix=%s repaint=%s', tostring(fftsa.sg_pix),
+                       tostring(fftsa.sg_pix_repaint))
 end)())
 
 -- sg_ncol is a live knob, and changing it must not touch the allocation: the buffer stays

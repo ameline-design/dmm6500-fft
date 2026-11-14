@@ -62,12 +62,18 @@ def ask(d, cmd, tag, timeout=600):
         if last.startswith(tag):
             return last
         if 'another interface' in last:
+            # A REFUSAL IS NOT A FAILURE, and against this app it is the normal answer: a
+            # frame holds the interpreter about three quarters of every period, so a
+            # statement is refused many times before it lands. BOUNDED BY THE DEADLINE AND
+            # NOTHING ELSE -- a count of refusals is a budget that depends on how fast the
+            # app is, and counting them desynced this probe twice while the instrument was
+            # working perfectly. Paced, so the resends do not themselves crowd the socket.
             resends += 1
-            if resends > 400:
-                break
+            time.sleep(0.2)
             d.drain()
             d.send(cmd)
-    raise SystemExit('DESYNC(%s) last=%r after %d refusals' % (tag, last, resends))
+    raise SystemExit('DESYNC(%s) last=%r after %d refusals in %gs'
+                     % (tag, last, resends, timeout))
 
 
 def one(*parts):
@@ -265,14 +271,43 @@ def live(d):
     return 0
 
 
+# Everything this probe turns on, turned off again, in ONE statement.
+#
+# One because a saturated interpreter refuses most of what is sent to it and each statement
+# that has to land is another chance to be locked out. And from a finally because an armed
+# pixel path left behind is not idle: it writes 40 KB into the display task's own ring every
+# frame, and a cursor it fails to restore is a modal 2350 that only a power cycle clears.
+def disarm(d):
+    try:
+        if getattr(d, 'sock', None) is None:
+            d._open()
+    except Exception:                                                # noqa: BLE001
+        pass
+    try:
+        print('disarm  : %s'
+              % ask(d, one("do fftsa.sg_pix = false",
+                           "if fftsa ~= nil and fftsa.nl ~= nil and fftsa.nl.px_off ~= nil",
+                           "then fftsa.nl.px_off('probe exited') end",
+                           "print('OF|' .. tostring(fftsa.sg_pix)) end"), 'OF|', timeout=180))
+    except Exception as exc:                                         # noqa: BLE001
+        print('disarm  : FAILED (%s) -- run on the instrument:' % type(exc).__name__)
+        print('          fftsa.sg_pix = false fftsa.nl.px_off("by hand")')
+
+
 def main():
     d = dmmrun.DMM(timeout=180, recover=False)
     ver = require_app(d)
     print('app     : v%s' % ver)
     if DRIVE:
-        return driven(d)
+        try:
+            return driven(d)
+        finally:
+            disarm(d)
     if LIVE:
-        return live(d)
+        try:
+            return live(d)
+        finally:
+            disarm(d)
 
     if OFF:
         ask(d, one("do fftsa.sg_pix = false",
