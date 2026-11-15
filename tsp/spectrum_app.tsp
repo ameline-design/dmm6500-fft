@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.32'
+fftsa.VERSION = '9.33'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -833,7 +833,11 @@ function fftsa.frame_body()
       -- call reduced: the display task works from its own copy of a bound buffer and that
       -- write is what feeds it, so a write into the buffer's chunk storage draws nothing
       -- and no notify call rescues it. nl.reduce says more.
-      local rd = fftsa.nl.reduce(nseg)
+      -- false: the decibels are not decoded unless something reads them, and on an engaged
+      -- pixel frame nothing does -- the image writes the ring from the same array in the
+      -- arena. About 8.5 ms of a frame at 255 points. fftsa.sg_db and fftsa.nl.db_now are
+      -- what the paths that DO read them go through.
+      local rd = fftsa.nl.reduce(nseg, false)
       if rd == nil then
         fftsa.nl.ready = false
         fftsa.nl_lasterr = 'reduce returned nil for nseg=' .. tostring(nseg)
@@ -861,7 +865,16 @@ function fftsa.frame_body()
         -- of about fps * window / period.
         --
         -- fftsa.sg_ring is the way out that does not shrink the window but removes it.
-        fftsa.sg_fill(rd.db, rd.hz, nseg)
+        --
+        -- ZERO MEANS IT WROTE NOTHING, and the frame has to carry that rather than discard
+        -- it. The decibels are decoded on demand now, so a fill can find there are none --
+        -- a short read of the arena, or a value that will not decode -- and it then leaves
+        -- the previous spectrum up, which is the right picture. What was wrong was going on
+        -- to set sg_nwrote, rank peaks and move the markers for a trace this frame did not
+        -- draw: the plot would freeze while everything beside it advanced, and nothing but
+        -- dbfail on the About page would say so. Before the decode moved, the same failure
+        -- came back from reduce as nil and fell through to the interpreted path.
+        if fftsa.sg_fill(rd.db, rd.hz, nseg) == 0 then nseg = 0 end
       end
     end
   else
@@ -869,11 +882,16 @@ function fftsa.frame_body()
     nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
   end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
-  -- Zero segments is a short record and not a failure: nothing was written and the previous
-  -- spectrum is still on screen. Counted by the primitive, mirrored here because the
-  -- settings line and the suite read this name.
+  -- Zero segments is a short record on the interpreted path, or a fill with no decibels to
+  -- write on the native one. Neither is a failure and both mean the same thing: nothing was
+  -- written and the previous spectrum is still on screen, so the frame stops here rather than
+  -- reporting a count and markers for a trace it did not draw.
+  --
+  -- shortreads only on the interpreted path, because it mirrors that primitive's own counter
+  -- and a native frame would copy a figure describing a transform it never ran. The native
+  -- side's own refusal is counted as nl.db_fails and reaches the About page from there.
   if nseg == 0 then
-    fftsa.shortreads = dsp.shortreads
+    if not fftsa.nl_frame then fftsa.shortreads = dsp.shortreads end
     return
   end
   -- On the native path binhz is set above from the capture's timestamps and is the figure
@@ -1063,11 +1081,22 @@ function fftsa.frame()
     -- that read is a single print.
     if FFTSA_CENSUS == nil then FFTSA_CENSUS = {} end
     local ph = fftsa.ph
+    -- THE DELIVERED PERIOD AND WHAT THE WINDOW ASKED FOR, which are the two figures the
+    -- armed period does not give. Measured on a DMM6500 at 2048 with the work pinned at
+    -- 55 ms: d took exactly two values, 56 and 100, against an armed 80 either way -- so the
+    -- rate is decided by which side of a 50 ms tick boundary the work falls on and not by the
+    -- period the controller computed. from is the peak the period was computed FROM, latched
+    -- where the decision is made rather than read afterwards, because the window peak resets
+    -- and would read low exactly when it mattered.
     FFTSA_CENSUS[fftsa.n] = string.format(
-      'per=%.3f fps=%.2f gap=%.1f wp=%.1f wt=%.1f acq=%.1f spec=%.1f yld=%.1f nl=%s',
+      'per=%.3f fps=%.2f gap=%.1f d=%.1f from=%.1f want=%.1f wp=%.1f wt=%.1f'
+      .. ' acq=%.1f spec=%.1f mark=%.1f yld=%.1f show=%.1f nl=%s',
       fftsa.period or 0, fftsa.fps or 0, 1000 * (fftsa.gap_peak or 0),
+      1000 * (fftsa.gap_last or 0), 1000 * (fftsa.armed_from or 0),
+      1000 * (fftsa.armed_want or 0),
       1000 * (fftsa.work_plain or 0), 1000 * (fftsa.work_tick or 0),
-      1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.yld or 0),
+      1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.mark or 0),
+      1000 * (ph.yld or 0), 1000 * (ph.show or 0),
       tostring(fftsa.nl_frame))
     -- The acq split, where a paint absorbed by the capture would show.
     local pn, tn = fftsa.acq_plain_n or 0, fftsa.acq_tick_n or 0

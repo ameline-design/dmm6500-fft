@@ -38,7 +38,10 @@ LUA502 = os.environ.get('LUA502',
 SPANS = [
     ('local function hx', '\n-- An IEEE-754 binary64 as the two'),
     ('local function u32_pack', '\nfftsa.nl._f32_unpack'),
-    ('function fftsa.nl.reduce(nseg)', "\n-- Describe a buffer's storage"),
+    # From the width helper rather than from reduce itself: the decode moved behind
+    # nl.reduce_db, and a span that started at reduce would extract a function calling three
+    # things that were left behind.
+    ('local function red_unpack', "\n-- Describe a buffer's storage"),
 ]
 
 # The arena addresses the fake memread answers for, and the gap between the two arrays:
@@ -220,6 +223,126 @@ end
 return nil
 """ % (n, HZ_ADDR, esc(image(vals, width)), n, luanums(want), n)))
 
+    # THE DECIBELS ARE NOT READ when the caller says it does not need them, which on an
+    # engaged frame is every frame: the image writes the graph ring from the same array in
+    # the arena and the spectrum never passes through Lua. RBYTES is the assertion, because
+    # nothing in the values returned would show the read still happening.
+    cases.append(('%s: a skipped reduction reads no decibels and leaves none' % tag,
+                  setup + """
+if nl.reduce(%d) == nil then return 'the priming call returned nil' end
+RBYTES = 0
+local r = nl.reduce(%d, false)
+if r == nil then return 'the skipped call returned nil' end
+-- The two-element frequency probe and nothing else; the decibels would be %d bytes more.
+local want = 2 * %d
+if RBYTES ~= want then
+  return string.format('%%d bytes, wanted %%d', RBYTES, want)
+end
+if r.db[1] ~= nil then
+  return 'db[1] reads ' .. tostring(r.db[1]) .. ', wanted nil'
+end
+return nil
+""" % (n, n, n * width, width)))
+
+    cases.append(('%s: the decibels decode on demand, once, and exactly' % tag, setup + """
+if nl.reduce(%d, false) == nil then return 'the skipped call returned nil' end
+RBYTES = 0
+local d = nl.reduce_db()
+if d == nil then return 'reduce_db returned nil' end
+local first = RBYTES
+if first ~= %d then
+  return string.format('%%d bytes for the decibels, wanted %%d', first, %d)
+end
+local again = nl.reduce_db()
+if again ~= d then return 'a second ask gave a different table' end
+if RBYTES ~= first then
+  return string.format('a second ask read %%d more bytes', RBYTES - first)
+end
+local want_db = {%s}
+local i
+for i = 1, %d do
+  if d[i] ~= want_db[i] then
+    return string.format('db[%%d] %%.17g wanted %%.17g', i, d[i], want_db[i])
+  end
+end
+return nil
+""" % (n, n * width, n * width, luanums(want_db), n)))
+
+    # THE CASE THAT WOULD BE INVISIBLE. The array is reused frame to frame, so a skip that
+    # left the previous values in place would draw last frame's spectrum for ever -- a frozen
+    # trace with nothing on the glass to report it.
+    moved = [v - 3.0 for v in DB]
+    cases.append(('%s: a skipped reduction cannot present as the last decoded one' % tag,
+                  setup + """
+local a = nl.reduce(%d)
+if a == nil then return 'the decoded call returned nil' end
+if a.db[1] ~= %.17g then return 'the decoded call has the wrong first value' end
+setmem(%d, '%s')
+local b = nl.reduce(%d, false)
+if b == nil then return 'the skipped call returned nil' end
+if b.db[1] ~= nil then
+  return 'db[1] still reads ' .. tostring(b.db[1]) .. ' from the frame before'
+end
+local d = nl.reduce_db()
+if d == nil then return 'reduce_db returned nil' end
+local want = {%s}
+local i
+for i = 1, %d do
+  if d[i] ~= want[i] then
+    return string.format('db[%%d] %%.17g wanted the moved %%.17g', i, d[i], want[i])
+  end
+end
+return nil
+""" % (n, want_db[0], DB_ADDR, esc(image(moved, width)), n,
+         luanums(at_width(moved, width)), n)))
+
+    # want_db TRUE, explicitly. The default and the explicit form have to agree, or a caller
+    # that passes the argument gets the opposite of what it asked for -- and nothing else here
+    # distinguishes them: a condition decoding only when the argument is absent passes every
+    # other case in this file.
+    cases.append(('%s: an explicit want_db decodes, like the default' % tag, setup + """
+local r = nl.reduce(%d, true)
+if r == nil then return 'reduce(n, true) returned nil' end
+local want_db = {%s}
+local i
+for i = 1, %d do
+  if r.db[i] ~= want_db[i] then
+    return string.format('db[%%d] %%.17g wanted %%.17g', i, r.db[i], want_db[i])
+  end
+end
+return nil
+""" % (n, luanums(want_db), n)))
+
+    # THE ARRAY IS PUBLISHED ONLY AFTER THE LAST VALUE LANDS. Installing it before the loop
+    # would pass every case above, because the first ask still answers nil -- what shows it is
+    # the SECOND ask, which would find a table in place and hand back the half-filled array
+    # the refusal left.
+    poisoned = bytearray(db_img)
+    poisoned[2 * width:3 * width] = struct.pack(
+        {8: '>Q', 4: '>I'}[width],
+        {8: 0x7FF8000000000000, 4: 0x7FC00000}[width])
+    cases.append(('%s: a refused on-demand decode publishes nothing, twice over' % tag,
+                  setup + """
+local r = nl.reduce(%d, false)
+if r == nil then return 'the skipped call returned nil' end
+setmem(%d, '%s')
+if nl.reduce_db() ~= nil then return 'the poisoned decode returned a table' end
+if nl.reduce_db() ~= nil then
+  return 'a second ask handed back the array the refusal half filled'
+end
+if r.db[1] ~= nil then return 'db[1] is readable after a refusal' end
+return nil
+""" % (n, DB_ADDR, esc(bytes(poisoned)))))
+
+    cases.append(('%s: refused: a short read on the on-demand decode' % tag, setup + """
+local r = nl.reduce(%d, false)
+if r == nil then return 'the skipped call returned nil' end
+nl.red_db = %d
+if nl.reduce_db() ~= nil then return 'reduce_db returned a table' end
+if r.db[1] ~= nil then return 'db[1] is readable after a refusal' end
+return nil
+""" % (n, DB_ADDR + width)))
+
     # Fails closed, one case per refusal. Each must be nil, not a table with a hole and not
     # an error: the caller falls back to the interpreted primitive on nil.
     refusals = [
@@ -310,8 +433,8 @@ MUTATIONS = [
     ('the decibel stride', 'db[i] = v\n    p = p + sz', 'db[i] = v\n    p = p + 8'),
     ('the frequency stride', 'hz[i] = f\n      p = p + sz', 'hz[i] = f\n      p = p + 8'),
     ('a short read accepted', 'string.len(sd) ~= nbytes', 'string.len(sd) < 0'),
-    ('the finite check dropped', 'if v == nil then return nil end',
-     'if v ~= nil and v == nil then return nil end'),
+    ('the finite check dropped', 'if v == nil then return db_failed() end',
+     'if v ~= nil and v == nil then return db_failed() end'),
     ('the binary32 exponent', 'local eb = b1 * 2 + math.floor(b2 / 128)',
      'local eb = b1 * 2 + math.floor(b2 / 64)'),
     ('the binary32 significand', 'local m = (math.mod(b2, 128) * 256',
@@ -319,8 +442,20 @@ MUTATIONS = [
     ('the cache ignores f0', ' or r.hz_1 ~= h1', ''),
     ('the cache ignores fstep', ' or r.hz_2 ~= h2', ''),
     ('the cache never hits', 'if r.hz_nseg ~= nseg or', 'if true or'),
-    ('the width dispatch', 'elseif sz == 4 then f_unpack = f32_unpack',
-     'elseif sz == 4 then f_unpack = f64_unpack'),
+    ('the width dispatch', 'if sz == 4 then return f32_unpack, 4 end',
+     'if sz == 4 then return f64_unpack, 4 end'),
+    # The decode moved behind reduce_db, so the two things that can go wrong with the move
+    # are a skip that decodes anyway -- which costs what the move was for and shows in
+    # nothing it returns -- and a skip that leaves the previous frame's array in place,
+    # which draws a frozen trace.
+    ('the skip decodes anyway', 'if want_db == nil or want_db then', 'if true then'),
+    ('an explicit want_db is ignored', 'if want_db == nil or want_db then',
+     'if want_db == nil then'),
+    ('the array is published before it is filled',
+     '  local i, p = nil, 1\n  for i = 1, nseg do\n    local v = f_unpack(sd, p)',
+     '  r.db = db\n  local i, p = nil, 1\n  for i = 1, nseg do'
+     '\n    local v = f_unpack(sd, p)'),
+    ('the stand-in is never installed', '  r.db = nl._db_none\n', '\n'),
 ]
 
 

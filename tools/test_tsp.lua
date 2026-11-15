@@ -3510,80 +3510,9 @@ check('no label row is created at all', (function()
       n = n + 1
     end
   end
-  return n == fftsa.sg_npeak * 3 + 3,
+  return n == fftsa.sg_npeak * 3 + 2,
          string.format('%d text objects on the spectrum screen, want %d',
-                       n, fftsa.sg_npeak * 3 + 3)
-end)())
--- THE FRAME TIMING FIELD SHARES THE NOISE ROW AND MUST COLLIDE WITH NEITHER END OF IT.
---
--- Its whole point is to be readable while the spectrum is running, so a field overlapping the
--- noise text or clipped at the right edge is the one failure that makes it useless. Checked
--- against the longest text each side can produce, at the measured 8 px FONT_SMALL advance,
--- and against the right edge of the plot the panel gives the app.
-check('the timing field is its own object on the noise row',
-      fftsa.sg_tm ~= nil and fftsa.sg_tm ~= fftsa.sg_thd
-      and OBJ[fftsa.sg_tm] ~= nil and OBJ[fftsa.sg_thd] ~= nil
-      and OBJ[fftsa.sg_tm].y == OBJ[fftsa.sg_thd].y
-      and OBJ[fftsa.sg_tm].x > OBJ[fftsa.sg_thd].x,
-      string.format('timing at (%s,%s), noise at (%s,%s)',
-                    tostring(OBJ[fftsa.sg_tm] and OBJ[fftsa.sg_tm].x),
-                    tostring(OBJ[fftsa.sg_tm] and OBJ[fftsa.sg_tm].y),
-                    tostring(OBJ[fftsa.sg_thd] and OBJ[fftsa.sg_thd].x),
-                    tostring(OBJ[fftsa.sg_thd] and OBJ[fftsa.sg_thd].y)))
--- Saved and restored around each of these, because the suite runs on from here with a live
--- app and a field left at a test value would be read by a later gate as the app's own.
-local function tm_set(work, per, gap, acq, spec, mark, yld, show, want)
-  local keep = {fftsa.frame_work, fftsa.period, fftsa.gap_last, fftsa.armed_want,
-                fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark, fftsa.ph.yld, fftsa.ph.show}
-  fftsa.frame_work, fftsa.period, fftsa.gap_last = work, per, gap
-  fftsa.armed_want = want or per
-  fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark = acq, spec, mark
-  fftsa.ph.yld, fftsa.ph.show = yld, show
-  local t = fftsa.sg_tm_text()
-  fftsa.frame_work, fftsa.period, fftsa.gap_last = keep[1], keep[2], keep[3]
-  fftsa.armed_want = keep[4]
-  fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark = keep[5], keep[6], keep[7]
-  fftsa.ph.yld, fftsa.ph.show = keep[8], keep[9]
-  return t
-end
-check('it clears the longest noise text and fits before the right edge', (function()
-  local adv = 8
-  local worst = fftsa.sg_thd_text(0.1234, -85.3, -110.6, 16384, false)
-  local noise_ends = fftsa.sg_thd_x + adv * string.len(worst)
-  -- Three-figure milliseconds in every field and the refused-move field present as well, which
-  -- is the 8192-point frame and then some. The widest line the field can ever carry.
-  local tm = tm_set(0.156, 0.160, 0.160, 0.085, 0.040, 0.020, 0.020, 0.030, 0.200)
-  local tm_ends = fftsa.sg_tm_x + adv * string.len(tm)
-  local right = fftsa.sg_gx + fftsa.sg_gw
-  return fftsa.sg_tm_x >= noise_ends and tm_ends <= right,
-         string.format('noise ends %d, timing %d..%d "%s", right edge %d',
-                       noise_ends, fftsa.sg_tm_x, tm_ends, tm, right)
-end)())
--- THE DELIVERED PERIOD MUST BE REPORTED, not inferred from the armed one. Measured on a
--- DMM6500 at 2048 with the work pinned at 55 ms, d read 56 at 15 fps and 100 at 9.9 fps against
--- an armed 80 either way -- so the armed period does not predict the rate and nothing else on
--- the glass carried the delivered figure. gap_last is the only source for it.
-check('the timing field reports the delivered period and the phase split', (function()
-  local t = tm_set(0.055, 0.080, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006)
-  return t == '55/80 d100 a22 s9 m3 y5 h6', t
-end)())
--- AND IT SAYS SO WHEN THE DEADBAND REFUSED THE MOVE. Raising the period takes tick_rise and
--- dropping it takes one grid step, so a window asking for 20 ms more than it has is declined,
--- the timer fires into a frame still running, and the tick is dropped. That state is the one
--- where the period on screen is not the period the work needs, and it showed as nothing at all.
-check('a refused period change is reported, and a satisfied one is not', (function()
-  local refused = tm_set(0.054, 0.110, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006, 0.130)
-  local settled = tm_set(0.054, 0.110, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006, 0.110)
-  return refused == '54/110 d100 a22 s9 m3 y5 h6 r130'
-         and settled == '54/110 d100 a22 s9 m3 y5 h6',
-         string.format('refused=%q settled=%q', refused, settled)
-end)())
-check('an unchanged timing line is not rewritten', (function()
-  fftsa.sg_tm_last = nil
-  local first = fftsa.sg_show_tm()
-  local again = fftsa.sg_show_tm()
-  return first == true and again == false,
-         string.format('first write=%s, second=%s', tostring(first), tostring(again))
+                       n, fftsa.sg_npeak * 3 + 2)
 end)())
 -- THD and the noise floor against a spectrum built here, so both answers are arithmetic
 -- rather than whatever the mock's generator happens to produce. Every bin is the floor
@@ -7745,6 +7674,187 @@ check('the shipped dsp has no spectrum, peak or distortion, and the app copes', 
                        tostring(rel), tostring(okp), tostring(okd),
                        okp and tostring(pk1) or tostring(hz))
 end)())
+
+-- ---------- the decibels the appends need ----------
+--
+-- nl.reduce hands a frame an EMPTY decibel array now: an engaged pixel frame reads none of
+-- them, because the image writes the ring from the same array in the arena, and 255 float
+-- decodes is about 8.5 ms of a frame. Every path in sg_fill that appends the spectrum has to
+-- ask for them first, which is what fftsa.sg_db does. Without that the appends write nils,
+-- and a nil reaching buffer.write.reading is a posted event per point.
+do
+  local keepnl, keepring, keeppix = fftsa.nl, fftsa.sg_ring, fftsa.sg_pix
+  local NSEG = 8
+  local EMPTY, HZ, REAL = {}, {}, {}
+  local j
+  for j = 1, NSEG do
+    HZ[j] = 100 * j
+    REAL[j] = -100 + j
+  end
+  local asked = 0
+  fftsa.nl = { db_now = function()
+    asked = asked + 1
+    return REAL
+  end }
+  -- No pixel path, so the fill appends: that is the state every launch starts in, before the
+  -- ring has been identified, and the state a refused frame returns to.
+  fftsa.sg_pix = false
+
+  local function nils_written(b, n)
+    local i, bad = nil, 0
+    for i = 1, n do
+      if b.readings[i] == nil then bad = bad + 1 end
+    end
+    return bad
+  end
+
+  fftsa.sg_ring = true
+  asked = 0
+  local w0 = WRITES
+  local n1 = fftsa.sg_fill(EMPTY, HZ, NSEG)
+  check('the ring fill asks for the decibels once and appends real values',
+        asked == 1 and WRITES > w0 and nils_written(fftsa.sg_buf, NSEG) == 0
+        and n1 == NSEG,
+        string.format('asked=%d writes=%d nils=%d n=%s', asked, WRITES - w0,
+                      nils_written(fftsa.sg_buf, NSEG), tostring(n1)))
+
+  fftsa.sg_ring = false
+  asked = 0
+  w0 = WRITES
+  local n2 = fftsa.sg_fill(EMPTY, HZ, NSEG)
+  check('the clear-and-refill path asks for them too',
+        asked == 1 and WRITES - w0 == NSEG and nils_written(fftsa.sg_buf, NSEG) == 0
+        and n2 == NSEG,
+        string.format('asked=%d writes=%d nils=%d', asked, WRITES - w0,
+                      nils_written(fftsa.sg_buf, NSEG)))
+
+  -- A DECODE THAT FAILS LEAVES THE PREVIOUS TRACE UP. The resolution is before the clear for
+  -- exactly this: clearing first and then finding there is nothing to write would blank the
+  -- graph, where keeping the last spectrum is the right answer to a frame that produced none.
+  fftsa.nl = { db_now = function()
+    asked = asked + 1
+    return nil
+  end }
+  local before = fftsa.sg_buf.n
+  w0 = WRITES
+  local n3 = fftsa.sg_fill(EMPTY, HZ, NSEG)
+  check('a decode that fails writes nothing and clears nothing',
+        n3 == 0 and WRITES == w0 and fftsa.sg_buf.n == before,
+        string.format('n=%s writes=%d buf.n=%s wanted %s', tostring(n3), WRITES - w0,
+                      tostring(fftsa.sg_buf.n), tostring(before)))
+
+  -- The un-folded lap as well as the folded one. The fold is what ships, but sg_fold is a
+  -- live knob and its arm has its own two append loops.
+  fftsa.nl = { db_now = function()
+    asked = asked + 1
+    return REAL
+  end }
+  local keepfold = fftsa.sg_fold
+  fftsa.sg_fold, fftsa.sg_ring = false, true
+  asked = 0
+  w0 = WRITES
+  local nf = fftsa.sg_fill(EMPTY, HZ, NSEG)
+  check('the un-folded lap asks for them once as well',
+        asked == 1 and WRITES > w0 and nils_written(fftsa.sg_buf, NSEG) == 0
+        and nf == NSEG,
+        string.format('asked=%d writes=%d nils=%d', asked, WRITES - w0,
+                      nils_written(fftsa.sg_buf, NSEG)))
+  fftsa.sg_fold, fftsa.sg_ring = keepfold, false
+
+  -- And with no nl at all -- the interpreted path, whose arrays arrive filled -- sg_db hands
+  -- back what it was given rather than refusing.
+  fftsa.nl = nil
+  w0 = WRITES
+  local n4 = fftsa.sg_fill(REAL, HZ, NSEG)
+  check('with no nl the arrays are taken as they arrive',
+        n4 == NSEG and WRITES - w0 == NSEG and nils_written(fftsa.sg_buf, NSEG) == 0,
+        string.format('n=%s writes=%d', tostring(n4), WRITES - w0))
+
+  fftsa.nl, fftsa.sg_ring, fftsa.sg_pix = keepnl, keepring, keeppix
+end
+
+-- ---------- a fill that wrote nothing must stop the frame ----------
+--
+-- The decibels are decoded on demand, so a fill can find there are none -- a short read of
+-- the arena, or a value that will not decode -- and it then leaves the previous spectrum up,
+-- which is the right picture. What would be wrong is going on to set sg_nwrote, rank peaks
+-- and move the markers for a trace the frame did not draw: the plot would freeze while
+-- everything beside it advanced, and nothing on the glass would say so. Before the decode
+-- moved behind reduce_db the same failure came back from reduce as nil and fell through to
+-- the interpreted path, so this is the handling that moved with it.
+do
+  local keep = { nl = fftsa.nl, en = fftsa.nl_enable, cap = fftsa.nl_cap,
+                 fill = fftsa.sg_fill, mk = fftsa.sg_update_markers,
+                 wrote = fftsa.sg_nwrote, frame = fftsa.nl_frame }
+  local RED, j = { db = {}, hz = {} }, nil
+  for j = 1, 8 do
+    RED.db[j] = -100 + j
+    RED.hz[j] = 100 * j
+  end
+  RED.nseg = 8
+  -- results is needed by the arm that DREW: dsp_peaks reads the results block, and the frame
+  -- that wrote nothing never reaches it. That asymmetry is the gate.
+  fftsa.nl = { ready = true, n = fftsa.n,
+               call_dsp = function() return 8 end,
+               reduce = function() return RED end,
+               results = function() return nil end }
+  fftsa.nl_enable, fftsa.nl_cap = true, {}
+  local marks = 0
+  fftsa.sg_update_markers = function() marks = marks + 1 end
+
+  -- The control first, so a gate that passed because the native arm was never reached is
+  -- distinguishable from one that passed because the frame stopped.
+  fftsa.sg_fill = function() return 8 end
+  fftsa.sg_nwrote, marks = nil, 0
+  fftsa.frame_body()
+  local drew_n, drew_m = fftsa.sg_nwrote, marks
+  check('a fill that wrote the pass reports it and moves the markers',
+        drew_n == 8 and drew_m == 1,
+        string.format('sg_nwrote=%s markers=%d', tostring(drew_n), drew_m))
+
+  fftsa.sg_fill = function() return 0 end
+  fftsa.sg_nwrote, marks = nil, 0
+  fftsa.frame_body()
+  check('a fill that wrote nothing reports no count and moves no marker',
+        fftsa.sg_nwrote == nil and marks == 0,
+        string.format('sg_nwrote=%s markers=%d', tostring(fftsa.sg_nwrote), marks))
+
+  -- THE CENSUS CARRIES WHAT THE TIMING FIELD USED TO SHOW, which is the only reason those
+  -- three latched figures were kept when the text object went. They are what settled the
+  -- 50 ms timer grid, so a field dropped from the census costs the next investigation the
+  -- measurement rather than a line on the glass.
+  --
+  -- from and want are latched BEFORE the census is written -- the re-arm block runs after it
+  -- -- so they can be set here and read back exactly. The rest are this frame's own figures,
+  -- so the gate on them is that the field is present and formatted at all.
+  --
+  -- Driven on the stubbed native arm, which the two cases above have just shown works: the
+  -- interpreted arm is not usable this late in the suite.
+  do
+    local ck = { w = fftsa.fps_window, t0 = fftsa.fps_t0, fn = fftsa.fps_n,
+                 af = fftsa.armed_from, aw = fftsa.armed_want, c = FFTSA_CENSUS }
+    FFTSA_CENSUS = nil
+    fftsa.sg_fill = function() return 8 end
+    fftsa.armed_from, fftsa.armed_want = 0.055, 0.130
+    fftsa.fps_window, fftsa.fps_t0, fftsa.fps_n = 0, 0, 1
+    -- fftsa.frame() and not frame_body: the accounting and the census are in the wrapper,
+    -- which is also what the timer calls.
+    fftsa.frame()
+    local line = nil
+    if FFTSA_CENSUS ~= nil then line = FFTSA_CENSUS[fftsa.n] end
+    local function has(k) return line ~= nil and string.find(line, k, 1, true) ~= nil end
+    check('the census carries the delivered period, the peak armed from and the ask',
+          has('from=55.0') and has('want=130.0') and has(' d=') and has('mark=')
+          and has('show=') and has('gap=') and has('acq=') and has('spec='),
+          tostring(line))
+    fftsa.fps_window, fftsa.fps_t0, fftsa.fps_n = ck.w, ck.t0, ck.fn
+    fftsa.armed_from, fftsa.armed_want, FFTSA_CENSUS = ck.af, ck.aw, ck.c
+  end
+
+  fftsa.nl, fftsa.nl_enable, fftsa.nl_cap = keep.nl, keep.en, keep.cap
+  fftsa.sg_fill, fftsa.sg_update_markers = keep.fill, keep.mk
+  fftsa.sg_nwrote, fftsa.nl_frame = keep.wrote, keep.frame
+end
 
 print()
 print(string.format('%d passed, %d failed', pass, fail))

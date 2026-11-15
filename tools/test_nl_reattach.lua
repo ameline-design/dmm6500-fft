@@ -2218,7 +2218,7 @@ do
   -- ---- the map ---------------------------------------------------------------
   do
     fftsa.nl.px_restart('test')
-    local ok = fftsa.nl.px_map(geom(), DB, HZ, NSEG)
+    local ok = fftsa.nl.px_map(geom(), HZ, NSEG)
     local p = fftsa.nl.px
     local good, s = true, nil
     for s = 1, NREC do
@@ -2243,7 +2243,7 @@ do
     build(nil)
     wrs(RLO + 2 * STRIDE + OX, fftsa.nl._f32_pack(999) .. fftsa.nl._f32_pack(999))
     fftsa.nl.px_restart('test')
-    local ok = fftsa.nl.px_map(geom(), DB, HZ, NSEG)
+    local ok = fftsa.nl.px_map(geom(), HZ, NSEG)
     check('a slot whose frequency is not in this plan refuses the whole map',
           not ok and string.find(tostring(fftsa.nl.px.why), 'frequency', 1, true) ~= nil,
           'why=' .. tostring(fftsa.nl.px.why))
@@ -2264,7 +2264,7 @@ do
     g.lo, g.hi = 8, 8 + NREC * STRIDE
     fftsa.nl.px_restart('test')
     check('a window below the backstop is refused before a byte is written',
-          not fftsa.nl.px_map(g, DB, HZ, NSEG)
+          not fftsa.nl.px_map(g, HZ, NSEG)
           and string.find(tostring(fftsa.nl.px.why), 'backstop', 1, true) ~= nil,
           'why=' .. tostring(fftsa.nl.px.why))
     build(nil)
@@ -2284,7 +2284,7 @@ do
     -- which is where it belongs: a slope fitted over two decibels of noise would put every
     -- column within a few rows of one another on a plot 280 rows tall.
     check('a spectrum too flat to carry a decibel map is refused',
-          not fftsa.nl.px_map(geom(), DB, HZ, NSEG),
+          not fftsa.nl.px_map(geom(), HZ, NSEG),
           'why=' .. tostring(fftsa.nl.px.why))
     DB = keep
     build(nil)
@@ -2294,7 +2294,7 @@ do
   do
     fftsa.nl.px_restart('test')
     check('the map stands up on the fixture before the frame cases run',
-          fftsa.nl.px_map(geom(), DB, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
+          fftsa.nl.px_map(geom(), HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
     local before = ringbytes()
     -- A spectrum 6 dB up, so every y moves and nothing else may.
     local up, j = {}, nil
@@ -2423,12 +2423,12 @@ do
     -- nseg unchanged is the one that would otherwise draw the new spectrum at the old
     -- frequencies, correctly and silently.
     fftsa.nl.px_restart('test')
-    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    assert(fftsa.nl.px_map(geom(), HZ, NSEG))
     check('a changed nseg restarts rather than drawing',
           fftsa.nl.px_frame(DB, HZ, NSEG - 1, 'TB', 1) == nil
           and fftsa.nl.px.state == 'idle', 'why=' .. tostring(fftsa.nl.px.why))
     fftsa.nl.px_restart('test')
-    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    assert(fftsa.nl.px_map(geom(), HZ, NSEG))
     local moved, j = {}, nil
     for j = 1, NSEG do moved[j] = HZ[j] + 1 end
     -- With re-pointing off, which is what the knob is for: the series moved and the path has
@@ -2448,7 +2448,7 @@ do
     -- whole check. One frame out of tolerance must not be enough to drop the path.
     build(nil)
     fftsa.nl.px_restart('test')
-    assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+    assert(fftsa.nl.px_map(geom(), HZ, NSEG))
     fftsa.nl.px.state = 'on'          -- what px_try sets once the map stands up
     -- Driven the way sg_pix_draw drives it: px_frame is called only while the state is 'on',
     -- so a drop ends the run rather than being followed by a frame that restarts for its own
@@ -2540,7 +2540,7 @@ do
     do
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       local p = fftsa.nl.px
       local blk = blockbytes()
       local ayh, ayl = fftsa.nl._f64_words(p.ay)
@@ -2570,7 +2570,7 @@ do
       wr32(HDRAT + fftsa.nl.HDR_OLD, RLO + STRIDE)
       wr32(HDRAT + fftsa.nl.HDR_COUNT, NREC - 1)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       local blk = ki.memread(string.format('%X', PXAT), string.format('%X', 24))
       check('the block declares the whole ring and writes the drawn window inside it',
             fftsa.nl.px.nat == true
@@ -2589,7 +2589,7 @@ do
       build(nil)
       fftsa.nl.PX_MAXREC = NREC - 1
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       check('a drawn window longer than the image holds refuses the block, and says so',
             fftsa.nl.px.nat == false
             and string.find(tostring(fftsa.nl.px.nat_why), 'records', 1, true) ~= nil,
@@ -2603,7 +2603,7 @@ do
       -- map it built, which is what a future route that derived idx some other way would do.
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       fftsa.nl.px.idx[3] = NSEG + 1
       check('a slot naming a column the spectrum does not have refuses the block',
             fftsa.nl.px_block() == false
@@ -2616,7 +2616,7 @@ do
       -- is the whole saving, so its absence is the gate.
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       MW, calls, answer = {}, 0, NREC
       local n = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4001)
       check('an answered ring write draws the frame and Lua writes no block',
@@ -2632,7 +2632,7 @@ do
       -- repeated would pay for the call on top of the write every frame for the session.
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       MW, calls, answer = {}, 0, fftsa.nl.RC.EBOUNDS
       local n = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4002)
       local first = calls
@@ -2654,7 +2654,7 @@ do
       -- without a relaunch.
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       local keepk = fftsa.nl.PX_NATIVE
       fftsa.nl.PX_NATIVE = false
       MW, calls, answer = {}, 0, NREC
@@ -2674,6 +2674,76 @@ do
     end
 
     do
+      -- THE SAVING, AS A GATE. An engaged frame must not decode the decibels at all: the
+      -- image writes the ring from the same array in the arena, and 255 values at a float
+      -- decode each is about 8.5 ms of a frame -- the whole cost back again if Lua reads
+      -- them for nothing.
+      --
+      -- Driven with an EMPTY db, which is exactly what nl.reduce now hands a frame: a reader
+      -- gets nil on its first index rather than the last frame's spectrum, so a path that
+      -- forgot to ask fails loudly instead of drawing a frozen trace.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
+      local saved_graph, keeprp = display.graph, fftsa.sg_pix_repaint
+      display.graph = { cursor = function() end }
+      fftsa.sg_pix_repaint = 'cursor'
+      fftsa.nl.px.gid = 52
+      local keepdn, dncalls = fftsa.nl.db_now, 0
+      fftsa.nl.db_now = function(d)
+        dncalls = dncalls + 1
+        return DB
+      end
+      MW, calls, answer, APPENDS = {}, 0, NREC, {}
+      local n = fftsa.nl.px_frame({}, HZ, NSEG, 'TB', 4020)
+      check('an engaged frame draws without decoding the decibels at all',
+            n == NSEG and calls == 1 and dncalls == 0 and not wrote_ring()
+            and table.getn(APPENDS) == 0,
+            string.format('n=%s calls=%d decodes=%d lua=%s appends=%d', tostring(n), calls,
+                          dncalls, tostring(wrote_ring()), table.getn(APPENDS)))
+
+      -- And the fallback DOES decode them, once, and draws from what it decoded -- which is
+      -- what makes the skip safe rather than merely cheap.
+      MW, calls, answer, dncalls = {}, 0, fftsa.nl.RC.EBOUNDS, 0
+      local n2 = fftsa.nl.px_frame({}, HZ, NSEG, 'TB', 4021)
+      local after = ringbytes()
+      local yok, s = true, nil
+      for s = 1, NREC do
+        local o = (s - 1) * STRIDE
+        local want = ypix(DB[slot_index(s)])
+        if (((string.byte(after, o + 13) * 256 + string.byte(after, o + 14)) * 256
+             + string.byte(after, o + 15)) * 256) + string.byte(after, o + 16) ~= want then
+          yok = false
+        end
+      end
+      check('a frame that falls back to Lua decodes them once and draws from them',
+            n2 == NSEG and dncalls == 1 and wrote_ring() and yok,
+            string.format('n=%s decodes=%d lua=%s pixels=%s', tostring(n2), dncalls,
+                          tostring(wrote_ring()), tostring(yok)))
+
+      -- A decode that cannot be had drops the frame rather than writing whatever an empty
+      -- table indexes to, which is a nil reaching the ring write.
+      fftsa.nl.db_now = function() return nil end
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
+      MW, calls, answer = {}, 0, fftsa.nl.RC.EBOUNDS
+      local n3 = fftsa.nl.px_frame({}, HZ, NSEG, 'TB', 4022)
+      check('a frame whose decibels will not decode drops rather than writing nils',
+            n3 == nil and not wrote_ring()
+            and string.find(tostring(fftsa.nl.px.whyframe), 'decode', 1, true) ~= nil,
+            string.format('n=%s lua=%s why=%s', tostring(n3), tostring(wrote_ring()),
+                          tostring(fftsa.nl.px.whyframe)))
+
+      fftsa.nl.db_now = keepdn
+      fftsa.sg_pix_repaint = keeprp
+      display.graph = saved_graph
+      fftsa.nl.px.gid = nil
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
+    end
+
+    do
       -- THE ONE CORRECTNESS CASE. A re-point rewrites the x pixel and the x float in the two
       -- pieces of the held image the ring write does not touch, so that frame has to lay the
       -- whole block down from Lua -- and the frame after it goes straight back to the image.
@@ -2681,7 +2751,7 @@ do
       -- draws the new spectrum at the old columns: correct-looking and wrong.
       build(nil)
       fftsa.nl.px_restart('test')
-      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
       local moved, j = {}, nil
       for j = 1, NSEG do moved[j] = HZ[j] + 1 end
       MW, calls, answer = {}, 0, NREC
@@ -3139,7 +3209,7 @@ do
     stale.lo, stale.hi = RLO + 131072, RLO + 131072 + NREC * STRIDE
     fftsa.nl.px_restart('test')
     check('a cached address the ring has moved off falls through to the search',
-          not fftsa.nl.px_map(stale, DB, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
+          not fftsa.nl.px_map(stale, HZ, NSEG), 'why=' .. tostring(fftsa.nl.px.why))
   end
 
   -- ---- the name walk costs one read ------------------------------------------
@@ -4745,6 +4815,117 @@ do
   fftsa.nl.map_lo, fftsa.nl.map_hi = nil, nil
   fftsa.nl.px_restart('suite done')
   tostring = SAVEDT
+end
+
+-- ---- the reduced arrays, and the decibels on demand ------------------------
+--
+-- nl.reduce used to decode both arrays on every frame. The decibels are 255 values at a float
+-- decode each, about 8.5 ms, and an engaged pixel frame reads NONE of them: the image writes
+-- the ring from the same array in the arena. So the decode moved behind nl.reduce_db, and
+-- what has to be gated is that the skip is safe as well as cheap -- a skipped frame must be
+-- unable to present as the last frame it decoded.
+do
+  local nl = fftsa.nl
+  local NSEG = 6
+  -- Decimal, because Lua 5.0.2 rejects a hex literal at parse time.
+  local DBAT, HZAT = 60000000, 60001024
+  local DBV = { -100, -92.5, -85, -40.25, -88, -110 }
+  local HZV = { 100, 200, 300, 400, 500, 600 }
+  local keep = { rd = ki.memread, db = nl.red_db, hz = nl.red_hz,
+                 nm = nl.nseg_max, sz = nl.SIZEOF_REAL, red = nl._red,
+                 fails = nl.db_fails }
+  local function packed(t)
+    local o, i = {}, nil
+    for i = 1, NSEG do o[i] = nl._f32_pack(t[i]) end
+    return table.concat(o)
+  end
+  local STORE = { [DBAT] = packed(DBV), [HZAT] = packed(HZV) }
+  local READS = {}
+  ki.memread = function(ah, lh)
+    local a, n = tonumber(ah, 16), tonumber(lh, 16)
+    READS[table.getn(READS) + 1] = a
+    local base = nil
+    if a >= DBAT and a < DBAT + NSEG * 4 then base = DBAT
+    elseif a >= HZAT and a < HZAT + NSEG * 4 then base = HZAT end
+    if base == nil then return nil end
+    return string.sub(STORE[base], a - base + 1, a - base + n)
+  end
+  local function reads_at(x)
+    local c, i = 0, nil
+    for i = 1, table.getn(READS) do
+      if READS[i] == x then c = c + 1 end
+    end
+    return c
+  end
+  local function matches(t, want)
+    local i
+    if t == nil then return false end
+    for i = 1, NSEG do
+      if t[i] == nil or math.abs(t[i] - want[i]) > 0.01 then return false end
+    end
+    return true
+  end
+
+  nl.red_db, nl.red_hz = DBAT, HZAT
+  nl.nseg_max, nl.SIZEOF_REAL = 32, 4
+  nl._red, nl.db_fails = nil, nil
+
+  READS = {}
+  local r = nl.reduce(NSEG)
+  check('the default reduction still decodes both arrays, as every old caller expects',
+        r ~= nil and matches(r.db, DBV) and matches(r.hz, HZV) and reads_at(DBAT) == 1,
+        string.format('db=%s hz=%s reads=%d', tostring(r ~= nil and matches(r.db, DBV)),
+                      tostring(r ~= nil and matches(r.hz, HZV)), reads_at(DBAT)))
+
+  READS = {}
+  local r2 = nl.reduce(NSEG, false)
+  check('a skipped reduction never reads the decibels, and leaves none to read',
+        r2 ~= nil and reads_at(DBAT) == 0 and r2.db[1] == nil and matches(r2.hz, HZV),
+        string.format('reads=%d db[1]=%s hz=%s', reads_at(DBAT),
+                      tostring(r2 ~= nil and r2.db[1]),
+                      tostring(r2 ~= nil and matches(r2.hz, HZV))))
+
+  READS = {}
+  local d = nl.reduce_db()
+  local first = reads_at(DBAT)
+  local again = nl.reduce_db()
+  check('the decibels decode once on demand, and a second ask costs no read',
+        matches(d, DBV) and first == 1 and again == d and reads_at(DBAT) == 1,
+        string.format('values=%s reads=%d then %d same=%s', tostring(matches(d, DBV)),
+                      first, reads_at(DBAT), tostring(again == d)))
+
+  -- THE CASE THAT WOULD BE INVISIBLE. The array is reused frame to frame, so a skip that
+  -- left the previous values in it would draw last frame's spectrum for ever -- a frozen
+  -- trace with nothing on the glass to report it.
+  local MOVED = { -1, -2, -3, -4, -5, -6 }
+  STORE[DBAT] = packed(MOVED)
+  READS = {}
+  local r3 = nl.reduce(NSEG, false)
+  check('a skipped reduction cannot present as the last frame it decoded',
+        r3 ~= nil and r3.db[1] == nil and reads_at(DBAT) == 0,
+        string.format('db[1]=%s reads=%d', tostring(r3 ~= nil and r3.db[1]),
+                      reads_at(DBAT)))
+  check('and the on-demand decode reads this reduction rather than the cached one',
+        matches(nl.reduce_db(), MOVED), 'values moved and were re-read')
+
+  -- A short read refuses the whole array and counts itself, because a half-filled spectrum
+  -- is a nil reaching buffer.write.reading, which is a posted event per point.
+  STORE[DBAT] = string.sub(packed(DBV), 1, 8)
+  local r4 = nl.reduce(NSEG, false)
+  local f0 = nl.db_fails or 0
+  local d4 = nl.reduce_db()
+  check('a short decibel read refuses whole, leaves nothing readable, and is counted',
+        d4 == nil and r4 ~= nil and r4.db[1] == nil and (nl.db_fails or 0) == f0 + 1,
+        string.format('d=%s db[1]=%s fails=%s -> %s', tostring(d4),
+                      tostring(r4 ~= nil and r4.db[1]), tostring(f0),
+                      tostring(nl.db_fails)))
+  check('and the eager form fails the whole reduction on the same read',
+        nl.reduce(NSEG) == nil)
+
+  ki.memread = keep.rd
+  nl.red_db, nl.red_hz = keep.db, keep.hz
+  nl.nseg_max, nl.SIZEOF_REAL = keep.nm, keep.sz
+  nl._red, nl.db_fails = keep.red, keep.fails
 end
 
 ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR

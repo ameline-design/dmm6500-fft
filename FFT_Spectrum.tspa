@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 9.32
+-- $Version: 9.33
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -264,24 +264,6 @@ fftsa.sg_thd_x = 8
 fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
-
--- Frame timing, on the noise row to the right of the noise text and in its OWN object so the
--- two never rewrite each other: the noise line is written only when its figures change, and
--- these change every frame.
---
--- The fields are the ones the period is computed from, which is what makes the line worth
--- reading: the frame just measured against the period actually armed, then the peak work on a
--- plain frame and on a frame that ran the slow tick, and the capture. A rate that moves while
--- the F stays up is one of those four changing, and this says which without leaving the
--- spectrum screen.
---
--- It costs one settext a second, and that write lands inside a slow-tick frame, so it is
--- charged to work_tick -- one of the figures beside it. A couple of milliseconds against the
--- tens this is for, but it is not free and the comparison should not be read as if it were.
-fftsa.sg_tm_x = 480
-fftsa.sg_tm_y = 328         -- the noise row, clear of the longest noise text
-fftsa.sg_tm_c = 13166335    -- pale blue, the volt column's colour
-fftsa.sg_tm_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
 -- Decimals follow the record length, because a digit is only worth printing once the record
 -- is long enough to hold a harmonic in one bin: each doubling halves the bin width and so
@@ -883,12 +865,32 @@ end
 -- cursor -- leaving the buffer part full and the seam sweeping. That path cannot produce a
 -- spectrum in this archive anyway (no dsp.spectrum, so the frame halts and says so), which
 -- is what makes the ring safe here rather than a second thing to get right.
+-- The decibels this frame's appends need.
+--
+-- On the native path they are decoded on demand, because an ENGAGED PIXEL FRAME NEVER READS
+-- THEM: the image writes the ring from the same array in the arena, so nl.reduce leaves an
+-- empty stand-in and whoever wants the spectrum asks for it. 255 values at a float decode
+-- each, measured at about 8.5 ms of a frame.
+--
+-- Hands back what it was given when there is no nl, or one without the accessor: that is the
+-- interpreted path, whose arrays are filled before they arrive.
+function fftsa.sg_db(db)
+  if db ~= nil and db[1] ~= nil then return db end
+  local nl = fftsa.nl
+  if nl == nil or type(nl.db_now) ~= 'function' then return db end
+  return nl.db_now(db)
+end
+
 function fftsa.sg_fill(db, hz, nseg)
   local wr = buffer.write.reading
   local tb = fftsa.sg_buf
   local i
   if tb == nil or nseg == nil or nseg < 1 then return 0 end
   if not fftsa.sg_ring then
+    -- Before the clear, not after it: a decode that failed would otherwise leave the graph
+    -- blank where leaving the previous trace up is the right answer.
+    db = fftsa.sg_db(db)
+    if db == nil then return 0 end
     tb.clear()
     for i = 1, nseg do
       wr(tb, db[i], hz[i], i, 0)
@@ -908,6 +910,10 @@ function fftsa.sg_fill(db, hz, nseg)
     local n = fftsa.sg_pix_draw(db, hz, nseg, tb)
     if n ~= nil then return n end
   end
+  -- Past here every path appends the spectrum, and the search at the end of each needs the
+  -- records those appends leave, so this is the one place the decibels have to be real.
+  db = fftsa.sg_db(db)
+  if db == nil then return 0 end
   local cap = tb.capacity
   local room = cap
   if fftsa.sg_fold then room = math.floor(cap / 2) end
@@ -1008,10 +1014,6 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
                         fftsa.sg_thd_text(nil, nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
 
-  fftsa.sg_tm_last = nil
-  fftsa.sg_tm = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_tm_x, fftsa.sg_tm_y,
-                       fftsa.sg_tm_text(), fftsa.sg_tm_c, small, display.JUST_LEFT)
-
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
@@ -1027,7 +1029,7 @@ function fftsa.sg_destroy(release)
   end
   fftsa.del_scr(fftsa.sg_scr)
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_thd, fftsa.sg_tm = nil, nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
   --
   -- Releasing is what an exit does: the buffers go, and defbuffer1 is made current first,
@@ -1226,59 +1228,6 @@ function fftsa.sg_show_thd()
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)
-  return true
-end
-
--- The frame just measured, the period armed for it, THE PERIOD DELIVERED, then where the frame
--- went: capture, spectrum, markers, yield, repaint. Milliseconds, rounded -- a tenth of a
--- millisecond is below what a settext-paced sample can resolve and the figures that matter here
--- differ by tens.
---
--- d IS THE FIELD THAT DECIDES THE FRAME RATE, and it is not the armed period. Measured on a
--- DMM6500 at 2048 points with the work pinned at 55 ms: d reads 56 at 15 fps and 100 at 9.9 fps,
--- two values and nothing between them, against an armed 80 either way. A cost effect gives a
--- continuum, so that is quantisation -- the rate is decided by which side of a boundary the WORK
--- falls on, and the period the controller arms barely enters it.
---
--- Which is why the phase split replaced the peak fields. w proved the controller innocent --
--- the peak it armed from equalled the work and the deadband refused nothing -- and having
--- proved it, the width is worth more to the five fields that say where the frame went. The
--- peaks are still in FFTSA_CENSUS for a socket to read.
---
--- a + s + m + y + h is most of the frame, so a field that is large is a field to attack. The
--- capture at 2048 and 100 kS/s is 20.5 ms of it and is not negotiable at that span.
---
--- Every field is read rather than recomputed, so the line cannot disagree with the period in
--- force. nil reads as 0 because the first frames have no figure yet and a gap is worse than a
--- zero in a field that is about to fill.
-function fftsa.sg_tm_text()
-  local ph = fftsa.ph or {}
-  local t = string.format("%.0f/%.0f d%.0f a%.0f s%.0f m%.0f y%.0f h%.0f",
-                          1000 * (fftsa.frame_work or 0), 1000 * (fftsa.period or 0),
-                          1000 * (fftsa.gap_last or 0), 1000 * (ph.acq or 0),
-                          1000 * (ph.spec or 0), 1000 * (ph.mark or 0),
-                          1000 * (ph.yld or 0), 1000 * (ph.show or 0))
-  -- r APPEARS ONLY WHEN THE DEADBAND REFUSED A MOVE, which is the one state where the period
-  -- on screen is not the period the window asked for. Raising takes tick_rise and dropping
-  -- takes one grid step, so a window wanting 20 ms more than it has is declined and the timer
-  -- then fires into a frame still running. Conditional, because a line that carries a field
-  -- for a condition that is almost never true spends width on nothing.
-  local want = fftsa.armed_want
-  if want ~= nil and fftsa.period ~= nil
-     and math.abs(want - fftsa.period) >= 0.001 then
-    t = t .. string.format(" r%.0f", 1000 * want)
-  end
-  return t
-end
-
--- On the peak table's clock, and only when the text changes -- which for this line is most
--- seconds, so the write is effectively once a second by construction rather than by a rule.
-function fftsa.sg_show_tm()
-  if fftsa.sg_tm == nil then return false end
-  local t = fftsa.sg_tm_text()
-  if t == fftsa.sg_tm_last then return false end
-  fftsa.sg_tm_last = t
-  display.settext(fftsa.sg_tm, t)
   return true
 end
 
@@ -1667,10 +1616,6 @@ function fftsa.sg_slow_tick()
     -- Distortion and noise: the noise mean is a pass over every plotted bin at 4.3 us a bin,
     -- so 35 ms at 16384, which is why it is on this clock and not the frame's.
     fftsa.sg_show_thd()
-    -- Last in the block, so the work it reports is the previous frame's complete figure
-    -- rather than this frame's partial one -- and so its own settext is the last thing
-    -- charged to the frame it inflates.
-    fftsa.sg_show_tm()
     did = true
     heavy = true
   end
@@ -2845,6 +2790,9 @@ function fftsa.nl.diag()
   o = o .. ' why=' .. tostring(nl.why)
   o = o .. ' | ready=' .. tostring(nl.ready) .. ' entry=' .. tostring(nl.entry)
   o = o .. ' rc=' .. tostring(nl.last_rc) .. ' spent=' .. tostring(nl.boot_spent)
+  -- A decibel decode that failed draws nothing and says nothing anywhere else: the frame
+  -- keeps the previous trace and carries on. Zero is the normal reading.
+  if nl.db_fails ~= nil then o = o .. ' dbfail=' .. tostring(nl.db_fails) end
   o = o .. ' | backstop=' .. hx(nl.BACKSTOP_LO or 0) .. '..' .. hx(nl.BACKSTOP_HI or 0)
   o = o .. ' anchor=' .. hx(nl.heap_anchor() or 0) .. ' ' .. nl.windows_str()
   o = o .. ' | glue=' .. tostring(nl.nglue) .. '/' .. tostring(nl.GLUE_MIN)
@@ -6846,7 +6794,7 @@ end
 -- THE SLOT MAP IS AN EXACT FLOAT32 MATCH, not a nearest-frequency search, and 721 exact matches
 -- against a 255-member set is also the confirmation that this is the right ring: nothing else in
 -- memory is a permutation of the app's own axis.
-function fftsa.nl.px_map(g, db, hz, nseg)
+function fftsa.nl.px_map(g, hz, nseg)
   local nl = fftsa.nl
   local p = nl.px
   p.why = nil
@@ -7477,6 +7425,13 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   local wrote = nil
   if not repointed then wrote = nl.px_write(nseg) end
   if wrote == nil then
+    -- The decibels, decoded here because this is the only arm that reads them. An engaged
+    -- frame never reaches it, which is the whole saving: the image writes the ring from the
+    -- same array in the arena and the spectrum never passes through Lua.
+    db = nl.db_now(db)
+    if db == nil then
+      return nl.px_dropframe('the decibels did not decode for the Lua ring write')
+    end
     local T, ytab, yb = p.T, p.ytab, p.yb
     local ay, by, ymax = p.ay, p.by, nl.PX_YMAX
     local fl = math.floor
@@ -7576,6 +7531,14 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   --
   -- So the append carries what the spectrum has there, and the lag is handled where it
   -- actually bites, in the check.
+  -- THE APPEND MODE PAYS THE DECODE, all 255 values for the one it writes. It is kept only so
+  -- the two repaint provocations can be compared on the glass without a rebuild, and 'cursor'
+  -- is what ships -- so the cost sits where the comparison is made rather than in a one-value
+  -- read path nothing else would use.
+  db = nl.db_now(db)
+  if db == nil then
+    return nl.px_dropframe('the decibels did not decode for the repaint append')
+  end
   buffer.write.reading(tb, db[k], hz[k], t, 0)
   p.slotprev, p.slot, p.slotdb = p.slotdb, slot, db[k]
   p.frames = (p.frames or 0) + 1
@@ -8006,7 +7969,7 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
       -- The pointer route reports bounds and a header but never looked at a record, so the x
       -- field is px_map's to derive. The cache carries one and px_map keeps it.
       if cands[ci].from == 'ptr' or cands[ci].from == 'sub' then g.ox = nil end
-      if nl.px_map(g, db, hz, nseg) then
+      if nl.px_map(g, hz, nseg) then
         p.state = 'on'
         nl.px_engaged()
         p.from = cands[ci].from
@@ -8253,7 +8216,7 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
       end
       return nil
     end
-    if nl.px_map(p.g, db, hz, nseg) then
+    if nl.px_map(p.g, hz, nseg) then
       p.state = 'on'
       nl.px_engaged()
       p.from = p.via or 'search'
@@ -9654,6 +9617,99 @@ function fftsa.nl.results()
   return r
 end
 
+-- The decoder for the reduced arrays, and its width.
+--
+-- The arrays are dsp_real, so the width comes from the image rather than from here: a decoder
+-- picked for the wrong one reads a plausible wrong trace and not a refusal. An image
+-- reporting neither width answers nil, and both callers refuse outright on that.
+local function red_unpack()
+  local sz = fftsa.nl.SIZEOF_REAL
+  if sz == 8 then return f64_unpack, 8 end
+  if sz == 4 then return f32_unpack, 4 end
+  return nil, nil
+end
+
+-- WHAT STANDS IN FOR THE DECIBELS UNTIL SOMEBODY ASKS FOR THEM.
+--
+-- They travel as a plain array through four functions, so "has this frame's spectrum been
+-- decoded?" has to be a question about the table itself and not about a flag somewhere else.
+-- An empty table is the answer: the first index gives nil, so a reader that forgot to ask
+-- fails at once instead of drawing the PREVIOUS frame's spectrum, which is a frozen trace
+-- nothing on the glass would report.
+--
+-- Shared and never written. Nothing may put a value in it.
+fftsa.nl._db_none = {}
+
+-- A refused decode, counted where the About page can report it. Returns nil, which is what
+-- every caller of reduce_db tests, so the count never changes an answer.
+local function db_failed()
+  local nl = fftsa.nl
+  nl.db_fails = (nl.db_fails or 0) + 1
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- The decibels of the reduction already read, decoded on demand.
+--
+-- 255 values at a ki.memread and a float decode each, measured at about 8.5 ms of a frame --
+-- and on an engaged frame NOTHING IN LUA READS THEM. The image writes the ring from the same
+-- array, in the arena, where dsp_reduce left it; the trace never passes through Lua at all.
+-- Only three things want them: the append fill, which is what runs when the pixel path has
+-- not engaged; the Lua ring writer, which a frame that re-points the series uses; and the
+-- repaint's one append, in 'append' mode. Each asks here, and a frame that asks twice pays
+-- once.
+--
+-- A value that does not decode fails the whole call rather than leaving a hole: a nil
+-- reaching buffer.write.reading is a posted event per point. The array is installed only
+-- after the last value lands, so a failure part way leaves the empty stand-in in place and
+-- the caller sees nil rather than a half-filled spectrum.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.reduce_db()
+  local nl = fftsa.nl
+  local r = nl._red
+  if r == nil or r.nseg == nil or nl.red_db == nil then return nil end
+  if r.db ~= nil and r.db ~= nl._db_none then return r.db end
+  local f_unpack, sz = red_unpack()
+  if f_unpack == nil then return nil end
+  local nseg = r.nseg
+  local nbytes = nseg * sz
+  local sd = ki.memread(hx(nl.red_db), hx(nbytes))
+  if sd == nil or string.len(sd) ~= nbytes then return db_failed() end
+  if r.db_buf == nil then r.db_buf = {} end
+  local db = r.db_buf
+  local i, p = nil, 1
+  for i = 1, nseg do
+    local v = f_unpack(sd, p)
+    if v == nil then return db_failed() end
+    db[i] = v
+    p = p + sz
+  end
+  r.db = db
+  return db
+end
+
+-- The decibels, decoded if they are not already.
+--
+-- THE REDUCTION'S OWN STATE DECIDES, not the argument, wherever there is a reduction to ask.
+-- Installing the empty stand-in changes r.db but cannot revoke a reference somebody already
+-- took to the buffer behind it, so a caller holding last frame's array could hand it back and
+-- be believed -- and that is exactly the frozen trace the stand-in exists to prevent. No
+-- path in this tree keeps such an alias across a frame; asking the reduction rather than the
+-- argument is what keeps that a fact about the code rather than a property to maintain.
+--
+-- The argument is taken only when there is no reduction at all, which is the interpreted path
+-- and the offline suites: there the array arrives filled and nothing else can supply it.
+function fftsa.nl.db_now(db)
+  local nl = fftsa.nl
+  local r = nl._red
+  if r ~= nil and r.nseg ~= nil then
+    if r.db ~= nil and r.db ~= nl._db_none then return r.db end
+    return nl.reduce_db()
+  end
+  if db ~= nil and db[1] ~= nil then return db end
+  return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- The reduced trace the last run produced: one decibel value per segment and the frequency
 -- of each, in two tables for the caller to write with buffer.write.reading.
@@ -9663,29 +9719,27 @@ end
 -- correct from Lua and buf.n says the right count -- and the graph stays blank, because the
 -- display task works from its own copy and no notify call reaches a write it never saw.
 --
--- A value that does not decode to a finite number fails the whole call rather than leaving a
--- hole, a nil reaching buffer.write.reading being a posted event per point. The tables are
--- allocated once and refilled, this running in a frame: the decibels every call and the
--- frequencies only when the plan behind them moves.
+-- THE DECIBELS ARE NOT DECODED HERE unless want_db says so, and the app says so only when
+-- something is going to read them. Default true, so a caller that does not know about the
+-- argument gets what this always did.
+--
+-- The frequencies are decoded whichever way: every caller needs them, the pixel path included
+-- -- it compares the first two against the series its slot map was built on, which is how an
+-- FFT size change is noticed -- and they only move when the plan behind them does, so they
+-- cost a 8-byte probe on the frames that matter and nothing on the rest.
+--
+-- The tables are allocated once and refilled, this running in a frame.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.reduce(nseg)
+function fftsa.nl.reduce(nseg, want_db)
   local nl = fftsa.nl
   if nl.red_db == nil or nl.red_hz == nil then return nil end
   if nseg == nil or nl.nseg_max == nil or nseg < 1 or nseg > nl.nseg_max then return nil end
-  -- The reduced arrays are dsp_real, so their width comes from the image rather than from
-  -- here. A decoder picked for the wrong width reads a plausible wrong trace, not a
-  -- refusal, so an image reporting neither width is refused outright.
-  local sz = nl.SIZEOF_REAL
-  local f_unpack
-  if sz == 8 then f_unpack = f64_unpack
-  elseif sz == 4 then f_unpack = f32_unpack
-  else return nil end
+  local f_unpack, sz = red_unpack()
+  if f_unpack == nil then return nil end
   local nbytes = nseg * sz
-  local sd = ki.memread(hx(nl.red_db), hx(nbytes))
-  if sd == nil or string.len(sd) ~= nbytes then return nil end
-  if nl._red == nil then nl._red = { db = {}, hz = {} } end
+  if nl._red == nil then nl._red = { hz = {} } end
   local r = nl._red
-  local db, hz = r.db, r.hz
+  local hz = r.hz
   local i, p
   -- The frequencies are an affine series the plan fixes: the primitive forms every one as
   -- f0 + c * fstep from two numbers it derives before the segment loop, so no sample can
@@ -9721,14 +9775,13 @@ function fftsa.nl.reduce(nseg)
     r.hz_nseg, r.hz_at, r.hz_sz = nseg, nl.red_hz, sz
     r.hz_1, r.hz_2 = h1, h2
   end
-  p = 1
-  for i = 1, nseg do
-    local v = f_unpack(sd, p)
-    if v == nil then return nil end
-    db[i] = v
-    p = p + sz
-  end
   r.nseg = nseg
+  -- The stand-in goes in before the decode is attempted, not after it fails, so there is no
+  -- window in which r.db still points at the last frame's values.
+  r.db = nl._db_none
+  if want_db == nil or want_db then
+    if nl.reduce_db() == nil then return nil end
+  end
   return r
 end
 
@@ -10342,7 +10395,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.32'
+fftsa.VERSION = '9.33'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -11158,7 +11211,11 @@ function fftsa.frame_body()
       -- call reduced: the display task works from its own copy of a bound buffer and that
       -- write is what feeds it, so a write into the buffer's chunk storage draws nothing
       -- and no notify call rescues it. nl.reduce says more.
-      local rd = fftsa.nl.reduce(nseg)
+      -- false: the decibels are not decoded unless something reads them, and on an engaged
+      -- pixel frame nothing does -- the image writes the ring from the same array in the
+      -- arena. About 8.5 ms of a frame at 255 points. fftsa.sg_db and fftsa.nl.db_now are
+      -- what the paths that DO read them go through.
+      local rd = fftsa.nl.reduce(nseg, false)
       if rd == nil then
         fftsa.nl.ready = false
         fftsa.nl_lasterr = 'reduce returned nil for nseg=' .. tostring(nseg)
@@ -11186,7 +11243,16 @@ function fftsa.frame_body()
         -- of about fps * window / period.
         --
         -- fftsa.sg_ring is the way out that does not shrink the window but removes it.
-        fftsa.sg_fill(rd.db, rd.hz, nseg)
+        --
+        -- ZERO MEANS IT WROTE NOTHING, and the frame has to carry that rather than discard
+        -- it. The decibels are decoded on demand now, so a fill can find there are none --
+        -- a short read of the arena, or a value that will not decode -- and it then leaves
+        -- the previous spectrum up, which is the right picture. What was wrong was going on
+        -- to set sg_nwrote, rank peaks and move the markers for a trace this frame did not
+        -- draw: the plot would freeze while everything beside it advanced, and nothing but
+        -- dbfail on the About page would say so. Before the decode moved, the same failure
+        -- came back from reduce as nil and fell through to the interpreted path.
+        if fftsa.sg_fill(rd.db, rd.hz, nseg) == 0 then nseg = 0 end
       end
     end
   else
@@ -11194,11 +11260,16 @@ function fftsa.frame_body()
     nseg = fftsa.spectrum_interp(fftsa.cap, fftsa.sg_buf)
   end
   if nseg == nil or nseg < 0 then error(fftsa.dsp_why("spectrum", nseg), 0) end
-  -- Zero segments is a short record and not a failure: nothing was written and the previous
-  -- spectrum is still on screen. Counted by the primitive, mirrored here because the
-  -- settings line and the suite read this name.
+  -- Zero segments is a short record on the interpreted path, or a fill with no decibels to
+  -- write on the native one. Neither is a failure and both mean the same thing: nothing was
+  -- written and the previous spectrum is still on screen, so the frame stops here rather than
+  -- reporting a count and markers for a trace it did not draw.
+  --
+  -- shortreads only on the interpreted path, because it mirrors that primitive's own counter
+  -- and a native frame would copy a figure describing a transform it never ran. The native
+  -- side's own refusal is counted as nl.db_fails and reaches the About page from there.
   if nseg == 0 then
-    fftsa.shortreads = dsp.shortreads
+    if not fftsa.nl_frame then fftsa.shortreads = dsp.shortreads end
     return
   end
   -- On the native path binhz is set above from the capture's timestamps and is the figure
@@ -11388,11 +11459,22 @@ function fftsa.frame()
     -- that read is a single print.
     if FFTSA_CENSUS == nil then FFTSA_CENSUS = {} end
     local ph = fftsa.ph
+    -- THE DELIVERED PERIOD AND WHAT THE WINDOW ASKED FOR, which are the two figures the
+    -- armed period does not give. Measured on a DMM6500 at 2048 with the work pinned at
+    -- 55 ms: d took exactly two values, 56 and 100, against an armed 80 either way -- so the
+    -- rate is decided by which side of a 50 ms tick boundary the work falls on and not by the
+    -- period the controller computed. from is the peak the period was computed FROM, latched
+    -- where the decision is made rather than read afterwards, because the window peak resets
+    -- and would read low exactly when it mattered.
     FFTSA_CENSUS[fftsa.n] = string.format(
-      'per=%.3f fps=%.2f gap=%.1f wp=%.1f wt=%.1f acq=%.1f spec=%.1f yld=%.1f nl=%s',
+      'per=%.3f fps=%.2f gap=%.1f d=%.1f from=%.1f want=%.1f wp=%.1f wt=%.1f'
+      .. ' acq=%.1f spec=%.1f mark=%.1f yld=%.1f show=%.1f nl=%s',
       fftsa.period or 0, fftsa.fps or 0, 1000 * (fftsa.gap_peak or 0),
+      1000 * (fftsa.gap_last or 0), 1000 * (fftsa.armed_from or 0),
+      1000 * (fftsa.armed_want or 0),
       1000 * (fftsa.work_plain or 0), 1000 * (fftsa.work_tick or 0),
-      1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.yld or 0),
+      1000 * (ph.acq or 0), 1000 * (ph.spec or 0), 1000 * (ph.mark or 0),
+      1000 * (ph.yld or 0), 1000 * (ph.show or 0),
       tostring(fftsa.nl_frame))
     -- The acq split, where a paint absorbed by the capture would show.
     local pn, tn = fftsa.acq_plain_n or 0, fftsa.acq_tick_n or 0

@@ -955,6 +955,9 @@ function fftsa.nl.diag()
   o = o .. ' why=' .. tostring(nl.why)
   o = o .. ' | ready=' .. tostring(nl.ready) .. ' entry=' .. tostring(nl.entry)
   o = o .. ' rc=' .. tostring(nl.last_rc) .. ' spent=' .. tostring(nl.boot_spent)
+  -- A decibel decode that failed draws nothing and says nothing anywhere else: the frame
+  -- keeps the previous trace and carries on. Zero is the normal reading.
+  if nl.db_fails ~= nil then o = o .. ' dbfail=' .. tostring(nl.db_fails) end
   o = o .. ' | backstop=' .. hx(nl.BACKSTOP_LO or 0) .. '..' .. hx(nl.BACKSTOP_HI or 0)
   o = o .. ' anchor=' .. hx(nl.heap_anchor() or 0) .. ' ' .. nl.windows_str()
   o = o .. ' | glue=' .. tostring(nl.nglue) .. '/' .. tostring(nl.GLUE_MIN)
@@ -4956,7 +4959,7 @@ end
 -- THE SLOT MAP IS AN EXACT FLOAT32 MATCH, not a nearest-frequency search, and 721 exact matches
 -- against a 255-member set is also the confirmation that this is the right ring: nothing else in
 -- memory is a permutation of the app's own axis.
-function fftsa.nl.px_map(g, db, hz, nseg)
+function fftsa.nl.px_map(g, hz, nseg)
   local nl = fftsa.nl
   local p = nl.px
   p.why = nil
@@ -5587,6 +5590,13 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   local wrote = nil
   if not repointed then wrote = nl.px_write(nseg) end
   if wrote == nil then
+    -- The decibels, decoded here because this is the only arm that reads them. An engaged
+    -- frame never reaches it, which is the whole saving: the image writes the ring from the
+    -- same array in the arena and the spectrum never passes through Lua.
+    db = nl.db_now(db)
+    if db == nil then
+      return nl.px_dropframe('the decibels did not decode for the Lua ring write')
+    end
     local T, ytab, yb = p.T, p.ytab, p.yb
     local ay, by, ymax = p.ay, p.by, nl.PX_YMAX
     local fl = math.floor
@@ -5686,6 +5696,14 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   --
   -- So the append carries what the spectrum has there, and the lag is handled where it
   -- actually bites, in the check.
+  -- THE APPEND MODE PAYS THE DECODE, all 255 values for the one it writes. It is kept only so
+  -- the two repaint provocations can be compared on the glass without a rebuild, and 'cursor'
+  -- is what ships -- so the cost sits where the comparison is made rather than in a one-value
+  -- read path nothing else would use.
+  db = nl.db_now(db)
+  if db == nil then
+    return nl.px_dropframe('the decibels did not decode for the repaint append')
+  end
   buffer.write.reading(tb, db[k], hz[k], t, 0)
   p.slotprev, p.slot, p.slotdb = p.slotdb, slot, db[k]
   p.frames = (p.frames or 0) + 1
@@ -6116,7 +6134,7 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
       -- The pointer route reports bounds and a header but never looked at a record, so the x
       -- field is px_map's to derive. The cache carries one and px_map keeps it.
       if cands[ci].from == 'ptr' or cands[ci].from == 'sub' then g.ox = nil end
-      if nl.px_map(g, db, hz, nseg) then
+      if nl.px_map(g, hz, nseg) then
         p.state = 'on'
         nl.px_engaged()
         p.from = cands[ci].from
@@ -6363,7 +6381,7 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
       end
       return nil
     end
-    if nl.px_map(p.g, db, hz, nseg) then
+    if nl.px_map(p.g, hz, nseg) then
       p.state = 'on'
       nl.px_engaged()
       p.from = p.via or 'search'
@@ -7764,6 +7782,99 @@ function fftsa.nl.results()
   return r
 end
 
+-- The decoder for the reduced arrays, and its width.
+--
+-- The arrays are dsp_real, so the width comes from the image rather than from here: a decoder
+-- picked for the wrong one reads a plausible wrong trace and not a refusal. An image
+-- reporting neither width answers nil, and both callers refuse outright on that.
+local function red_unpack()
+  local sz = fftsa.nl.SIZEOF_REAL
+  if sz == 8 then return f64_unpack, 8 end
+  if sz == 4 then return f32_unpack, 4 end
+  return nil, nil
+end
+
+-- WHAT STANDS IN FOR THE DECIBELS UNTIL SOMEBODY ASKS FOR THEM.
+--
+-- They travel as a plain array through four functions, so "has this frame's spectrum been
+-- decoded?" has to be a question about the table itself and not about a flag somewhere else.
+-- An empty table is the answer: the first index gives nil, so a reader that forgot to ask
+-- fails at once instead of drawing the PREVIOUS frame's spectrum, which is a frozen trace
+-- nothing on the glass would report.
+--
+-- Shared and never written. Nothing may put a value in it.
+fftsa.nl._db_none = {}
+
+-- A refused decode, counted where the About page can report it. Returns nil, which is what
+-- every caller of reduce_db tests, so the count never changes an answer.
+local function db_failed()
+  local nl = fftsa.nl
+  nl.db_fails = (nl.db_fails or 0) + 1
+  return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- The decibels of the reduction already read, decoded on demand.
+--
+-- 255 values at a ki.memread and a float decode each, measured at about 8.5 ms of a frame --
+-- and on an engaged frame NOTHING IN LUA READS THEM. The image writes the ring from the same
+-- array, in the arena, where dsp_reduce left it; the trace never passes through Lua at all.
+-- Only three things want them: the append fill, which is what runs when the pixel path has
+-- not engaged; the Lua ring writer, which a frame that re-points the series uses; and the
+-- repaint's one append, in 'append' mode. Each asks here, and a frame that asks twice pays
+-- once.
+--
+-- A value that does not decode fails the whole call rather than leaving a hole: a nil
+-- reaching buffer.write.reading is a posted event per point. The array is installed only
+-- after the last value lands, so a failure part way leaves the empty stand-in in place and
+-- the caller sees nil rather than a half-filled spectrum.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.reduce_db()
+  local nl = fftsa.nl
+  local r = nl._red
+  if r == nil or r.nseg == nil or nl.red_db == nil then return nil end
+  if r.db ~= nil and r.db ~= nl._db_none then return r.db end
+  local f_unpack, sz = red_unpack()
+  if f_unpack == nil then return nil end
+  local nseg = r.nseg
+  local nbytes = nseg * sz
+  local sd = ki.memread(hx(nl.red_db), hx(nbytes))
+  if sd == nil or string.len(sd) ~= nbytes then return db_failed() end
+  if r.db_buf == nil then r.db_buf = {} end
+  local db = r.db_buf
+  local i, p = nil, 1
+  for i = 1, nseg do
+    local v = f_unpack(sd, p)
+    if v == nil then return db_failed() end
+    db[i] = v
+    p = p + sz
+  end
+  r.db = db
+  return db
+end
+
+-- The decibels, decoded if they are not already.
+--
+-- THE REDUCTION'S OWN STATE DECIDES, not the argument, wherever there is a reduction to ask.
+-- Installing the empty stand-in changes r.db but cannot revoke a reference somebody already
+-- took to the buffer behind it, so a caller holding last frame's array could hand it back and
+-- be believed -- and that is exactly the frozen trace the stand-in exists to prevent. No
+-- path in this tree keeps such an alias across a frame; asking the reduction rather than the
+-- argument is what keeps that a fact about the code rather than a property to maintain.
+--
+-- The argument is taken only when there is no reduction at all, which is the interpreted path
+-- and the offline suites: there the array arrives filled and nothing else can supply it.
+function fftsa.nl.db_now(db)
+  local nl = fftsa.nl
+  local r = nl._red
+  if r ~= nil and r.nseg ~= nil then
+    if r.db ~= nil and r.db ~= nl._db_none then return r.db end
+    return nl.reduce_db()
+  end
+  if db ~= nil and db[1] ~= nil then return db end
+  return nil
+end
+
 -- ---------------------------------------------------------------------------
 -- The reduced trace the last run produced: one decibel value per segment and the frequency
 -- of each, in two tables for the caller to write with buffer.write.reading.
@@ -7773,29 +7884,27 @@ end
 -- correct from Lua and buf.n says the right count -- and the graph stays blank, because the
 -- display task works from its own copy and no notify call reaches a write it never saw.
 --
--- A value that does not decode to a finite number fails the whole call rather than leaving a
--- hole, a nil reaching buffer.write.reading being a posted event per point. The tables are
--- allocated once and refilled, this running in a frame: the decibels every call and the
--- frequencies only when the plan behind them moves.
+-- THE DECIBELS ARE NOT DECODED HERE unless want_db says so, and the app says so only when
+-- something is going to read them. Default true, so a caller that does not know about the
+-- argument gets what this always did.
+--
+-- The frequencies are decoded whichever way: every caller needs them, the pixel path included
+-- -- it compares the first two against the series its slot map was built on, which is how an
+-- FFT size change is noticed -- and they only move when the plan behind them does, so they
+-- cost a 8-byte probe on the frames that matter and nothing on the rest.
+--
+-- The tables are allocated once and refilled, this running in a frame.
 -- ---------------------------------------------------------------------------
-function fftsa.nl.reduce(nseg)
+function fftsa.nl.reduce(nseg, want_db)
   local nl = fftsa.nl
   if nl.red_db == nil or nl.red_hz == nil then return nil end
   if nseg == nil or nl.nseg_max == nil or nseg < 1 or nseg > nl.nseg_max then return nil end
-  -- The reduced arrays are dsp_real, so their width comes from the image rather than from
-  -- here. A decoder picked for the wrong width reads a plausible wrong trace, not a
-  -- refusal, so an image reporting neither width is refused outright.
-  local sz = nl.SIZEOF_REAL
-  local f_unpack
-  if sz == 8 then f_unpack = f64_unpack
-  elseif sz == 4 then f_unpack = f32_unpack
-  else return nil end
+  local f_unpack, sz = red_unpack()
+  if f_unpack == nil then return nil end
   local nbytes = nseg * sz
-  local sd = ki.memread(hx(nl.red_db), hx(nbytes))
-  if sd == nil or string.len(sd) ~= nbytes then return nil end
-  if nl._red == nil then nl._red = { db = {}, hz = {} } end
+  if nl._red == nil then nl._red = { hz = {} } end
   local r = nl._red
-  local db, hz = r.db, r.hz
+  local hz = r.hz
   local i, p
   -- The frequencies are an affine series the plan fixes: the primitive forms every one as
   -- f0 + c * fstep from two numbers it derives before the segment loop, so no sample can
@@ -7831,14 +7940,13 @@ function fftsa.nl.reduce(nseg)
     r.hz_nseg, r.hz_at, r.hz_sz = nseg, nl.red_hz, sz
     r.hz_1, r.hz_2 = h1, h2
   end
-  p = 1
-  for i = 1, nseg do
-    local v = f_unpack(sd, p)
-    if v == nil then return nil end
-    db[i] = v
-    p = p + sz
-  end
   r.nseg = nseg
+  -- The stand-in goes in before the decode is attempted, not after it fails, so there is no
+  -- window in which r.db still points at the last frame's values.
+  r.db = nl._db_none
+  if want_db == nil or want_db then
+    if nl.reduce_db() == nil then return nil end
+  end
   return r
 end
 
