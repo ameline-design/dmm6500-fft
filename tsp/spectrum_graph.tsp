@@ -142,6 +142,24 @@ fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
+-- Frame timing, on the noise row to the right of the noise text and in its OWN object so the
+-- two never rewrite each other: the noise line is written only when its figures change, and
+-- these change every frame.
+--
+-- The fields are the ones the period is computed from, which is what makes the line worth
+-- reading: the frame just measured against the period actually armed, then the peak work on a
+-- plain frame and on a frame that ran the slow tick, and the capture. A rate that moves while
+-- the F stays up is one of those four changing, and this says which without leaving the
+-- spectrum screen.
+--
+-- It costs one settext a second, and that write lands inside a slow-tick frame, so it is
+-- charged to work_tick -- one of the figures beside it. A couple of milliseconds against the
+-- tens this is for, but it is not free and the comparison should not be read as if it were.
+fftsa.sg_tm_x = 480
+fftsa.sg_tm_y = 328         -- the noise row, clear of the longest noise text
+fftsa.sg_tm_c = 13166335    -- pale blue, the volt column's colour
+fftsa.sg_tm_last = nil      -- the text on screen, so an unchanged line is not rewritten
+
 -- Decimals follow the record length, because a digit is only worth printing once the record
 -- is long enough to hold a harmonic in one bin: each doubling halves the bin width and so
 -- the power leaking into its neighbours. Gated on the committed sample count, so the line
@@ -867,6 +885,10 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
                         fftsa.sg_thd_text(nil, nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
 
+  fftsa.sg_tm_last = nil
+  fftsa.sg_tm = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_tm_x, fftsa.sg_tm_y,
+                       fftsa.sg_tm_text(), fftsa.sg_tm_c, small, display.JUST_LEFT)
+
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
@@ -882,7 +904,7 @@ function fftsa.sg_destroy(release)
   end
   fftsa.del_scr(fftsa.sg_scr)
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_thd, fftsa.sg_tm = nil, nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
   --
   -- Releasing is what an exit does: the buffers go, and defbuffer1 is made current first,
@@ -1081,6 +1103,59 @@ function fftsa.sg_show_thd()
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)
+  return true
+end
+
+-- The frame just measured, the period armed for it, THE PERIOD DELIVERED, then where the frame
+-- went: capture, spectrum, markers, yield, repaint. Milliseconds, rounded -- a tenth of a
+-- millisecond is below what a settext-paced sample can resolve and the figures that matter here
+-- differ by tens.
+--
+-- d IS THE FIELD THAT DECIDES THE FRAME RATE, and it is not the armed period. Measured on a
+-- DMM6500 at 2048 points with the work pinned at 55 ms: d reads 56 at 15 fps and 100 at 9.9 fps,
+-- two values and nothing between them, against an armed 80 either way. A cost effect gives a
+-- continuum, so that is quantisation -- the rate is decided by which side of a boundary the WORK
+-- falls on, and the period the controller arms barely enters it.
+--
+-- Which is why the phase split replaced the peak fields. w proved the controller innocent --
+-- the peak it armed from equalled the work and the deadband refused nothing -- and having
+-- proved it, the width is worth more to the five fields that say where the frame went. The
+-- peaks are still in FFTSA_CENSUS for a socket to read.
+--
+-- a + s + m + y + h is most of the frame, so a field that is large is a field to attack. The
+-- capture at 2048 and 100 kS/s is 20.5 ms of it and is not negotiable at that span.
+--
+-- Every field is read rather than recomputed, so the line cannot disagree with the period in
+-- force. nil reads as 0 because the first frames have no figure yet and a gap is worse than a
+-- zero in a field that is about to fill.
+function fftsa.sg_tm_text()
+  local ph = fftsa.ph or {}
+  local t = string.format("%.0f/%.0f d%.0f a%.0f s%.0f m%.0f y%.0f h%.0f",
+                          1000 * (fftsa.frame_work or 0), 1000 * (fftsa.period or 0),
+                          1000 * (fftsa.gap_last or 0), 1000 * (ph.acq or 0),
+                          1000 * (ph.spec or 0), 1000 * (ph.mark or 0),
+                          1000 * (ph.yld or 0), 1000 * (ph.show or 0))
+  -- r APPEARS ONLY WHEN THE DEADBAND REFUSED A MOVE, which is the one state where the period
+  -- on screen is not the period the window asked for. Raising takes tick_rise and dropping
+  -- takes one grid step, so a window wanting 20 ms more than it has is declined and the timer
+  -- then fires into a frame still running. Conditional, because a line that carries a field
+  -- for a condition that is almost never true spends width on nothing.
+  local want = fftsa.armed_want
+  if want ~= nil and fftsa.period ~= nil
+     and math.abs(want - fftsa.period) >= 0.001 then
+    t = t .. string.format(" r%.0f", 1000 * want)
+  end
+  return t
+end
+
+-- On the peak table's clock, and only when the text changes -- which for this line is most
+-- seconds, so the write is effectively once a second by construction rather than by a rule.
+function fftsa.sg_show_tm()
+  if fftsa.sg_tm == nil then return false end
+  local t = fftsa.sg_tm_text()
+  if t == fftsa.sg_tm_last then return false end
+  fftsa.sg_tm_last = t
+  display.settext(fftsa.sg_tm, t)
   return true
 end
 
@@ -1469,6 +1544,10 @@ function fftsa.sg_slow_tick()
     -- Distortion and noise: the noise mean is a pass over every plotted bin at 4.3 us a bin,
     -- so 35 ms at 16384, which is why it is on this clock and not the frame's.
     fftsa.sg_show_thd()
+    -- Last in the block, so the work it reports is the previous frame's complete figure
+    -- rather than this frame's partial one -- and so its own settext is the last thing
+    -- charged to the frame it inflates.
+    fftsa.sg_show_tm()
     did = true
     heavy = true
   end

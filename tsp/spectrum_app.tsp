@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.26'
+fftsa.VERSION = '9.32'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -700,7 +700,7 @@ function fftsa.dsp_peaks(count)
   -- and not nl_res, so a native frame whose results did not read back answers no peaks
   -- rather than putting the question to a primitive that cannot answer it.
   if fftsa.nl_frame then
-    local res = fftsa.nl_res
+    local res = fftsa.nl_results()
     for i = 1, count do
       if res == nil then hz[i], v[i] = nil, nil
       else hz[i], v[i] = res.hz[i], res.v[i] end
@@ -723,9 +723,25 @@ end
 -- spectrum on screen. thd is a fraction, as dsp.distortion() reports it; the THD line
 -- turns it into a percentage. Each figure is nil where the measurement did not apply, and
 -- all three are nil on a native frame whose results block did not read back.
+-- The native results block for THIS frame, read at most once and only when asked.
+--
+-- Keyed on a flag the frame clears rather than on a frame number, so there is no counter to
+-- wrap or to reset: nl_res_done false means "this frame has not tried yet", and a read that
+-- fails leaves nl_res nil with the flag set, so a failure is not retried thirty times by
+-- thirty callers. Gated on nl_frame for the same reason the eager read was -- a frame the
+-- compiled path did not produce has no block to read.
+function fftsa.nl_results()
+  if not fftsa.nl_frame then return nil end
+  if not fftsa.nl_res_done then
+    fftsa.nl_res_done = true
+    fftsa.nl_res = fftsa.nl.results()
+  end
+  return fftsa.nl_res
+end
+
 function fftsa.distortion()
   if fftsa.nl_frame then
-    local res = fftsa.nl_res
+    local res = fftsa.nl_results()
     if res == nil then return nil, nil, nil end
     return res.thd, res.snr, res.noise
   end
@@ -773,7 +789,10 @@ function fftsa.frame_body()
   -- written while the results block fails to read back.
   local nseg
   fftsa.nl_frame = false
-  fftsa.nl_res = nil
+  -- nl_res_done says "this frame has already tried", so the block is read at most once a
+  -- frame and only if something asks for it. Cleared here with nl_res itself, which is what
+  -- keeps a frame from ever being handed the previous frame's figures.
+  fftsa.nl_res, fftsa.nl_res_done = nil, false
   local native = fftsa.nl_usable()
   -- A wrapped capture comes back rotated: readings[1] is the ring's physical slot 1 and the
   -- oldest reading sits at startindex, so a linear walk over the storage transforms the
@@ -822,7 +841,12 @@ function fftsa.frame_body()
       else
         fftsa.binhz = binhz
         fftsa.nl_frame = true
-        fftsa.nl_res = fftsa.nl.results()
+        -- THE RESULTS BLOCK IS NOT READ HERE. Every consumer of it -- the peak table and the
+        -- THD line -- runs on the one-second clock, while this ran on every frame: a memread
+        -- plus a double decode per field, measured at about 3 ms of a frame with 50 to spend,
+        -- paid thirty times for each time it was used. fftsa.nl_results() reads it on demand
+        -- instead, once a frame at most, which leaves the figures exactly as fresh as the
+        -- frame that asks for them.
         -- buffer.write.reading is the only way points reach the glass. The display task
         -- paints from its own copy and that copy is fed one point per call: measured by
         -- replacing all 255 elements in place with the descriptor untouched, which the
@@ -1019,6 +1043,11 @@ function fftsa.frame()
   if fftsa.last_entry ~= nil then
     local gap = entry - fftsa.last_entry
     if fftsa.gap_peak == nil or gap > fftsa.gap_peak then fftsa.gap_peak = gap end
+    -- The last gap as well as the peak, because the peak answers "what is the period armed
+    -- against" and this answers "what is the loop actually delivering". They differ in both
+    -- directions -- measured at 4096, armed 0.15 and delivered 0.20 -- and no arithmetic over
+    -- the armed period recovers it, so it is reported rather than inferred.
+    fftsa.gap_last = gap
   end
   fftsa.last_entry = entry
   fftsa.fps_n = (fftsa.fps_n or 0) + 1
@@ -1121,6 +1150,15 @@ function fftsa.frame()
       -- window adopt what it measured, in either direction, which is one window instead of
       -- several seconds of hunting. Jitter is still deadbanded every window after it.
       if fftsa.period_modelled then need = 0 end
+      -- WHAT THE WINDOW ASKED FOR AND WHAT IT GOT, kept because neither is recoverable
+      -- afterwards. The peaks are decayed four lines below, so a reader sampling plain_peak
+      -- later sees the value it was reset to and not the one the period was armed from --
+      -- measured on the glass as a 110 ms period sitting beside a peak of 55, which reads as
+      -- the controller ignoring its own input. want is kept as well as the peak: when it
+      -- differs from the period the deadband refused the move, which is the one state where
+      -- the period and the work disagree and nothing on screen said so.
+      fftsa.armed_from = fftsa.plain_peak or fftsa.work_peak
+      fftsa.armed_want = want
       if fftsa.period == nil or move >= need then
         fftsa.period = want
         fftsa.arm(want)

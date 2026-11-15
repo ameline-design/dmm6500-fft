@@ -262,18 +262,22 @@ def main():
     sizes_addr = elf.symbol_named("dsp_native_sizes")
     if sizes_addr is None:
         sys.exit("dsp_native_sizes not found: the Lua side needs the target's struct sizes")
-    raw = elf.read_at(sizes_addr, 48)
-    if raw is None or len(raw) != 48:
+    raw = elf.read_at(sizes_addr, 56)
+    if raw is None or len(raw) != 56:
         sys.exit("dsp_native_sizes at 0x%08X is not inside an allocated section" % sizes_addr)
     (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
      res_peaks, res_doubles, status_off, fail_off,
-     find_words, find_max) = struct.unpack(">IIIIIIIIIIII", raw)
+     find_words, find_max, px_words, px_maxrec) = struct.unpack(">IIIIIIIIIIIIII", raw)
     # fail_off is excluded from the zero test: it is an offset and a zero one would mean the
     # field had moved to the front of the struct, which the fit test below catches anyway.
     if 0 in (plan_sz, params_sz, real_sz, align, bs_lo, bs_hi,
-             res_peaks, res_doubles, status_off, find_words, find_max):
+             res_peaks, res_doubles, status_off, find_words, find_max,
+             px_words, px_maxrec):
         sys.exit("dsp_native_sizes reads as zeros; it is a tentative definition in .bss "
                  "rather than an initialised one in .rodata")
+    if px_maxrec >= px_words:
+        sys.exit("dsp_native_sizes has the px block at %d words holding %d slot-map entries, "
+                 "which leaves no header" % (px_words, px_maxrec))
     if bs_lo >= bs_hi:
         sys.exit("dsp_native_sizes backstop bounds are inverted: 0x%08X >= 0x%08X"
                  % (bs_lo, bs_hi))
@@ -314,6 +318,10 @@ def main():
         fh.write("-- the find block, for the native search: Lua reserves it and packs it\n")
         fh.write("fftsa.nl.FIND_WORDS = %d\n" % find_words)
         fh.write("fftsa.nl.FIND_MAX = %d\n" % find_max)
+        fh.write("-- the graph ring block: the geometry and the slot map the ring write reads\n")
+        fh.write("fftsa.nl.PX_WORDS = %d\n" % px_words)
+        fh.write("fftsa.nl.PX_MAXREC = %d\n" % px_maxrec)
+        fh.write("fftsa.nl.PX_HDR = %d\n" % (px_words - px_maxrec))
         fh.write("-- the word in the image the params address is patched into, and the word\n")
         fh.write("-- of the params struct the call reports through\n")
         fh.write("fftsa.nl.PARAMS_SLOT = %d\n" % params_slot)

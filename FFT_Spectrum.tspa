@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 9.26
+-- $Version: 9.32
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -264,6 +264,24 @@ fftsa.sg_thd_x = 8
 fftsa.sg_thd_y = 328
 fftsa.sg_thd_c = 16769184
 fftsa.sg_thd_last = nil      -- the text on screen, so an unchanged line is not rewritten
+
+-- Frame timing, on the noise row to the right of the noise text and in its OWN object so the
+-- two never rewrite each other: the noise line is written only when its figures change, and
+-- these change every frame.
+--
+-- The fields are the ones the period is computed from, which is what makes the line worth
+-- reading: the frame just measured against the period actually armed, then the peak work on a
+-- plain frame and on a frame that ran the slow tick, and the capture. A rate that moves while
+-- the F stays up is one of those four changing, and this says which without leaving the
+-- spectrum screen.
+--
+-- It costs one settext a second, and that write lands inside a slow-tick frame, so it is
+-- charged to work_tick -- one of the figures beside it. A couple of milliseconds against the
+-- tens this is for, but it is not free and the comparison should not be read as if it were.
+fftsa.sg_tm_x = 480
+fftsa.sg_tm_y = 328         -- the noise row, clear of the longest noise text
+fftsa.sg_tm_c = 13166335    -- pale blue, the volt column's colour
+fftsa.sg_tm_last = nil      -- the text on screen, so an unchanged line is not rewritten
 
 -- Decimals follow the record length, because a digit is only worth printing once the record
 -- is long enough to hold a harmonic in one bin: each doubling halves the bin width and so
@@ -990,6 +1008,10 @@ function fftsa.sg_build(title, nbins, npoints)
   fftsa.sg_thd = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_thd_x, fftsa.sg_thd_y,
                         fftsa.sg_thd_text(nil, nil, nil), fftsa.sg_thd_c, small, display.JUST_LEFT)
 
+  fftsa.sg_tm_last = nil
+  fftsa.sg_tm = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_tm_x, fftsa.sg_tm_y,
+                       fftsa.sg_tm_text(), fftsa.sg_tm_c, small, display.JUST_LEFT)
+
   fftsa.sg_xunit = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_xunit_x, fftsa.sg_xunit_y,
                           fftsa.sg_xunit_text(), fftsa.sg_xunit_c, small, display.JUST_LEFT)
 
@@ -1005,7 +1027,7 @@ function fftsa.sg_destroy(release)
   end
   fftsa.del_scr(fftsa.sg_scr)
   fftsa.sg_scr, fftsa.sg_graph, fftsa.sg_pk_f, fftsa.sg_pk_v, fftsa.sg_pk_d,
-    fftsa.sg_xunit, fftsa.sg_thd = nil, nil, nil, nil, nil, nil, nil
+    fftsa.sg_xunit, fftsa.sg_thd, fftsa.sg_tm = nil, nil, nil, nil, nil, nil, nil, nil
   -- Two callers want opposite things here, so release says which.
   --
   -- Releasing is what an exit does: the buffers go, and defbuffer1 is made current first,
@@ -1204,6 +1226,59 @@ function fftsa.sg_show_thd()
   if t == fftsa.sg_thd_last then return false end
   fftsa.sg_thd_last = t
   display.settext(fftsa.sg_thd, t)
+  return true
+end
+
+-- The frame just measured, the period armed for it, THE PERIOD DELIVERED, then where the frame
+-- went: capture, spectrum, markers, yield, repaint. Milliseconds, rounded -- a tenth of a
+-- millisecond is below what a settext-paced sample can resolve and the figures that matter here
+-- differ by tens.
+--
+-- d IS THE FIELD THAT DECIDES THE FRAME RATE, and it is not the armed period. Measured on a
+-- DMM6500 at 2048 points with the work pinned at 55 ms: d reads 56 at 15 fps and 100 at 9.9 fps,
+-- two values and nothing between them, against an armed 80 either way. A cost effect gives a
+-- continuum, so that is quantisation -- the rate is decided by which side of a boundary the WORK
+-- falls on, and the period the controller arms barely enters it.
+--
+-- Which is why the phase split replaced the peak fields. w proved the controller innocent --
+-- the peak it armed from equalled the work and the deadband refused nothing -- and having
+-- proved it, the width is worth more to the five fields that say where the frame went. The
+-- peaks are still in FFTSA_CENSUS for a socket to read.
+--
+-- a + s + m + y + h is most of the frame, so a field that is large is a field to attack. The
+-- capture at 2048 and 100 kS/s is 20.5 ms of it and is not negotiable at that span.
+--
+-- Every field is read rather than recomputed, so the line cannot disagree with the period in
+-- force. nil reads as 0 because the first frames have no figure yet and a gap is worse than a
+-- zero in a field that is about to fill.
+function fftsa.sg_tm_text()
+  local ph = fftsa.ph or {}
+  local t = string.format("%.0f/%.0f d%.0f a%.0f s%.0f m%.0f y%.0f h%.0f",
+                          1000 * (fftsa.frame_work or 0), 1000 * (fftsa.period or 0),
+                          1000 * (fftsa.gap_last or 0), 1000 * (ph.acq or 0),
+                          1000 * (ph.spec or 0), 1000 * (ph.mark or 0),
+                          1000 * (ph.yld or 0), 1000 * (ph.show or 0))
+  -- r APPEARS ONLY WHEN THE DEADBAND REFUSED A MOVE, which is the one state where the period
+  -- on screen is not the period the window asked for. Raising takes tick_rise and dropping
+  -- takes one grid step, so a window wanting 20 ms more than it has is declined and the timer
+  -- then fires into a frame still running. Conditional, because a line that carries a field
+  -- for a condition that is almost never true spends width on nothing.
+  local want = fftsa.armed_want
+  if want ~= nil and fftsa.period ~= nil
+     and math.abs(want - fftsa.period) >= 0.001 then
+    t = t .. string.format(" r%.0f", 1000 * want)
+  end
+  return t
+end
+
+-- On the peak table's clock, and only when the text changes -- which for this line is most
+-- seconds, so the write is effectively once a second by construction rather than by a rule.
+function fftsa.sg_show_tm()
+  if fftsa.sg_tm == nil then return false end
+  local t = fftsa.sg_tm_text()
+  if t == fftsa.sg_tm_last then return false end
+  fftsa.sg_tm_last = t
+  display.settext(fftsa.sg_tm, t)
   return true
 end
 
@@ -1592,6 +1667,10 @@ function fftsa.sg_slow_tick()
     -- Distortion and noise: the noise mean is a pass over every plotted bin at 4.3 us a bin,
     -- so 35 ms at 16384, which is why it is on this clock and not the frame's.
     fftsa.sg_show_thd()
+    -- Last in the block, so the work it reports is the previous frame's complete figure
+    -- rather than this frame's partial one -- and so its own settext is the last thing
+    -- charged to the frame it inflates.
+    fftsa.sg_show_tm()
     did = true
     heavy = true
   end
@@ -1888,6 +1967,13 @@ fftsa.nl.MODE_SEGS  = 4
 -- backstop is 800 frames of the budget a frame can spare. Native code is in the same address
 -- space and loads memory directly -- no IPC, no block, no budget.
 fftsa.nl.MODE_FIND  = 5
+-- The graph ring's y pixels, written in the image from the reduction's own array. What it
+-- replaces in Lua is a loop over the trace columns, a second over the ring slots, a
+-- table.concat of three pieces per record and one 28 KB ki.memwrite -- 9.6 ms measured for
+-- the memwrite alone at 510 records, against a multiply, a clamp and three stores per record
+-- here. Nothing is copied in to make the call: the decibels are already in the arena, which
+-- is where dsp_reduce put them.
+fftsa.nl.MODE_PX    = 6
 
 fftsa.nl.MAGIC = 1146310705   -- 0x44535031, 'DSP1'
 
@@ -1911,7 +1997,7 @@ fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
 fftsa.nl._align32 = align32
-fftsa.nl.PARAM_WORDS = 56
+fftsa.nl.PARAM_WORDS = 57
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -1930,6 +2016,13 @@ fftsa.nl.BACKSTOP_HI = 0
 -- nl.results() refuse rather than decode a block of some other size.
 fftsa.nl.RES_PEAKS   = 0
 fftsa.nl.RES_DOUBLES = 0
+
+-- Shape of the graph ring block, also from the image: its total words, the slot-map entries
+-- it can hold and the header words before that map. Zero until the generated module loads,
+-- which leaves the ring write unavailable and the frame on its Lua writer.
+fftsa.nl.PX_WORDS  = 0
+fftsa.nl.PX_MAXREC = 0
+fftsa.nl.PX_HDR    = 0
 
 -- Picker index to DSP_WINDOW_*, the enum in csrc/dsp.h, and a separate map from
 -- fftsa.win_dsp, which goes to dsp.WINDOW_*. The two enums coincide today and nothing holds
@@ -4889,6 +4982,13 @@ function fftsa.nl.px_clear()
   p.xcol, p.cands, p.curfail = nil, nil, 0
   p.slicehits, p.slicefrom = nil, nil
   p.cachetries = 0
+  -- The route that engaged goes with the geometry it engaged through. Left set, these two
+  -- outlive the session that earned them, and the next pass reports a route it is not using:
+  -- via=sub and /chain on a launch whose chain never closed.
+  p.via, p.from = nil, nil
+  -- And the image's ring block, which describes the geometry above. Left set, px_write would
+  -- call with a block naming a ring this map no longer believes in.
+  p.nat, p.nat_why, p.natwrote = false, nil, nil
 end
 
 -- Cleared only when the path actually engages: px_clear runs on every restart, and a counter
@@ -5010,6 +5110,10 @@ function fftsa.nl.px_restart(why)
   -- Left to run on, it spent itself during the first pass and every later pass reported "the
   -- ladder is spent" having read nothing.
   nl.px_subwin = nil
+  -- And the half-adjudicated hit list, by the same rule: the hits are addresses in the window
+  -- read for the PREVIOUS subscription, so finishing them after a rebind spends reads on slots
+  -- that cannot name the new trace, and holds off the window read that could.
+  nl.sub_hitlist, nl.sub_hitat, nl.sub_hitround = nil, nil, nil
   return nil
 end
 
@@ -5349,6 +5453,11 @@ fftsa.nl.PX_SUB_HITS  = 12
 -- is elsewhere, where re-reading 64 KB every frame for the whole session would be the cost of
 -- being wrong rather than one read.
 fftsa.nl.PX_SUB_FINDS = 32
+-- Guarded reads one call may spend deciding which of a window's name hits is a slot, before it
+-- saves its place and lets the frame go. Where the name offset is known that covers every hit
+-- the window can hold; where it is not, a hit costs one read per candidate offset and this is
+-- what keeps a failing window from spending 144 round trips without a yield.
+fftsa.nl.PX_SUB_JUDGE = 16
 -- Frames to wait for a known slot's ring to fill before sweeping anyway. The ring fills from
 -- the app's own appends, so this is a couple of frames in practice; the bound exists for a
 -- build where a slot reads as live and the chain behind it means something else. Reset by
@@ -5378,6 +5487,14 @@ function fftsa.nl.px_sub_slot()
     nl.px_subslot, nl.sub_trace = nil, nil
     nl.sub_why = 'the slot stopped reading as the kind it was found with'
   end
+  -- An adjudication a frame ran out of budget for is finished before any window is read again.
+  -- The hits are addresses, so resuming costs nothing, and a second attempt within one frame
+  -- continues the list instead of reading the window a second time.
+  if nl.sub_hitlist ~= nil then return nl.px_sub_judge() end
+  -- The window read itself is ONE call and is deliberately not charged against rd_over: this is
+  -- the route that makes the search unnecessary, and gating it would let whichever engine ran
+  -- earlier in the frame starve the best answer. Only the adjudication, which is where the
+  -- round trips multiply, takes a share of the frame.
   nl.px_subfinds = (nl.px_subfinds or 0) + 1
   if nl.px_subfinds > nl.PX_SUB_FINDS then
     nl.sub_why = 'the name is not in the window, ' .. tostring(nl.PX_SUB_FINDS)
@@ -5437,6 +5554,12 @@ function fftsa.nl.px_sub_slot()
   -- So the hits are collected, then tried in two rounds. The 7510's kind is known to be the
   -- same 0x407F, so the loose round is a fallback for a build that changed it and never a
   -- shortcut past a slot that would have matched exactly.
+  --
+  -- The hits are collected as ADDRESSES and the window string is then dropped, so the rounds
+  -- can be charged to the frame budget and resumed on a later frame without reading the window
+  -- again. A hit costs up to one read per candidate name offset: twelve hits against twelve
+  -- offsets is 144 round trips, three times the whole per-frame allowance, and spending them
+  -- in one uninterruptible frame is the fault that PX_NAME_FAIL at 512 already cost a build.
   local at, seen = 1, 0
   local hits, nh = {}, 0
   nl.sub_hits = nl.sub_hits or 0
@@ -5451,38 +5574,80 @@ function fftsa.nl.px_sub_slot()
     if nl.sub_first == nil then nl.sub_first = hits[nh] end
   end
   nl.sub_wincap = seen >= nl.PX_SUB_HITS
-  local round
-  for round = 1, 2 do
-    if round == 2 and not nl.PX_SUB_ANYKIND then break end
-    local hi2
-    for hi2 = 1, nh do
-      local na = hits[hi2]
+  nl.sub_hitlist, nl.sub_hitat, nl.sub_hitround = hits, 1, 1
+  return nl.px_sub_judge()
+end
+
+-- One frame's share of adjudicating the name hits a window produced, resuming where the last
+-- frame stopped. Returns the slot, or nil with the reason -- and keeps sub_hitlist set while
+-- there is anything left to try, which is what px_sub_slot tests to know not to read again.
+function fftsa.nl.px_sub_judge()
+  local nl = fftsa.nl
+  local hits = nl.sub_hitlist
+  if hits == nil then return nil end
+  local nh = table.getn(hits)
+  -- ONE OFFSET WHERE THE OFFSET IS KNOWN. The twelve candidates exist to cover a model that
+  -- moved the field; on a DMM6500 the name is at slot+8, read off bufsub_subscribe and the same
+  -- in both builds. Trying all twelve against every hit is what made a failing window cost
+  -- twelve hits times twelve offsets -- 144 round trips, three times the whole per-frame
+  -- allowance, in one uninterruptible frame. With one offset the measured 6500 case is two
+  -- reads: the decoy rejected, the slot found.
+  local offs = nl.PX_SUB_NAMEOFFS
+  if not nl.PX_SUB_DERIVE then offs = { nl.PX_SUB_NAME } end
+  local noffs = table.getn(offs)
+  local nread = 0
+  while nl.sub_hitround <= 2 do
+    if nl.sub_hitround == 2 and not nl.PX_SUB_ANYKIND then break end
+    while nl.sub_hitat <= nh do
+      -- A CALL'S SHARE, not a frame's. The route also runs at bind time, where thousands of
+      -- reads have already been spent and no frame boundary has passed, so charging this
+      -- against rd_over would refuse the best answer precisely when it is wanted. The list
+      -- holds addresses, so what is left resumes on the next call for nothing.
+      if nread > 0 and (nread + noffs) > nl.PX_SUB_JUDGE then
+        nl.sub_why = 'hit ' .. tostring(nl.sub_hitat) .. ' of ' .. tostring(nh)
+                     .. ' still to try in round ' .. tostring(nl.sub_hitround)
+        return nil
+      end
+      local na = hits[nl.sub_hitat]
       local d
-      for d = 1, table.getn(nl.PX_SUB_NAMEOFFS) do
-        local slot = na - nl.PX_SUB_NAMEOFFS[d]
+      for d = 1, noffs do
+        local slot = na - offs[d]
         local kw = nil
-        if slot > 0 and math.mod(slot, 4) == 0 then kw = nl._wg(slot) end
+        if slot > 0 and math.mod(slot, 4) == 0 then
+          kw = nl._wg(slot)
+          nread = nread + 1
+        end
         local livekind = kw == nl.PX_SUB_KIND
-        if round == 2 and (not livekind) and kw ~= nil and kw ~= 0
+        if nl.sub_hitround == 2 and (not livekind) and kw ~= nil and kw ~= 0
            and kw ~= 4294967294 and kw < nl.DRAM_END then
           livekind = true
         end
         if livekind then
           nl.px_subslot = slot
-          nl.sub_nameoff = nl.PX_SUB_NAMEOFFS[d]
+          nl.sub_nameoff = offs[d]
           nl.sub_kind = kw
-          nl.sub_loose = round == 2
+          nl.sub_loose = nl.sub_hitround == 2
           nl.sub_why = nil
+          nl.sub_hitlist, nl.sub_hitat, nl.sub_hitround = nil, nil, nil
           return slot
         end
       end
+      nl.sub_hitat = nl.sub_hitat + 1
     end
+    nl.sub_hitround = nl.sub_hitround + 1
+    nl.sub_hitat = 1
   end
-  -- No hit was a slot: keep the first one's neighbourhood for the report, because on a model
+  -- Every hit tried in every round. Keep one neighbourhood for the report, because on a model
   -- whose layout differs that dump is what settles the offsets without another run.
-  if nl.sub_map == nil and nh > 0 then nl.sub_map = nl.px_sub_dump(hits[1]) end
+  --
+  -- THE LAST HIT, NOT THE FIRST. The c2c request record carries a copy of the name BELOW the
+  -- table, so a forward search meets the decoy first and the genuine slots after it -- measured
+  -- on the 6500 as two hits with the decoy leading. Dumping the first described the decoy in
+  -- the one field whose job is to show where a new model's fields really are.
+  if nl.sub_map == nil and nh > 0 then nl.sub_map = nl.px_sub_dump(hits[nh]) end
   nl.sub_why = tostring(nl.sub_hits) .. ' name hit(s) through ' .. hx(nl.px_subwin)
                .. ', none a live graph trace'
+  nl.sub_hitlist, nl.sub_hitat, nl.sub_hitround = nil, nil, nil
   return nil
 end
 
@@ -5505,6 +5670,9 @@ fftsa.nl.PX_SUB_NAMEOFFS = { 8, 12, 16, 4, 20, 24, 32, 40, 48, 52, 56, 64 }
 fftsa.nl.PX_SUB_DUMP = 10
 function fftsa.nl.px_sub_dump(na)
   local nl = fftsa.nl
+  -- Which hit these words belong to. Offsets without the address they are measured from cannot
+  -- be checked against anything, and the window holds a decoy as well as the slots.
+  nl.sub_mapat = na
   local out, n = '', 0
   local d
   for d = -64, 192, 4 do
@@ -6924,6 +7092,10 @@ function fftsa.nl.px_map(g, db, hz, nseg)
       p.xpmin, p.xpmax = math.floor(a2), math.floor(a1 + 0.5)
     end
   end
+  -- The image's copy of all of it, so a frame writes the ring with one call instead of
+  -- assembling 28 KB in Lua. A refusal here is not a refusal of the map: the Lua writer draws
+  -- the same picture and px_block says on the About page why it is the one running.
+  nl.px_block()
   return true
 end
 
@@ -7049,6 +7221,136 @@ function fftsa.nl.px_repoint(hz, nseg)
   return true
 end
 
+-- Whether the ring write runs in the image or in Lua. A LIVE KNOB, because the two draw the
+-- same picture at very different costs and the comparison is made on the glass: one
+-- assignment from the socket moves a running app from one writer to the other without a
+-- rebuild, which is how the saving gets measured rather than asserted.
+--
+-- It gates the CALL and not the block, so flipping it either way takes effect on the next
+-- frame. Gating the block instead would mean a session that started with it off could never
+-- be turned on, the block being written once per map.
+fftsa.nl.PX_NATIVE = true
+
+-- ---------------------------------------------------------------------------
+-- THE RING WRITE IN THE IMAGE, and the block it reads.
+--
+-- A pass is 510 twelve-byte patches. In Lua that is a loop over the trace columns to pick
+-- each row's triple out of a prebuilt table, a second loop over the ring slots to place them,
+-- a table.concat of 1530 pieces and one ki.memwrite of 28 KB -- 9.6 ms measured for the
+-- memwrite alone. The image does the same work as a multiply, a clamp and three stores per
+-- record, reading the decibels out of the arena where dsp_reduce left them, so nothing is
+-- copied in to make the call.
+--
+-- NOTHING IN THE BLOCK CHANGES FROM FRAME TO FRAME, which is why it is written once here
+-- rather than packed per frame. The ring, the stride, the two field offsets, the slot map and
+-- the row map are all settled by px_map and hold until px_map runs again; px_repoint rewrites
+-- the x fields of the held image and leaves every one of them alone.
+--
+-- THE WINDOW THE BLOCK DECLARES IS THE WHOLE RING, from the bounds pair in the trace object,
+-- while the records written are the drawn window the ring header reports. Two different
+-- sources, which is the point: a header that has crept cannot take the write outside the ring
+-- the object says it owns. wr_lo..wr_hi is not that window and could not be -- it describes
+-- the arena, and widening it to cover the ring would weaken every test it gates.
+-- ---------------------------------------------------------------------------
+function fftsa.nl.px_block()
+  local nl = fftsa.nl
+  local p = nl.px
+  p.nat, p.nat_why, p.natwrote = false, nil, nil
+  if not nl.ready or nl.entry == nil or nl.entry == 0 then
+    p.nat_why = 'no install'
+    return false
+  end
+  if nl.px_addr == nil or nl.px_addr == 0 or (nl.PX_WORDS or 0) == 0
+     or (nl.PX_HDR or 0) == 0 or (nl.PX_MAXREC or 0) == 0 then
+    p.nat_why = 'the image carries no ring block'
+    return false
+  end
+  local g = p.g
+  local lo, stride, yoff, nrec = p.lo, p.stride, p.yoff, p.nrec
+  local ay, by, idx, nseg = p.ay, p.by, p.idx, p.nseg
+  if g == nil or g.lo == nil or g.hi == nil or lo == nil or stride == nil or yoff == nil
+     or nrec == nil or ay == nil or by == nil or idx == nil or nseg == nil then
+    p.nat_why = 'no mapped geometry'
+    return false
+  end
+  if nrec > nl.PX_MAXREC then
+    p.nat_why = 'the drawn window is ' .. tostring(nrec) .. ' records against the '
+                .. tostring(nl.PX_MAXREC) .. ' the image holds'
+    return false
+  end
+  local ayh, ayl = f64_words(ay)
+  local byh, byl = f64_words(by)
+  local b = { g.lo, g.hi, lo, stride, yoff, nrec, nl.PX_YMAX, ayh, ayl, byh, byl }
+  -- The header width against the image's own figure, for the same reason write_params checks
+  -- PARAM_WORDS: a word added on one side only shifts the slot map, and the image would then
+  -- read a column index out of a row map.
+  if table.getn(b) ~= nl.PX_HDR then
+    p.nat_why = 'the block header is ' .. tostring(table.getn(b)) .. ' words against the '
+                .. tostring(nl.PX_HDR) .. ' the image reads'
+    return false
+  end
+  local s
+  for s = 1, nrec do
+    local k = idx[s]
+    if type(k) ~= 'number' or k < 1 or k > nseg then
+      p.nat_why = 'slot ' .. tostring(s) .. ' maps to column ' .. tostring(k)
+      return false
+    end
+    b[nl.PX_HDR + s] = k
+  end
+  local parts = {}
+  for s = 1, nl.PX_HDR + nrec do parts[s] = u32_pack(b[s]) end
+  ki.memwrite(hx(nl.px_addr), table.concat(parts))
+  p.nat, p.natwrote = true, 0
+  return true
+end
+
+-- One frame's ring write, in the image. Returns the records written, or nil to leave the
+-- caller its Lua writer.
+--
+-- The params struct is packed in full rather than poked: one 228-byte ki.memwrite costs the
+-- same round trip as a four-byte one, and the alternative is a mode word that depends on the
+-- last MODE_RUN having left every other field right.
+--
+-- ONE REFUSAL RETIRES IT. A persistent refusal would otherwise cost the call on top of the
+-- Lua write that has to follow it, every frame for the rest of the session, and the reason
+-- would never be read -- so the reason is kept where the About page shows it and the path
+-- stops asking.
+function fftsa.nl.px_write(nseg)
+  local nl = fftsa.nl
+  local p = nl.px
+  if not p.nat or not nl.PX_NATIVE then return nil end
+  if not nl.ready or nl.entry == nil or nl.entry == 0 then return nil end
+  if nseg ~= p.nseg or p.nrec == nil then return nil end
+  local ok = nl.write_params({
+    mode = nl.MODE_PX,
+    wr_lo = nl.wr_lo, wr_hi = nl.wr_hi,
+    rd_lo = nl.wr_lo, rd_hi = nl.wr_hi,
+    seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
+    plan_addr = nl.plan_addr,
+    red_db = nl.red_db, red_nseg = nseg,
+    px_addr = nl.px_addr,
+  })
+  if not ok then
+    p.nat, p.nat_why = false, 'write_params refused'
+    return nil
+  end
+  -- nl.last_rc is deliberately NOT written here. Two callers read it as the status of the
+  -- last SPECTRUM run -- the demotion message, and the About page's rc= -- and both would
+  -- otherwise read a ring record count, which is positive too and so reads as a run that
+  -- went fine. This call's status goes to nat_why, which px_str shows beside nw=.
+  local rc = nl.call_native(nl.entry)
+  -- The record count and not just a non-negative status: the image reports what it wrote, so
+  -- a short write is a refusal here rather than a picture nothing accounted for.
+  if type(rc) ~= 'number' or rc ~= p.nrec then
+    p.nat = false
+    p.nat_why = 'rc=' .. nl.rc_name(rc) .. ' wanted ' .. tostring(p.nrec)
+    return nil
+  end
+  p.natwrote = (p.natwrote or 0) + 1
+  return rc
+end
+
 -- One frame. Returns the points drawn, or nil to leave the caller its append path.
 --
 -- tb and t are the caller's: the trace buffer and the one timestamp this frame may use. The
@@ -7062,6 +7364,10 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   if p.nseg ~= nseg then
     return nl.px_dropframe('nseg moved from ' .. tostring(p.nseg) .. ' to ' .. tostring(nseg))
   end
+  -- Whether this frame re-pointed, which decides which writer lays the block down: the x
+  -- fields the re-point rewrote live outside the y triple and only the Lua writer carries
+  -- them to the ring.
+  local repointed = false
   if p.hz1 ~= hz[1] or p.hz2 ~= hz[2] then
     -- An FFT size change moves every column frequency and nothing else. Re-point the two x
     -- fields in place and keep drawing; drop only if something beyond the series moved.
@@ -7070,6 +7376,7 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
       if p.rp_why ~= nil then w = w .. ': ' .. tostring(p.rp_why) end
       return nl.px_dropframe(w)
     end
+    repointed = true
   end
   local stride, nrec, lo = p.stride, p.nrec, p.lo
   -- The cursor, which says where the repaint's own append will land. Read rather than tracked:
@@ -7158,21 +7465,34 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
       end
     end
   end
-  local T, ytab, idx, yb = p.T, p.ytab, p.idx, p.yb
-  local ay, by, ymax = p.ay, p.by, nl.PX_YMAX
-  local fl = math.floor
-  local j
-  for j = 1, nseg do
-    local y = fl(ay * db[j] + by + 0.5)
-    if y < 0 then y = 0 end
-    if y > ymax then y = ymax end
-    yb[j] = ytab[y]
+  local idx = p.idx
+  -- THE RING WRITE, in the image where there is one: a multiply, a clamp and three stores per
+  -- record, reading the decibels where dsp_reduce left them.
+  --
+  -- The Lua writer below is not a fallback nobody runs. It is what a build with no image
+  -- uses, and it is the ONLY form that lays down a RE-POINTED series -- the x pixel and the x
+  -- float sit in the held image's other two pieces and the ring write touches neither -- so a
+  -- frame that re-pointed writes the whole block from here. That is also what keeps the held
+  -- image's y pieces from going stale: they are refreshed by the one writer that reads them.
+  local wrote = nil
+  if not repointed then wrote = nl.px_write(nseg) end
+  if wrote == nil then
+    local T, ytab, yb = p.T, p.ytab, p.yb
+    local ay, by, ymax = p.ay, p.by, nl.PX_YMAX
+    local fl = math.floor
+    local j
+    for j = 1, nseg do
+      local y = fl(ay * db[j] + by + 0.5)
+      if y < 0 then y = 0 end
+      if y > ymax then y = ymax end
+      yb[j] = ytab[y]
+    end
+    local s
+    for s = 1, nrec do
+      T[3 * s - 1] = yb[idx[s]]
+    end
+    ki.memwrite(hx(lo), table.concat(T))
   end
-  local s
-  for s = 1, nrec do
-    T[3 * s - 1] = yb[idx[s]]
-  end
-  ki.memwrite(hx(lo), table.concat(T))
   -- The repaint. At the frequency the cursor's slot already carries, so the firmware draws the
   -- point this code would have drawn there, and its pixel is next frame's check on the map.
   --
@@ -8005,6 +8325,16 @@ function fftsa.nl.px_str()
     o = o .. string.format(' map=%.4f*db%+.2f r=%.2f sp=%.0f', p.ay, p.by, p.resid, p.span)
   end
   if p.frames ~= nil then o = o .. ' n=' .. tostring(p.frames) end
+  -- WHICH WRITER IS LAYING THE RING DOWN, and why it is not the image's. The two draw the
+  -- same picture at very different costs -- one call against 28 KB assembled in Lua -- so a
+  -- frame rate that does not match the build is read off this field first.
+  if p.nat and not nl.PX_NATIVE then
+    o = o .. ' nw=off'
+  elseif p.nat then
+    o = o .. ' nw=' .. tostring(p.natwrote or 0)
+  elseif p.nat_why ~= nil then
+    o = o .. ' nw=0/' .. tostring(p.nat_why)
+  end
   if p.from ~= nil then o = o .. ' via=' .. tostring(p.from) end
   -- The derived table base, and why it is absent. This is the figure that turns a sweep per
   -- launch into three reads, so whether it was derived is the thing to read off the glass.
@@ -8095,8 +8425,8 @@ function fftsa.nl.px_str()
   -- /chain means the chain closed and handed over geometry. /mapped means px_map accepted it
   -- and the path drew. They are different claims and a report that conflates them says the
   -- route worked on a launch where the frequencies never matched.
-  if nl.px_subok then o = o .. '/chain' end
-  if nl.px.from == 'sub' or nl.px.via == 'sub' then o = o .. '/mapped' end
+  if nl.px.from == 'sub' or nl.px.via == 'sub' then o = o .. '/chain' end
+  if nl.px_subok then o = o .. '/mapped' end
   -- WHICH PROFILE AND WHICH WINDOW. A 7510 report reading 0hit cannot otherwise show that the
   -- 7510 window was the one actually read.
   o = o .. ' subcfg=' .. tostring(nl.sub_profile or '?') .. '@' .. hx(nl.PX_SUB_LO)
@@ -8129,7 +8459,9 @@ function fftsa.nl.px_str()
   end
   local sw = nl.sub_why or nl.sub_lastwhy
   if sw ~= nil then o = o .. '[' .. tostring(sw) .. ']' end
-  if nl.sub_map ~= nil and not nl.px_subok then o = o .. ' submap=' .. nl.sub_map end
+  if nl.sub_map ~= nil and not nl.px_subok then
+    o = o .. ' submap=' .. hxn(nl.sub_mapat) .. ':' .. nl.sub_map
+  end
   -- Hits and candidates, because without them a search that finds the ring and rejects it
   -- reads exactly like a search that never reached it. That is how the staging-ring stride
   -- came to look like 981 MB of absence.
@@ -8245,6 +8577,10 @@ function fftsa.nl.write_params(t)
     -- do no searching. Zero when the caller has none, which the image treats as a refusal
     -- rather than reading address zero.
     t.find_addr or 0,
+    -- And the graph ring block, for DSPN_MODE_PX. Addressed for the same reason, and with a
+    -- stronger one: nothing in it changes from frame to frame, so a frame that draws writes
+    -- the mode and calls.
+    t.px_addr or 0,
   }
   if table.getn(w) ~= fftsa.nl.PARAM_WORDS then return false end
   local parts = {}
@@ -8516,7 +8852,12 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- same two figures rather than sent across as a third.
   local res_bytes = nl.RES_DOUBLES * 8 + nl.RES_PEAKS * 4
                     + 2 * nl.RES_PEAKS * nl.SIZEOF_REAL
-  nl.nseg_ceil = math.floor((nl.CHUNK_BYTES - 32 - res_bytes) / (2 * nl.SIZEOF_REAL))
+  -- The find block and the graph ring block share that chunk too, so the ceiling counts them
+  -- as well. Without the ring block it was over by a kilobyte, and the figure a refusal
+  -- quotes has to be the room that actually exists.
+  local blk_bytes = (nl.FIND_WORDS or 0) * 4 + (nl.PX_WORDS or 0) * 4
+  nl.nseg_ceil = math.floor((nl.CHUNK_BYTES - 32 - res_bytes - blk_bytes)
+                            / (2 * nl.SIZEOF_REAL))
   if want_n > nmax or want_nseg < 2 or want_nseg > nl.nseg_ceil then
     trace('size.refused', want_n, want_nseg)
     return nl._no('size refused: n=' .. tostring(want_n) .. ' max=' .. tostring(nmax)
@@ -8834,10 +9175,15 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- is a whole number of doubles so the sum stays 8-aligned for anything that follows.
   local find_bytes = (nl.FIND_WORDS or 0) * 4
   local find_addr = res_addr + res_bytes
-  if (res_addr - payload[nseg + 2]) + res_bytes + find_bytes > nl.CHUNK_BYTES then
+  -- Then the graph ring block, for MODE_PX: the ring geometry and the slot map. Words again,
+  -- and the largest of the four because the map is one entry per ring record.
+  local px_bytes = (nl.PX_WORDS or 0) * 4
+  local px_addr = find_addr + find_bytes
+  if (res_addr - payload[nseg + 2]) + res_bytes + find_bytes + px_bytes > nl.CHUNK_BYTES then
     return fftsa.nl._abort(cb, pb, 'reduction arrays plus a ' .. tostring(res_bytes)
-                           .. '-byte results block and a ' .. tostring(find_bytes)
-                           .. '-byte find block will not fit a chunk')
+                           .. '-byte results block, a ' .. tostring(find_bytes)
+                           .. '-byte find block and a ' .. tostring(px_bytes)
+                           .. '-byte ring block will not fit a chunk')
   end
 
   -- The segment vector itself, in the code buffer above the params struct.
@@ -8889,6 +9235,7 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   nl.red_hz    = red_hz
   nl.res_addr  = res_addr
   nl.find_addr = find_addr
+  nl.px_addr   = px_addr
   nl.nseg_max  = want_nseg
   nl.kind      = kind or 1
   nl.beta      = beta or 0
@@ -9624,38 +9971,38 @@ end
 -- address. Concatenated after native_link.tsp, which creates fftsa.nl, and before
 -- spectrum_app.tsp, which reads nl.ready.
 --
--- 25840 bytes of image, 2565 relocation bytes (285 entries).
+-- 26640 bytes of image, 2619 relocation bytes (291 entries).
 
-fftsa.nl._DSP_CODE_B64_LEN = 25840
+fftsa.nl._DSP_CODE_B64_LEN = 26640
 fftsa.nl._DSP_CODE_B64 = table.concat({
-'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',
+'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',
 })
 
 -- Relocation table and the target struct sizes, from emit_reloc.py.
-fftsa.nl._DSP_RELOC_B64_LEN = 2565
+fftsa.nl._DSP_RELOC_B64_LEN = 2619
 fftsa.nl._DSP_RELOC_B64 = table.concat({
-'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',
+'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',
 })
 
 -- Generated by csrc/tools/emit_reloc.py; do not edit.
--- 285 relocations over a 25840-byte image.
-fftsa.nl._DSP_RELOC_BSS_LO = 25840
-fftsa.nl._DSP_RELOC_BSS_HI = 25868
+-- 291 relocations over a 26640-byte image.
+fftsa.nl._DSP_RELOC_BSS_LO = 26640
+fftsa.nl._DSP_RELOC_BSS_HI = 26668
 -- struct sizes from the target compiler, not from a host build
 fftsa.nl.SIZEOF_PLAN = 2504
-fftsa.nl.SIZEOF_PARAMS = 224
+fftsa.nl.SIZEOF_PARAMS = 228
 fftsa.nl.SIZEOF_REAL = 4
 fftsa.nl.DSP_ALIGN = 32
 -- backstop bounds from dsp_native_bounds.h, so Lua holds no second copy
@@ -9667,9 +10014,13 @@ fftsa.nl.RES_DOUBLES = 42
 -- the find block, for the native search: Lua reserves it and packs it
 fftsa.nl.FIND_WORDS = 42
 fftsa.nl.FIND_MAX = 32
+-- the graph ring block: the geometry and the slot map the ring write reads
+fftsa.nl.PX_WORDS = 1035
+fftsa.nl.PX_MAXREC = 1024
+fftsa.nl.PX_HDR = 11
 -- the word in the image the params address is patched into, and the word
 -- of the params struct the call reports through
-fftsa.nl.PARAMS_SLOT = 25840
+fftsa.nl.PARAMS_SLOT = 26640
 fftsa.nl.STATUS_OFF = 96
 -- the line of dsp_native.c that refused, so a status code names the test
 fftsa.nl.FAIL_OFF = 216
@@ -9991,7 +10342,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.26'
+fftsa.VERSION = '9.32'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -10674,7 +11025,7 @@ function fftsa.dsp_peaks(count)
   -- and not nl_res, so a native frame whose results did not read back answers no peaks
   -- rather than putting the question to a primitive that cannot answer it.
   if fftsa.nl_frame then
-    local res = fftsa.nl_res
+    local res = fftsa.nl_results()
     for i = 1, count do
       if res == nil then hz[i], v[i] = nil, nil
       else hz[i], v[i] = res.hz[i], res.v[i] end
@@ -10697,9 +11048,25 @@ end
 -- spectrum on screen. thd is a fraction, as dsp.distortion() reports it; the THD line
 -- turns it into a percentage. Each figure is nil where the measurement did not apply, and
 -- all three are nil on a native frame whose results block did not read back.
+-- The native results block for THIS frame, read at most once and only when asked.
+--
+-- Keyed on a flag the frame clears rather than on a frame number, so there is no counter to
+-- wrap or to reset: nl_res_done false means "this frame has not tried yet", and a read that
+-- fails leaves nl_res nil with the flag set, so a failure is not retried thirty times by
+-- thirty callers. Gated on nl_frame for the same reason the eager read was -- a frame the
+-- compiled path did not produce has no block to read.
+function fftsa.nl_results()
+  if not fftsa.nl_frame then return nil end
+  if not fftsa.nl_res_done then
+    fftsa.nl_res_done = true
+    fftsa.nl_res = fftsa.nl.results()
+  end
+  return fftsa.nl_res
+end
+
 function fftsa.distortion()
   if fftsa.nl_frame then
-    local res = fftsa.nl_res
+    local res = fftsa.nl_results()
     if res == nil then return nil, nil, nil end
     return res.thd, res.snr, res.noise
   end
@@ -10747,7 +11114,10 @@ function fftsa.frame_body()
   -- written while the results block fails to read back.
   local nseg
   fftsa.nl_frame = false
-  fftsa.nl_res = nil
+  -- nl_res_done says "this frame has already tried", so the block is read at most once a
+  -- frame and only if something asks for it. Cleared here with nl_res itself, which is what
+  -- keeps a frame from ever being handed the previous frame's figures.
+  fftsa.nl_res, fftsa.nl_res_done = nil, false
   local native = fftsa.nl_usable()
   -- A wrapped capture comes back rotated: readings[1] is the ring's physical slot 1 and the
   -- oldest reading sits at startindex, so a linear walk over the storage transforms the
@@ -10796,7 +11166,12 @@ function fftsa.frame_body()
       else
         fftsa.binhz = binhz
         fftsa.nl_frame = true
-        fftsa.nl_res = fftsa.nl.results()
+        -- THE RESULTS BLOCK IS NOT READ HERE. Every consumer of it -- the peak table and the
+        -- THD line -- runs on the one-second clock, while this ran on every frame: a memread
+        -- plus a double decode per field, measured at about 3 ms of a frame with 50 to spend,
+        -- paid thirty times for each time it was used. fftsa.nl_results() reads it on demand
+        -- instead, once a frame at most, which leaves the figures exactly as fresh as the
+        -- frame that asks for them.
         -- buffer.write.reading is the only way points reach the glass. The display task
         -- paints from its own copy and that copy is fed one point per call: measured by
         -- replacing all 255 elements in place with the descriptor untouched, which the
@@ -10993,6 +11368,11 @@ function fftsa.frame()
   if fftsa.last_entry ~= nil then
     local gap = entry - fftsa.last_entry
     if fftsa.gap_peak == nil or gap > fftsa.gap_peak then fftsa.gap_peak = gap end
+    -- The last gap as well as the peak, because the peak answers "what is the period armed
+    -- against" and this answers "what is the loop actually delivering". They differ in both
+    -- directions -- measured at 4096, armed 0.15 and delivered 0.20 -- and no arithmetic over
+    -- the armed period recovers it, so it is reported rather than inferred.
+    fftsa.gap_last = gap
   end
   fftsa.last_entry = entry
   fftsa.fps_n = (fftsa.fps_n or 0) + 1
@@ -11095,6 +11475,15 @@ function fftsa.frame()
       -- window adopt what it measured, in either direction, which is one window instead of
       -- several seconds of hunting. Jitter is still deadbanded every window after it.
       if fftsa.period_modelled then need = 0 end
+      -- WHAT THE WINDOW ASKED FOR AND WHAT IT GOT, kept because neither is recoverable
+      -- afterwards. The peaks are decayed four lines below, so a reader sampling plain_peak
+      -- later sees the value it was reset to and not the one the period was armed from --
+      -- measured on the glass as a 110 ms period sitting beside a peak of 55, which reads as
+      -- the controller ignoring its own input. want is kept as well as the peak: when it
+      -- differs from the period the deadband refused the move, which is the one state where
+      -- the period and the work disagree and nothing on screen said so.
+      fftsa.armed_from = fftsa.plain_peak or fftsa.work_peak
+      fftsa.armed_want = want
       if fftsa.period == nil or move >= need then
         fftsa.period = want
         fftsa.arm(want)

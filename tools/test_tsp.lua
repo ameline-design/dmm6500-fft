@@ -159,6 +159,9 @@ function display.create(parent, kind, ...)
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].value = 1 end
   -- OBJ_TEXT is (x, y, text, colour, font, justify), so the font is a[5].
   if kind == display.OBJ_TEXT then OBJ[h].text = a[3] end
+  -- And where it was put, so a gate about two fields sharing a row can ask the objects
+  -- rather than re-reading the constants the app positioned them from.
+  if kind == display.OBJ_TEXT then OBJ[h].x, OBJ[h].y = a[1], a[2] end
   if kind == display.OBJ_TEXT then OBJ[h].colour, OBJ[h].font = a[4], a[5] end
   if kind == display.OBJ_TEXT then OBJ[h].justify = a[6] end
   if kind == display.OBJ_EDIT_OPTION then OBJ[h].help = a[4] end
@@ -1846,6 +1849,41 @@ check('peak fields were populated', OBJ[fftsa.sg_pk_f[1]].text ~= nil
 check('the settings line is on screen', OBJ[fftsa.sg_xunit].text ~= nil,
       tostring(OBJ[fftsa.sg_xunit].text))
 
+-- THE RESULTS BLOCK IS READ ON DEMAND, ONCE A FRAME, AND NOT CACHED ACROSS ONE.
+--
+-- It feeds the peak table and the THD line, both of which run on the one-second clock, and it
+-- was read on every frame: a memread plus a double decode per field, about 3 ms of a frame
+-- with 50 to spend, for figures nothing had asked for. The cache must not outlive its frame
+-- either, or a report puts the previous frame's peaks beside this frame's trace.
+check('the results block is read on demand, once a frame, and not cached across one',
+      (function()
+  -- This suite runs the interpreted path and has no nl at all, so the reader is driven
+  -- against a stub: what is under test is the once-a-frame rule, not the native read.
+  local keepnl = fftsa.nl
+  local n = 0
+  fftsa.nl = { results = function() n = n + 1 return {hz = {}, v = {}, npk = 0} end }
+  local keepf, keepd, keepr = fftsa.nl_frame, fftsa.nl_res_done, fftsa.nl_res
+  fftsa.nl_frame, fftsa.nl_res_done, fftsa.nl_res = true, false, nil
+  local none = n
+  fftsa.nl_results()
+  local once = n
+  fftsa.nl_results()
+  local twice = n
+  -- What the frame body does at its top.
+  fftsa.nl_res, fftsa.nl_res_done = nil, false
+  fftsa.nl_results()
+  local nextframe = n
+  -- And a frame the compiled path did not produce has no block to read.
+  fftsa.nl_frame, fftsa.nl_res_done = false, false
+  fftsa.nl_results()
+  local notnative = n
+  fftsa.nl = keepnl
+  fftsa.nl_frame, fftsa.nl_res_done, fftsa.nl_res = keepf, keepd, keepr
+  return none == 0 and once == 1 and twice == 1 and nextframe == 2 and notnative == 2,
+         string.format('unasked=%d one ask=%d two asks=%d new frame=%d not native=%d',
+                       none, once, twice, nextframe, notnative)
+end)())
+
 -- The peak-text gate, asserted in both directions. Five frames ran above and
 -- only the first of them is allowed to have drawn the block; a gate that never
 -- opens would pass the "populated" check above just as well as a correct one,
@@ -3461,9 +3499,10 @@ check('X is bound to the extra field, not the timestamp',
       'xelem=' .. tostring(OBJ[fftsa.sg_graph].xelem) .. ' time would be '
       .. tostring(display.ELEMENT_TIME))
 -- Counted, not probed by name: the firmware labels both axes, so the spectrum screen's
--- only text children are the peak table, the distortion line and the settings line --
--- eighteen peak fields and two lines at the shipped sg_npeak. A row of tick labels coming
--- back breaks it.
+-- only text children are the peak table and three single lines -- the distortion line, the
+-- frame-timing field beside it, and the settings line -- which is eighteen peak fields and
+-- three at the shipped sg_npeak. A row of tick labels coming back is eleven objects and
+-- breaks it; the count is kept exact so one stray object is caught as well.
 check('no label row is created at all', (function()
   local n = 0
   for _, o in pairs(OBJ) do
@@ -3471,9 +3510,80 @@ check('no label row is created at all', (function()
       n = n + 1
     end
   end
-  return n == fftsa.sg_npeak * 3 + 2,
+  return n == fftsa.sg_npeak * 3 + 3,
          string.format('%d text objects on the spectrum screen, want %d',
-                       n, fftsa.sg_npeak * 3 + 2)
+                       n, fftsa.sg_npeak * 3 + 3)
+end)())
+-- THE FRAME TIMING FIELD SHARES THE NOISE ROW AND MUST COLLIDE WITH NEITHER END OF IT.
+--
+-- Its whole point is to be readable while the spectrum is running, so a field overlapping the
+-- noise text or clipped at the right edge is the one failure that makes it useless. Checked
+-- against the longest text each side can produce, at the measured 8 px FONT_SMALL advance,
+-- and against the right edge of the plot the panel gives the app.
+check('the timing field is its own object on the noise row',
+      fftsa.sg_tm ~= nil and fftsa.sg_tm ~= fftsa.sg_thd
+      and OBJ[fftsa.sg_tm] ~= nil and OBJ[fftsa.sg_thd] ~= nil
+      and OBJ[fftsa.sg_tm].y == OBJ[fftsa.sg_thd].y
+      and OBJ[fftsa.sg_tm].x > OBJ[fftsa.sg_thd].x,
+      string.format('timing at (%s,%s), noise at (%s,%s)',
+                    tostring(OBJ[fftsa.sg_tm] and OBJ[fftsa.sg_tm].x),
+                    tostring(OBJ[fftsa.sg_tm] and OBJ[fftsa.sg_tm].y),
+                    tostring(OBJ[fftsa.sg_thd] and OBJ[fftsa.sg_thd].x),
+                    tostring(OBJ[fftsa.sg_thd] and OBJ[fftsa.sg_thd].y)))
+-- Saved and restored around each of these, because the suite runs on from here with a live
+-- app and a field left at a test value would be read by a later gate as the app's own.
+local function tm_set(work, per, gap, acq, spec, mark, yld, show, want)
+  local keep = {fftsa.frame_work, fftsa.period, fftsa.gap_last, fftsa.armed_want,
+                fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark, fftsa.ph.yld, fftsa.ph.show}
+  fftsa.frame_work, fftsa.period, fftsa.gap_last = work, per, gap
+  fftsa.armed_want = want or per
+  fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark = acq, spec, mark
+  fftsa.ph.yld, fftsa.ph.show = yld, show
+  local t = fftsa.sg_tm_text()
+  fftsa.frame_work, fftsa.period, fftsa.gap_last = keep[1], keep[2], keep[3]
+  fftsa.armed_want = keep[4]
+  fftsa.ph.acq, fftsa.ph.spec, fftsa.ph.mark = keep[5], keep[6], keep[7]
+  fftsa.ph.yld, fftsa.ph.show = keep[8], keep[9]
+  return t
+end
+check('it clears the longest noise text and fits before the right edge', (function()
+  local adv = 8
+  local worst = fftsa.sg_thd_text(0.1234, -85.3, -110.6, 16384, false)
+  local noise_ends = fftsa.sg_thd_x + adv * string.len(worst)
+  -- Three-figure milliseconds in every field and the refused-move field present as well, which
+  -- is the 8192-point frame and then some. The widest line the field can ever carry.
+  local tm = tm_set(0.156, 0.160, 0.160, 0.085, 0.040, 0.020, 0.020, 0.030, 0.200)
+  local tm_ends = fftsa.sg_tm_x + adv * string.len(tm)
+  local right = fftsa.sg_gx + fftsa.sg_gw
+  return fftsa.sg_tm_x >= noise_ends and tm_ends <= right,
+         string.format('noise ends %d, timing %d..%d "%s", right edge %d',
+                       noise_ends, fftsa.sg_tm_x, tm_ends, tm, right)
+end)())
+-- THE DELIVERED PERIOD MUST BE REPORTED, not inferred from the armed one. Measured on a
+-- DMM6500 at 2048 with the work pinned at 55 ms, d read 56 at 15 fps and 100 at 9.9 fps against
+-- an armed 80 either way -- so the armed period does not predict the rate and nothing else on
+-- the glass carried the delivered figure. gap_last is the only source for it.
+check('the timing field reports the delivered period and the phase split', (function()
+  local t = tm_set(0.055, 0.080, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006)
+  return t == '55/80 d100 a22 s9 m3 y5 h6', t
+end)())
+-- AND IT SAYS SO WHEN THE DEADBAND REFUSED THE MOVE. Raising the period takes tick_rise and
+-- dropping it takes one grid step, so a window asking for 20 ms more than it has is declined,
+-- the timer fires into a frame still running, and the tick is dropped. That state is the one
+-- where the period on screen is not the period the work needs, and it showed as nothing at all.
+check('a refused period change is reported, and a satisfied one is not', (function()
+  local refused = tm_set(0.054, 0.110, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006, 0.130)
+  local settled = tm_set(0.054, 0.110, 0.100, 0.022, 0.009, 0.003, 0.005, 0.006, 0.110)
+  return refused == '54/110 d100 a22 s9 m3 y5 h6 r130'
+         and settled == '54/110 d100 a22 s9 m3 y5 h6',
+         string.format('refused=%q settled=%q', refused, settled)
+end)())
+check('an unchanged timing line is not rewritten', (function()
+  fftsa.sg_tm_last = nil
+  local first = fftsa.sg_show_tm()
+  local again = fftsa.sg_show_tm()
+  return first == true and again == false,
+         string.format('first write=%s, second=%s', tostring(first), tostring(again))
 end)())
 -- THD and the noise floor against a spectrum built here, so both answers are arithmetic
 -- rather than whatever the mock's generator happens to produce. Every bin is the floor

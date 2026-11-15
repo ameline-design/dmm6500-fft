@@ -278,6 +278,22 @@ target_link_libraries(dsp_native_bounds_test PRIVATE GTest::gtest_main)
 target_compile_options(dsp_native_bounds_test PRIVATE ${DSP_CXX_FLAGS})
 add_test(NAME dsp_native_bounds COMMAND dsp_native_bounds_test)
 
+# And the graph ring fill, for the same reason: the loop that writes the display task's own
+# records cannot be exercised on the instrument, where a wrong destination lands in the heap's
+# free list. The Lua gates stub the native call, so without this the loop's indexing, extent,
+# stores, clamping and rounding are covered by nothing.
+add_executable(dsp_native_px_test test/dsp_native_px_test.cc)
+target_include_directories(dsp_native_px_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(dsp_native_px_test PRIVATE GTest::gtest_main)
+# -ffp-contract=fast, matching the image rather than the host dsp.c variants: this test
+# compiles the shipped loop, so it should compile it the way the image does. It is NOT the
+# gate on contraction, and must not be mistaken for one -- measured on this host, clang
+# declines to fuse `prod + by` across the statement boundary at any contraction setting, so
+# removing the volatile in dspn_px_row passes here and still emits fmadd on PowerPC. The gate
+# that catches that is csrc/tools/check_fp_contract.py, which reads the built image.
+target_compile_options(dsp_native_px_test PRIVATE ${DSP_CXX_FLAGS} -ffp-contract=fast)
+add_test(NAME dsp_native_px COMMAND dsp_native_px_test)
+
 endif()  # NOT CMAKE_CROSSCOMPILING
 
 # The relocation applier runs on the instrument under Lua 5.0.2, where a wrong patch is a
@@ -518,14 +534,24 @@ if(DSP_DST_NATIVE)
       --emit-relocs)
 
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  # The graph ring fill, checked on the linked image before anything is emitted from it. It
+  # is the one loop with a Lua reimplementation that has to agree with it, and -ffp-contract
+  # =fast above makes one fused multiply-add the difference between the two drawing the same
+  # row and drawing rows a pixel apart. The host suite cannot see it: clang does not fuse
+  # this expression on the host at any flag and does on PowerPC, so the built image is the
+  # only place to look.
   add_custom_command(
       OUTPUT dsp_native.bin dsp_native_reloc.lua
+      COMMAND ${Python3_EXECUTABLE} -I
+              ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fp_contract.py
+              --elf $<TARGET_FILE:dsp_native_elf>
       COMMAND ${Python3_EXECUTABLE}
               ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
               $<TARGET_FILE:dsp_native_elf>
               --stem ${CMAKE_CURRENT_BINARY_DIR}/dsp_native
       DEPENDS dsp_native_elf ${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_reloc.py
-      COMMENT "Emitting dsp_native.bin and its relocation table")
+              ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_fp_contract.py
+      COMMENT "Checking the ring fill, then emitting dsp_native.bin and its relocations")
   add_custom_target(dsp_native_bin ALL DEPENDS dsp_native.bin dsp_native_reloc.lua)
 
   # The cache-flush trampoline. Assembled, never linked: it is position-independent and

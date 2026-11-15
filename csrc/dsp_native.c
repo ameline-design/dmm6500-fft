@@ -26,7 +26,9 @@
  * every one is validated before use, at entry, against two independent bounds:
  *
  *   1. The region Lua declares it owns (params->wr_lo .. wr_hi), which is the chunk
- *      storage of buffers the app allocated.
+ *      storage of buffers the app allocated.  DSPN_MODE_PX writes the display task's
+ *      ring, which is in neither, so it declares a window of its own in its own block
+ *      rather than widening that one and weakening every test it gates.
  *   2. A compiled-in backstop of the documented heap extent, so a params struct that
  *      is garbage cannot widen the window.
  *
@@ -71,6 +73,10 @@ volatile uint32_t dspn_params_addr;
  * host suite tests the code that ships rather than a copy of it; see
  * test/dsp_native_bounds_test.cc, which covers every forbidden region by name. */
 #include "dsp_native_bounds.h"
+
+/* The graph ring fill, in a header for the same reason and tested the same way; see
+ * test/dsp_native_px_test.cc. */
+#include "dsp_native_px.h"
 
 #define BACKSTOP_LO  DSPN_DRAM_LO
 #define BACKSTOP_HI  DSPN_DRAM_END
@@ -236,6 +242,29 @@ typedef struct {
      * wire format Lua packs on every frame, and forty-two words of search state would be
      * written on every frame that does no searching. */
     uint32_t find_addr;
+
+    /* Scratch for DSPN_MODE_PX: the graph ring write, addressed for the same reason the two
+     * above are, and with a stronger one.  NOTHING IN THE BLOCK CHANGES FROM FRAME TO FRAME.
+     * The ring, the record stride, the two field offsets, the slot-to-column map and the
+     * decibel-to-row map are all settled when the ring is identified and hold until it is
+     * identified again, so inlining them would pack a kilobyte of unchanged words per frame.
+     *
+     * The block, big-endian words, all written by Lua and none written here:
+     *
+     *   [0]  lo       the only region this call may write, inclusive
+     *   [1]  hi       one past the end
+     *   [2]  ring     the record slot 1 starts at
+     *   [3]  stride   bytes per record
+     *   [4]  yoff     where the y triple sits within a record
+     *   [5]  nrec     records to write, 1..DSPN_PX_MAXREC
+     *   [6]  ymax     the bottom row; a y is clamped into 0..ymax
+     *   [7]  ay_hi    rows per decibel, as the two halves of a double
+     *   [8]  ay_lo
+     *   [9]  by_hi    the row at zero decibels
+     *   [10] by_lo
+     *   [11..] idx    nrec words: the column in red_db each slot draws, 1-based
+     */
+    uint32_t px_addr;
 } dsp_native_params;
 
 #define DSPN_MODE_INIT   1U
@@ -245,6 +274,8 @@ typedef struct {
 #define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes, the same way       */
 #define DSPN_MODE_FIND   5U   /* byte-pattern search; reads the find block and DRAM, and */
                               /* writes nothing but that block's output words            */
+#define DSPN_MODE_PX     6U   /* write the graph ring's y pixels from the reduction's own */
+                              /* array; reads the px block and red_db, writes the ring    */
 
 /* The needle, and the hits one call may report. Sixteen bytes covers everything the search
  * uses: a buffer name with its NUL is twelve, a doubled float32 is eight, four frequencies
@@ -258,6 +289,29 @@ typedef struct {
 /* Chunks the arena may span. At the largest n a single chunk can hold an array for, the
  * layout needs six, so this is generous; it bounds a stack array in dsp_native_run. */
 #define DSPN_MAX_SEGS    32U
+
+/* The graph ring write.
+ *
+ * DSPN_PX_MAXREC bounds the slot map, which is what makes `nrec * stride` safe to compute
+ * before it is checked: the drawn window measured on a DMM6500 is 510 records of a 721-record
+ * ring at 255 trace columns, so a thousand leaves room for a longer ring on another model and
+ * still costs one eighth of the chunk the reduction's arrays live in.
+ *
+ * DSPN_PX_STRIDE_MAX is the other half of that multiply.  A record is 56 bytes on the
+ * firmware this was measured on; the figure here only has to be loose enough not to refuse a
+ * different layout and tight enough that the product cannot wrap.
+ *
+ * DSPN_PX_YMAX keeps the row a plausible panel row rather than any word at all.  It is a
+ * value and not an address, so it cannot reach memory -- but a y of four billion is a wrong
+ * picture, and the conversion to int32 that produces it is undefined.  The panel is 480 rows
+ * and the caller sends 479; this is a sanity ceiling an order of magnitude above it, loose
+ * enough not to refuse a panel nobody here has measured. */
+#define DSPN_PX_MAXREC      1024U
+#define DSPN_PX_STRIDE_MAX  4096U
+#define DSPN_PX_YMAX        4095U
+#define DSPN_PX_HDR         11U
+#define DSPN_PX_WORDS       (DSPN_PX_HDR + DSPN_PX_MAXREC)
+#define DSPN_PX_BYTES       (DSPN_PX_WORDS * 4U)
 
 
 /* The results block.  The peaks and the distortion measurement, as plain doubles that Lua
@@ -309,6 +363,8 @@ typedef struct {
  *   [9] offsetof(dsp_native_params, fail_at)
  *  [10] DSPN_FIND_WORDS
  *  [11] DSPN_FIND_MAX
+ *  [12] DSPN_PX_WORDS
+ *  [13] DSPN_PX_MAXREC
  *
  * The backstop bounds are here so the Lua side can sanity-check an address before passing
  * it in, without a second copy of the numbers to drift: a Lua literal and this header
@@ -321,7 +377,7 @@ typedef struct {
  * Initialised, not tentative: without the initialiser this is a common definition that
  * lands in .bss as zeros and reports nothing.
  */
-const uint32_t dsp_native_sizes[12] = {
+const uint32_t dsp_native_sizes[14] = {
     (uint32_t)sizeof(dsp_plan),
     (uint32_t)sizeof(dsp_native_params),
     (uint32_t)sizeof(dsp_real),
@@ -333,11 +389,13 @@ const uint32_t dsp_native_sizes[12] = {
     (uint32_t)offsetof(dsp_native_params, status),
     (uint32_t)offsetof(dsp_native_params, fail_at),
     (uint32_t)DSPN_FIND_WORDS,
-    (uint32_t)DSPN_FIND_MAX
+    (uint32_t)DSPN_FIND_MAX,
+    (uint32_t)DSPN_PX_WORDS,
+    (uint32_t)DSPN_PX_MAXREC
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  56
+#define DSP_NATIVE_PARAM_WORDS  57
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -745,6 +803,99 @@ int dsp_native_run(void *L)
                 RET(DSPN_EBOUNDS);
             }
         }
+    }
+
+    /* THE GRAPH RING WRITE, answered here because it needs the declared window and the
+     * arena's chunks -- both checked above -- and nothing below it: no plan contents, no
+     * capture, no math entry points.
+     *
+     * What it replaces is a Lua loop over the trace columns, a second loop over the ring
+     * slots, a table.concat of three pieces per record and one ki.memwrite of the whole
+     * block: 9.6 ms measured for the memwrite alone at 510 records, against a multiply, a
+     * clamp and three stores here.  The decibels are read straight out of red_db, which the
+     * MODE_RUN call this one follows has already written, so nothing is copied in to make
+     * the call.
+     *
+     * It writes the y triples and nothing else.  The x pixel and the x float in each record
+     * stay the firmware's own, which is what a re-pointed series has to rewrite -- so a
+     * frame that re-points lays the whole block down from Lua instead and this is not asked.
+     */
+    if (p->mode == DSPN_MODE_PX) {
+        const uint32_t *pb;
+        const dsp_real *db;
+        uint32_t plo, phi, ring, stride, yoff, nrec, ymax, span, rbytes;
+        double ay, by;
+
+        /* The block is read and never written, so the backstop is the bound it needs, and
+         * 4-aligned because it is read as words. */
+        if ((p->px_addr & 3U) != 0U ||
+            !range_ok(p->px_addr, DSPN_PX_BYTES, BACKSTOP_LO, BACKSTOP_HI)) {
+            RET(DSPN_EBOUNDS);
+        }
+        pb     = (const uint32_t *)(uintptr_t)p->px_addr;
+        plo    = pb[0];
+        phi    = pb[1];
+        ring   = pb[2];
+        stride = pb[3];
+        yoff   = pb[4];
+        nrec   = pb[5];
+        ymax   = pb[6];
+        ay     = pw_double(pb[7], pb[8]);
+        by     = pw_double(pb[9], pb[10]);
+
+        /* The geometry first, because the bound on the write is a multiply of two of these
+         * and a sum with a third.  yoff is bounded against stride BEFORE yoff + 12 is
+         * formed: a yoff near 2^32 makes that sum small and it would pass the fit test while
+         * the address it produces wraps. */
+        if (nrec == 0U || nrec > DSPN_PX_MAXREC ||
+            stride == 0U || stride > DSPN_PX_STRIDE_MAX || (stride & 3U) != 0U ||
+            yoff > stride || (yoff & 3U) != 0U || yoff + 12U > stride ||
+            (ring & 3U) != 0U || ymax == 0U || ymax > DSPN_PX_YMAX) {
+            RET(DSPN_EGEOM);
+        }
+        span = nrec * stride;   /* both bounded above, so this cannot wrap */
+
+        /* The region the block declares, and the records inside it.  A WINDOW OF ITS OWN,
+         * not wr_lo..wr_hi: the ring is the display task's allocation for a trace object and
+         * no part of any buffer this code owns, so the window that describes the arena says
+         * nothing about it and widening that one to cover it would weaken every other test
+         * it gates. */
+        if (plo >= phi || plo < BACKSTOP_LO || phi > BACKSTOP_HI ||
+            !dspn_write_ok(ring, span, plo, phi)) {
+            RET(DSPN_EBOUNDS);
+        }
+        /* And clear of everything this call and the next one own.  A ring address that
+         * landed on the arena would be overwritten by the next transform and would corrupt
+         * it in the meantime; one that landed on the plan, the params struct or this block
+         * would corrupt the call in progress. */
+        if (hits_arena(ring, span, segs, nsegs, seg_bytes) ||
+            overlaps(ring, span, p->plan_addr, (uint32_t)sizeof(dsp_plan)) ||
+            overlaps(ring, span, paddr, (uint32_t)sizeof(dsp_native_params)) ||
+            overlaps(ring, span, p->px_addr, DSPN_PX_BYTES)) {
+            RET(DSPN_EBOUNDS);
+        }
+
+        /* The decibels: dsp_reduce's own output array, read in place.  Same window and same
+         * alignment MODE_RUN gives it, and clear of the ring, which a map fitted against the
+         * arena by accident would otherwise read while overwriting. */
+        rbytes = p->red_nseg * (uint32_t)sizeof(dsp_real);
+        if (p->red_nseg == 0U || p->red_nseg > (uint32_t)DSP_NSEG_MAX ||
+            (p->red_db & ((uint32_t)sizeof(dsp_real) - 1U)) != 0U ||
+            !wr_ok(p, p->red_db, rbytes) ||
+            overlaps(ring, span, p->red_db, rbytes)) {
+            RET(DSPN_EREDUCE);
+        }
+
+        /* The slot map, whole, before the first store, and the fill itself.  Both are in
+         * dsp_native_px.h so the host suite runs them rather than a copy: the destination of
+         * every store, the clamp at both ends, NaN, the infinities and the rounding against
+         * the Lua writer's are all covered in test/dsp_native_px_test.cc.  Nothing here can
+         * be reached on the instrument without a destination already proved to be ours. */
+        if (!dspn_px_map_ok(pb + DSPN_PX_HDR, nrec, p->red_nseg)) { RET(DSPN_EGEOM); }
+        db = (const dsp_real *)(uintptr_t)p->red_db;
+        dspn_px_fill((uintptr_t)ring, stride, yoff, nrec, ymax, ay, by,
+                     pb + DSPN_PX_HDR, db);
+        RET((int32_t)nrec);
     }
 
     /* Math addresses, before anything calls through them. */

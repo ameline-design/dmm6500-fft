@@ -2475,6 +2475,242 @@ do
     build(nil)
   end
 
+  -- ---- the ring write in the image -------------------------------------------
+  --
+  -- The write itself is a loop in dsp_native.c and cannot run here. What the Lua side owns
+  -- can be gated, and all of it is: the block the image reads, the refusals that keep a bad
+  -- block out of it, and -- the one that is a correctness question and not a format one --
+  -- which writer lays the ring down on a frame that re-pointed the series.
+  do
+    -- The block's shape comes out of the generated module, not out of this file. A build that
+    -- stops emitting it fails here instead of leaving these gates testing nothing.
+    local fh = io.open('tsp/native_code.tsp', 'r')
+    local gen = ''
+    if fh ~= nil then
+      gen = fh:read('*a')
+      fh:close()
+    end
+    local _, _, gw = string.find(gen, 'fftsa%.nl%.PX_WORDS = (%d+)')
+    local _, _, gm = string.find(gen, 'fftsa%.nl%.PX_MAXREC = (%d+)')
+    local _, _, gh = string.find(gen, 'fftsa%.nl%.PX_HDR = (%d+)')
+    check('the generated module carries the ring block shape the image compiled',
+          gw ~= nil and gm ~= nil and gh ~= nil
+          and tonumber(gh) + tonumber(gm) == tonumber(gw) and tonumber(gm) > NREC,
+          string.format('words=%s hdr=%s map=%s', tostring(gw), tostring(gh), tostring(gm)))
+
+    local keepW, keepM, keepH = fftsa.nl.PX_WORDS, fftsa.nl.PX_MAXREC, fftsa.nl.PX_HDR
+    local keepP, keepCN = fftsa.nl.px_addr, fftsa.nl.call_native
+    fftsa.nl.PX_WORDS  = tonumber(gw) or 0
+    fftsa.nl.PX_MAXREC = tonumber(gm) or 0
+    fftsa.nl.PX_HDR    = tonumber(gh) or 0
+    -- Clear of the ring, of the staging lookalike and of the trace fixture below it.
+    local PXAT = RLO + NREC * STRIDE + 4096
+    fftsa.nl.px_addr = PXAT
+
+    -- The image, as a return code this suite chooses. Nothing here executes PowerPC.
+    local calls, answer = 0, nil
+    fftsa.nl.call_native = function()
+      calls = calls + 1
+      return answer
+    end
+    -- Every write, in order, because the question these gates ask is WHICH write happened.
+    local MW = {}
+    local realmw = ki.memwrite
+    ki.memwrite = function(ah, s)
+      MW[table.getn(MW) + 1] = { at = tonumber(ah, 16), len = string.len(s) }
+      return realmw(ah, s)
+    end
+    local function wrote_ring()
+      local i
+      for i = 1, table.getn(MW) do
+        if MW[i].at == RLO and MW[i].len == NREC * STRIDE then return true end
+      end
+      return false
+    end
+    local function bword(blk, i)
+      local o = i * 4
+      return (((string.byte(blk, o + 1) * 256 + string.byte(blk, o + 2)) * 256
+               + string.byte(blk, o + 3)) * 256) + string.byte(blk, o + 4)
+    end
+    local function blockbytes()
+      return ki.memread(string.format('%X', PXAT),
+                        string.format('%X', (fftsa.nl.PX_HDR + NREC) * 4))
+    end
+
+    do
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      local p = fftsa.nl.px
+      local blk = blockbytes()
+      local ayh, ayl = fftsa.nl._f64_words(p.ay)
+      local byh, byl = fftsa.nl._f64_words(p.by)
+      local hdrok = bword(blk, 3) == STRIDE and bword(blk, 4) == p.yoff
+                    and bword(blk, 5) == NREC and bword(blk, 6) == fftsa.nl.PX_YMAX
+                    and bword(blk, 7) == ayh and bword(blk, 8) == ayl
+                    and bword(blk, 9) == byh and bword(blk, 10) == byl
+      local mapok, s = true, nil
+      for s = 1, NREC do
+        if bword(blk, fftsa.nl.PX_HDR + s - 1) ~= slot_index(s) then mapok = false end
+      end
+      check('the ring block carries the geometry, the row map and one column per slot',
+            p.nat == true and hdrok and mapok,
+            string.format('nat=%s why=%s stride=%d y@%d nrec=%d ymax=%d map=%s',
+                          tostring(p.nat), tostring(p.nat_why), bword(blk, 3),
+                          bword(blk, 4), bword(blk, 5), bword(blk, 6), tostring(mapok)))
+    end
+
+    do
+      -- THE WINDOW IS THE RING AND THE RECORDS ARE THE DRAWN WINDOW, which are two different
+      -- things from two different sources: the bounds pair in the trace object, and the ring
+      -- header's own oldest and count. Made to differ here on purpose -- on the fixture they
+      -- coincide, so a block that declared the drawn window as its window would pass every
+      -- other gate in this file and let a crept header carry the write out of the ring.
+      build(nil)
+      wr32(HDRAT + fftsa.nl.HDR_OLD, RLO + STRIDE)
+      wr32(HDRAT + fftsa.nl.HDR_COUNT, NREC - 1)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      local blk = ki.memread(string.format('%X', PXAT), string.format('%X', 24))
+      check('the block declares the whole ring and writes the drawn window inside it',
+            fftsa.nl.px.nat == true
+            and bword(blk, 0) == RLO and bword(blk, 1) == RLO + NREC * STRIDE
+            and bword(blk, 2) == RLO + STRIDE and bword(blk, 5) == NREC - 1,
+            string.format('window %X..%X, %d records from %X; ring is %X..%X',
+                          bword(blk, 0), bword(blk, 1), bword(blk, 5), bword(blk, 2),
+                          RLO, RLO + NREC * STRIDE))
+      build(nil)
+    end
+
+    do
+      -- A drawn window longer than the map the image compiled room for. Refused, and the
+      -- frame stays on the Lua writer rather than calling with a block the image will read
+      -- past the end of.
+      build(nil)
+      fftsa.nl.PX_MAXREC = NREC - 1
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      check('a drawn window longer than the image holds refuses the block, and says so',
+            fftsa.nl.px.nat == false
+            and string.find(tostring(fftsa.nl.px.nat_why), 'records', 1, true) ~= nil,
+            'nat=' .. tostring(fftsa.nl.px.nat) .. ' why=' .. tostring(fftsa.nl.px.nat_why))
+      fftsa.nl.PX_MAXREC = tonumber(gm) or 0
+    end
+
+    do
+      -- A slot naming a column the spectrum does not have. px_map cannot produce one -- it
+      -- refuses a frequency that is not in the plan -- so this is reached by corrupting the
+      -- map it built, which is what a future route that derived idx some other way would do.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      fftsa.nl.px.idx[3] = NSEG + 1
+      check('a slot naming a column the spectrum does not have refuses the block',
+            fftsa.nl.px_block() == false
+            and string.find(tostring(fftsa.nl.px.nat_why), 'slot 3', 1, true) ~= nil,
+            'why=' .. tostring(fftsa.nl.px.nat_why))
+    end
+
+    do
+      -- The satisfied call: the image writes the ring and Lua does not. The 28 KB block write
+      -- is the whole saving, so its absence is the gate.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      MW, calls, answer = {}, 0, NREC
+      local n = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4001)
+      check('an answered ring write draws the frame and Lua writes no block',
+            n == NSEG and calls == 1 and not wrote_ring()
+            and fftsa.nl.px.natwrote == 1,
+            string.format('n=%s calls=%d blockwrite=%s nw=%s', tostring(n), calls,
+                          tostring(wrote_ring()), tostring(fftsa.nl.px.natwrote)))
+    end
+
+    do
+      -- A REFUSAL COSTS THE CALL AND NOT THE PICTURE. The Lua writer runs in the same frame,
+      -- so the ring is still complete; and the path stops asking, because a refusal that
+      -- repeated would pay for the call on top of the write every frame for the session.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      MW, calls, answer = {}, 0, fftsa.nl.RC.EBOUNDS
+      local n = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4002)
+      local first = calls
+      local drawn = wrote_ring()
+      MW = {}
+      local n2 = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4003)
+      check('a refused ring write draws from Lua, retires itself and keeps the reason',
+            n == NSEG and first == 1 and drawn and n2 == NSEG and calls == 1
+            and wrote_ring() and fftsa.nl.px.nat == false
+            and string.find(fftsa.nl.px_str(), 'nw=0/', 1, true) ~= nil,
+            string.format('n=%s/%s calls=%d drawn=%s,%s nat=%s why=%s', tostring(n),
+                          tostring(n2), calls, tostring(drawn), tostring(wrote_ring()),
+                          tostring(fftsa.nl.px.nat), tostring(fftsa.nl.px.nat_why)))
+    end
+
+    do
+      -- The knob, which is live because the comparison is made on the glass: it gates the
+      -- call and not the block, so a session that came up with it off can be turned on
+      -- without a relaunch.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      local keepk = fftsa.nl.PX_NATIVE
+      fftsa.nl.PX_NATIVE = false
+      MW, calls, answer = {}, 0, NREC
+      local noff = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4010)
+      local off_lua, off_calls = wrote_ring(), calls
+      local off_page = string.find(fftsa.nl.px_str(), 'nw=off', 1, true) ~= nil
+      fftsa.nl.PX_NATIVE = true
+      MW, calls = {}, 0
+      local non = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 4011)
+      check('the writer knob is live in both directions, with no re-map between',
+            noff == NSEG and off_lua and off_calls == 0 and off_page
+            and non == NSEG and calls == 1 and not wrote_ring(),
+            string.format('off: lua=%s calls=%d page=%s; on: lua=%s calls=%d',
+                          tostring(off_lua), off_calls, tostring(off_page),
+                          tostring(wrote_ring()), calls))
+      fftsa.nl.PX_NATIVE = keepk
+    end
+
+    do
+      -- THE ONE CORRECTNESS CASE. A re-point rewrites the x pixel and the x float in the two
+      -- pieces of the held image the ring write does not touch, so that frame has to lay the
+      -- whole block down from Lua -- and the frame after it goes straight back to the image.
+      -- Without this the series re-points in Lua and the ring keeps the old frequencies, which
+      -- draws the new spectrum at the old columns: correct-looking and wrong.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), DB, HZ, NSEG))
+      local moved, j = {}, nil
+      for j = 1, NSEG do moved[j] = HZ[j] + 1 end
+      MW, calls, answer = {}, 0, NREC
+      local n = fftsa.nl.px_frame(DB, moved, NSEG, 'TB', 4004)
+      local rp = fftsa.nl.px.repoints
+      local lua_drew, img_called = wrote_ring(), calls
+      -- And the x float in the ring is the moved series, which is what the block write was
+      -- for: the image's write would have left the old one there.
+      local rec = ki.memread(string.format('%X', RLO + 2 * STRIDE + OX),
+                             string.format('%X', 4))
+      local xf = fftsa.nl._f32_unpack(rec, 1)
+      MW, calls = {}, 0
+      local n2 = fftsa.nl.px_frame(DB, moved, NSEG, 'TB', 4005)
+      check('a re-pointed frame writes the block from Lua, and the next frame does not',
+            n == NSEG and rp == 1 and lua_drew and img_called == 0
+            and xf ~= nil and math.abs(xf - moved[slot_index(3)]) < 0.01
+            and n2 == NSEG and calls == 1 and not wrote_ring(),
+            string.format('rp=%s lua=%s calls=%d x=%s wanted %s; next lua=%s calls=%d',
+                          tostring(rp), tostring(lua_drew), img_called, tostring(xf),
+                          tostring(moved[slot_index(3)]), tostring(wrote_ring()), calls))
+    end
+
+    ki.memwrite = realmw
+    fftsa.nl.PX_WORDS, fftsa.nl.PX_MAXREC, fftsa.nl.PX_HDR = keepW, keepM, keepH
+    fftsa.nl.px_addr, fftsa.nl.call_native = keepP, keepCN
+    build(nil)
+    fftsa.nl.px_restart('test')
+  end
+
   -- ---- the search ------------------------------------------------------------
   do
     -- Resumable, over slices far smaller than the distance the ring sits from the window start,
@@ -4380,6 +4616,120 @@ do
                             pick and string.format('%X', pick) or 'nil', SLOT,
                             tostring(fftsa.nl.sub_loose)))
         fftsa.nl.PX_SUB_ANYKIND = keepa2
+      end
+      -- /chain AND /mapped ARE DIFFERENT CLAIMS, and the labels were on each other's condition.
+      -- /chain is the chain closing and handing over geometry; /mapped is px_map accepting that
+      -- geometry against the app's own 510 frequencies. Swapped, a launch whose frequencies
+      -- never matched reported the route as mapped -- which is the one thing the field exists
+      -- to distinguish, on a model where a screenshot is all anyone will ever send back.
+      do
+        wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subok = nil
+        fftsa.nl.px.via, fftsa.nl.px.from = 'sub', nil
+        local chained = fftsa.nl.px_str()
+        fftsa.nl.px_subok = true
+        local mapped = fftsa.nl.px_str()
+        local c_has = string.find(chained, '/chain', 1, true) ~= nil
+        local c_no = string.find(chained, '/mapped', 1, true) == nil
+        local m_has = string.find(mapped, '/mapped', 1, true) ~= nil
+        check('a closed chain says /chain, and only an accepted map says /mapped',
+              c_has and c_no and m_has,
+              string.format('chain=%s, chain-only-is-not-mapped=%s, after-map=%s',
+                            tostring(c_has), tostring(c_no), tostring(m_has)))
+        fftsa.nl.px_subok = nil
+      end
+      -- AND THE ROUTE DOES NOT OUTLIVE THE SESSION THAT EARNED IT. px_clear runs on every
+      -- restart; leaving via and from set meant the next pass reported via=sub and a closed
+      -- chain while its own chain had never been asked.
+      do
+        fftsa.nl.px.via, fftsa.nl.px.from = 'sub', 'sub'
+        fftsa.nl.px_subok = nil
+        fftsa.nl.px_restart('the route must not outlive the session')
+        local after = fftsa.nl.px_str()
+        check('a restart drops the route it engaged through, so no later page claims it',
+              fftsa.nl.px.via == nil and fftsa.nl.px.from == nil
+              and string.find(after, '/chain', 1, true) == nil,
+              string.format('via=%s from=%s, page still claims /chain=%s',
+                            tostring(fftsa.nl.px.via), tostring(fftsa.nl.px.from),
+                            tostring(string.find(after, '/chain', 1, true) ~= nil)))
+      end
+      -- A FAILING WINDOW IS ADJUDICATED A CALL AT A TIME. Where the name offset is unknown a
+      -- hit costs one read per candidate offset, so twelve hits against twelve offsets is 144
+      -- round trips -- three times the whole per-frame allowance, spent without a yield. That
+      -- is the same bug class as PX_NAME_FAIL at 512, which measured a relaunch under 3 fps.
+      -- The hits are kept as addresses, so what is left resumes without re-reading the window.
+      do
+        local keepd = fftsa.nl.PX_SUB_DERIVE
+        fftsa.nl.PX_SUB_DERIVE = true
+        wire(0, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+        fftsa.nl.sub_hitlist, fftsa.nl.sub_map, fftsa.nl.sub_mapat = nil, nil, nil
+        -- Counting BOTH primitives, because _wg reads through peek32 and the window through
+        -- memread: a count of one of them is not a count of round trips, which is the cost.
+        local reads, wins = 0, 0
+        local km, kp = ki.memread, ki.peek32
+        ki.memread = function(a, n)
+          reads = reads + 1
+          if tonumber(n, 16) == fftsa.nl.PX_SUB_BYTES then wins = wins + 1 end
+          return km(a, n)
+        end
+        ki.peek32 = function(a)
+          reads = reads + 1
+          return kp(a)
+        end
+        local first = fftsa.nl.px_sub_slot()
+        local pending, reads1 = fftsa.nl.sub_hitlist, reads
+        local calls = 1
+        while fftsa.nl.sub_hitlist ~= nil and calls < 40 do
+          fftsa.nl.px_sub_slot()
+          calls = calls + 1
+        end
+        ki.memread, ki.peek32 = km, kp
+        check('a failing window is adjudicated a call at a time, not in one burst',
+              first == nil and pending ~= nil and calls > 1
+              and reads1 <= fftsa.nl.PX_SUB_JUDGE + 12 and wins == 1,
+              string.format('%d read(s) in the first call, %d call(s), %d window read(s)',
+                            reads1, calls, wins))
+        -- AND THE DUMP DESCRIBES A GENUINE SLOT, NOT THE DECOY. The c2c request record sits
+        -- BELOW the table, so a forward search meets it first; dumping the first hit described
+        -- the one structure already known, in the field whose job is to show where an
+        -- unmeasured model's fields really are.
+        check('the neighbourhood dump is taken from the last hit, not the leading decoy',
+              fftsa.nl.sub_mapat == SLOT + fftsa.nl.PX_SUB_NAME,
+              string.format('dumped around %s, decoy at %X, real slot name at %X',
+                            fftsa.nl.sub_mapat
+                            and string.format('%X', fftsa.nl.sub_mapat) or 'nil',
+                            DECOY + fftsa.nl.PX_SUB_NAME, SLOT + fftsa.nl.PX_SUB_NAME))
+        fftsa.nl.PX_SUB_DERIVE = keepd
+        fftsa.nl.sub_hitlist, fftsa.nl.sub_map, fftsa.nl.sub_mapat = nil, nil, nil
+      end
+      -- AND ON A 6500 THE WHOLE COST IS ONE READ A HIT, because the name offset is known: it
+      -- was read off bufsub_subscribe and is slot+8 on both builds that have been dumped. The
+      -- twelve candidate offsets exist for a model that moved the field, and spending them on a
+      -- model that did not is what made a failing window cost twelve reads a hit.
+      do
+        local keepd2 = fftsa.nl.PX_SUB_DERIVE
+        fftsa.nl.PX_SUB_DERIVE = false
+        wire(0, SP4, SGRAPH, SLOT)
+        fftsa.nl.px_subslot, fftsa.nl.px_subwin, fftsa.nl.px_subfinds = nil, nil, 0
+        fftsa.nl.sub_hitlist = nil
+        -- The REPEATED cost, with the neighbourhood dump already taken. A launch may re-read
+        -- the window PX_SUB_FINDS times and only the first of them pays for the dump, which
+        -- scans 65 words looking for ten pointer-like ones.
+        fftsa.nl.sub_map = 'already taken'
+        local tries = 0
+        local kp2 = ki.peek32
+        ki.peek32 = function(a)
+          tries = tries + 1
+          return kp2(a)
+        end
+        local none = fftsa.nl.px_sub_slot()
+        ki.peek32 = kp2
+        check('on a 6500 a hit that is not a slot costs one read, not one per offset',
+              none == nil and tries <= 2 and fftsa.nl.sub_hitlist == nil,
+              string.format('%d read(s) to reject 2 hits, finished in one call=%s',
+                            tries, tostring(fftsa.nl.sub_hitlist == nil)))
+        fftsa.nl.PX_SUB_DERIVE = keepd2
       end
       fftsa.nl.px_subslot, fftsa.nl.px_subwin = nil, nil
       fftsa.nl.px_subfinds, fftsa.nl.sub_walkdone = 0, nil
