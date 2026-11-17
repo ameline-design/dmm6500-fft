@@ -7856,6 +7856,65 @@ do
   fftsa.sg_nwrote, fftsa.nl_frame = keep.wrote, keep.frame
 end
 
+print('\nthe options screen does no work (real code)')
+
+-- WHAT MAKES THE OPTIONS SCREEN RESPONSIVE is that the frame timer is not its timer.
+--
+-- docs/DMM6500DisplayDoc.md: "A timer is active when its parent object is visible." The frame
+-- timer is created on the spectrum screen, so changing screen stops frames -- and with them the
+-- capture, the transform and every write into the graph -- without anything being switched off.
+-- Parentage is therefore the whole mechanism, and it is one display.create argument away from
+-- being wrong in a way nothing else would report: a timer parented to ROOT, or to the options
+-- screen, would keep digitizing behind a form the operator is trying to read.
+check('the frame timer belongs to the spectrum screen, and only the preview to Options',
+      (function()
+  local ids, k, o = {}, nil, nil
+  for k, o in pairs(OBJ) do
+    if o.alive and o.type == display.OBJ_TIMER then ids[table.getn(ids) + 1] = k end
+  end
+  if table.getn(ids) ~= 2 then
+    return false, table.getn(ids) .. ' live timer(s), wanted 2'
+  end
+  local frame_on, other_on, i = nil, nil, nil
+  for i = 1, 2 do
+    if ids[i] == fftsa.timer then frame_on = OBJ[ids[i]].parent
+    else other_on = OBJ[ids[i]].parent end
+  end
+  return frame_on == fftsa.sg_scr and other_on == fftsa.optscr,
+         string.format('frame timer on %s (spectrum %s), other on %s (options %s)',
+                       tostring(frame_on), tostring(fftsa.sg_scr),
+                       tostring(other_on), tostring(fftsa.optscr))
+end)())
+
+-- And the one timer that IS the options screen's touches no hardware. It previews what the
+-- fields say, so it reads display values and formats a line; a capture or a graph write here
+-- would be acquisition running behind the form, which is what the parentage above prevents.
+check('the options preview tick takes no capture and writes nothing to the graph',
+      (function()
+  local reads, writes, fills = 0, 0, 0
+  local realread, realwrite = dmm.digitize.read, buffer.write.reading
+  local realfill = fftsa.sg_fill
+  dmm.digitize.read = function(b) reads = reads + 1; return realread(b) end
+  -- Fixed arity on both, because 5.0.2 has no pass-through `...`: varargs arrive in arg.
+  buffer.write.reading = function(b, val, extra, secs, frac)
+    writes = writes + 1
+    return realwrite(b, val, extra, secs, frac)
+  end
+  fftsa.sg_fill = function(db, hz, nseg)
+    fills = fills + 1
+    return realfill(db, hz, nseg)
+  end
+  local ok, err, i = true, nil, nil
+  for i = 1, 10 do
+    local o, e = pcall(function() fftsa.opt_tick() end)
+    if not o then ok, err = false, e end
+  end
+  dmm.digitize.read, buffer.write.reading, fftsa.sg_fill = realread, realwrite, realfill
+  return ok and reads == 0 and writes == 0 and fills == 0,
+         string.format('10 ticks: captures=%d graph writes=%d fills=%d err=%s',
+                       reads, writes, fills, tostring(err))
+end)())
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)
