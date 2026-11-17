@@ -5383,6 +5383,50 @@ check('a modelled period is corrected in one window; a converged one holds', (fu
   return ok, why
 end)())
 
+-- A DEADBAND GOVERNS SLACK AND NEVER THE FLOOR.
+--
+-- Rising is deadbanded so a converged period stops chasing jitter, which is right for the slack
+-- ABOVE the work. Below it there is no slack to trade: the timer fires into a frame still
+-- running, the tick is dropped, frames run back to back, and the idle a press needs does not
+-- exist -- so the operator reported every button on the screen starved, worst at 4096 and
+-- stochastic, which is the ratchet arriving in some jitter orders and not others.
+--
+-- The asymmetry is what gets it there: falling takes one 10 ms grid step and rising takes the
+-- 50 ms tick_rise, so work swinging between those two bounds walks the period down to the
+-- fastest frame with no way back. At 4096 the capture alone varies 42 to 74 ms, inside that
+-- window exactly.
+--
+-- Driven at the decision rather than through jitter, because what has to hold is the invariant
+-- and not one sequence that reaches it: a 100 ms peak against an 80 ms period wants 120 ms, and
+-- that 40 ms rise is refused by the 50 ms threshold. The period is then 20 ms SHORT of the
+-- work, which is the state this forbids.
+check('the deadband may not hold the period below the measured work', (function()
+  fftsa.start()
+  local realclock, realarm = os.clock, fftsa.arm
+  local armed = nil
+  fftsa.arm = function(pp) armed = pp return realarm(pp) end
+  local t = 0
+  os.clock = function() t = t + 0.001 return t end
+  -- The starved state, injected: the frame's own work under a stubbed clock is a few
+  -- milliseconds and the peaks are taken with max(), so these survive into the deadband.
+  fftsa.period, fftsa.period_modelled = 0.080, false
+  fftsa.plain_peak, fftsa.work_peak = 0.100, 0.100
+  fftsa.work_seen, fftsa.ph_tick = 7, false
+  local want_was = fftsa.tick_period(0.100)
+  fftsa.frame()
+  local per, wanted = fftsa.period, fftsa.armed_want
+  os.clock, fftsa.arm = realclock, realarm
+  -- Covered means the period leaves room for the work plus the floor. 0.080 is the refusal.
+  local ok = per ~= nil and per >= 0.100 + fftsa.tick_floor and armed == per
+  local why = string.format('peak 100 ms, period was 80: now %s (wanted %s, rise needs %s,'
+                            .. ' so the move of %s would be refused), armed=%s',
+                            tostring(per), tostring(wanted), tostring(fftsa.tick_rise),
+                            tostring(want_was - 0.080), tostring(armed))
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
+end)())
+
 check('every frame length keeps the idle floor, and the long ones do not overpay',
       (function()
   local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}

@@ -1179,6 +1179,30 @@ function fftsa.frame()
       -- window adopt what it measured, in either direction, which is one window instead of
       -- several seconds of hunting. Jitter is still deadbanded every window after it.
       if fftsa.period_modelled then need = 0 end
+      -- NOR MAY A DEADBAND HOLD THE PERIOD BELOW THE WORK.
+      --
+      -- Deadbanding a RISE is right for the slack above the work: that is the part that costs a
+      -- frame when it is too generous, and chasing jitter into it swung the rate at 4096. A
+      -- period SHORT of the work is not slack. The timer fires into a frame that is still
+      -- running, the tick is dropped, frames run back to back, and the idle that dispatches a
+      -- press does not exist -- so every button on the screen is starved for as long as it
+      -- lasts.
+      --
+      -- The asymmetry is what gets it there. Falling takes one grid step and rising takes
+      -- tick_rise, so work that swings by more than the step and less than the rise ratchets
+      -- the period down to the fastest frame and can never climb back. At 4096 the capture
+      -- alone varies 42 to 74 ms, which is exactly that window -- wider than the 10 ms step,
+      -- narrower than the 50 ms rise -- which is why 4096 is where this bites, why 2048 and
+      -- 32768 settle instead, and why it depends on the order the jitter arrives rather than
+      -- happening every time.
+      --
+      -- So the deadband governs slack and never the floor: a rise needed to cover the measured
+      -- work is taken whatever its size.
+      local peak = fftsa.plain_peak or fftsa.work_peak
+      if peak ~= nil and fftsa.period ~= nil
+         and fftsa.period < peak + fftsa.tick_floor then
+        need = 0
+      end
       -- WHAT THE WINDOW ASKED FOR AND WHAT IT GOT, kept because neither is recoverable
       -- afterwards. The peaks are decayed four lines below, so a reader sampling plain_peak
       -- later sees the value it was reset to and not the one the period was armed from --
