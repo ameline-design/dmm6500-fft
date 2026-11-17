@@ -2772,6 +2772,51 @@ do
             string.format('rp=%s lua=%s calls=%d x=%s wanted %s; next lua=%s calls=%d',
                           tostring(rp), tostring(lua_drew), img_called, tostring(xf),
                           tostring(moved[slot_index(3)]), tostring(wrote_ring()), calls))
+      -- A NARROWED SPAN IS A RETUNED AXIS, and it must drop rather than re-point.
+      --
+      -- The fit maps a frequency to an x pixel under the axis it was measured against. Narrow
+      -- the span and every new frequency is still inside the fitted range, so a containment
+      -- test that only looks for frequencies OUTSIDE it passes -- and then each column takes
+      -- its pixel from the old line, lands within a few columns of one end and clamps there.
+      -- Nothing refuses, the decibel fit is untouched, and the trace is wrong: on the
+      -- instrument, a 50 kHz stop moved to 500 Hz. Dropping costs a re-map, which is already
+      -- what a WIDENED span pays, and that one draws correctly.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
+      local narrow, q = {}, nil
+      for q = 1, NSEG do narrow[q] = HZ[q] / 100 end
+      -- Inside the fitted range at both ends, which is what makes the one-sided test pass.
+      local inside = narrow[1] >= fftsa.nl.px.fmin - (fftsa.nl.px.fmax - fftsa.nl.px.fmin)
+                     and narrow[NSEG] <= fftsa.nl.px.fmax
+      MW, calls, answer = {}, 0, NREC
+      -- The delta, not the count: repoints is cumulative over this section.
+      local rp0 = fftsa.nl.px.repoints or 0
+      local nn = fftsa.nl.px_frame(DB, narrow, NSEG, 'TB', 4006)
+      local rp2 = (fftsa.nl.px.repoints or 0) - rp0
+      check('a narrowed span drops the frame rather than re-pointing onto the old fit',
+            inside and nn == nil and rp2 == 0 and not wrote_ring()
+            and string.find(tostring(fftsa.nl.px.whyframe), 'retuned', 1, true) ~= nil,
+            string.format('inside=%s n=%s repoints=%s drew=%s why=%s',
+                          tostring(inside), tostring(nn), tostring(rp2),
+                          tostring(wrote_ring()), tostring(fftsa.nl.px.whyframe)))
+
+      -- And the legitimate case still re-points: the step changes, the ends do not.
+      build(nil)
+      fftsa.nl.px_restart('test')
+      assert(fftsa.nl.px_map(geom(), HZ, NSEG))
+      local regrid = {}
+      for q = 1, NSEG do
+        regrid[q] = HZ[1] + (HZ[NSEG] - HZ[1]) * (q - 1) / (NSEG - 1) + 0.5
+      end
+      MW, calls, answer = {}, 0, NREC
+      local rg0 = fftsa.nl.px.repoints or 0
+      local ng = fftsa.nl.px_frame(DB, regrid, NSEG, 'TB', 4007)
+      local rgd = (fftsa.nl.px.repoints or 0) - rg0
+      check('a re-gridded series at the same span still re-points',
+            ng == NSEG and rgd == 1,
+            string.format('n=%s repointed=%s why=%s', tostring(ng), tostring(rgd),
+                          tostring(fftsa.nl.px.rp_why)))
     end
 
     ki.memwrite = realmw

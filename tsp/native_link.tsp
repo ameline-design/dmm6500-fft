@@ -5292,21 +5292,32 @@ function fftsa.nl.px_repoint(hz, nseg)
     p.rp_why = 'the series has no ends'
     return false
   end
-  -- Inside the fitted axis, give or take one column.
+  -- BOTH ENDS STAY PUT, give or take one column. This is what tells a re-gridded series from
+  -- a retuned axis, and it is the whole licence for reusing the fit.
   --
-  -- Containment with no margin refuses the very case this exists for: a finer bin grid moves
-  -- the end columns by a fraction of a column, and either end can land just outside the range
-  -- the fit was measured over. One column of extrapolation on a line fitted across every slot
-  -- in the window is bounded and harmless, and the pixel is clamped to the measured ends
-  -- regardless. Anything further than that is a retuned axis, not a re-gridded series.
+  -- A re-grid changes the STEP and not the ends: a finer bin grid moves the first and last
+  -- column by a fraction of a column, the span either side of them being the same. A retune
+  -- moves the ends, because the ends are the span. So each end is held to the end it was
+  -- fitted at, within one column -- one column of extrapolation on a line fitted across every
+  -- slot in the window is bounded and harmless, and the pixel is clamped to the measured ends
+  -- regardless.
+  --
+  -- Asking only that the new series lie INSIDE the fitted range does not distinguish the two,
+  -- and fails in one direction only: a narrowed span leaves every new frequency inside the old
+  -- range, so a one-sided test passes while the widget has been re-pinned underneath it. Every
+  -- column then takes its pixel from a line fitted to the old span, lands within a few columns
+  -- of one end and clamps there -- a drawn trace, with nothing refused and the decibel fit
+  -- still reading healthy. A widened span is caught either way, which is why widening a span
+  -- draws correctly and narrowing it does not.
   if p.fmin == nil or p.fmax == nil then
     p.rp_why = 'no fitted axis range'
     return false
   end
   local marg = 0
   if nseg > 1 then marg = (p.fmax - p.fmin) / (nseg - 1) end
-  if f1 < p.fmin - marg or fn > p.fmax + marg then
-    p.rp_why = 'the new series runs outside the axis the fit was measured over'
+  if f1 < p.fmin - marg or f1 > p.fmin + marg
+     or fn < p.fmax - marg or fn > p.fmax + marg then
+    p.rp_why = 'the series ends moved, so the axis was retuned rather than re-gridded'
     return false
   end
   local fl = math.floor
