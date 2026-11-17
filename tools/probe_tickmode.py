@@ -150,20 +150,20 @@ def set_count(d, n):
                ".. '|' .. tostring(fftsa.halted)) end"), 'NC|', timeout=600)
 
 
-# The fixed-period case. The app's own arithmetic is replaced by a constant, and the re-arm
-# threshold is pushed out of reach so nothing changes it back; the frame body is untouched.
+# The fixed-period case. The app's own arithmetic is replaced by a constant and the timer is
+# armed from it at once, so every later re-arm computes the same period back; the frame body is
+# untouched. The deadband that decides whether a re-arm happens at all is tick_rise against the
+# grid step, in fftsa.frame -- there is no threshold knob to push out of reach.
 def fix_timer(d, period):
     return ask(d, one("do fftsa.ZKEEP = fftsa.tick_period",
                       "fftsa.tick_period = function() return %.3f end" % period,
-                      "fftsa.ZRE = fftsa.tick_rearm fftsa.tick_rearm = 1e9",
                       "fftsa.arm(%.3f)" % period,
                       "print('FX|' .. tostring(fftsa.timer ~= nil)) end"), 'FX|', timeout=300)
 
 
 def unfix_timer(d):
     return ask(d, one("do if fftsa.ZKEEP ~= nil then fftsa.tick_period = fftsa.ZKEEP end",
-                      "if fftsa.ZRE ~= nil then fftsa.tick_rearm = fftsa.ZRE end",
-                      "fftsa.ZKEEP, fftsa.ZRE = nil, nil",
+                      "fftsa.ZKEEP = nil",
                       "fftsa.arm(fftsa.tick_period(fftsa.frame_work))",
                       "print('UF|' .. tostring(fftsa.timer ~= nil)) end"), 'UF|', timeout=300)
 
@@ -179,8 +179,6 @@ def restore(d):
                       "fftsa.ZWRAP = nil end",
                       "if fftsa.ZKEEP ~= nil then fftsa.tick_period = fftsa.ZKEEP",
                       "fftsa.ZKEEP = nil end",
-                      "if fftsa.ZRE ~= nil then fftsa.tick_rearm = fftsa.ZRE",
-                      "fftsa.ZRE = nil end",
                       "ZY = 0 fftsa.arm(fftsa.tick_period(fftsa.frame_work))",
                       "print('RS|n=' .. tostring(fftsa.n)",
                       ".. ' timer=' .. tostring(fftsa.timer ~= nil)) end"), 'RS|', timeout=300)

@@ -6835,7 +6835,7 @@ check('stop() twice is harmless', pcall(function() fftsa.stop() end))
 -- The capture buffer has to be the SAME OBJECT across launches, because its storage address
 -- is what nl.describe() caches against it. A replacement moves the storage, the sweep for
 -- the moved buffer comes back empty on a second launch -- measured with nl._stor_elem0 nil
--- while nl.reattached was true -- and the app halts with the graph already drawn.
+-- on a re-attached install -- and the app halts with the graph already drawn.
 --
 -- Three launches, not two, because the count has to be shown not to grow: the first attempt
 -- at keeping buffers across launches leaked a pair per launch and reached 21.

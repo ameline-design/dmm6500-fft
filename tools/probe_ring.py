@@ -34,10 +34,12 @@ configured rate with no catch-up surplus, which a flushed backlog would have sho
 acquisition needs the processor, and the time dmm.digitize.read appears to spend waiting is
 not reclaimable idle -- there is nothing to overlap it with.
 
-That kills the ring, and the arithmetic kills the ping-pong too even though arming is cheap
-at 9.07 ms: processing 140 ms accrues only ~2 400 of 16 384 samples at 17 kS/s, the
-remaining ~14 000 then need ~140 ms at full rate, so a frame is ~289 ms against ~304 ms --
-5%, and both round to the same seven ticks.
+That kills the ring. The 5% that used to be quoted here was arithmetic for a PING-PONG --
+each frame accumulating a fresh, disjoint N, some during compute and the rest after -- and it
+does not describe a sliding window, where successive records overlap and a frame needs only
+what arrived since the last one. The sliding window was built and run on the instrument on
+2026-11-16 and fails for two other reasons; docs/PERFORMANCE.md, "Continuous digitizing into a
+ring", has them. Arming itself is cheap, 9.07 ms.
 
 Also measured: buffer.clear() on 100 000 readings is 0.129 ms, so it is O(1) and not
 O(capacity). Making the capture buffer eight times larger at the short counts cost nothing.

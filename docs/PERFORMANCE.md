@@ -878,6 +878,104 @@ Together 1 + 3 + 4 were worth about **18 ms off 80**, with no resolution cost. T
 visible in the phase table, and the displayed rate went 3.2 -> 10 fps because the timer period came
 down with them. What is left is 2 and 5, and neither crosses the 50 ms boundary that would matter.
 
+## Continuous digitizing into a ring: measured, and it does not work
+
+The capture is the longest thing in a frame at every count above 2048 -- 339 ms of a 401 ms
+frame at 32768 -- and it is serial, so the standing proposal was to run the digitizer
+continuously into the capture buffer as a ring and have each frame transform the most recent
+whole record. Successive windows overlap, so a frame would need whatever arrived since the last
+one rather than a fresh N, and the update rate would stop being the record duration.
+
+**It was built, gated and run on the instrument on 2026-11-16, and it fails for two independent
+reasons. The second cannot be engineered around from this app.**
+
+### 1. At the rate the app uses there is no processor to overlap with
+
+A reading costs **10.36 us of processor to store**, independent of the rate requested -- which is
+why 65,536 readings take 0.679 s at 1 MS/s, 500 kS/s, 200 kS/s and 100 kS/s alike. At 100 kS/s
+that is essentially the whole processor, and `tools/probe_ring.py` measured exactly that: a
+`COUNT_INFINITE` digitize delivered **100,164 S/s with the processor yielded and 17,004 S/s while
+a non-yielding Lua loop held it**, with the samples **dropped rather than queued** -- the
+`delay()` window advanced at the configured rate with no catch-up surplus.
+
+So the blocking read is not wasting idle time; there is none to waste. During the capture the
+processor stores readings and during the rest of the frame it computes, and the duty cycle is
+~100% either way. Overlapping windows give more frames **of the same information**, not more
+information, and they only pay where there is spare processor to put the compute in. Below the
+~96.5 kS/s crossover there is some: a 4096-point record at 50 kS/s spans 82 ms of wall clock but
+only ~42 ms of processor. Above it there is none.
+
+A second, visible consequence: while the model runs the panel is starved, so the Options and
+About buttons respond slowly. That is not the app being busy -- it is the digitizer owning the
+machine.
+
+### 2. The trigger model does not survive a display timer, and it gets worse with N
+
+`dmm6500-serial-decode/docs/TRIGGER.md` records that **a resident application's panel tick,
+dispatched at 2 Hz whenever the interpreter is idle, aborts trigger models it did not start**,
+measured killing one at 427.6, 436.1 and 441.4 ms. Nothing ends a model whose initiating chunk is
+still executing -- but a frame here is a timer callback, so the interpreter **is** idle between
+frames, which is the condition.
+
+Measured on the glass at 32768: **`cont=off[dead]`** -- twenty-four consecutive frames each found
+the model had delivered nothing since the frame before, each re-armed it, and the mode stood
+itself down to the blocking read. The continuity question was never reached at that size.
+
+The tax is the frame period divided by the model's lifetime, so it is worst exactly where the
+prize was:
+
+| N | frame period | frames between deaths |
+|---|---|---|
+| 4096 | 67 ms | ~6 |
+| 8192 | 115 ms | ~4 |
+| 16384 | 208 ms | ~2 |
+| 32768 | 417 ms | **under 1** |
+
+At 4096 the mode stayed armed and delivered **15 fps, the same as the blocking read** -- the
+deaths, the re-arms at 9 ms each and the per-frame window checks accounted for what the removed
+capture gave back. Lowering the sample rate fixes reason 1 and leaves reason 2 untouched.
+
+### What was built, and what is worth keeping from it
+
+The window arithmetic was correct and is the one part worth recording. On a lapped ring the
+physical order is: `1..hp` is this lap with the newest reading at `hp`, and `hp+1..cap_n` is the
+lap before. A window must be chunk-aligned (because `dsp_src_at` maps element k to
+`blk[k/perchunk] + (k%perchunk)*stride`, and a mid-chunk start reads the wrong place from block 1
+on -- which `dspn_chunk_stride_ok` **accepts**, bounding the walk by `[base, base+32768)` rather
+than by the real chunk, so the failure would be a plausible wrong spectrum and never a refusal),
+and it must lie wholly on one side of `hp`. Swept under Lua 5.0.2 over all 65,536 cursor
+positions of the 65536-reading ring at perchunk 1365, with a 100 ms headroom bound:
+
+| N | fresh | repeats the previous window | too close to the writer | no window |
+|---|---|---|---|---|
+| 4096 | 93.8% | 6.2% | 0.0% | 0.00% |
+| 8192 | 87.5% | 12.5% | 0.0% | 0.00% |
+| 16384 | 75.0% | 25.0% | 0.0% | 0.00% |
+| 32768 | 50.0% | 34.7% | 15.3% | 0.01% (7 of 65,536) |
+
+Two further things the attempt established, both of which cost a gate to find:
+
+* **`apply()`'s blocking read leaves a seam in the ring.** Elements `1..n` are the blocking
+  capture and the rest is the continuous model, and the join is a real time discontinuity. At
+  32768 no valid window can avoid it until a full lap completes: a window entirely past the seam
+  needs `ps >= 32769`, so chunk 25, so `hp >= 66893`, and the ring is 65536. Clearing the ring at
+  arming is the fix, not leaving the old contents in place.
+* **A continuity check must partition the window, not sample it.** Checking a few adjacent
+  intervals at offsets that rotate frame to frame does not work, because the window itself moves
+  -- a chunk every `perchunk/fs`, 13.65 ms at 100 kS/s -- so a transient gap leaves the window
+  before the offsets sweep it. Eight missing samples in 4096 is 0.195% of the span and passes a
+  0.2% whole-window test. Partitioning into S contiguous segments and checking each segment's
+  span covers every interval in one frame, costs `S+1` timestamp reads against `2+2S`, and
+  catches a gap of about `tol*count/S` samples.
+
+### What it would take
+
+Driving frames from inside one long-running chunk instead of a display timer, so the interpreter
+is never idle and the tick cannot be dispatched. That is a different application structure --
+`display.waitevent` wedges the interpreter, a key-launched app is what keeps its frame timer at
+all, and the timer is also what lets the display task paint. Not a change worth making for an
+overlap that only pays below 96.5 kS/s.
+
 ## Dead ends, measured -- do not retry these
 
 - **Writing the FLOAT VALUE of a display-task record.** The records were found, the slots were
@@ -892,6 +990,10 @@ down with them. What is left is 2 and 5, and neither crosses the 50 ms boundary 
 - **`bit.*` is slower than arithmetic for masking.** The firmware has an undocumented global `bit`
   table, but a call is 4.1 µs against 2.7 µs for `i - math.floor(i/256)*256`. It wins only where the
   pure-Lua alternative is a loop, and always for XOR, which has no cheap arithmetic equivalent.
+- **Running the digitizer continuously into a ring and transforming the latest N.** Two
+  independent reasons, both measured on 2026-11-16; the section above has them. The short form:
+  at 100 kS/s storing readings is already the whole processor, and the 2 Hz panel tick aborts the
+  trigger model about as often as a large-N frame runs.
 - **A plain Lua table cannot be graphed.** `display.graph.add(g, {...})` is refused with event 1138,
   "Parameter 2, expected type 'reading buffer', but found type 'table'", for both the 2- and
   4-argument forms. The buffer refill is unavoidable.

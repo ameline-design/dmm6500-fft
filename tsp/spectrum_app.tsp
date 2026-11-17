@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.33'
+fftsa.VERSION = '9.43'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -1315,7 +1315,6 @@ function fftsa.opt_layout()
   local spare = floor_y - ((nrows - 1) * dy + eh + edy) - y0
   if spare > 0 then y0 = y0 + math.floor(spare / 2) end
   if y0 + fftsa.opt_y_adj >= 0 then y0 = y0 + fftsa.opt_y_adj end
-  fftsa.opt_nrows, fftsa.opt_dy_used, fftsa.opt_y0_used = nrows, dy, y0
   return nrows, dy, y0
 end
 
@@ -2081,10 +2080,6 @@ fftsa.tick_grid = 0.010
 -- continent. Not raising the event needs nothing undocumented.
 fftsa.tick_grid_7510 = 0.050
 fftsa.tick_min  = 0.050
--- How far the period must move before a re-arm is worth it: every re-arm is a display timer
--- deleted and created against a 463-object pool, and on a 10 ms grid a period that dithers
--- by one step would re-arm for the life of the app.
-fftsa.tick_rearm = 0.020
 -- How far the period must rise before it is re-armed, against one grid step to fall. Wider
 -- than the jitter it is meant to ignore and narrower than a size change.
 fftsa.tick_rise = 0.050

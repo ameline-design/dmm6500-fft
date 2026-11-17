@@ -333,21 +333,16 @@ enum {
  * amplitudes self-correct from the stored window sum, so the only symptom is sidelobes unlike
  * the ones beta promised. A 40-term cap is 3.6e-15 off at beta 30, 2.0e-05 at beta 50 and
  * wrong by 0.43 at the window centre at beta 80.
+ *
+ * WHAT IS TESTED IS A SHORTER LIST: `4, 6, 9, 12, 15, 18`. The ceiling above is what the
+ * Bessel series and the interpolation tables can carry; that list is what is exercised, on
+ * both sides of the API. The TSP implementation holds window tables for exactly those and
+ * refuses ::DSP_EBETA for anything else, so a beta outside the list is accepted here and
+ * rejected there -- the conformance harness keeps a case for that difference rather than
+ * letting it be rediscovered. A caller wanting another beta is asking for an untested
+ * configuration, not a refused one.
  */
 #define DSP_KAISER_BETA_MAX 200.0
-
-/**
- * @brief The Kaiser betas that are tested and supported.
- *
- * `4, 6, 9, 12, 15, 18`. The range above is what the Bessel series and the interpolation
- * tables can carry; this list is what is exercised, on both sides of the API. The TSP
- * implementation holds window tables for exactly these and refuses ::DSP_EBETA for anything
- * else, so a beta outside the list is accepted here and rejected there -- the conformance
- * harness keeps a case for that difference rather than letting it be rediscovered.
- *
- * A caller wanting another beta is asking for an untested configuration, not a refused one.
- */
-#define DSP_KAISER_BETA_SUPPORTED "4, 6, 9, 12, 15, 18"
 
 /**
  * @brief Longest filter a plan reserves room for, and the proposal's order ceiling.

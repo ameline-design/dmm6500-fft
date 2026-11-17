@@ -107,7 +107,7 @@ local function try(mutate)
   reset_heap()
   NLSTASH = fresh_stash()
   if mutate then mutate(NLSTASH) end
-  nl.ready, nl.reattached = false, nil
+  nl.ready = false
   arm_reinit(true)
   local got = nl.reattach(2048, 1, 0, 1, 1)
   return got, nl.ready, replans
@@ -276,7 +276,7 @@ NLSTASH._desc_of, NLSTASH._desc_at = CAP_E0, CAP_E0 + 65568
 fftsa.nl._stor_of, fftsa.nl._stor_x = nil, nil
 fftsa.nl._stor_elem0, fftsa.nl._stor_stride = nil, nil
 fftsa.nl._desc_of, fftsa.nl._desc_at = nil, nil
-nl.ready, nl.reattached = false, nil
+nl.ready = false
 arm_reinit(true)
 local rok = nl.reattach(2048, 1, 0, 1, 1)
 check('puts all six cache fields back on a cold module table',
@@ -2772,6 +2772,7 @@ do
             string.format('rp=%s lua=%s calls=%d x=%s wanted %s; next lua=%s calls=%d',
                           tostring(rp), tostring(lua_drew), img_called, tostring(xf),
                           tostring(moved[slot_index(3)]), tostring(wrote_ring()), calls))
+
       -- A NARROWED SPAN IS A RETUNED AXIS, and it must drop rather than re-point.
       --
       -- The fit maps a frequency to an x pixel under the axis it was measured against. Narrow
@@ -3544,6 +3545,51 @@ do
             string.format('saved=%s loaded=%s span=[%s,%s] ring=%s',
                           tostring(saved), tostring(loaded), tostring(la), tostring(lb),
                           lc ~= nil and string.format('%X/%d', lc.lo, lc.stride) or 'nil'))
+      -- WHY A LOAD MISSED MUST OUTLIVE THE NEXT SAVE. The key's record is what turns the
+      -- 72 MB sweep into a read, so a slow engage is answered by this field and by nothing
+      -- else on the page. A confirmed geometry is re-put on every engage, so if the save
+      -- cleared one reason field the load's reason would be gone by the time anyone read it --
+      -- and a slow engage with no reason beside it is the case that cannot be diagnosed from
+      -- a screen grab.
+      do
+        wrote = nil
+        FFTSA_PXRING, FFTSA_PXSEED = nil, nil
+        fftsa.nl._px_loaded, fftsa.nl._px_saved = nil, nil
+        fftsa.nl.px_load_why, fftsa.nl.px_save_why = nil, nil
+        io, file = keepio, keepfile
+        file = { usbdriveexists = function() return 1 end }
+        io = { open = function(nm, mode)
+          if mode == 'w' then
+            return { write = function(self, b) wrote = b end, close = function() end }
+          end
+          if wrote == nil then return nil end
+          return { read = function(self, n) return wrote end, close = function() end }
+        end }
+        local keepfs2, keepkey2 = fs, fftsa.nl.PX_CACHE_KEY
+        fs = { readdir = function(d)
+          if d ~= fftsa.nl.PX_CACHE_DIR then return nil end
+          local t = {}
+          t[0] = 'something_else.tspa'
+          return t
+        end }
+        fftsa.nl.PX_CACHE_KEY = true
+        local miss = fftsa.nl.px_cache_load()
+        local why_after_load = fftsa.nl.px_load_why
+        fftsa.nl.px_seed_note(SEED2)
+        FFTSA_PXRING = string.format('%d,%d,%d,%d,%d,%d', SEED2, SEED2 + 4096, 24, 56, 0, 12)
+        local re = fftsa.nl.px_cache_save()
+        io, fs, file = keepio, keepfs2, keepfile
+        fftsa.nl.PX_CACHE_KEY = keepkey2
+        check('a save that succeeds does not erase why the load missed',
+              miss == false and why_after_load == 'no record on the key yet'
+              and re == true and fftsa.nl.px_load_why == why_after_load
+              and fftsa.nl.px_save_why == nil,
+              string.format('load=%s loadwhy=%s save=%s loadwhy after=%s savewhy=%s',
+                            tostring(miss), tostring(why_after_load), tostring(re),
+                            tostring(fftsa.nl.px_load_why),
+                            tostring(fftsa.nl.px_save_why)))
+        fftsa.nl.px_load_why, fftsa.nl.px_save_why = nil, nil
+      end
       -- With no key in the slot a save must not raise into the frame, and must not claim it
       -- wrote. file.usbdriveexists is the guard: a write with no key posts 2203 over the app.
       file = { usbdriveexists = function() return 0 end }

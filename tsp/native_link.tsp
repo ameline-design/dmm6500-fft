@@ -63,10 +63,10 @@ function fftsa.nl.rc_name(rc)
 end
 
 -- DSP_THD_MAINS_* from csrc/dsp.h. Hum at a multiple of the selected mains frequency is
--- passed over when the fundamental is sought; BOTH discounts 50 and 60.
+-- passed over when the fundamental is sought, and BOTH discounts 50 and 60. The image also
+-- takes 50 or 60 alone; this app has no mains setting and sends BOTH on every frame, so the
+-- other two are not named here.
 fftsa.nl.MAINS_BOTH = -1
-fftsa.nl.MAINS_A    = 50
-fftsa.nl.MAINS_B    = 60
 
 fftsa.nl.MODE_INIT  = 1
 fftsa.nl.MODE_RUN   = 2
@@ -87,9 +87,9 @@ fftsa.nl.MODE_PX    = 6
 
 fftsa.nl.MAGIC = 1146310705   -- 0x44535031, 'DSP1'
 
--- DSP_FFT_* from csrc/dsp.h. Four-step is the default there and the only one measured on
--- the instrument; radix-2 is kept because the equivalence tests run both.
-fftsa.nl.FFT_RADIX2   = 0
+-- DSP_FFT_* from csrc/dsp.h. Four-step is the default there and the only one measured on the
+-- instrument, and the only one this side sends. The host equivalence tests run radix-2 as well,
+-- through the C enum rather than through here.
 fftsa.nl.FFT_FOURSTEP = 1
 
 -- Chunk payload is a fixed 32,768 bytes; 1024 elements follows from 32768/32.
@@ -106,7 +106,6 @@ fftsa.nl.CHUNK_BYTES = 32768
 fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
-fftsa.nl._align32 = align32
 fftsa.nl.PARAM_WORDS = 57
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
@@ -182,7 +181,6 @@ fftsa.nl._DSP_CODE_B64 = nil
 fftsa.nl._DSP_CODE_B64_LEN = 0
 fftsa.nl._DSP_RELOC_B64 = nil
 fftsa.nl._DSP_RELOC_B64_LEN = 0
-fftsa.nl._DSP_RELOC_BSS_LO = 0
 fftsa.nl._DSP_RELOC_BSS_HI = 0
 
 -- ---------------------------------------------------------------------------
@@ -301,7 +299,6 @@ local function align8(v) return v + math.mod(8 - math.mod(v, 8), 8) end
 -- To a cache line. A flush works in whole lines, so anything that must not be invalidated
 -- along with the image has to start on a line the image does not reach into.
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
-fftsa.nl._align32 = align32
 
 -- The 32-byte line a byte belongs to, and one past the last line a range touches. The
 -- range a flush covers is wider than the range asked for, by up to 31 bytes at each end.
@@ -521,7 +518,7 @@ function fftsa.nl.resolve_math()
       end
     end
   end
-  nl.glue, nl.nglue = glue, nglue
+  nl.nglue = nglue
   if nglue < nl.GLUE_MIN then return 0 end
 
   -- 2. Each census wrapper's targets, and the ones not in the glue set. Every wrapper has
@@ -1339,7 +1336,7 @@ function fftsa.nl.map_bounds()
   if hi - lo < nl.MAP_MIN_SPAN then
     return keep('live addresses span only ' .. tostring(hi - lo) .. ' bytes')
   end
-  nl.map_lo, nl.map_hi, nl.map_n = lo, hi, n
+  nl.map_lo, nl.map_hi = lo, hi
   nl._map_age = 0
   nl.map_why = nil
   return lo, hi
@@ -2351,7 +2348,6 @@ function fftsa.nl.find_ring(sentinels, full)
   local i
   for i = 1, table.getn(c) do
     if nl.find_ring_header(c[i]) ~= nil then
-      nl.ring = c[i]
       nl.ring_why = nil
       return c[i]
     end
@@ -3423,7 +3419,6 @@ end
 -- buffer, the bounds pair has to bracket the ring at the documented distance, and the cursors
 -- have to be consistent with both. A base that has gone stale therefore refuses and the
 -- content route runs, which is also what happens on a build whose layout differs.
-fftsa.nl.PX_TRACE_RING  = 544        -- 0x220, the ring, within the trace object
 fftsa.nl.PX_TRACE_NAME  = 8          -- 0x08, buffer name, 32 bytes
 fftsa.nl.PX_TRACE_BNDS  = 496        -- 0x1F0, ring base and end
 fftsa.nl.PX_GRAPH_TRACE = 1004       -- 0x3EC, the widget's null-terminated trace array
@@ -5959,8 +5954,8 @@ function fftsa.nl.px_cache_save()
     fh:close()
   end)
   if ok then nl._px_saved = body end
-  nl.px_cache_why = nil
-  if not ok then nl.px_cache_why = 'save refused' end
+  nl.px_save_why = nil
+  if not ok then nl.px_save_why = 'save refused' end
   return ok
 end
 
@@ -5982,12 +5977,12 @@ function fftsa.nl.px_cache_load()
     -- and fs.is_file is not: is_file on an absent path is unmeasured, and the whole point is
     -- to not find out the expensive way. The table is 0-BASED, so pairs and not getn.
     if file.usbdriveexists() ~= 1 then
-      nl.px_cache_why = 'no key in the slot'
+      nl.px_load_why = 'no key in the slot'
       return
     end
     local t = fs.readdir(nl.PX_CACHE_DIR)
     if t == nil then
-      nl.px_cache_why = 'cannot list ' .. tostring(nl.PX_CACHE_DIR)
+      nl.px_load_why = 'cannot list ' .. tostring(nl.PX_CACHE_DIR)
       return
     end
     local there, k, v = false, nil, nil
@@ -5995,12 +5990,12 @@ function fftsa.nl.px_cache_load()
       if tostring(v) == nl.PX_CACHE_NAME then there = true end
     end
     if not there then
-      nl.px_cache_why = 'no record on the key yet'
+      nl.px_load_why = 'no record on the key yet'
       return
     end
     local fh = io.open(nl.PX_CACHE_FILE, 'r')
     if fh == nil then
-      nl.px_cache_why = 'open for read refused'
+      nl.px_load_why = 'open for read refused'
       return
     end
     local body = fh:read(256)
@@ -6061,7 +6056,6 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
   if nl.t_first == nil then nl.t_first = os.clock() end
   if st ~= 'on' then nl.pre_frames = (nl.pre_frames or 0) + 1 end
   if st == 'off' then return nil end
-  nl.px_buf = tb
   if type(gid) == 'number' then
     -- A handle that has changed takes the derived base with it: the table is indexed by id,
     -- so an entry read at the wrong one is some other object.
@@ -6444,6 +6438,13 @@ function fftsa.nl.px_str()
     o = o .. string.format(' trying=%.1fs/%df',
                            os.clock() - (nl.t_first or os.clock()), nl.pre_frames)
   end
+  -- WHY THE KEY'S RECORD DID NOT SHORTEN THE SEARCH, which is the question eng= raises and
+  -- cannot answer on its own. The geometry on the key is what turns a 72 MB sweep into a
+  -- read, so a slow engage is either a record that was not there or one that was not
+  -- believed, and those are different faults. The load reason is kept apart from the save
+  -- reason because a save that succeeds afterwards would otherwise erase why the load missed.
+  if nl.px_load_why ~= nil then o = o .. ' loadwhy=' .. tostring(nl.px_load_why) end
+  if nl.px_save_why ~= nil then o = o .. ' savewhy=' .. tostring(nl.px_save_why) end
   if nl.PX_PTR == false then o = o .. ' ptr=0' end
   if nl.PX_HDR_DERIVE then o = o .. ' der=1' end
   if fftsa.sg_pix_armed ~= nil then
@@ -6753,13 +6754,10 @@ local function via_peek8(addr)
   -- read out of memory afterwards.
   fftsa.nl.last_call = ok
   if not ok then
-    fftsa.nl.last_err = tostring(r)
     return false, r
   end
-  fftsa.nl.last_err = nil
   return true
 end
-fftsa.nl._via_peek8 = via_peek8
 
 -- Flush written code out of the D-cache and invalidate the I-cache for it.
 local function flush(addr, len)
@@ -6792,7 +6790,6 @@ fftsa.nl.flush = flush
 local function call_native(addr)
   local nl = fftsa.nl
   local function refuse(why)
-    nl.last_err = why
     return nil, why
   end
   if nl.params == nil or nl.params == 0 then return refuse('no params') end
@@ -6979,7 +6976,6 @@ function fftsa.nl.init(barrier_buf, want_n, kind, beta, decim, method, want_nseg
   -- count dsp_plan_segs reports at step 7 against DSPN_MAX_SEGS, and a count needing more is
   -- refused there. DSP_N_MAX is the library's own ceiling.
   local nmax = 65536
-  nl.nceil = nmax
   -- The plan struct has a chunk to itself, which is the one size still checked here.
   if align8(nl.SIZEOF_PLAN) + 32 > nl.CHUNK_BYTES then
     trace('size.plan', nl.SIZEOF_PLAN)
@@ -7496,7 +7492,6 @@ function fftsa.nl.reattach(want_n, kind, beta, decim, method)
     nl.ready = false
     return false
   end
-  nl.reattached = true
   trace('reattach.ok', hx(s.entry))
   return true
 end
