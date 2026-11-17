@@ -7959,6 +7959,90 @@ check('the options preview tick takes no capture and writes nothing to the graph
                        reads, writes, fills, tostring(err))
 end)())
 
+print('\npolling for a press when the acquisition leaves no idle (real code)')
+
+-- WHATEVER waitevent RETURNS WILL NOT BE DELIVERED AGAIN, so every object on the spectrum
+-- screen with an event enabled has to be dispatched here. The screen carries EVENT_ENDAPP and
+-- no press, so an event for sg_scr is End App -- the operator's way out of the very state this
+-- exists for, and the one thing that must never be swallowed.
+check('a polled event reaches its own handler, and End App is not eaten', (function()
+  fftsa.start()
+  local realwait = display.waitevent
+  local answer = nil
+  display.waitevent = function(t) return answer, 'sub' end
+  local ro, rc, rl = fftsa.options, fftsa.cleanup, fftsa.toggle_lock
+  local opened, ended, locked = 0, 0, 0
+  fftsa.options = function() opened = opened + 1 return true end
+  fftsa.cleanup = function() ended = ended + 1 return true end
+  fftsa.toggle_lock = function() locked = locked + 1 return true end
+  fftsa.poll_lost = 0
+  answer = fftsa.optbtn  ; local a = fftsa.press_poll()
+  answer = fftsa.sg_scr  ; local b = fftsa.press_poll()
+  answer = fftsa.lockbtn ; local c = fftsa.press_poll()
+  answer = fftsa.timer   ; local d = fftsa.press_poll()
+  answer = 987654        ; local e = fftsa.press_poll()
+  answer = nil           ; local f = fftsa.press_poll()
+  local lost = fftsa.poll_lost
+  display.waitevent = realwait
+  fftsa.options, fftsa.cleanup, fftsa.toggle_lock = ro, rc, rl
+  return a and b and c and not d and not e and not f
+         and opened == 1 and ended == 1 and locked == 1 and lost == 1,
+         string.format('opt=%s/%d endapp=%s/%d lock=%s/%d tick=%s unknown=%s lost=%d none=%s',
+                       tostring(a), opened, tostring(b), ended, tostring(c), locked,
+                       tostring(d), tostring(e), lost, tostring(f))
+end)())
+
+-- AND IT IS REACHED ONLY WHERE IT IS NEEDED. waitevent with no argument waits forever and the
+-- reference documents the timeout only as "number of seconds", so a fractional value that did
+-- not survive into the firmware would wedge the interpreter -- recoverable by a power cycle
+-- and nothing less. Ordinary settings must therefore never reach the call: 32768 at 100 kS/s
+-- is a 0.33 s record and stays on the dispatch path that already works.
+check('the frame polls only when the acquisition alone is over the threshold', (function()
+  fftsa.start()
+  local realwait = display.waitevent
+  display.waitevent = function(t) return nil end
+  local n0, fs0 = fftsa.n, fftsa.fs
+  fftsa.poll_n = 0
+  -- 0.33 s of acquisition: under the threshold, so the call is not reached at all.
+  fftsa.n, fftsa.fs = 32768, 100000
+  fftsa.frame()
+  local short = fftsa.poll_n
+  -- 10.24 s: over it.
+  fftsa.n, fftsa.fs = 1024, 100
+  fftsa.frame()
+  local long = fftsa.poll_n
+  display.waitevent = realwait
+  fftsa.n, fftsa.fs = n0, fs0
+  fftsa.start()
+  fftsa.frame()
+  return short == 0 and long > 0,
+         string.format('0.33 s record polled %d time(s), 10.24 s record polled %d,'
+                       .. ' threshold %s s', short, long, tostring(fftsa.press_poll_above))
+end)())
+
+-- A STARVED APP DISPATCHES EVERY QUEUED PRESS AT ONCE. Fifteen presses to reach Options were
+-- measured, and the fourteen behind the first became fourteen more switches and fourteen
+-- six-field fills -- which is what left Apply and Cancel dead in their turn.
+check('an Options press while Options is up switches and fills nothing', (function()
+  fftsa.start()
+  local real = display.changescreen
+  local switches = 0
+  display.changescreen = function(sc) switches = switches + 1 return real(sc) end
+  fftsa.options()
+  local first = switches
+  local c0 = fftsa.opt_coalesced or 0
+  fftsa.options()
+  fftsa.options()
+  fftsa.options()
+  local after = switches
+  local coalesced = (fftsa.opt_coalesced or 0) - c0
+  display.changescreen = real
+  fftsa.show_main()
+  return first == 1 and after == 1 and coalesced == 3,
+         string.format('first press switched %d, three more switched %d more, coalesced %d',
+                       first, after - first, coalesced)
+end)())
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

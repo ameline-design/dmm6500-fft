@@ -5668,6 +5668,16 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   -- is what identified the ring in the first place -- 510 exact float matches of the x field
   -- against this app's own axis.
   if fftsa.sg_pix_repaint == 'cursor' and p.gid ~= nil then
+    -- Rate-limited when asked, which bounds how deep the task's repaint queue can get. The
+    -- pixels for this pass are already in the ring, so a suppressed provocation shows them on
+    -- the next one; what it does not do is add another request to a queue already too long.
+    local gap = fftsa.sg_repaint_min or 0
+    local now = os.clock()
+    if gap > 0 and p.rp_at ~= nil and now - p.rp_at < gap then
+      p.rpskip = (p.rpskip or 0) + 1
+      p.frames = (p.frames or 0) + 1
+      return nseg
+    end
     local ok = pcall(function()
       display.graph.cursor(p.gid, display.CURSOR_VERTICAL, 9.9e37, 9.9e37)
     end)
@@ -5688,6 +5698,7 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
                              .. ' times running on handle ' .. tostring(p.gid))
     end
     p.curfail = 0
+    p.rp_at = now
     p.slot, p.slotdb, p.slotprev = nil, nil, nil
     p.frames = (p.frames or 0) + 1
     p.repaints = (p.repaints or 0) + 1
@@ -6465,6 +6476,8 @@ function fftsa.nl.px_str()
     o = o .. string.format(' map=%.4f*db%+.2f r=%.2f sp=%.0f', p.ay, p.by, p.resid, p.span)
   end
   if p.frames ~= nil then o = o .. ' n=' .. tostring(p.frames) end
+  -- Repaints suppressed by the rate limit, so the knob's effect is readable on the glass.
+  if p.rpskip ~= nil then o = o .. ' rpskip=' .. tostring(p.rpskip) end
   -- WHICH WRITER IS LAYING THE RING DOWN, and why it is not the image's. The two draw the
   -- same picture at very different costs -- one call against 28 KB assembled in Lua -- so a
   -- frame rate that does not match the build is read off this field first.

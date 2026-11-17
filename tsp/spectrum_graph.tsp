@@ -618,6 +618,24 @@ end
 -- is nothing to restore. A live knob, so the two can be compared from the socket on one boot.
 fftsa.sg_pix_repaint = 'cursor'
 
+-- THE SHORTEST INTERVAL BETWEEN REPAINT PROVOCATIONS, in seconds. Zero provokes every frame.
+--
+-- A provocation is acknowledged by the GUI, not completed by it, so the frame learns that the
+-- task has TAKEN the request and nothing about when it will have drawn. If a repaint costs more
+-- than a frame period the requests accumulate, and the only thing that drains them is the
+-- producer stopping -- which is what leaving the spectrum screen does, the frame timer being
+-- parented to it. A press arriving meanwhile is answered behind whatever has piled up.
+--
+-- There is no completion signal to wait on: in this mode no record moves, which is the whole
+-- reason it replaced the append. So the queue is bounded by rate instead. Raising this caps
+-- repaints a second and therefore the depth the queue can reach, and it costs picture update
+-- rate and not frame rate -- the pixels are in the ring either way, so a suppressed frame is
+-- shown by the next provocation rather than lost.
+--
+-- A live knob, and zero by default: raise it from the socket on a running app and the effect on
+-- a press is visible without a rebuild.
+fftsa.sg_repaint_min = 0
+
 -- The pixel path's two halves, and why they sit on opposite sides of the fill.
 --
 -- DRAWING replaces the fill, so it comes first and returns the points drawn. SEEKING needs the

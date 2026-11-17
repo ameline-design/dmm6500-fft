@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.43'
+fftsa.VERSION = '9.45'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -769,6 +769,12 @@ function fftsa.frame_body()
   -- trace buffer, so dropouts that continue are the widget's and not ours. A bare global
   -- because a socket command aborts a running app.
   if FFTSA_FREEZE and fftsa.froze then return end
+  -- Before the capture, so a press is served at the head of the frame instead of behind it,
+  -- and the frame is abandoned when one is: the handler has changed screen, so the capture
+  -- and everything after it would be computing for a plot nobody is looking at.
+  local acq = 0
+  if fftsa.fs ~= nil and fftsa.fs > 0 then acq = fftsa.n / fftsa.fs end
+  if acq > fftsa.press_poll_above and fftsa.press_poll() then return end
   local t_a = os.clock()
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
@@ -1129,6 +1135,9 @@ function fftsa.frame()
       end
     end
     fftsa.work_seen = (fftsa.work_seen or 0) + 1
+    -- Monotonic, never reset, so the count of frames between two Options opens can be taken as
+    -- a difference. work_seen cannot serve: apply() zeroes it and the deadband decays it.
+    fftsa.nframes = (fftsa.nframes or 0) + 1
     -- One frame replaces a modelled period, eight replace a measured one. The model is the
     -- interpreted primitive's cost for the count and the compiled path runs a fraction of
     -- it, so at the large counts a window of eight would hold the app at several times the
@@ -1511,6 +1520,13 @@ end
 -- The app's own state comes first. nl.diag() describes how the native path was DISCOVERED;
 -- what a frame then did with it is in fftsa.nl_lasterr and nowhere else, and that is the
 -- string that names a compiled DSP which started and then stopped.
+-- Milliseconds, or a dash where nothing has been measured yet: a 0 would read as a switch
+-- that cost nothing, which is the answer this is meant to establish rather than assume.
+function fftsa.ms_str(t)
+  if type(t) ~= 'number' then return '-' end
+  return string.format('%.0f', t * 1000)
+end
+
 function fftsa.diag_str()
   local app = 'halt=' .. tostring(fftsa.halted)
               .. ' err=' .. tostring(fftsa.lasterr)
@@ -1522,6 +1538,19 @@ function fftsa.diag_str()
               .. ' n=' .. tostring(fftsa.n)
               .. ' ncol=' .. tostring(fftsa.sg_ncol)
               .. ' repin=' .. tostring(fftsa.binhz_repins or 0)
+              -- ui=<switch into Options>/<fill>/<switch back>, then the interval before this
+              -- open as milliseconds and frames. arm=<re-arms>/<those off the 50 ms grid, so
+              -- posting 1727>. Terse because the diagnostic has a row budget and the sentinel
+              -- that closes it is what says the page is complete.
+              .. ' ui=' .. fftsa.ms_str(fftsa.opt_t_sw) .. '/' .. fftsa.ms_str(fftsa.opt_t_fill)
+              .. '/' .. fftsa.ms_str(fftsa.main_t_sw)
+              .. ' gap=' .. fftsa.ms_str(fftsa.opt_gap) .. '/' .. tostring(fftsa.opt_frames)
+              .. ' arm=' .. tostring(fftsa.narms or 0)
+              .. '/' .. tostring(fftsa.narms_off or 0)
+              -- poll=<calls>/<events taken>/<not recognised>, and presses coalesced away.
+              .. ' poll=' .. tostring(fftsa.poll_n or 0)
+              .. '/' .. tostring(fftsa.poll_got) .. '/' .. tostring(fftsa.poll_lost or 0)
+              .. ' coal=' .. tostring(fftsa.opt_coalesced or 0)
   local d = nil
   if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
     local ok, got = pcall(fftsa.nl.diag)
@@ -1679,7 +1708,9 @@ function fftsa.about()
   -- objects it writes into were built with the screen.
   pcall(fftsa.about_add_diag)
   fftsa.about_show_page(1)
+  if fftsa.scr_now == fftsa.aboutscr then return true end
   display.changescreen(fftsa.aboutscr)
+  fftsa.scr_now = fftsa.aboutscr
   return true
 end
 
@@ -1806,10 +1837,18 @@ end
 -- Back to the spectrum screen, which is also what lets the frame timer run again.
 function fftsa.show_main()
   if fftsa.sg_scr ~= nil then
+    -- Timed for the same reason as the switch into Options, and it is not the same switch:
+    -- this one arrives at the screen carrying the trace, so the task has a plot to put up
+    -- rather than a form. Cancel and Apply both come through here.
+    if fftsa.scr_now == fftsa.sg_scr then return true end
+    local t0 = os.clock()
     display.changescreen(fftsa.sg_scr)
+    fftsa.scr_now = fftsa.sg_scr
+    fftsa.main_t_sw = os.clock() - t0
     return true
   end
   display.changescreen(display.SCREEN_HOME)
+  fftsa.scr_now = nil
   return false
 end
 
@@ -1841,9 +1880,41 @@ function fftsa.options()
   -- The form holds the previous open's values for the moment before the fill lands, which is
   -- a flicker of stale text against seconds of apparent hang. The yield is what lets the
   -- switch take effect before the writes, as for every other screen in this app.
+  -- THE SWITCH TIMED ON ITS OWN, which is what says where a slow press went.
+  --
+  -- changescreen is a request to the display task, not a draw: it returns when the task has
+  -- taken it. So a switch that costs seconds is a task with a queue in front of it, and a
+  -- switch that returns at once with the press still feeling slow puts the delay before this
+  -- function ran -- in the firmware's delivery of the touch. The two have opposite repairs and
+  -- nothing on the glass could tell them apart.
+  -- ALREADY THERE IS NOTHING TO DO. Presses queue while the interpreter is busy, so a
+  -- starved app that finally frees up dispatches every one of them: fifteen Options presses
+  -- became fifteen switches and fifteen six-field fills, and Apply waited behind the lot.
+  -- Reported as Options arriving and then Apply and Cancel being dead in their turn.
+  if fftsa.scr_now == fftsa.optscr then
+    fftsa.opt_coalesced = (fftsa.opt_coalesced or 0) + 1
+    return true
+  end
+  local t0 = os.clock()
   display.changescreen(fftsa.optscr)
+  fftsa.scr_now = fftsa.optscr
+  local t1 = os.clock()
   delay(fftsa.sg_yield)
   fftsa.opt_fill(fftsa.flo, fftsa.fhi, fftsa.range, fftsa.win_i, fftsa.kbeta_i, fftsa.n)
+  local t2 = os.clock()
+  -- The gap since the last open goes with them: the lag was reported as growing with the time
+  -- the button has NOT been pressed, so the interval is part of the measurement and not
+  -- context for it.
+  fftsa.opt_gap = nil
+  if fftsa.opt_t_at ~= nil then fftsa.opt_gap = t0 - fftsa.opt_t_at end
+  fftsa.opt_t_sw, fftsa.opt_t_fill, fftsa.opt_t_at = t1 - t0, t2 - t1, t2
+  -- Frames drawn in that interval, beside the interval itself. A cost that tracks the frame
+  -- count is something the drawing accumulates; one that tracks the seconds and not the frames
+  -- is something that decays on its own, and 2048 and 8192 differ twofold in frames a second,
+  -- so the pair separates them in one run.
+  fftsa.opt_frames = nil
+  if fftsa.opt_nf_at ~= nil then fftsa.opt_frames = (fftsa.nframes or 0) - fftsa.opt_nf_at end
+  fftsa.opt_nf_at = fftsa.nframes or 0
   -- Counted so the remaining first-press lag can be measured rather than described. It is
   -- only the FIRST open that is slow, which rules out the press and the fill -- both cost the
   -- same every time -- and points at work the display task does once per screen. A probe
@@ -2153,8 +2224,64 @@ end
 -- Arm the frame timer. It is active only while its parent screen is visible, which is
 -- what stops frames while Options or About is on show. One frame per tick: back-to-back
 -- frames keep the interpreter out of its event loop.
+-- POLLING FOR A PRESS, because a long acquisition leaves no idle for one to be dispatched in.
+--
+-- A press is delivered to a registered handler only when the interpreter is free, and a frame
+-- is Lua: during a capture nothing gets in. At most settings that is a fraction of the frame
+-- and the slack the period carries is enough. At 32768 points and a 500 Hz stop the rate is
+-- 12.5 kS/s, so the record is 2.62 s and cannot be shorter -- 0.38 Hz bins take that long to
+-- gather -- against 20 ms of slack. That is 0.74% of the frame, and the operator measured it:
+-- fifteen presses and over a minute to reach Options.
+--
+-- End App stays instant throughout, which says the touch and its delivery are both healthy.
+-- It is firmware chrome and it ABORTS the interpreter rather than queueing behind it; a
+-- registered handler has no such privilege.
+--
+-- So the frame asks for the press itself, before the capture it would otherwise be buried
+-- under, and dispatches it. Latency becomes one frame rather than unbounded.
+--
+-- ONLY WHERE IT IS NEEDED. display.waitevent with no argument waits forever, and whether a
+-- fractional timeout survives into the firmware is not documented -- the reference says
+-- "number of seconds". A value that truncated to zero would wedge the interpreter, and the
+-- recovery is a power cycle. So the call is reached only when the acquisition alone is over
+-- press_poll_above, which no ordinary setting crosses: 32768 at 100 kS/s is 0.33 s and stays
+-- on the dispatch path that already works. Both are live knobs.
+fftsa.press_poll_above = 1.0     -- seconds of acquisition before the frame polls at all
+fftsa.press_poll_wait  = 0.02    -- the timeout handed to waitevent, never nil and never 0
+
+-- Dispatched here and not left to the handler strings, because consuming an event is what
+-- waitevent does: whatever it returns will not be delivered again. Every object on this screen
+-- that has an event enabled is named below. The screen itself carries EVENT_ENDAPP and nothing
+-- else -- no press is registered on it -- so an event for sg_scr is End App, and that is the
+-- operator's way out of exactly the state this exists for. It must never be the thing we eat.
+function fftsa.press_poll()
+  if display.waitevent == nil or fftsa.optbtn == nil then return false end
+  fftsa.poll_n = (fftsa.poll_n or 0) + 1
+  local ok, id, sub = pcall(display.waitevent, fftsa.press_poll_wait)
+  if not ok or id == nil then return false end
+  fftsa.poll_got = tostring(id) .. '/' .. tostring(sub)
+  -- The frame timer is on this screen too. Its tick is not a press, and a tick arriving while
+  -- the frame runs would have been dropped anyway, so taking it costs nothing.
+  if id == fftsa.timer then return false end
+  if id == fftsa.sg_scr then fftsa.guard(fftsa.cleanup) return true end
+  if id == fftsa.optbtn then fftsa.guard(fftsa.options) return true end
+  if id == fftsa.lockbtn then fftsa.guard(fftsa.toggle_lock) return true end
+  -- Something this does not know, and now nobody will get it. Counted rather than hidden: a
+  -- swallowed press is the one failure this change can introduce.
+  fftsa.poll_lost = (fftsa.poll_lost or 0) + 1
+  return false
+end
+
 function fftsa.arm(period_s)
   if period_s == nil then period_s = 0.05 end
+  -- EVERY RE-ARM COSTS A DISPLAY OBJECT DELETED AND ONE CREATED, and an off-grid period posts
+  -- event 1727 with it. A converged period stops re-arming, so these two counts are flat on a
+  -- settled app and climb only where the deadband is still moving -- which is a thing that
+  -- accumulates for as long as the screen is up and stops the moment it is left. Counted
+  -- separately because the second is the one that reaches the event log.
+  fftsa.narms = (fftsa.narms or 0) + 1
+  local ms = math.floor(period_s * 1000 + 0.5)
+  if math.mod(ms, 50) ~= 0 then fftsa.narms_off = (fftsa.narms_off or 0) + 1 end
   if fftsa.timer ~= nil then
     fftsa.del_obj(fftsa.timer)
     fftsa.timer = nil
@@ -2377,7 +2504,7 @@ function fftsa.stop()
   -- screen that is already gone. It also keeps a gesture from the previous launch off the
   -- next one's first frame, fftsa.start() opening with a stop().
   fftsa.busy, fftsa.halted, fftsa.errrun = false, false, 0
-  fftsa.retune_pending, fftsa.armed_n = false, nil
+  fftsa.retune_pending, fftsa.armed_n, fftsa.scr_now = false, nil, nil
   return true
 end
 
@@ -2555,6 +2682,7 @@ function fftsa.show_error(msg, stay)
                    display.FONT_1, display.JUST_LEFT)
     display.setevent(fftsa.errscr, display.EVENT_ENDAPP, "if fftsa ~= nil then fftsa.cleanup() end")
     display.changescreen(fftsa.errscr)
+    fftsa.scr_now = fftsa.errscr
   end)
   if not shown or fftsa.errscr == nil then
     fftsa.errscr = nil
