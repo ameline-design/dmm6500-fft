@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 9.48
+-- $Version: 9.49
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -6439,11 +6439,12 @@ end
 -- costs one memread.
 -- EVERY CANDIDATE STRIDE OFF ONE READ.
 --
--- px_xconfirm is one ki.memread per stride and the walk is REC_MIN..REC_MAX in fours -- 29
--- round trips for every hit -- and the frequency needle takes as many hits in a slice as the
--- heap happens to hold. Measured on the glass at 8.81: 0.1 fps at 2048 points, ten seconds
--- inside a single frame, as soon as the name cap made this route run routinely instead of only
--- after a whole ladder. The same defect as the 257 peeks in the name walk, in its sibling.
+-- One read per candidate stride walks REC_MIN..REC_MAX in fours -- 29 round trips for every
+-- hit -- and the frequency needle takes as many hits in a slice as the heap happens to hold.
+-- Measured on the glass at 0.1 fps at 2048 points, ten seconds inside a single frame, as soon
+-- as the name cap made this route run routinely instead of only after a whole ladder. It is
+-- the same defect as a peek per element in the name walk, and it is why there is one read
+-- here and not a loop of them.
 --
 -- The widest stride needs (n-1)*REC_MAX + 8 bytes, 392 for four needles, so one read covers
 -- all of them and the test becomes arithmetic in a string.
@@ -6475,30 +6476,14 @@ function fftsa.nl.px_xconfirm_all(xat, xs)
         end
       end
       if ok then
-        -- val0 is the x field and dx is zero, exactly as px_xconfirm reports it: this
-        -- confirmed on the x and nothing else, and px_map derives the value field itself.
+        -- val0 is the x field and dx is zero: this confirmed on the x and nothing else, and
+        -- px_map derives the value field itself.
         nout = nout + 1
         out[nout] = { val0 = xat, stride = sv, dx = 0, nconf = n }
       end
     end
   end
   return out
-end
-
-function fftsa.nl.px_xconfirm(xat, stride, xs)
-  local n = table.getn(xs)
-  local span = (n - 1) * stride + 8
-  local blk = ki.memread(hx(xat), hx(span))
-  if blk == nil or string.len(blk) < span then return nil end
-  local i
-  for i = 1, n do
-    local at = (i - 1) * stride + 1
-    if string.sub(blk, at, at + 7) ~= xs[i] .. xs[i] then return nil end
-  end
-  -- val0 is the x field, and dx is zero because this confirmed on the x and nothing else. The
-  -- header check reads both as "a field at this offset, which must fit inside a record", which
-  -- is all it needs; px_map derives the value field for itself.
-  return { val0 = xat, stride = stride, dx = 0, nconf = n }
 end
 
 function fftsa.nl.px_seek(hz, nseg, budget, buf)
@@ -8229,9 +8214,9 @@ function fftsa.nl.px_try(db, hz, nseg, tb, t, gid)
     table.remove(c)
     -- A name-derived geometry already has its bounds and its header; only the record route
     -- has to go looking for one.
-    -- Which needle this candidate came from. px_from_name stamps name_at; px_xconfirm does
-    -- not. Reported, because "engaged on the name" and "engaged on the frequencies" are
-    -- different confidences in the same answer.
+    -- Which needle this candidate came from. px_from_name stamps name_at; the frequency
+    -- route does not. Reported, because "engaged on the name" and "engaged on the
+    -- frequencies" are different confidences in the same answer.
     p.needle = 'freq'
     if g.name_at ~= nil then p.needle = 'name' end
     if g.hdr ~= nil and g.lo ~= nil then
@@ -8715,6 +8700,11 @@ fftsa.nl.call_native = call_native
 -- Put ki.peek8 back. Refuses rather than writing a value that is not a .text address:
 -- a restore that writes garbage is worse than no restore, because the closure still
 -- works until something calls it.
+--
+-- The app never calls this. The redirect is meant to outlive a run -- a relaunch re-attaches
+-- to the installed code rather than installing it again, which is the only route a second
+-- launch in one boot has -- so undoing it at teardown would break the next launch. This is
+-- the manual undo, for a socket session that wants the interpreter's own peek8 back.
 function fftsa.nl.restore_peek8()
   local nl = fftsa.nl
   if nl.peek8_cls == 0 then return false end
@@ -10462,7 +10452,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.48'
+fftsa.VERSION = '9.49'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
