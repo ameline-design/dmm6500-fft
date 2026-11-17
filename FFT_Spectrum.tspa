@@ -3,7 +3,7 @@ loadscript FFT_Spectrum
 -- $Product: DMM6500, DAQ6510, DMM7510
 -- $Tag: FFT, Spectrum, Digitize, Audio
 -- $Description: On-instrument FFT spectrum analyser: digitize mode + FFT with a live graph, top-6 peaks, and a touch options form (start/stop frequency, input range).
--- $Version: 9.45
+-- $Version: 9.46
 -- $Requires: 1.7.0
 -- $Icon: fft_icon
 
@@ -10431,7 +10431,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.45'
+fftsa.VERSION = '9.46'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -11725,6 +11725,10 @@ function fftsa.destroy_options()
   fftsa.opt_win, fftsa.opt_beta, fftsa.opt_n = nil, nil, nil
   fftsa.opt_mk = nil
   fftsa.opt_info_last = nil
+  -- With the screen, or a recycled object id could match a handle that no longer exists and
+  -- a press would be dispatched to a dead form.
+  fftsa.opt_b_apply, fftsa.opt_b_cancel = nil, nil
+  fftsa.opt_b_about, fftsa.opt_b_rst, fftsa.opt_preview = nil, nil, nil
 end
 
 -- Form geometry, two columns: six fields become three rows, and the gap that buys is what
@@ -11831,18 +11835,28 @@ function fftsa.build_options()
   -- A timer on the options screen previews edits without configuring acquisition.
   local preview = create(fftsa.optscr, display.OBJ_TIMER, fftsa.opt_tick_period,
                          display.TIMER_FOREVER)
+  fftsa.opt_preview = preview
   display.setevent(preview, display.EVENT_PRESS,
                   "if fftsa ~= nil then fftsa.guard(fftsa.opt_tick) end")
 
+  -- KEPT, not local. press_poll consumes whatever waitevent hands it, so it has to be able
+  -- to NAME every object this app registers an event on. Without these four it cannot tell a
+  -- press it deliberately drops -- one queued from a form that has since been dismissed -- from
+  -- one it simply failed to recognise, and those are very different faults.
   local b_apply = create(fftsa.optscr, display.OBJ_BUTTON, 470, fftsa.opt_btn_y, "Apply", 140)
+  fftsa.opt_b_apply = b_apply
   display.setevent(b_apply, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_apply) end")
   local b_cancel = create(fftsa.optscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y, "Cancel", 140)
+  fftsa.opt_b_cancel = b_cancel
   display.setevent(b_cancel, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_cancel) end")
   local b_about = create(fftsa.optscr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "About", 140)
+  fftsa.opt_b_about = b_about
+  fftsa.opt_b_about = b_about
   display.setevent(b_about, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.about) end")
   -- Left of centre, 20 px off About and well clear of Apply at 470: the two that change
   -- what is measured stay together on the right, away from a thumb reaching for About.
   local b_rst = create(fftsa.optscr, display.OBJ_BUTTON, 168, fftsa.opt_btn_y, "Reset", 140)
+  fftsa.opt_b_rst = b_rst
   display.setevent(b_rst, display.EVENT_PRESS, "if fftsa ~= nil then fftsa.guard(fftsa.options_reset) end")
   -- End App is hooked on this screen too: the firmware may deliver EVENT_ENDAPP to
   -- the visible screen, and leaving from the form must still tear down.
@@ -11911,6 +11925,7 @@ function fftsa.destroy_about()
   fftsa.del_scr(fftsa.aboutscr, fftsa.sg_scr)
   fftsa.aboutscr, fftsa.about_name, fftsa.about_lines = nil, nil, nil
   fftsa.about_pageno, fftsa.about_page = nil, 1
+  fftsa.ab_up, fftsa.ab_dn, fftsa.ab_back = nil, nil, nil
 end
 
 -- The native path's state appended to the About pages.
@@ -11963,7 +11978,9 @@ function fftsa.diag_str()
               .. '/' .. tostring(fftsa.narms_off or 0)
               -- poll=<calls>/<events taken>/<not recognised>, and presses coalesced away.
               .. ' poll=' .. tostring(fftsa.poll_n or 0)
-              .. '/' .. tostring(fftsa.poll_got) .. '/' .. tostring(fftsa.poll_lost or 0)
+              .. '/' .. tostring(fftsa.poll_got)
+              .. '/' .. tostring(fftsa.poll_stale or 0)
+              .. '/' .. tostring(fftsa.poll_lost or 0)
               .. ' coal=' .. tostring(fftsa.opt_coalesced or 0)
   local d = nil
   if fftsa.nl ~= nil and fftsa.nl.diag ~= nil then
@@ -12094,14 +12111,17 @@ function fftsa.build_about()
                               fftsa.opt_btn_y - 8, "", fftsa.about_c_title,
                               display.FONT_SMALL, display.JUST_CENTER)
   local b_up = create(fftsa.aboutscr, display.OBJ_BUTTON, 8, fftsa.opt_btn_y, "PgUp", 140)
+  fftsa.ab_up = b_up
   display.setevent(b_up, display.EVENT_PRESS,
                    "if fftsa ~= nil then fftsa.guard(fftsa.about_pgup) end")
   local b_dn = create(fftsa.aboutscr, display.OBJ_BUTTON, 168, fftsa.opt_btn_y,
                       "PgDn", 140)
+  fftsa.ab_dn = b_dn
   display.setevent(b_dn, display.EVENT_PRESS,
                    "if fftsa ~= nil then fftsa.guard(fftsa.about_pgdn) end")
   local b_back = create(fftsa.aboutscr, display.OBJ_BUTTON, 630, fftsa.opt_btn_y,
                         "Back", 140)
+  fftsa.ab_back = b_back
   display.setevent(b_back, display.EVENT_PRESS,
                    "if fftsa ~= nil then fftsa.guard(fftsa.about_back) end")
   -- End App is delivered to the visible screen, and this one can be it.
@@ -12671,17 +12691,34 @@ fftsa.press_poll_wait  = 0.02    -- the timeout handed to waitevent, never nil a
 function fftsa.press_poll()
   if display.waitevent == nil or fftsa.optbtn == nil then return false end
   fftsa.poll_n = (fftsa.poll_n or 0) + 1
-  local ok, id, sub = pcall(display.waitevent, fftsa.press_poll_wait)
+  local ok, id, ev = pcall(display.waitevent, fftsa.press_poll_wait)
   if not ok or id == nil then return false end
-  fftsa.poll_got = tostring(id) .. '/' .. tostring(sub)
-  -- The frame timer is on this screen too. Its tick is not a press, and a tick arriving while
-  -- the frame runs would have been dropped anyway, so taking it costs nothing.
-  if id == fftsa.timer then return false end
+  fftsa.poll_got = tostring(id) .. '/' .. tostring(ev)
+  -- END APP FIRST, ALWAYS. Only EVENT_ENDAPP is registered on sg_scr -- no press is -- so an
+  -- event for the screen is End App, and it is the way out of the very state this exists for.
   if id == fftsa.sg_scr then fftsa.guard(fftsa.cleanup) return true end
+  -- This screen's own two, which are the presses worth having.
   if id == fftsa.optbtn then fftsa.guard(fftsa.options) return true end
   if id == fftsa.lockbtn then fftsa.guard(fftsa.toggle_lock) return true end
-  -- Something this does not know, and now nobody will get it. Counted rather than hidden: a
-  -- swallowed press is the one failure this change can introduce.
+  -- Taken and deliberately not acted on. The frame timer's tick is not a press, and one
+  -- arriving mid-frame would have been dropped anyway. The graph's scale event is counted by
+  -- its own handler for a gesture this is not.
+  if id == fftsa.timer or id == fftsa.sg_graph then return false end
+  -- NAMED, AND STILL DROPPED. A press queues while the interpreter is busy and is delivered
+  -- whenever one frees up, so a form dismissed in between leaves its presses in the queue --
+  -- and acting on a dismissed Apply would reconfigure the instrument from a screen the
+  -- operator has left. Measured: one press of object 111, sub display.BUTTON_SELF, taken by a
+  -- poll on the spectrum screen while none of this screen's objects had that id.
+  if id == fftsa.opt_b_apply or id == fftsa.opt_b_cancel or id == fftsa.opt_b_about
+     or id == fftsa.opt_b_rst or id == fftsa.opt_preview or id == fftsa.optscr
+     or id == fftsa.ab_up or id == fftsa.ab_dn or id == fftsa.ab_back
+     or id == fftsa.aboutscr then
+    fftsa.poll_stale = (fftsa.poll_stale or 0) + 1
+    return false
+  end
+  -- Not this app's at all, so far as it can tell, and nobody will get it now. Counted rather
+  -- than hidden: a swallowed press is the one failure this change can introduce, and the count
+  -- is what says whether it is still happening.
   fftsa.poll_lost = (fftsa.poll_lost or 0) + 1
   return false
 end

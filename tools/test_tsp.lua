@@ -7975,21 +7975,29 @@ check('a polled event reaches its own handler, and End App is not eaten', (funct
   fftsa.options = function() opened = opened + 1 return true end
   fftsa.cleanup = function() ended = ended + 1 return true end
   fftsa.toggle_lock = function() locked = locked + 1 return true end
-  fftsa.poll_lost = 0
-  answer = fftsa.optbtn  ; local a = fftsa.press_poll()
-  answer = fftsa.sg_scr  ; local b = fftsa.press_poll()
-  answer = fftsa.lockbtn ; local c = fftsa.press_poll()
-  answer = fftsa.timer   ; local d = fftsa.press_poll()
-  answer = 987654        ; local e = fftsa.press_poll()
-  answer = nil           ; local f = fftsa.press_poll()
-  local lost = fftsa.poll_lost
+  fftsa.poll_lost, fftsa.poll_stale = 0, 0
+  answer = fftsa.optbtn      ; local a = fftsa.press_poll()
+  answer = fftsa.sg_scr      ; local b = fftsa.press_poll()
+  answer = fftsa.lockbtn     ; local c = fftsa.press_poll()
+  answer = fftsa.timer       ; local d = fftsa.press_poll()
+  -- A press queued from a form that has since been dismissed. Named, so it can be dropped on
+  -- purpose rather than counted as a failure: acting on it would reconfigure the instrument
+  -- from a screen the operator has left.
+  answer = fftsa.opt_b_apply ; local g = fftsa.press_poll()
+  answer = fftsa.ab_back     ; local h = fftsa.press_poll()
+  answer = 987654            ; local e = fftsa.press_poll()
+  answer = nil               ; local f = fftsa.press_poll()
+  local lost, stale = fftsa.poll_lost, fftsa.poll_stale
   display.waitevent = realwait
   fftsa.options, fftsa.cleanup, fftsa.toggle_lock = ro, rc, rl
-  return a and b and c and not d and not e and not f
-         and opened == 1 and ended == 1 and locked == 1 and lost == 1,
-         string.format('opt=%s/%d endapp=%s/%d lock=%s/%d tick=%s unknown=%s lost=%d none=%s',
+  return a and b and c and not d and not e and not f and not g and not h
+         and opened == 1 and ended == 1 and locked == 1
+         and stale == 2 and lost == 1,
+         string.format('opt=%s/%d endapp=%s/%d lock=%s/%d tick=%s stale=%s,%s/%d'
+                       .. ' unknown=%s lost=%d none=%s',
                        tostring(a), opened, tostring(b), ended, tostring(c), locked,
-                       tostring(d), tostring(e), lost, tostring(f))
+                       tostring(d), tostring(g), tostring(h), stale,
+                       tostring(e), lost, tostring(f))
 end)())
 
 -- AND IT IS REACHED ONLY WHERE IT IS NEEDED. waitevent with no argument waits forever and the
