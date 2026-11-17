@@ -294,6 +294,43 @@ target_link_libraries(dsp_native_px_test PRIVATE GTest::gtest_main)
 target_compile_options(dsp_native_px_test PRIVATE ${DSP_CXX_FLAGS} -ffp-contract=fast)
 add_test(NAME dsp_native_px COMMAND dsp_native_px_test)
 
+# THE ENTRY POINT ITSELF, which until now nothing could call. dsp_native.c is built for
+# powerpc-unknown-elf and entered by redirecting ki.peek8, so thirty-one refusal sites, the
+# mode dispatch and the status word were covered by reading alone -- which is how DSP_EBETA
+# came to be reported as DSPN_EOUTPUT, the two error spaces sharing -6.
+#
+# DSPN_HOST switches DSPN_P, DSPN_A and DSPN_FP in dsp_native_bounds.h from the identity to
+# base-relative, so the struct's uint32 addresses become offsets into one arena the test owns:
+# a 64-bit host reserves the low 4 GB and no real pointer fits those fields. The bounds checks
+# then run for real -- the test had to place its arena above DSPN_TEXT_HI before the image
+# would accept a writable segment, which is the firmware text exclusion doing its job.
+#
+# DSPN_FP is what reaches the frame itself. The six math addresses are code, not arena
+# offsets, so the host resolves them through dspn_host_fp and a SUCCEEDING MODE_INIT and
+# MODE_RUN become reachable -- at both element layouts the two instruments use, a DMM6500's
+# 8-aligned 24-byte element and a DMM7510's 20-byte one, where every other reading is only
+# 4-aligned and dsp_src_at assembles the double from two word loads. Reading was all that
+# covered that path before.
+#
+# The shipped source is INCLUDED, not linked, so the struct and the codes are the ones the
+# image is built from. With DSPN_HOST unset the macros are the cast the file always did, and
+# csrc/tools/check_rc.py plus a byte-identical target image are what hold that.
+add_executable(dsp_native_run_test test/dsp_native_run_test.c)
+target_link_libraries(dsp_native_run_test PRIVATE dsp_single ${CMAKE_DL_LIBS})
+target_include_directories(dsp_native_run_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Including a .c means its definitions have no prior declaration, which is inherent to a
+# white-box test and not a defect in the shipped file: the target build declares them through
+# the reloc emitter and the Lua side. Only these two are relaxed.
+target_compile_options(dsp_native_run_test PRIVATE ${DSP_C_FLAGS}
+                       -Wno-missing-prototypes -Wno-missing-variable-declarations)
+# The included source declared as a DEPENDENCY. The compiler's own depfile already carries it,
+# measured by perturbing MODE_INIT's forward and watching this object rebuild and the test
+# fail; this says the same thing independently of whether the generator in use writes
+# depfiles. A gate reporting on a stale copy of the thing it gates is worse than no gate.
+set_property(SOURCE test/dsp_native_run_test.c APPEND
+             PROPERTY OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/dsp_native.c)
+add_test(NAME dsp_native_run COMMAND dsp_native_run_test)
+
 endif()  # NOT CMAKE_CROSSCOMPILING
 
 # The relocation applier runs on the instrument under Lua 5.0.2, where a wrong patch is a
@@ -349,6 +386,18 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME params_layout_selftest
            COMMAND ${Python3_EXECUTABLE} -I
                    ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_params_layout.py --self-test)
+
+  # One status word carries two sets of negative codes: dsp_native.c's own DSPN_E*, and
+  # dsp.h's DSP_E* forwarded by MODE_INIT. The numbers collide -- DSP_EBETA is -6 and so is
+  # DSPN_EOUTPUT -- so the image shifts a forwarded negative by DSPN_PLAN_BASE and rc_name
+  # subtracts it again. Nothing in either language ties the C numbers to the Lua names that
+  # reach the glass, and a diagnostic naming the wrong fault costs more than a missing one.
+  add_test(NAME status_codes
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_rc.py)
+  add_test(NAME status_codes_selftest
+           COMMAND ${Python3_EXECUTABLE} -I
+                   ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_rc.py --self-test)
 
   # Every double that crosses to the native side -- the bin width, the decibel window, the
   # voltage floor -- goes as the word pair the Lua packer builds, and comes back through the

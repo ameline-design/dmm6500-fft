@@ -5427,6 +5427,102 @@ check('the deadband may not hold the period below the measured work', (function(
   return ok, why
 end)())
 
+-- THE DMM7510's GRID IS 50 ms, AND EVERYTHING THAT COMPARES PERIODS HAS TO USE IT.
+--
+-- A period off the 50 ms grid raises event 1727. On a DMM6500 that goes to the event log and
+-- the app runs on; on a DMM7510 it is a MODAL prompt over the running app -- it covers the
+-- trace, waits for a press, and makes the control socket refuse every statement until it is
+-- answered. That instrument is reached by a screen grab from another continent.
+check('the grid is the one the model in force uses', (function()
+  local save = fftsa.model_str
+  fftsa.model_str = 'DMM6500' ; local g65 = fftsa.tick_grid_now()
+  fftsa.model_str = 'DMM7510' ; local g75 = fftsa.tick_grid_now()
+  -- An instrument that did not identify itself takes the measured 10 ms rather than guessing
+  -- the stricter grid: the 6500 is what every figure in this app was measured on.
+  fftsa.model_str = 'SOMETHINGELSE' ; local gun = fftsa.tick_grid_now()
+  fftsa.model_str = save
+  return g65 == 0.010 and g75 == 0.050 and gun == 0.010,
+         string.format('6500 %s, 7510 %s, unidentified %s',
+                       tostring(g65), tostring(g75), tostring(gun))
+end)())
+
+-- A ONE-STEP FALL MUST ACTUALLY BE TAKEN, and on this grid that is not free. Both sides of
+-- the deadband's compare are grid multiples held as binary floats, and 0.05 is a decimal
+-- fraction no binary float holds: of the twelve adjacent periods tick_period produces over
+-- 0 to 600 ms of work, SEVEN measure one step apart as 0.04999999999999998890 -- under the
+-- stored 0.05. An exact compare rejects those seven, and the period then sticks where it is
+-- for the life of the app.
+--
+-- Driven through fftsa.frame rather than by re-testing the arithmetic here, which would only
+-- check this gate's own copy of the rule. 0.200 down to 0.150 is one of the seven.
+check('a one-step fall is taken where the step is 0.05', (function()
+  fftsa.start()
+  local keepmodel = fftsa.model_str
+  fftsa.model_str = 'DMM7510'
+  local realclock, realarm = os.clock, fftsa.arm
+  local armed = nil
+  fftsa.arm = function(pp) armed = pp return realarm(pp) end
+  local t = 0
+  os.clock = function() t = t + 0.001 return t end
+  -- A 100 ms peak wants 150 ms on a 50 ms grid, against a period of 200: exactly one step
+  -- down. The period is above the work, so the deadband proper decides this and not the floor
+  -- rule, which would set need to 0 and pass it for the wrong reason.
+  local want = fftsa.tick_period(0.100)
+  local measured = 0.200 - want
+  fftsa.period, fftsa.period_modelled = 0.200, false
+  fftsa.plain_peak, fftsa.work_peak = 0.100, 0.100
+  fftsa.work_seen, fftsa.ph_tick = 7, false
+  fftsa.frame()
+  local per = fftsa.period
+  os.clock, fftsa.arm = realclock, realarm
+  fftsa.model_str = keepmodel
+  -- Against the grid multiple and not the literal: 3 * 0.05 is 0.15000000000000002 and the
+  -- literal 0.150 is 0.14999999999999999, so an exact compare here fails for the same reason
+  -- the deadband's did.
+  local ok = math.abs(want - 3 * 0.05) < 1e-12 and per == want and armed == want
+             and not (measured >= 0.050)
+  local why = string.format('200 ms -> %s (one step measures %.17f, under the stored 0.05),'
+                            .. ' period now %s, armed %s',
+                            tostring(want), measured, tostring(per), tostring(armed))
+  fftsa.start()
+  fftsa.frame()
+  return ok, why
+end)())
+
+-- AND THE COMPILED CONSTANT IS NOT READ ANYWHERE THE GRID IS MEANT. A behavioural gate cannot
+-- reach the line: fftsa.frame returns on fftsa.halted, which earlier halt cases leave set, and
+-- the deadband sits behind a window count as well. So this reads the source. Occurrence-precise
+-- rather than line-matching, so a reformat that is still correct survives it.
+check('fftsa.tick_grid is read only inside fftsa.tick_grid_now', (function()
+  local fh = io.open('tsp/spectrum_app.tsp', 'r')
+  if fh == nil then return false, 'cannot open tsp/spectrum_app.tsp' end
+  local src = fh:read('*a')
+  fh:close()
+  local bad, nline, inacc, line = {}, 0, false, nil
+  for line in string.gfind(src, '([^\n]*)\n') do
+    nline = nline + 1
+    if string.find(line, 'function fftsa.tick_grid_now', 1, true) ~= nil then inacc = true end
+    -- tick_grid_7510 and tick_grid_now both contain the name, so the needle is the bare field
+    -- followed by something that cannot continue an identifier -- OR by the end of the line,
+    -- which is where the deadband's own read sits and which a trailing-character pattern
+    -- alone walks straight past.
+    local hit = string.find(line, 'fftsa%.tick_grid[^%w_]')
+    if hit == nil then hit = string.find(line, 'fftsa%.tick_grid$') end
+    if hit ~= nil then
+      local decl = string.find(line, '^fftsa%.tick_grid%s*=') ~= nil
+      local comment = string.find(line, '^%s*%-%-') ~= nil
+      if not (decl or comment or inacc) then
+        bad[table.getn(bad) + 1] = nline .. ': ' .. line
+      end
+    end
+    if inacc and string.find(line, '^end', 1, true) ~= nil then inacc = false end
+  end
+  return table.getn(bad) == 0,
+         string.format('%d line(s) scanned, %s', nline,
+                       table.getn(bad) == 0 and 'no read outside the accessor'
+                       or table.concat(bad, ' | '))
+end)())
+
 check('every frame length keeps the idle floor, and the long ones do not overpay',
       (function()
   local busy = {0.005, 0.02, 0.05, 0.08, 0.12, 0.2, 0.26, 0.34, 0.5, 0.9}

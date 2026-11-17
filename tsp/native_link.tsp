@@ -36,8 +36,23 @@ fftsa.nl = {
 -- Status codes dsp_native.c writes into the params struct. Non-negative is a result.
 fftsa.nl.RC = {
   EMAGIC = -1, EBOUNDS = -2, EPLAN = -3, EGEOM = -4, ECAPTURE = -5,
-  EOUTPUT = -6, EDESC = -7, EARENA = -8, ESCRATCH = -9, ERUN = -10, EMATH = -11,
-  EREDUCE = -12, ERESULT = -13,
+  EOUTPUT = -6, EDESC = -7, EARENA = -8, ERUN = -10, EMATH = -11,
+  EREDUCE = -12, ERESULT = -13, EFIND = -14,
+}
+
+-- THE OTHER ERROR SPACE, forwarded through the same status word.
+--
+-- MODE_INIT hands back whatever dsp_plan_init_segs returned, and dsp.h's DSP_E* set is small
+-- negatives like this one: DSP_EBETA is -6 and so is RC.EOUTPUT, so a Kaiser beta the plan
+-- builder refused used to be reported as an output-geometry fault. There is one word and no
+-- room for a tag, so the image SHIFTS a forwarded negative by PLAN_BASE and rc_name subtracts
+-- it again. Every code in csrc/dsp.h's enum is named here; csrc/tools/check_rc.py holds the
+-- two lists together, this file being the only place they could drift apart.
+fftsa.nl.PLAN_BASE = -100
+fftsa.nl.PLAN_RC = {
+  EARG = -1, EPOW2 = -2, ENOMEM = -3, EUNSUPPORTED = -4, ESHORT = -5,
+  EBETA = -6, EDECLINE = -7, EALIGN = -8, EZONE = -9, EDIRTY = -10,
+  ESEG = -11,
 }
 
 -- A return code as its name, for anything an operator reads. "rc=-11" needs this file open
@@ -45,7 +60,7 @@ fftsa.nl.RC = {
 -- glass. The table is written name-to-number because that is how the code uses it, so this
 -- walks it rather than keeping a second copy that could disagree.
 -- The line of dsp_native.c that returned goes on the end as @NNN, and it is the half that
--- places a fault: there are 26 refusal sites against a dozen codes, and DSPN_ECAPTURE alone
+-- places a fault: there are 31 refusal sites against thirteen codes, and DSPN_ECAPTURE alone
 -- has three sites with ten conditions among them. So the code names the stage and the line
 -- names the test. Four characters on a settings line that holds 70, and placing one rc=-5
 -- cost a hand-decoded hex dump of a descriptor without it.
@@ -56,6 +71,16 @@ function fftsa.nl.rc_name(rc)
     at = '@' .. tostring(fftsa.nl.fail_at)
   end
   local k, v
+  -- The forwarded space first, and named as such: "plan EBETA" says the refusal came from the
+  -- plan builder and not from the wrapper, which is the distinction the raw numbers lost.
+  if rc <= fftsa.nl.PLAN_BASE then
+    for k, v in pairs(fftsa.nl.PLAN_RC) do
+      if v == rc - fftsa.nl.PLAN_BASE then
+        return tostring(rc) .. ' plan ' .. k .. at
+      end
+    end
+    return tostring(rc) .. ' plan?' .. at
+  end
   for k, v in pairs(fftsa.nl.RC) do
     if v == rc then return tostring(rc) .. ' ' .. k .. at end
   end
@@ -70,7 +95,6 @@ fftsa.nl.MAINS_BOTH = -1
 
 fftsa.nl.MODE_INIT  = 1
 fftsa.nl.MODE_RUN   = 2
-fftsa.nl.MODE_BYTES = 3
 fftsa.nl.MODE_SEGS  = 4
 -- The byte-pattern search, run in the image because Lua cannot afford it: there a sweep is
 -- ki.memread per 32 KB over the control path at 25 MB/s measured, so one pass over the
@@ -106,7 +130,7 @@ fftsa.nl.CHUNK_BYTES = 32768
 fftsa.nl.SEG_BYTES = 32768 - 32
 
 local function align32(v) return v + math.mod(32 - math.mod(v, 32), 32) end
-fftsa.nl.PARAM_WORDS = 57
+fftsa.nl.PARAM_WORDS = 55
 
 -- Overwritten by the generated dsp_native_reloc.lua, which reads them out of the linked
 -- image. Not literals to rely on: the target is 32-bit big-endian PowerPC with 4-byte
@@ -6692,8 +6716,16 @@ function fftsa.nl.write_params(t)
   -- zero, which is a module with no generated code to run.
   if fftsa.nl.SIZEOF_PARAMS ~= 0 and
      fftsa.nl.PARAM_WORDS * 4 ~= fftsa.nl.SIZEOF_PARAMS then
+    -- NAMED, because this is the refusal a layout change is relied on to produce. Both
+    -- numbers go in it: a pair that disagrees is a Lua from one build meeting an image from
+    -- another, which inside one power cycle is what re-attaching across an install looks
+    -- like, and "write_params refused" alone would send the reader to the wrong place.
+    fftsa.nl.wp_why = 'params layout: ' .. tostring(fftsa.nl.PARAM_WORDS)
+                      .. ' words against a ' .. tostring(fftsa.nl.SIZEOF_PARAMS)
+                      .. '-byte struct'
     return false
   end
+  fftsa.nl.wp_why = nil
   local f0h, f0l = f64_words(t.red_f0 or 0)
   local bwh, bwl = f64_words(t.red_binhz or 0)
   local dnh, dnl = f64_words(t.red_dbmin or 0)
@@ -6707,8 +6739,7 @@ function fftsa.nl.write_params(t)
     t.out_lo or 0, t.out_hi or 0,
     t.seg_bytes or 0, t.nsegs or 0, t.segs_addr or 0,
     t.plan_addr or 0,
-    t.src_flat or 0,              -- unused: the capture is read in place
-    t.cap_chunk1 or 0, t.cap_chunk2 or 0, t.cap_n or 0, t.cap_perchunk or 0,
+    t.cap_chunk1 or 0, t.cap_n or 0, t.cap_perchunk or 0,
     t.cap_stride or 32,
     t.cap_vec or 0, t.cap_nchunks or 0,
     t.out_chunk1 or 0, t.out_chunk2 or 0, t.out_perchunk or 0, t.out_desc or 0,
@@ -7618,7 +7649,7 @@ function fftsa.nl.call_dsp(cap, out, red)
     out_lo = out_lo, out_hi = out_hi,
     seg_bytes = nl.seg_bytes, nsegs = nl.nsegs, segs_addr = nl.segs_addr,
     plan_addr = nl.plan_addr,
-    cap_chunk1 = cap.chunk1, cap_chunk2 = cap.chunk2,
+    cap_chunk1 = cap.chunk1,
     cap_n = nl.n, cap_perchunk = cap.perchunk, cap_stride = cap.elemsize,
     cap_vec = cap.vec, cap_nchunks = cap.nchunks,
     out_chunk1 = out_ch1, out_chunk2 = out_ch2,

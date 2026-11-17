@@ -5021,6 +5021,67 @@ end
 
 ki.peek32, ki.memread, tostring = SAVED_PEEK, SAVED_READ, SAVED_TOSTR
 
+print('\nthe two status-code spaces (real code)')
+
+-- rc_name IS THE DIAGNOSTIC. The instrument is reached by a screen grab, so a code that comes
+-- back named for the wrong fault sends the reader somewhere else entirely -- which is what the
+-- collision did: DSP_EBETA is -6 and so is RC.EOUTPUT, so a Kaiser beta the plan builder
+-- refused read as an output-geometry fault. csrc/tools/check_rc.py holds the two tables against
+-- the C; this holds what rc_name DOES with them.
+check('a forwarded plan refusal is named from the plan space, and says so', (function()
+  local nl = fftsa.nl
+  local keep = nl.fail_at
+  nl.fail_at = 943
+  -- As the image sends it: the plan builder's -6 shifted out of the wrapper's space.
+  local beta = nl.rc_name(nl.PLAN_BASE + nl.PLAN_RC.EBETA)
+  -- And the wrapper's own -6, which must still be EOUTPUT.
+  local out = nl.rc_name(nl.RC.EOUTPUT)
+  nl.fail_at = keep
+  return string.find(beta, 'plan EBETA', 1, true) ~= nil
+         and string.find(beta, '@943', 1, true) ~= nil
+         and string.find(out, 'EOUTPUT', 1, true) ~= nil
+         and string.find(out, 'plan', 1, true) == nil,
+         string.format('forwarded -6 -> %s ; wrapper -6 -> %s', beta, out)
+end)())
+
+-- An unknown code in either space prints as a number with its space named, not as a bare one.
+-- A forwarded code this build does not know is still a PLAN refusal, and saying so narrows the
+-- search to dsp.c even when the name does not come out.
+check('an unknown code names its space rather than going bare', (function()
+  local nl = fftsa.nl
+  local keep = nl.fail_at
+  nl.fail_at = 0
+  local unknown_plan = nl.rc_name(nl.PLAN_BASE - 77)
+  local unknown_wrap = nl.rc_name(-55)
+  nl.fail_at = keep
+  return string.find(unknown_plan, 'plan?', 1, true) ~= nil
+         and string.find(unknown_wrap, 'plan', 1, true) == nil,
+         string.format('unknown forwarded -> %s ; unknown wrapper -> %s',
+                       unknown_plan, unknown_wrap)
+end)())
+
+-- MODE_FIND refusing its own arguments has a code of its own. It used to answer DSP_EARG,
+-- which is -1 and reads back as EMAGIC -- a bad needle length reported as a corrupt params
+-- struct, which is a different fault in a different place.
+check('the search has its own refusal code, distinct from EMAGIC', (function()
+  local nl = fftsa.nl
+  return nl.RC.EFIND ~= nil and nl.RC.EFIND ~= nl.RC.EMAGIC
+         and string.find(nl.rc_name(nl.RC.EFIND), 'EFIND', 1, true) ~= nil,
+         string.format('EFIND=%s EMAGIC=%s named %s', tostring(nl.RC.EFIND),
+                       tostring(nl.RC.EMAGIC), nl.rc_name(nl.RC.EFIND))
+end)())
+
+-- -9 IS UNASSIGNED ON THE WRAPPER SIDE, and must stay that way rather than being reused: the
+-- forwarded DSP_EZONE is -9, and a wrapper code at the same number would be the collision
+-- again for anyone reading a shifted value by eye.
+check('no wrapper code occupies -9', (function()
+  local nl, k, v = fftsa.nl, nil, nil
+  for k, v in pairs(nl.RC) do
+    if v == -9 then return false, 'RC.' .. k .. ' is -9' end
+  end
+  return true, 'the slot EZONE forwards into is free on the wrapper side'
+end)())
+
 print()
 print(string.format('%d passed, %d failed', pass, fail))
 os.exit(fail == 0 and 0 or 1)

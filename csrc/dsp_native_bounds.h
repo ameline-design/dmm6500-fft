@@ -48,6 +48,55 @@
  * window alone is not a tight enough bound for a chunk access. */
 #define DSPN_CHUNK_BYTES  32768U
 
+/* ADDRESSES THE PARAMS STRUCT CARRIES, AND HOW THEY BECOME POINTERS.
+ *
+ * Every address in dsp_native_params is a uint32_t, because the instrument is a 32-bit
+ * PowerPC and Lua writes the struct as big-endian words. On the target these macros are the
+ * identity -- the cast this file always did -- and the built image is byte for byte the one
+ * built without them.
+ *
+ * A HOST BUILD CANNOT USE THE IDENTITY. The host is 64-bit and reserves the low 4 GB, so no
+ * real pointer fits in a uint32_t field. So a host build places one arena and treats every
+ * address in the struct as an OFFSET into it, which lets the host exercise the real bounds
+ * checks: an offset inside DSPN_DRAM_LO..DSPN_DRAM_END passes for the same reason it does on
+ * the instrument, and one outside is refused by the same comparison.
+ *
+ * DSPN_FP is separate and is NEVER base-relative. sin_addr and the five beside it carry CODE
+ * addresses -- libm entries the loader resolved -- and an arena offset is not what they are.
+ * On the target it is the identity. A host build resolves them through dspn_host_fp, which
+ * the host suite defines: the address the caller put in the struct is a token there, mapped
+ * to a real libm entry so that MODE_INIT can build a window table and MODE_RUN can transform.
+ * What the image validates is unchanged -- text_ok still tests the address in the struct,
+ * before the mode dispatch and before this macro is reached -- so the host still has to
+ * present six addresses inside the firmware text span to get that far.
+ */
+#ifdef DSPN_HOST
+extern unsigned char *dspn_host_base;
+extern uintptr_t dspn_host_fp(uint32_t a);
+
+/* The null pointer's address is zero in both worlds, and the subtraction below does not give
+ * that: NULL minus the arena base is a large wrapped offset. It matters because the only
+ * caller tests for zero to skip the plan arrays that are NULL by design -- the ones belonging
+ * to the decomposition the arena was not built for -- so without this the host reads them as
+ * addresses outside the arena and refuses a good plan. Measured as DSPN_EARENA. */
+static uint32_t dspn_host_addr(const void *q)
+{
+    if (q == NULL) { return 0U; }
+    return (uint32_t)((uintptr_t)q - (uintptr_t)dspn_host_base);
+}
+#define DSPN_P(a)  ((uintptr_t)dspn_host_base + (uintptr_t)(a))
+#define DSPN_A(q)  dspn_host_addr(q)
+/* The added zero is not decoration. The image casts this value to a function pointer, and
+ * -Wbad-function-cast refuses such a cast when its operand is a bare call; the sum makes the
+ * operand an expression and changes no value. */
+#define DSPN_FP(a) (dspn_host_fp(a) + (uintptr_t)0)
+#else
+#define DSPN_P(a)  ((uintptr_t)(a))
+#define DSPN_A(q)  ((uint32_t)(uintptr_t)(q))
+#define DSPN_FP(a) ((uintptr_t)(a))
+#endif
+
+
 /* The longest chunk vector a capture buffer may own.
  *
  * NOT the number of blocks a record spans.  That is DSP_MAX_SRC_BLOCKS, and it bounds the

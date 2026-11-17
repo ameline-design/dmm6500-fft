@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.46'
+fftsa.VERSION = '9.48'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -1164,10 +1164,18 @@ function fftsa.frame()
       -- 74 ms -- so a symmetric deadband chases that jitter and the rate swings between 8.2
       -- and 6.7 fps. Dropping takes one grid step and raising takes tick_rise, so it settles
       -- at the fast end and still follows a size change, which moves the period far more.
+      --
+      -- ONE GRID STEP IS THE STEP IN FORCE, not the compiled constant. The grid is 10 ms on a
+      -- DMM6500 and 50 ms on a DMM7510, where a period off the 50 ms grid raises event 1727 as
+      -- a MODAL prompt over the running app: it covers the trace, waits for a press, and makes
+      -- the control socket refuse every statement until it is answered. That instrument is
+      -- reached by a screen grab from another continent, so one value off its grid is
+      -- expensive, and reading the 6500's constant here would not mean what the line above
+      -- says there.
       local move = want - (fftsa.period or 0)
       local need = fftsa.tick_rise
       if move < 0 then
-        move, need = -move, fftsa.tick_grid
+        move, need = -move, fftsa.tick_grid_now()
       end
       -- A MODELLED PERIOD IS NOT A CONVERGED ONE, so the deadband does not apply to the first
       -- measurement after a size change.
@@ -1221,7 +1229,14 @@ function fftsa.frame()
       -- the period and the work disagree and nothing on screen said so.
       fftsa.armed_from = fftsa.plain_peak or fftsa.work_peak
       fftsa.armed_want = want
-      if fftsa.period == nil or move >= need then
+      -- NOT AN EXACT COMPARE, and this is why the line above needs the slack rather than
+      -- merely tolerating it. Both sides are multiples of the grid, and the grid is a decimal
+      -- fraction no binary float holds: 4 * 0.05 is 0.20000000000000001 and 3 * 0.05 is
+      -- 0.15000000000000002, so the one step between them measures 0.049999999999999989 --
+      -- under the stored 0.05. Where the step IS 0.05 that rejects every one-step fall, and
+      -- the period then sticks where it is for the life of the app. The slack is a thousandth
+      -- of the smallest grid, so it cannot admit a move the deadband means to hold.
+      if fftsa.period == nil or move >= need - 1e-5 then
         fftsa.period = want
         fftsa.arm(want)
       end

@@ -83,7 +83,6 @@ volatile uint32_t dspn_params_addr;
 #define DRAM_END     DSPN_DRAM_END
 
 /* Status pushed back to Lua.  Non-negative is a bin count; negative is a refusal. */
-#define DSPN_OK            0
 #define DSPN_EMAGIC      (-1)
 #define DSPN_EBOUNDS     (-2)
 #define DSPN_EPLAN       (-3)
@@ -92,11 +91,30 @@ volatile uint32_t dspn_params_addr;
 #define DSPN_EOUTPUT     (-6)
 #define DSPN_EDESC       (-7)
 #define DSPN_EARENA      (-8)
-#define DSPN_ESCRATCH    (-9)
+/* -9 is unassigned. */
 #define DSPN_ERUN       (-10)
 #define DSPN_EMATH      (-11)
 #define DSPN_EREDUCE    (-12)
 #define DSPN_ERESULT    (-13)
+/* MODE_FIND refusing its OWN arguments. It used to answer DSP_EARG, which is -1 and so reads
+ * back as DSPN_EMAGIC -- a wrong needle length reported as a corrupt params struct. */
+#define DSPN_EFIND      (-14)
+
+/* TWO ERROR SPACES SHARE THIS WORD, and the numbers collide.
+ *
+ * Everything above is this wrapper's. dsp.h has its own DSP_E* set, also small negatives, and
+ * MODE_INIT forwards whatever dsp_plan_init_segs returns -- so DSP_EBETA, -6, arrived
+ * indistinguishable from DSPN_EOUTPUT, and a Kaiser beta the plan builder refused was reported
+ * on the glass as an output-geometry fault. There is one status word and no room for a tag, so
+ * the forwarded space is MOVED instead: a negative from the plan builder comes back shifted by
+ * this, and Lua's rc_name knows to subtract it and name the code from dsp.h.
+ *
+ * Only negatives shift. A non-negative answer from either side is a count, not a code.
+ *
+ * MODE_SEGS forwards dsp_plan_segs and is deliberately NOT shifted: that function converts
+ * every invalid configuration to 0 -- seg_bytes of zero, a layout it cannot lay out, a count
+ * over DSP_N_MAX -- so it has no negative to forward and a shift there would be unreachable. */
+#define DSPN_PLAN_BASE (-100)
 
 /* What Lua writes into p->status before the call, and no exit here ever writes.  Reading
  * it back afterwards means the call did not return through any of them. */
@@ -130,13 +148,8 @@ typedef struct {
     uint32_t segs_addr;    /* nsegs big-endian words: the payload addresses         */
 
     uint32_t plan_addr;    /* dsp_plan, initialised by dsp_plan_init at startup      */
-    uint32_t src_flat;     /* unread.  The record is read in place through cap_vec,  */
-                           /* so there is no de-strided copy; the field stays because */
-                           /* the struct is a wire format and removing it would shift */
-                           /* every word after it.  write_params sends zero.          */
 
     uint32_t cap_chunk1;   /* capture chunk payloads, reading at +0                  */
-    uint32_t cap_chunk2;   /* 0 when the capture fits one chunk                     */
     uint32_t cap_n;        /* samples, a power of two                               */
     uint32_t cap_perchunk; /* elements per chunk, from the descriptor               */
     uint32_t cap_stride;   /* capture element size in bytes.  NOT ASSUMED TO BE 32: */
@@ -207,10 +220,10 @@ typedef struct {
     uint32_t res_mains;    /* DSP_THD_MAINS_*, as an int32; -1 is BOTH                  */
 
     /* WHICH refusal, not just which code.  The line in this file that returned, written by
-     * RET at every exit.  There are 26 of them against a dozen status codes -- DSPN_ECAPTURE
-     * alone has three sites and ten conditions among them -- so a code names the stage and
-     * not the test, and the test is what a fix needs.  A DMM7510 reported rc=-5 ECAPTURE and
-     * placing it took a hand-decoded hex dump of the descriptor.
+     * RET at every exit.  Thirty-one of them refuse, against thirteen status codes --
+     * DSPN_ECAPTURE alone has three sites and ten conditions among them -- so a code names
+     * the stage and not the test, and the test is what a fix needs.  A DMM7510 reported
+     * rc=-5 ECAPTURE and placing it took a hand-decoded hex dump of the descriptor.
      *
      * Last in the struct deliberately: appended, so no field Lua already packs moves, and
      * the PARAM_WORDS check catches the two sides disagreeing about the size.  Lua writes 0
@@ -267,10 +280,12 @@ typedef struct {
     uint32_t px_addr;
 } dsp_native_params;
 
+/* 3 is unassigned. It reported dsp_plan_bytes, a configuration-dependent arena size, and
+ * nothing ever sent it: the caller sizes the arena in CHUNKS from DSPN_MODE_SEGS, and the plan
+ * struct's own size comes out of the linked image as fftsa.nl.SIZEOF_PLAN. dsp_plan_bytes
+ * itself stays -- it is public dsp.h API that the host suite exercises. */
 #define DSPN_MODE_INIT   1U
 #define DSPN_MODE_RUN    2U
-#define DSPN_MODE_BYTES  3U   /* report dsp_plan_bytes and stop; reads nothing but the  */
-                              /* params struct, and writes nothing but its status word  */
 #define DSPN_MODE_SEGS   4U   /* report dsp_plan_segs for seg_bytes, the same way       */
 #define DSPN_MODE_FIND   5U   /* byte-pattern search; reads the find block and DRAM, and */
                               /* writes nothing but that block's output words            */
@@ -395,7 +410,7 @@ const uint32_t dsp_native_sizes[14] = {
 };
 
 /* Words in the struct; write_params must pack exactly this many. */
-#define DSP_NATIVE_PARAM_WORDS  57
+#define DSP_NATIVE_PARAM_WORDS  55
 
 /* Column descriptor field offsets, from the table in fwmem-BUFFER.md.
  *
@@ -510,7 +525,7 @@ static void rb_write(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k, doubl
     uint32_t idx = (uint32_t)k;
     uint32_t base = (idx < perchunk) ? ch1 : ch2;
     uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
-    *(double *)(uintptr_t)(base + off * 32U) = v;
+    *(double *)DSPN_P(base + off * 32U) = v;
 }
 
 /* The extra value, a double at +20 in a 32-byte element: 4-aligned and not 8, which is
@@ -523,7 +538,7 @@ static void rb_write_extra(uint32_t ch1, uint32_t ch2, uint32_t perchunk, int k,
     uint32_t idx  = (uint32_t)k;
     uint32_t base = (idx < perchunk) ? ch1 : ch2;
     uint32_t off  = (idx < perchunk) ? idx : (idx - perchunk);
-    uint32_t *p   = (uint32_t *)(uintptr_t)(base + off * 32U + 20U);
+    uint32_t *p   = (uint32_t *)DSPN_P(base + off * 32U + 20U);
     u.d = v;
     p[0] = u.w[0];
     p[1] = u.w[1];
@@ -592,7 +607,7 @@ static int plan_ptrs_ok(const dsp_plan *pl, const uint32_t *segs, int nsegs,
     };
     int i, s;
     for (i = 0; i < 20; i++) {
-        uint32_t a = (uint32_t)(uintptr_t)ptrs[i];
+        uint32_t a = DSPN_A(ptrs[i]);
         int inside = 0;
         if (a == 0U) { continue; }
         /* Inside one of the segments. With a segmented arena there is no single range to
@@ -639,25 +654,21 @@ int dsp_native_run(void *L)
     if (!range_ok(paddr, (uint32_t)sizeof(dsp_native_params), BACKSTOP_LO, BACKSTOP_HI)) {
         return 0;
     }
-    p = (const dsp_native_params *)(uintptr_t)paddr;
+    p = (const dsp_native_params *)DSPN_P(paddr);
 
     /* The one word written through a pointer the caller did not supply.  It is inside the
      * struct the test above proved to be in DRAM, so it needs no window of its own. */
-    st = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, status));
+    st = (volatile uint32_t *)DSPN_P(paddr + offsetof(dsp_native_params, status));
     /* The second reported word, in the same proven-writable struct and for the same reason:
      * RET writes both, so it has to be set before the first RET below can fire. */
-    fl = (volatile uint32_t *)(uintptr_t)(paddr + offsetof(dsp_native_params, fail_at));
+    fl = (volatile uint32_t *)DSPN_P(paddr + offsetof(dsp_native_params, fail_at));
 
     if (p->magic != DSP_NATIVE_MAGIC) { RET(DSPN_EMAGIC); }
 
     /* Arena sizing, answered before any bound is examined because it dereferences
      * nothing beyond the struct already proved to be in DRAM: it is how Lua learns
      * how much storage to find in the first place, so requiring a valid arena to ask
-     * would be circular. Both are pure arithmetic. */
-    if (p->mode == DSPN_MODE_BYTES) {
-        RET(dsp_plan_bytes((int)p->cap_n, (int)p->init_decim,
-                           (int)p->init_method));
-    }
+     * would be circular. Pure arithmetic. */
     if (p->mode == DSPN_MODE_SEGS) {
         RET(dsp_plan_segs((int)p->cap_n, (int)p->init_decim,
                           (int)p->init_method, (size_t)p->seg_bytes));
@@ -681,7 +692,7 @@ int dsp_native_run(void *L)
         if (!range_ok(p->find_addr, DSPN_FIND_BYTES, BACKSTOP_LO, BACKSTOP_HI)) {
             RET(DSPN_EBOUNDS);
         }
-        fb = (volatile uint32_t *)(uintptr_t)p->find_addr;
+        fb = (volatile uint32_t *)DSPN_P(p->find_addr);
 
         flo  = fb[0];
         fhi  = fb[1];
@@ -691,7 +702,7 @@ int dsp_native_run(void *L)
          * wrong trade -- it exists to refuse exactly this shape of constant. */
         flen  = (fb[3] << 16) >> 16;
         fstep = fb[3] >> 16;
-        if (flen == 0U || flen > DSPN_FIND_PAT) { RET(DSP_EARG); }
+        if (flen == 0U || flen > DSPN_FIND_PAT) { RET(DSPN_EFIND); }
         for (i = 0U; i < flen; i++) {
             pat[i] = (unsigned char)((fb[4U + (i >> 2)] >> (24U - 8U * (i & 3U))) & 0xFFU);
         }
@@ -725,8 +736,8 @@ int dsp_native_run(void *L)
          * step keeps them aligned. That is the whole of the common case: a position that does
          * not match is rejected by one load and one compare instead of up to four of each. */
         if (fstep == 0U) { fstep = 1U; }
-        if (fstep != 1U && fstep != 2U && fstep != 4U) { RET(DSP_EARG); }
-        if (fstep == 4U && (flo & 3U) != 0U) { RET(DSP_EARG); }
+        if (fstep != 1U && fstep != 2U && fstep != 4U) { RET(DSPN_EFIND); }
+        if (fstep == 4U && (flo & 3U) != 0U) { RET(DSPN_EFIND); }
         {
             uint32_t pw0 = 0U;
             uint32_t wordwise = (flen >= 4U && fstep == 4U) ? 1U : 0U;
@@ -736,8 +747,8 @@ int dsp_native_run(void *L)
             }
             while (pos + flen <= fhi && scanned < fcap && nhit < DSPN_FIND_MAX) {
                 if (wordwise) {
-                    if (*(const uint32_t *)(uintptr_t)pos == pw0) {
-                        hay = (const unsigned char *)(uintptr_t)pos;
+                    if (*(const uint32_t *)DSPN_P(pos) == pw0) {
+                        hay = (const unsigned char *)DSPN_P(pos);
                         for (i = 4U; i < flen; i++) {
                             if (hay[i] != pat[i]) { break; }
                         }
@@ -747,7 +758,7 @@ int dsp_native_run(void *L)
                         }
                     }
                 } else {
-                    hay = (const unsigned char *)(uintptr_t)pos;
+                    hay = (const unsigned char *)DSPN_P(pos);
                     for (i = 0U; i < flen; i++) {
                         if (hay[i] != pat[i]) { break; }
                     }
@@ -792,7 +803,7 @@ int dsp_native_run(void *L)
     nsegs = (int)p->nsegs;
     seg_bytes = p->seg_bytes;
     {
-        const uint32_t *vec = (const uint32_t *)(uintptr_t)p->segs_addr;
+        const uint32_t *vec = (const uint32_t *)DSPN_P(p->segs_addr);
         int s;
         for (s = 0; s < nsegs; s++) {
             segs[s] = vec[s];
@@ -832,7 +843,7 @@ int dsp_native_run(void *L)
             !range_ok(p->px_addr, DSPN_PX_BYTES, BACKSTOP_LO, BACKSTOP_HI)) {
             RET(DSPN_EBOUNDS);
         }
-        pb     = (const uint32_t *)(uintptr_t)p->px_addr;
+        pb     = (const uint32_t *)DSPN_P(p->px_addr);
         plo    = pb[0];
         phi    = pb[1];
         ring   = pb[2];
@@ -892,8 +903,8 @@ int dsp_native_run(void *L)
          * the Lua writer's are all covered in test/dsp_native_px_test.cc.  Nothing here can
          * be reached on the instrument without a destination already proved to be ours. */
         if (!dspn_px_map_ok(pb + DSPN_PX_HDR, nrec, p->red_nseg)) { RET(DSPN_EGEOM); }
-        db = (const dsp_real *)(uintptr_t)p->red_db;
-        dspn_px_fill((uintptr_t)ring, stride, yoff, nrec, ymax, ay, by,
+        db = (const dsp_real *)DSPN_P(p->red_db);
+        dspn_px_fill(DSPN_P(ring), stride, yoff, nrec, ymax, ay, by,
                      pb + DSPN_PX_HDR, db);
         RET((int32_t)nrec);
     }
@@ -903,12 +914,12 @@ int dsp_native_run(void *L)
         !text_ok(p->log10_addr)|| !text_ok(p->floor_addr) || !text_ok(p->ceil_addr)) {
         RET(DSPN_EMATH);
     }
-    g_sin   = (math1_fn)(uintptr_t)p->sin_addr;
-    g_cos   = (math1_fn)(uintptr_t)p->cos_addr;
-    g_sqrt  = (math1_fn)(uintptr_t)p->sqrt_addr;
-    g_log10 = (math1_fn)(uintptr_t)p->log10_addr;
-    g_floor = (math1_fn)(uintptr_t)p->floor_addr;
-    g_ceil  = (math1_fn)(uintptr_t)p->ceil_addr;
+    g_sin   = (math1_fn)DSPN_FP(p->sin_addr);
+    g_cos   = (math1_fn)DSPN_FP(p->cos_addr);
+    g_sqrt  = (math1_fn)DSPN_FP(p->sqrt_addr);
+    g_log10 = (math1_fn)DSPN_FP(p->log10_addr);
+    g_floor = (math1_fn)DSPN_FP(p->floor_addr);
+    g_ceil  = (math1_fn)DSPN_FP(p->ceil_addr);
 
     /* The plan struct is written by dsp_plan_init, so it needs the writable test.  It
      * must not sit inside the arena: dsp_plan_init carves the arena from its base and
@@ -917,8 +928,8 @@ int dsp_native_run(void *L)
         hits_arena(p->plan_addr, (uint32_t)sizeof(dsp_plan), segs, nsegs, seg_bytes)) {
         RET(DSPN_EPLAN);
     }
-    plan   = (const dsp_plan *)(uintptr_t)p->plan_addr;
-    plan_w = (dsp_plan *)(uintptr_t)p->plan_addr;
+    plan   = (const dsp_plan *)DSPN_P(p->plan_addr);
+    plan_w = (dsp_plan *)DSPN_P(p->plan_addr);
 
     n = (int)p->cap_n;
 
@@ -929,14 +940,16 @@ int dsp_native_run(void *L)
          * array here keeps the type pun out of it. */
         void *segv[DSPN_MAX_SEGS];
         int rc, s;
-        for (s = 0; s < nsegs; s++) { segv[s] = (void *)(uintptr_t)segs[s]; }
+        for (s = 0; s < nsegs; s++) { segv[s] = (void *)DSPN_P(segs[s]); }
         rc = dsp_plan_init_segs(plan_w, segv, nsegs, (size_t)seg_bytes,
                                 n,
                                 (int)p->init_kind,
                                 (double)p->init_beta_milli / 1000.0,
                                 (int)p->init_decim,
                                 (int)p->init_method);
-        RET(rc);
+        /* Shifted out of this wrapper's space, so -6 from the plan builder cannot be read as
+         * DSPN_EOUTPUT. A non-negative rc is not a code and is forwarded as it stands. */
+        RET(rc < 0 ? rc + DSPN_PLAN_BASE : rc);
     }
 
     if (p->mode != DSPN_MODE_RUN) { RET(DSPN_EBOUNDS); }
@@ -997,7 +1010,7 @@ int dsp_native_run(void *L)
             cap_src.blk[i] = NULL;
         }
         {
-            const uint32_t *cvec = (const uint32_t *)(uintptr_t)p->cap_vec;
+            const uint32_t *cvec = (const uint32_t *)DSPN_P(p->cap_vec);
             for (i = 0; i < want; i++) {
                 /* Element 0 is where the content scan found it, not where the first chunk's
                  * payload begins: the record does not start at the base of its chunk.  Later
@@ -1013,7 +1026,7 @@ int dsp_native_run(void *L)
                 if ((base & 3U) != 0U || !stride_ok_rd(p, base, take, p->cap_stride)) {
                     RET(DSPN_ECAPTURE);
                 }
-                cap_src.blk[i] = (const unsigned char *)(uintptr_t)base;
+                cap_src.blk[i] = (const unsigned char *)DSPN_P(base);
                 left -= take;
             }
         }
@@ -1100,8 +1113,8 @@ int dsp_native_run(void *L)
      * all necessary and none of them is obvious. */
     {
         dsp_bandmap map;
-        dsp_real *db = (dsp_real *)(uintptr_t)p->red_db;
-        dsp_real *hz = (dsp_real *)(uintptr_t)p->red_hz;
+        dsp_real *db = (dsp_real *)DSPN_P(p->red_db);
+        dsp_real *hz = (dsp_real *)DSPN_P(p->red_hz);
         /* zone is the fold the decimation produced, and dsp_reduce reads f0, binhz and
          * sense only; Lua does not send one rather than send a figure nothing uses. */
         map.f0    = pw_double(p->red_f0_hi, p->red_f0_lo);
@@ -1132,10 +1145,10 @@ int dsp_native_run(void *L)
      * native frame would leave dsp.peak and dsp.distortion to post "no spectrum yet" once
      * per peak per frame -- nothing on this path sets the Lua implementation's dsp.ran. */
     {
-        double   *res   = (double *)(uintptr_t)p->res_addr;
-        int      *pbin  = (int *)(uintptr_t)(p->res_addr
+        double   *res   = (double *)DSPN_P(p->res_addr);
+        int      *pbin  = (int *)DSPN_P(p->res_addr
                                              + (uint32_t)DSPN_RES_DOUBLES * 8U);
-        dsp_real *pfrac = (dsp_real *)(uintptr_t)(p->res_addr
+        dsp_real *pfrac = (dsp_real *)DSPN_P(p->res_addr
                                                   + (uint32_t)DSPN_RES_DOUBLES * 8U
                                                   + (uint32_t)DSPN_RES_PEAKS * 4U);
         dsp_real *pamp  = pfrac + DSPN_RES_PEAKS;
@@ -1189,7 +1202,7 @@ int dsp_native_run(void *L)
         const uint32_t nt  = (uint32_t)ntrace;
         const uint32_t cur = rb_addr(ch1, ch2, per, nt);
         const uint32_t chk = rb_chunk(ch1, ch2, per, nt);
-        volatile uint32_t *dsc = (volatile uint32_t *)(uintptr_t)p->out_desc;
+        volatile uint32_t *dsc = (volatile uint32_t *)DSPN_P(p->out_desc);
         dsc[DESC_IT1_PTR   / 4U] = cur;
         dsc[DESC_IT1_IDX   / 4U] = nt;
         dsc[DESC_IT1_CHUNK / 4U] = chk;
