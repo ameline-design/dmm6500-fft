@@ -427,6 +427,16 @@ if(Python3_Interpreter_FOUND)
              COMMAND ${Python3_EXECUTABLE} -I tools/test_probe_ringfind.py
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+    # And the same for probe_pool, which was written, passed, and then run by nothing: a
+    # suite nothing invokes reports its own health to no one and rots at the speed of the
+    # code under it. It covers classify() over seven census series -- the clean case, a pool
+    # dry from the first press, a volunteered event line, a handle that climbs -- and that
+    # the statements it sends go through exec(), which appends a sentinel, rather than q(),
+    # which would block for its whole timeout against a silent statement.
+    add_test(NAME probe_pool
+             COMMAND ${Python3_EXECUTABLE} -I tools/test_probe_pool.py
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
     # The archive carries the image as base64, so there is a decoder between the compiler
     # and the CPU. A wrong byte there is not a failure to load: it is one instruction or
     # one float constant quietly different, which relocation then places perfectly.
