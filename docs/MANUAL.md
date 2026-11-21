@@ -10,18 +10,19 @@ live spectrum, the physical **EXIT** key exits the analyser too.
 
 ## The spectrum screen
 
-![The spectrum screen: a 12.5 kHz 4.0020 V tone reading 12.0 dBV as a single 195 Hz-wide lump, over a 10 Hz to 50 kHz span at 512 samples with the Hann window. The vertical axis is labelled +020.0dB down to -120.0dB and the horizontal axis +00.00kHz to +40.00kHz, both by the firmware. The noise floor sits near -95 dB. Between the graph and the peak table a line reads THD 0.01%, S/N 78.4 dB and a noise floor of -89.7 dBV. A padlock button, closed, and a cog button sit to the right of the peak table](manual-spectrum.png)
+![DMM6500 spectrum screen showing a 6.000 kHz tone at 708.06 mVrms and 0.0 dBV. THD is 0.01%, S/N is 70.8 dB, and the noise floor is -100.4 dBV. The fast-path F indicator is on, and padlock and Options buttons sit to the right of the peak table.](manual-spectrum-current.png)
 
-+20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. By default, 2048
-samples a frame, 256 bins, 10 frames a second. Options offers larger records for finer bin spacing,
-at a slower update rate.
++20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. At the default
+2,048 samples and 100 kS/s, bins are 48.83 Hz wide. The screenshot shows the fast path at 20 fps.
+Options offers larger records for finer bin spacing at a slower update rate.
 
 ### The `F` at the start of the bottom line
 
 The bottom line reads `F  2048 pts  …` once the app is drawing by its **fast path**. Instead of
 appending 510 readings one at a time for the firmware's display task to copy, it writes the
 pixel records straight into the task's own ring in a single operation, and asks for one repaint.
-That is about twice the frame rate, and it is what the rate figures in *Limits* assume.
+That is about twice the frame rate of appending. The *Limits* section keeps an older frame-rate
+benchmark for comparison.
 
 It should appear **within about three seconds of launch**, and then stay. A number after it --
 `F2`, `F3` -- counts how many times the path has had to re-acquire since the line last changed.
@@ -63,13 +64,12 @@ Six peaks, strongest first, in two columns. The voltage is the RMS amplitude of 
 on the graph. Older screenshots show the previous peak-voltage readout.
 
 ```
-1  21.100 kHz   3.1906 Vrms   13.1 dBV
+1  6.000 kHz   708.06mVrms   0.0 dBV
 ```
 
-In the capture, peaks 2 and 3 are the tone's second and third harmonics, 81 and 82 dB down; peaks 4
-to 6 are noise, 84 dB down. At 195 Hz bins the harmonics sit close enough to the floor that their
-frequencies read tens of hertz out — 24.927 kHz for one that is really 25.000. The 16,384-sample
-capture further down resolves them exactly.
+The other rows show the next strongest peaks in the span. They can be harmonics or noise; rank
+does not identify them. The 16,384-sample comparison further down shows how finer bins can
+separate low-level harmonics from the noise floor.
 
 Two buttons sit to the right of the peak table: a **padlock**, which decides what a sideways drag
 means, and a **cog**, which opens Options.
@@ -124,7 +124,7 @@ beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelo
 down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
 telling you about the window rather than the instrument.
 
-![The same capture with Kaiser beta 18: the 12.5 kHz tone at 12.0 dBV with visibly narrower skirts than
+![An earlier 12.5 kHz capture with Kaiser beta 18: the tone is at 12.0 dBV with visibly narrower skirts than
 Hann, and a distortion line reading THD 0.01%, S/N 77.0 dB and a noise floor of -103.9 dBV -- within
 two decibels of what Hann reports, where before the leakage outliers were clipped the two windows
 disagreed by 23](manual-spectrum-kaiser18.png)
@@ -272,7 +272,7 @@ works either way.
 
 ## Options
 
-![The options form: Start Freq, Stop Freq and Input Range in the left column, Window, Kaiser Beta and FFT Samples in the right, with the preview line beneath and About, Reset, Apply and Cancel along the bottom. Start Freq reads 10.0000 Hz, Stop Freq 50.0000 kHz, Input Range 10 V, Window Hann, Kaiser Beta 12 -90dB and FFT Samples 512](manual-options.png)
+![The Options form shows a 10 Hz to 50 kHz span, 10 V input range, Hann window and 2,048 FFT samples. The preview shows 100 kS/s and 48.83 Hz bins. About, Reset, Apply and Cancel sit along the bottom.](manual-options.png)
 
 **If the Options key is slow to respond, something is talking to the instrument.** Front-panel
 keys are dispatched by the firmware's display task, and that dispatch stops while a LAN or USB
@@ -287,7 +287,7 @@ again. On its own the app stays responsive at every sample count.
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
-| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At the small counts the frame rate is set by per-frame overhead rather than by the count, so a step up costs less than doubling suggests; 1024 and 2048 are both measured at 10 frames a second. |
+| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At small counts, per-frame overhead means doubling the sample count does not necessarily halve the frame rate. |
 
 Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
 open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
@@ -549,7 +549,7 @@ distortion line reads THD 0.02%, S/N 78.9 dB and a noise floor of -105.8 dBV -- 
 512-sample figure, which is the 3 dB a doubling a per-bin level gives. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
 +40.00kHz](manual-spectrum-16384.png)
 
-Compare the 512-sample shot at the top of this manual, where the same tone is a single 195 Hz-wide
+Compare the [earlier 512-sample shot](manual-spectrum.png), where the same tone is a single 195 Hz-wide
 lump and the harmonics are down in the noise of the trace — the table still finds them, a few tens
 of hertz out.
 
@@ -645,7 +645,8 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
   tone the instrument can show.
-- **10 frames a second at 1024 and 2048 samples, falling as the count rises.** The firmware's
+- **Earlier frame-rate benchmark.** The table below records a build that appended every point;
+  it does not show the current fast-path rates. In that benchmark the firmware's
   shortest timer period is 0.05 s and a tick arriving mid-frame is dropped. The period itself is
   **not restricted to multiples of 0.05**: asking for one off that grid posts event 1727 in the log
   and the period is honoured anyway. So the rate is `1 / period` on a 10 ms grid, with 0.05 s a hard
@@ -657,13 +658,12 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   | displayed | **10 fps** | **10** | **8.2** | **6.0** | **3.6** | **1.9** |
   | period, derived | 0.10 s | 0.10 | 0.12 | 0.17 | 0.28 | 0.53 |
 
-  **The displayed row is measured, every count, on a DMM6500 1.7.17a.** The period row is `1 / rate`
+  The displayed row was measured at every count on a DMM6500 1.7.17a. The period row is `1 / rate`
   rounded to the 10 ms grid, which is derived and not read back -- the app chooses the period and
   the displayed rate is what comes of it.
 
-  An earlier build read 13 to 15 fps at 1024 and that figure is gone rather than kept: the trace is
-  now written as a folded pass, up the band and back down, which is twice the appends and is what
-  removes the dropout the earlier build had. Over 500 appends at about 76 us each is roughly 39 ms
+  The benchmark used a folded pass, up the band and back down, to remove the dropout of an earlier
+  build that read 13 to 15 fps at 1024. Over 500 appends at about 76 us each is roughly 39 ms
   of every frame. A single ascending lap costs half that and runs 17 fps at 1024, and it cannot be
   used -- it draws the spectrum twice on alternate frames.
 
