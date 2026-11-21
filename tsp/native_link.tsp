@@ -1369,18 +1369,29 @@ end
 
 fftsa.nl.NFIND_CAP = 4194304
 
-function fftsa.nl._finds_native(lo, hi, pat)
+-- Buffer discovery has to reach allocations outside the app's own measured span.
+-- The .heap section in both DMM7510 main images (1.7.16a and 1.7.18a) gives these
+-- bounds. Use them only for this read-only buffer search, never for graph pointers
+-- or for a build whose heap has not been verified.
+function fftsa.nl._buffer_heap_bounds()
+  if localnode == nil or localnode.model ~= 'DMM7510' then return nil end
+  local v = localnode.version
+  if v ~= '1.7.16a' and v ~= '1.7.18a' then return nil end
+  return 9052160, 260710400             -- 0x008A2000 .. 0x0F8A2000
+end
+
+function fftsa.nl._finds_native(lo, hi, pat, heap_lo, heap_hi)
   local nl = fftsa.nl
   if not nl.NFIND then return nil end
   if nl.nfind == nil or not nl.ready then return nil end
-  -- CLAMPED TO MEASURED MEMORY, not to the backstop. Outside it there is nothing to find and
-  -- a load would fault, so a range wholly outside answers "no hits" -- which is what the Lua
-  -- sweep answers there too, by skipping the blocks ki.memread refuses.
-  local mlo, mhi = nl.map_bounds()
+  -- The graph search stays within the live span; buffer discovery may instead use the
+  -- verified firmware heap. The compiled backstop is not evidence that a range is mapped.
+  local mlo, mhi = heap_lo, heap_hi
+  if mlo == nil then mlo, mhi = nl.map_bounds() end
   if mlo == nil then return nil end
   if lo < mlo then lo = mlo end
   if hi > mhi then hi = mhi end
-  if hi <= lo + string.len(pat) then return {} end
+  if hi < lo + string.len(pat) then return {} end
   if nl.find_addr == nil or nl.find_addr == 0 then return nil end
   if string.len(pat) > (nl.NFIND_PAT_MAX or 0) then return nil end
   local out, n, at = {}, 0, lo
@@ -1410,11 +1421,18 @@ function fftsa.nl._finds_native(lo, hi, pat)
   return out
 end
 
-function fftsa.nl.FINDS(lo, hi, pat)
+function fftsa.nl.FINDS(lo, hi, pat, buffer_search)
   local nl  = fftsa.nl
+  local hlo, hhi
+  if buffer_search then hlo, hhi = nl._buffer_heap_bounds() end
+  -- Keep the Lua fallback inside the same verified heap if the native scan is unavailable.
+  if hlo ~= nil then
+    lo, hi = math.max(lo, hlo), math.min(hi, hhi)
+    if hi < lo + string.len(pat) then return {} end
+  end
   -- The image first. nil means there is none, or it refused, and the Lua sweep below is what
   -- every build before the native search shipped with.
-  local nat = nl._finds_native(lo, hi, pat)
+  local nat = nl._finds_native(lo, hi, pat, hlo, hhi)
   if nat ~= nil then return nat end
   -- The pixel path takes native or nothing: an empty table here would read as "the needle is
   -- not in this range" and move its cursor past bytes nothing looked at.
@@ -1541,7 +1559,7 @@ function fftsa.nl._find_storage(buf, has_extras)
   local nhits = 0
   fftsa.nl.sweep_reset()
   for wi = 1, table.getn(windows) do
-    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle, true)
     nhits = nhits + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
@@ -2098,7 +2116,7 @@ function fftsa.nl._find_desc(elem0, buf, stride)
   end
   local wi
   for wi = 1, table.getn(windows) do
-    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle, true)
     nl._raw_n = nl._raw_n + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
@@ -2179,7 +2197,7 @@ function fftsa.nl._find_desc_by_sig(buf)
   local nhits = 0
   nl.sweep_reset()
   for wi = 1, table.getn(windows) do
-    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle)
+    local hits = fftsa.nl.FINDS(windows[wi][1], windows[wi][2], needle, true)
     nhits = nhits + table.getn(hits)
     local k
     for k = 1, table.getn(hits) do
@@ -3908,6 +3926,7 @@ function fftsa.nl.px_from_bufsub()
   local slot = nl.px_sub_slot()
   if slot == nil then return {} end
   local tr = nl.px_sub_fixed(slot)
+  local fixed = tr ~= nil
   if tr == nil then
     -- THE COMPILED OFFSETS DID NOT CLOSE THE CHAIN, so derive the pair from the slot's own
     -- words. On a DMM6500 this never runs. On a model that moved the fields it is the
@@ -3919,7 +3938,7 @@ function fftsa.nl.px_from_bufsub()
     end
     if tr == nil then return {} end
   end
-  local g = nl.px_from_trace(tr)
+  local g = nl.px_from_trace(tr, fixed)
   if table.getn(g) == 0 then
     -- THE REASON px_from_trace GAVE, not a presumed one. An empty ring is the usual cause on
     -- the early frames -- px_from_name's last test is cnt >= 1, the corpse test, right for a
@@ -4066,7 +4085,37 @@ function fftsa.nl.px_live(addr)
   return false
 end
 
-function fftsa.nl.px_from_trace(tr)
+-- The fixed subscriber chain authenticates the 6500 trace. Its drawn header at +0x1F0
+-- and staging header at +0x208 swap their bounds when the GUI swaps the inline banks.
+-- Measured on 1.7.17a: the second bank was drawn and all 510 records matched the FFT
+-- grid. It is too far past the header for the generic name search's proximity test.
+function fftsa.nl.px_from_banks(tr, at)
+  local nl = fftsa.nl
+  local stride, nrec = 56, 721
+  local a, b = tr + 544, tr + 41424       -- inline banks at +0x220 and +0xA1D0
+  local span = stride * nrec
+  local hdr = tr + nl.PX_TRACE_BNDS
+  local blo, bhi = nl.BACKSTOP_LO, nl.BACKSTOP_HI
+  if blo == nil or bhi == nil or blo >= bhi then blo, bhi = 0, nl.DRAM_END end
+  if hdr < blo or b + span > bhi then return nil end
+  local h = ki.memread(hx(hdr), '20')     -- 32 bytes, including both pairs of bounds
+  nl.rd_note(32)
+  if h == nil or string.len(h) ~= 32 then return nil end
+  local lo, hi = u32_at(h, 1), u32_at(h, 5)
+  local alt = u32_at(h, 25)
+  if not ((lo == a and alt == b) or (lo == b and alt == a))
+     or hi ~= lo + span or u32_at(h, 29) ~= alt + span then return nil end
+  local old, wr, cnt = u32_at(h, nl.HDR_OLD + 1), u32_at(h, nl.HDR_WRITE + 1),
+                       u32_at(h, nl.HDR_COUNT + 1)
+  if old < lo or old >= hi or math.mod(old - lo, stride) ~= 0
+     or wr < lo or wr > hi or math.mod(wr - lo, stride) ~= 0
+     or cnt < 1 or cnt > nrec then return nil end
+  return { lo = lo, hi = hi, nrec = nrec, stride = stride, hdr = hdr,
+           name_at = at, name_off = hdr - at,
+           h_old = nl.HDR_OLD, h_wr = nl.HDR_WRITE, h_cnt = nl.HDR_COUNT }
+end
+
+function fftsa.nl.px_from_trace(tr, fixed_subscriber)
   local nl = fftsa.nl
   if type(tr) ~= 'number' or tr <= 0 or math.mod(tr, 4) ~= 0 then return {} end
   -- The trace object itself, and the whole name field, inside proven memory.
@@ -4081,6 +4130,10 @@ function fftsa.nl.px_from_trace(tr)
   if got ~= want then
     nl.ptr_why = 'trace at ' .. hx(tr) .. ' does not carry this buffer name'
     return {}
+  end
+  if fixed_subscriber and not nl.model_7510 and not nl.PX_HDR_DERIVE then
+    local g = nl.px_from_banks(tr, at)
+    if g ~= nil then return {g} end
   end
   -- And the geometry, from the bounds pair the layout puts at +0x1F0. px_from_name walks
   -- forward from the name for a pair that stands up, which lands on exactly that word
@@ -5513,6 +5566,12 @@ function fftsa.nl.px_frame(db, hz, nseg, tb, t)
   local h = ki.memread(hx(p.hdr), hx(24))
   if h == nil or string.len(h) < 24 then
     return nl.px_dropframe('header read gave ' .. tostring(h ~= nil and string.len(h) or 0))
+  end
+  -- The cached geometry carries these same bounds. Check them regardless of where
+  -- it came from: during a bank switch the cursors may still describe the old bank.
+  if p.g ~= nil and p.g.lo ~= nil and p.g.hi ~= nil
+     and (u32_at(h, 1) ~= p.g.lo or u32_at(h, 5) ~= p.g.hi) then
+    return nl.px_dropframe('the displayed bank changed')
   end
   -- THE WINDOW IS PUT BACK, every frame, before anything is written.
   --

@@ -17,7 +17,7 @@ fftsa = fftsa or {}   -- the single global this app exposes
 -- worth nothing if it does not say which build produced it -- and the report arrives as a
 -- screen grab, so the build has to be IN the grab. tools/check_version.py fails the build if
 -- this and tools/package_tspa.py disagree.
-fftsa.VERSION = '9.49'
+fftsa.VERSION = '9.56'
 
 -- Capability gate, fastest first:
 --   1. the compiled PPC DSP. nl.ready is set by nl.init() from fftsa.start(), so it is
@@ -756,6 +756,14 @@ function fftsa.plan_n()
   return dsp.fft.samples
 end
 
+-- FUNCTION changes the meter independently of the app. Give the panel back to the
+-- operator instead of trying to capture in the new mode or switching it back to ours.
+function fftsa.exit_if_function_changed()
+  if dmm.digitize.func == dmm.FUNC_DIGITIZE_VOLTAGE then return false end
+  fftsa.cleanup()  -- deferred to the frame boundary if a frame is in flight
+  return true
+end
+
 -- One frame: acquire, one primitive call, plot. Runs under pcall from fftsa.frame().
 -- docs/PERFORMANCE.md has the measured phase costs.
 function fftsa.frame_body()
@@ -765,6 +773,7 @@ function fftsa.frame_body()
      or fftsa.sg_pk_f == nil then
     return
   end
+  if fftsa.exit_if_function_changed() then return end
   -- Diagnostic: FFTSA_FREEZE, set before launch, runs one frame then stops touching the
   -- trace buffer, so dropouts that continue are the widget's and not ours. A bare global
   -- because a socket command aborts a running app.
@@ -778,6 +787,8 @@ function fftsa.frame_body()
   local t_a = os.clock()
   fftsa.cap.clear()
   dmm.digitize.read(fftsa.cap)
+  -- The function can also change while the capture blocks. Do not send that record to DSP.
+  if fftsa.exit_if_function_changed() then return end
   -- Asked of the capture before anything is computed from it, and free: the firmware keeps
   -- the buffer's min and max current as readings land, so this is a read and not a pass.
   fftsa.overrange = fftsa.cap_overrange(fftsa.cap)
@@ -800,6 +811,13 @@ function fftsa.frame_body()
   -- keeps a frame from ever being handed the previous frame's figures.
   fftsa.nl_res, fftsa.nl_res_done = nil, false
   local native = fftsa.nl_usable()
+  -- An empty firmware buffer has startindex=0, not a wrapped record. Check the count
+  -- first so a missed or partial capture does not force the (possibly absent) fallback.
+  if native and (fftsa.cap.n == nil or fftsa.cap.n < fftsa.n) then
+    fftsa.nl_shortreads = (fftsa.nl_shortreads or 0) + 1
+    fftsa.shortreads = fftsa.nl_shortreads
+    return
+  end
   -- A wrapped capture comes back rotated: readings[1] is the ring's physical slot 1 and the
   -- oldest reading sits at startindex, so a linear walk over the storage transforms the
   -- record in the wrong order -- every frequency wrong, and nothing on the plot to say so.
@@ -811,15 +829,6 @@ function fftsa.frame_body()
     native = false
   end
   if native then
-    -- A short record is refused rather than transformed: zero-padding the tail gives a
-    -- convincing and false broadband spectrum, and a trigger timeout is the ordinary cause.
-    if fftsa.cap.n == nil or fftsa.cap.n < fftsa.n then
-      -- Counted on its own name and then mirrored, because the other path keeps an absolute
-      -- total of its own and the shared figure would jump at a demotion.
-      fftsa.nl_shortreads = (fftsa.nl_shortreads or 0) + 1
-      fftsa.shortreads = fftsa.nl_shortreads
-      return
-    end
     -- The bin width in force, off the capture's own timestamps -- the samplerate read-back
     -- does not match what arrives, so it is never the source -- but HELD, because the trace's
     -- frequency series has to be the same one from frame to frame. binhz_hold says why.
@@ -1057,6 +1066,11 @@ function fftsa.frame()
   -- Timed, because the timer period is set from what a frame actually costs.
   local entry = os.clock()
   local ok, err = pcall(fftsa.frame_body)
+  if fftsa.stop_pending then
+    fftsa.busy = false
+    fftsa.stop()
+    return
+  end
   fftsa.frame_work = os.clock() - entry
   -- The delivered interval between frames, which is where the rate actually goes and is not
   -- frame_work: the firmware's timer and the display task both live in the gap between
@@ -1290,7 +1304,8 @@ function fftsa.frame()
   -- buffers. halted keeps the timer out of frame_body meanwhile and the guard above is
   -- still held. Skipped when a teardown waits, and when the frame above gave up: halted is
   -- cleared at the end of this block, so retuning through a halt would restart that loop.
-  if fftsa.retune_pending and not fftsa.stop_pending and not fftsa.halted then
+  if fftsa.retune_pending and not fftsa.stop_pending and not fftsa.halted
+     and not fftsa.exit_if_function_changed() then
     fftsa.retune_pending = false
     -- Reconfigures the digitizer and takes one capture, with the trace frozen for it. No
     -- window tables are rebuilt: fft_init() is keyed on the count and the window, and a
@@ -1682,6 +1697,7 @@ end
 fftsa.opt_tick_period = 0.1
 
 function fftsa.opt_tick()
+  if fftsa.timer ~= nil and fftsa.exit_if_function_changed() then return false end
   fftsa.options_preview()
   return true
 end
@@ -1728,6 +1744,12 @@ function fftsa.build_about()
   -- End App is delivered to the visible screen, and this one can be it.
   display.setevent(fftsa.aboutscr, display.EVENT_ENDAPP,
                    "if fftsa ~= nil then fftsa.cleanup() end")
+  -- The frame and Options timers are inactive here. Watch the function without acquiring.
+  local watch = create(fftsa.aboutscr, display.OBJ_TIMER, 0.25, display.TIMER_FOREVER)
+  if watch ~= nil then
+    display.setevent(watch, display.EVENT_PRESS,
+      "if fftsa ~= nil and fftsa.timer ~= nil then fftsa.guard(fftsa.exit_if_function_changed) end")
+  end
   fftsa.about_show_page(1)
   return fftsa.aboutscr
 end
@@ -1880,6 +1902,7 @@ function fftsa.show_main()
     display.changescreen(fftsa.sg_scr)
     fftsa.scr_now = fftsa.sg_scr
     fftsa.main_t_sw = os.clock() - t0
+    fftsa.loading_watch_back()
     return true
   end
   display.changescreen(display.SCREEN_HOME)
@@ -1982,6 +2005,8 @@ function fftsa.options_span()
 end
 
 function fftsa.options_apply()
+  -- Apply may be delivered before the preview timer notices the front-panel selection.
+  if fftsa.timer ~= nil and fftsa.exit_if_function_changed() then return false end
   -- Every field is read before anything is committed, so a raise in here leaves the applied
   -- state untouched. A raise after the first commit would leave the span changed with the
   -- axis, the cover and the message describing the old one, and say() writes the spectrum
@@ -2298,6 +2323,10 @@ function fftsa.press_poll()
   -- END APP FIRST, ALWAYS. Only EVENT_ENDAPP is registered on sg_scr -- no press is -- so an
   -- event for the screen is End App, and it is the way out of the very state this exists for.
   if id == fftsa.sg_scr then fftsa.guard(fftsa.cleanup) return true end
+  if id == fftsa.loadscr and fftsa.loadwatch then
+    fftsa.guard(fftsa.cleanup)
+    return true
+  end
   -- This screen's own two, which are the presses worth having.
   if id == fftsa.optbtn then fftsa.guard(fftsa.options) return true end
   if id == fftsa.lockbtn then fftsa.guard(fftsa.toggle_lock) return true end

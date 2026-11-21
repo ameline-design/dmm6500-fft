@@ -1061,6 +1061,57 @@ end
 
 fftsa.nl.FINDS = FINDS_REAL
 
+-- v9.49 / DMM7510 1.7.18a reported a completed search with 66 signature hits,
+-- but the native finder had clipped every window to the app's live allocations.
+-- Emulate that span, a nearby signature decoy, and a real descriptor above it.
+do
+  local keepnode, keepfind, keepmap = localnode, nl.nfind, nl.map_bounds
+  local keepready, keepaddr, keepnf = nl.ready, nl.find_addr, nl.NFIND
+  local keepinst, keeparena = nl.cclass, nl.arena
+  local base, elem0 = 33554432, 34603008             -- 0x02000000, 0x02100000
+  local heaplo, heaphi = 9052160, 260710400          -- 0x008A2000, 0x0F8A2000
+  local mappedlo, mappedhi = 17250192, 23695200     -- anchor to DSP arena from the report
+  local decoy, hit = mappedlo + 4096, base + D75.cap
+  local crossed, outside = false, false
+  reset_heap()
+  place_desc(base, elem0, 20, 1638, 41, 65536, 2048, D75)
+  place_geom(elem0, 20, 1638, VEC, 2048, live)
+  nl._stor_of, nl._desc_of, nl._desc_at = nil, nil, nil
+  nl.NFIND, nl.ready, nl.find_addr = true, true, mappedhi - 4096
+  nl.cclass = function() return 20913520 end         -- 0x013F1D70
+  nl.map_bounds = function() return mappedlo, mappedhi end
+  nl.nfind = function(lo, hi, pat, cap)
+    crossed = crossed or (lo >= mappedhi or hi > mappedhi)
+    outside = outside or lo < heaplo or hi > heaphi
+    local nextpos = math.min(lo + cap, hi)
+    local out = {}
+    if pat == SIGPAT then
+      if decoy >= lo and decoy < nextpos then table.insert(out, decoy) end
+      if hit >= lo and hit < nextpos then table.insert(out, hit) end
+    end
+    return out, nextpos
+  end
+  localnode = {model = 'DMM7510', version = '1.7.18a'}
+  local fixed = nl.describe({n = 2048, capacity = 65536, readings = live}, false)
+  check('a DMM7510 capture descriptor outside the pixel search span still binds',
+        crossed and not outside and fixed ~= nil and fixed.desc == base
+        and fixed.elemsize == 20 and fixed.perchunk == 1638,
+        'crossed=' .. tostring(crossed) .. ' outside heap=' .. tostring(outside)
+        .. ' why=' .. tostring(nl._stor_why))
+
+  crossed = false
+  nl.FINDS(heaplo, heaphi, SIGPAT)  -- no buffer flag: leave display search bounds alone
+  check('an ordinary sweep on the same DMM7510 still uses the measured span', not crossed)
+  localnode.version = '1.7.19a'
+  crossed = false
+  nl.FINDS(heaplo, heaphi, SIGPAT, true)
+  check('an unverified firmware does not get the wider buffer search', not crossed)
+  localnode, nl.nfind, nl.map_bounds = keepnode, keepfind, keepmap
+  nl.ready, nl.find_addr, nl.NFIND = keepready, keepaddr, keepnf
+  nl.cclass, nl.arena = keepinst, keeparena
+  nl._stor_of, nl._desc_of, nl._desc_at = nil, nil, nil
+end
+
 -- ========================================================================================
 -- resolve_math: finding the libm entries without comparing anything to an address.
 --
@@ -4271,8 +4322,68 @@ do
           g ~= nil and g.lo == TRING and g.hdr == TBOUND and g.via_sub == true,
           g ~= nil and string.format('ring %X hdr %X via_sub=%s', g.lo, g.hdr,
                                      tostring(g.via_sub))
-          or string.format('%d candidate(s), why=%s', table.getn(gs),
-                           tostring(fftsa.nl.sub_why)))
+           or string.format('%d candidate(s), why=%s', table.getn(gs),
+                            tostring(fftsa.nl.sub_why)))
+    do
+      -- DMM6500 1.7.17a, observed on 9.54: the subscriber is correct, but the
+      -- displayed and staging headers have exchanged the two inline banks.
+      wire(fftsa.nl.PX_SUB_KIND, SP4, SGRAPH, SLOT)
+      local second, span = TLO + 41424, 40376   -- trace+0xA1D0, 721 * 56
+      local dst = ki.memread(string.format('%X', TRING), string.format('%X', NREC * STRIDE))
+      wrs(second, dst)
+      wr32(TBOUND, second)
+      wr32(TBOUND + 4, second + span)
+      wr32(TBOUND + 8, second)
+      wr32(TBOUND + 12, second + NREC * STRIDE)
+      wr32(TBOUND + 24, TRING)
+      wr32(TBOUND + 28, TRING + span)
+      local alternate = fftsa.nl.px_from_bufsub()[1]
+      local mapped = alternate ~= nil and fftsa.nl.px_map(alternate, HZ, NSEG)
+      check('the live subscription maps the second display bank without a sweep',
+            mapped and alternate.lo == second and alternate.nrec == 721
+            and alternate.stride == STRIDE,
+            alternate == nil and 'no geometry' or tostring(fftsa.nl.px.why))
+      local cached
+      if mapped then
+        local ring, seed, save = FFTSA_PXRING, FFTSA_PXSEED, fftsa.nl.px_cache_save
+        fftsa.nl.px_cache_save = function() end
+        fftsa.nl.px_cache_put(alternate)
+        cached = fftsa.nl.px_cache_get()
+        FFTSA_PXRING, FFTSA_PXSEED, fftsa.nl.px_cache_save = ring, seed, save
+      end
+      check('a name hit alone cannot authorize the second bank',
+            table.getn(fftsa.nl.px_from_name(TNAME)) == 0)
+      wr32(TBOUND + 28, TRING + span - STRIDE)
+      check('a mismatched staging bank does not authenticate the second bank',
+            table.getn(fftsa.nl.px_from_bufsub()) == 0)
+
+      -- Present a switched header but leave its old/count fields temporarily
+      -- unchanged, so the existing cursor-slip check cannot pass this test.
+      wr32(TBOUND, TRING)
+      wr32(TBOUND + 4, TRING + span)
+      local writes, mw, got_frame = 0, ki.memwrite, nil
+      ki.memwrite = function() writes = writes + 1 end
+      if mapped then got_frame = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 14100) end
+      ki.memwrite = mw
+      check('a bank switch invalidates the fast path before any write',
+            mapped and got_frame == nil and writes == 0 and
+            string.find(tostring(fftsa.nl.px.whyframe), 'bank changed', 1, true) ~= nil,
+            'writes=' .. tostring(writes) .. ' why=' .. tostring(fftsa.nl.px.whyframe))
+
+      wr32(TBOUND, second)
+      wr32(TBOUND + 4, second + span)
+      local cache_mapped = cached ~= nil and fftsa.nl.px_map(cached, HZ, NSEG)
+      wr32(TBOUND, TRING)
+      wr32(TBOUND + 4, TRING + span)
+      writes, got_frame = 0, nil
+      ki.memwrite = function() writes = writes + 1 end
+      if cache_mapped then got_frame = fftsa.nl.px_frame(DB, HZ, NSEG, 'TB', 14101) end
+      ki.memwrite = mw
+      check('the same bank switch refuses all writes after restoring cached geometry',
+            cache_mapped and got_frame == nil and writes == 0 and
+            string.find(tostring(fftsa.nl.px.whyframe), 'bank changed', 1, true) ~= nil,
+            'writes=' .. tostring(writes) .. ' why=' .. tostring(fftsa.nl.px.whyframe))
+    end
     -- A TRACE OUTSIDE THE APP'S OWN SPAN IS STILL THE RIGHT TRACE.
     --
     -- Measured on the glass at 9.24, second run of a boot: the chain found the right slot and

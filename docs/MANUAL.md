@@ -3,8 +3,10 @@
 Runs entirely on the instrument: the digitizer captures, the instrument computes the transform, the
 firmware's own graph object draws the trace. DMM6500, DAQ6510 and DMM7510.
 
-Install `FFT_Spectrum.tspa` from a USB key under **MENU > Manage Apps**. **End App** frees every
-screen and buffer the app made.
+Install `FFT_Spectrum.tspa` from a USB key under **MENU > Manage Apps**. **End App** frees the app's
+screens and graph buffers. Selecting a different measurement or digitize function with the
+front-panel **FUNCTION** key also exits the analyser and leaves that function selected. From the
+live spectrum, the physical **EXIT** key exits the analyser too.
 
 ## The spectrum screen
 
@@ -55,10 +57,13 @@ it is at every default: a 10 Hz Start on a 50 kHz span would otherwise put the t
 20010 Hz and label them `+00.01kHz`. Zoom into a narrow band and the axis keeps that band's own
 limits, so the trace still fills the plot.
 
-Six peaks, strongest first, in two columns:
+Six peaks, strongest first, in two columns. The voltage is the RMS amplitude of each tone
+(`Vpeak / √2`). The dBV column uses the graph's peak-amplitude reference,
+`20 log10(Vpeak / 1 V)`, not the displayed RMS voltage. It matches the level of a peak marker
+on the graph. Older screenshots show the previous peak-voltage readout.
 
 ```
-1  21.100 kHz   4.5122 V   13.1 dBV
+1  21.100 kHz   3.1906 Vrms   13.1 dBV
 ```
 
 In the capture, peaks 2 and 3 are the tone's second and third harmonics, 81 and 82 dB down; peaks 4

@@ -118,12 +118,13 @@ fftsa.sg_fmax_real = 1e6
 
 -- Peak table: 6 rows as two columns of three. freq/volt/dB are separate objects at fixed x,
 -- so the volt and dB columns do not jitter as the proportional-font frequency text changes
--- width.
+-- width. Use the narrower FONT_1 for the RMS values so their units fit before the
+-- next field and before the lock button (x=660).
 fftsa.sg_pky     = 350     -- first peak row baseline
 fftsa.sg_pkdy    = 20      -- row pitch
-fftsa.sg_pk_colx_f = {8,   360}   -- frequency field x, per column
-fftsa.sg_pk_colx_v = {118, 470}   -- voltage field x,   per column
-fftsa.sg_pk_colx_d = {200, 552}   -- dB field x,        per column
+fftsa.sg_pk_colx_f = {8,   334}   -- frequency field x, per column
+fftsa.sg_pk_colx_v = {123, 444}   -- voltage field x,   per column
+fftsa.sg_pk_colx_d = {235, 547}   -- dB field x,        per column
 fftsa.sg_pk_cf   = 14745568  -- freq colour (pale green)
 fftsa.sg_pk_cv   = 13166335  -- volt colour (pale blue)
 fftsa.sg_pk_cd   = 16769184  -- dB colour   (pale amber)
@@ -901,8 +902,8 @@ function fftsa.sg_build(title, nbins, npoints)
     if y > 418 then y = 418 end
     fftsa.sg_pk_f[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_f[col], y,
                         string.format("%d  ---", p), fftsa.sg_pk_cf, small, display.JUST_LEFT)
-    fftsa.sg_pk_v[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_v[col], y, "", fftsa.sg_pk_cv, small, display.JUST_LEFT)
-    fftsa.sg_pk_d[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_d[col], y, "", fftsa.sg_pk_cd, small, display.JUST_LEFT)
+    fftsa.sg_pk_v[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_v[col], y, "", fftsa.sg_pk_cv, display.FONT_1, display.JUST_LEFT)
+    fftsa.sg_pk_d[p] = create(fftsa.sg_scr, display.OBJ_TEXT, fftsa.sg_pk_colx_d[col], y, "", fftsa.sg_pk_cd, display.FONT_1, display.JUST_LEFT)
   end
 
   fftsa.sg_thd_last = nil
@@ -981,11 +982,16 @@ function fftsa.sg_restore_defbuffer()
   -- Whichever side is live. The app's own exit is the digitize branch; the measure branch is
   -- for an exit after the panel has been moved to a measure function under the app.
   local ok = false
-  if dmm.digitize.func ~= dmm.FUNC_NONE then
+  local func = dmm.digitize.func
+  if func ~= dmm.FUNC_NONE then
+    -- If the operator selected a different digitize function, preserve its count.
+    local count
+    if func ~= dmm.FUNC_DIGITIZE_VOLTAGE then count = dmm.digitize.count end
     ok = pcall(function()
       dmm.digitize.count = 1
       dmm.digitize.read(defbuffer1)
     end)
+    if count ~= nil and dmm.digitize.func == func then dmm.digitize.count = count end
   elseif dmm.measure.func ~= dmm.FUNC_NONE then
     ok = pcall(function() dmm.measure.read(defbuffer1) end)
   end
@@ -1078,7 +1084,8 @@ function fftsa.sg_store_xrange(flo_hz, fhi_hz)
 end
 
 -- "---", not a number, for anything unmeasured: 0.00% reads as a clean signal where no
--- harmonic in the window means no figure at all. dBV, as the peak table's dB column. n is
+-- harmonic in the window means no figure at all. dBV uses the same reference as the graph
+-- and the peak table's dBV column. n is
 -- the sample count, and it chooses the THD decimal count and nothing else.
 function fftsa.sg_thd_text(thd, snr, ndb, n, over)
   local t, s
@@ -1676,16 +1683,19 @@ end
 -- The microvolt format the peak table's volt column uses: one decimal on the 1 V and 0.1 V
 -- ranges, where a whole-microvolt step throws away resolution, and whole microvolts on 10 V.
 -- One decimal and not two, because the digitizer is 4.5 digits -- an LSB of about 2 uV on
--- 0.1 V -- and the measured per-bin noise floor is 2.95 uV. The widest result is "999.9 uV",
--- inside what "%.2f mV" and "%.4f V" already print in the same 82 px field.
-fftsa.sg_uv_fmt_std  = "%0.0f uV"
-fftsa.sg_uv_fmt_fine = "%0.1f uV"
+-- 0.1 V. The RMS suffix fits in the same field as the volts and millivolts formats.
+fftsa.sg_uv_fmt_std  = "%0.0f uVrms"
+fftsa.sg_uv_fmt_fine = "%0.1f uVrms"
 fftsa.sg_uv_fine_vmax = 1        -- the largest range that gets the decimal
 
 function fftsa.sg_uv_fmt(range)
   if range ~= nil and range <= fftsa.sg_uv_fine_vmax then return fftsa.sg_uv_fmt_fine end
   return fftsa.sg_uv_fmt_std
 end
+
+-- Convert only the peak table's voltage column. The dBV column stays on the same
+-- peak-amplitude reference as the graph and its markers.
+local SG_PK_RMS = 1 / math.sqrt(2)
 
 -- The unconditional draw; the gate above is the only thing deciding when it runs.
 function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
@@ -1699,17 +1709,18 @@ function fftsa.sg_show_peaks_now(bi, bv, count, binhz, pk_hz, pk_v)
       else ftxt = string.format("%d  %.1f Hz", p, f) end
       -- An amplitude past the largest range is not a voltage, so both columns dash rather
       -- than one of them stating a figure. It is also a width matter: %.4f of the 9.9e+37
-      -- sentinel is 45 characters where the column holds 8, and at a fixed x that overwrites
+      -- sentinel is 45 characters, and at a fixed x that overwrites
       -- the dB column and the whole second column with it.
       local vtxt, dtxt
       if v ~= v then vtxt, dtxt = "", ""
       elseif v > fftsa.sg_vmax_real then vtxt, dtxt = "---", "--- dBV"
       else
-        if v >= 1 then vtxt = string.format("%.4f V", v)
-        elseif v >= 1e-3 then vtxt = string.format("%.2f mV", v * 1e3)
-        else vtxt = string.format(fftsa.sg_uv_fmt(fftsa.range), v * 1e6) end
-        -- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against an axis
-        -- that stops at -120, which the trace cannot show and the column has no room for.
+        local rms = v * SG_PK_RMS
+        -- Promote a value that would round to 1000.00 mVrms. The compact suffix
+        -- keeps three-digit mV readouts clear of the dBV field without losing digits.
+        if rms >= 0.999995 then vtxt = string.format("%.4f Vrms", rms)
+        elseif rms >= 1e-3 then vtxt = string.format("%.2fmVrms", rms * 1e3)
+        else vtxt = string.format(fftsa.sg_uv_fmt(fftsa.range), rms * 1e6) end
         local dbv = 20 * log10(v)
         if not (dbv > fftsa.sg_dbmin) then dbv = fftsa.sg_dbmin end
         dtxt = string.format("%.1f dBV", dbv)

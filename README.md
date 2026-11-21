@@ -53,6 +53,7 @@ responsive at every sample count.
   sample count, each carrying the **maximum of the bins it covers**, so a narrow tone always reaches
   it however many bins the span holds.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
+  The peak table shows Vrms and graph-referenced dBV; older screenshots show the previous peak-voltage readout.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Settles every gesture.** The firmware's graph pans and zooms on touch and will not be told not to,
   so a brushed screen slides the trace off its axes. The dB axis always goes back — there is no
@@ -88,8 +89,8 @@ which does not.
 and 0.1 V ranges, where the axis reaches −140: a 7510 measures a noise floor of −134 dBV on 0.1 V and
 −129 on 1 V, both of which sit under a −120 axis altogether. A DMM6500 reads −123 and −121 on the same
 two ranges, close enough to show, and keeps −120 everywhere. The axis, the trace's clamp and the peak
-table's dB column all take that one floor, which moves on Apply because that is where the range is
-committed. `localnode.model` picks it — matched on the digits, so a variant name still reads as a
+table's dB column use the same floor. It moves on
+Apply because that is where the range is committed. `localnode.model` picks it — matched on the digits, so a variant name still reads as a
 7510.
 
 The THD figure carries **two decimals below 8,192 samples, three at 8,192 and four at 16,384**, gated
@@ -128,4 +129,3 @@ nine settings: **4.0e-6 bins of frequency error and 0.0035 dB of amplitude error
 ## Licence
 
 MIT. See `LICENSE`.
-

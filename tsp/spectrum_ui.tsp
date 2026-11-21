@@ -33,14 +33,32 @@ end
 
 function fftsa.loading_front()
   if fftsa.loadscr == nil then return false end
+  -- Intentional visits (startup and Apply) are not exits. Unregister the show event
+  -- before raising the cover, so there is no delayed callback to run after Apply.
+  if fftsa.loadwatch then
+    display.setevent(fftsa.loadscr, display.EVENT_PRESS, 0)
+    fftsa.loadwatch = false
+  end
   display.changescreen(fftsa.loadscr)
+  fftsa.scr_now = fftsa.loadscr
   return true
+end
+
+-- The physical EXIT key is firmware Back, not EVENT_ENDAPP. If it returns to the
+-- retained cover, the screen's on-show event must exit instead of stranding the app
+-- on a screen whose frame timer never runs. Arm only after switching off the cover.
+function fftsa.loading_watch_back()
+  if fftsa.loadscr == nil or fftsa.loadwatch then return end
+  display.setevent(fftsa.loadscr, display.EVENT_PRESS,
+    "if fftsa ~= nil and fftsa.loadwatch then fftsa.guard(fftsa.cleanup) end")
+  fftsa.loadwatch = true
 end
 
 -- Put a real screen in front, then take the cover away. Switch first, delete
 -- second: deleting the screen on show leaves the panel black.
 function fftsa.loading_destroy(showscr)
   if showscr == nil then showscr = display.SCREEN_HOME end
+  fftsa.loadwatch = false
   if fftsa.loadscr == nil then
     display.changescreen(showscr)
     return false

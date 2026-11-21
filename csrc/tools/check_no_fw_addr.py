@@ -42,8 +42,8 @@ this checks the three places an address could hide and fails the build if one ap
      csrc/dsp_native_bounds.h was not read at all, which is where the backstop lives.
 
      The list is small on purpose. A new DRAM-range constant fails until someone writes
-     down what it is, and the one model-dependent figure left in the tree -- TEXT_HI -- is
-     named as such rather than hidden among the arithmetic.
+      down what it is. The DMM7510 buffer search has a separate, build-scoped exception for
+      the read-only heap bounds verified in its firmware images, never for a call or write.
 
     python3 -I csrc/tools/check_no_fw_addr.py
     python3 -I csrc/tools/check_no_fw_addr.py --self-test
@@ -104,7 +104,7 @@ DRAM_ALLOW = {
     6291456: 'PX_INST_BANDS, 6 MB: a sub-band edge in the instance-relative search band, a '
              'distance from a runtime address and not a place',
     4194304: 'MID, 4 MB: the second descriptor window, a distance',
-    5402624: 'TEXT_HI, 0x527000. THE ONE MODEL-DEPENDENT FIRMWARE FIGURE LEFT IN THE TREE. '
+    5402624: 'TEXT_HI, 0x527000. '
              'It is a ceiling the backstop and the lua_CFunction check rest on, and every '
              'image measured so far puts its heap floor above it -- check_fw_strategy.py '
              'asserts that per image. A model that does not would need this derived',
@@ -148,7 +148,23 @@ TEXT_ALLOW = {
            'graph-trace subscription, passed to bufsub_subscribe by graph_trace_add and '
            'COMPARED against a word read out of a subscriber slot. Nothing branches to it and '
            'nothing is read from it; a wrong value makes every slot refuse',
+    41424: '0xA1D0: second inline ring offset relative to an authenticated trace object, '
+           'not a firmware address. Both banks and the current frequency grid must agree',
 }
+DRAM_ALLOW[41424] = TEXT_ALLOW[41424]
+
+# Only this exact firmware-gated function may carry the .heap bounds. The finder clamps
+# each read to the window, and the graph path, writes and other firmware builds do not use it.
+VERIFIED_HEAP = {
+    9052160: 'DMM7510 1.7.16a/1.7.18a .heap start, for read-only buffer discovery',
+    260710400: 'DMM7510 1.7.16a/1.7.18a .heap end (exclusive), for read-only buffer discovery',
+}
+VERIFIED_HEAP_SOURCE = re.compile(
+    r'^function fftsa\.nl\._buffer_heap_bounds\(\)\n'
+    r"  if localnode == nil or localnode\.model ~= 'DMM7510' then return nil end\n"
+    r'  local v = localnode\.version\n'
+    r"  if v ~= '1\.7\.16a' and v ~= '1\.7\.18a' then return nil end\n"
+    r'  return 9052160, 260710400[ \t]*(?:--[^\n]*)?\nend$', re.M)
 
 # Firmware .text, the same extent TEXT_LO and TEXT_HI declare. A call target has to be in
 # here to be a call target, which is what makes this the range to scan.
@@ -257,10 +273,13 @@ def check_dram(files):
     bad, seen = [], {}
     for name, src, kind in files:
         lits = c_literals(src) if kind == 'c' else lua_literals(src)
+        elsewhere = lits
+        if kind == 'lua':
+            elsewhere = lua_literals(VERIFIED_HEAP_SOURCE.sub('', src, count=1))
         for v in sorted(lits):
             if not DRAM_FLOOR <= v < DRAM_END:
                 continue
-            if v in DRAM_ALLOW:
+            if v in DRAM_ALLOW or (v in VERIFIED_HEAP and v not in elsewhere):
                 seen.setdefault(v, []).append(name)
                 continue
             bad.append('%s has %d (0x%08X), inside DRAM and not in DRAM_ALLOW. If it is not '
@@ -353,6 +372,10 @@ def main():
              lambda m, c: (m + '\nfftsa.nl.HEAP_LO = 16998400\n', c)),
             ('a 6500 heap bound in the backstop header', '226713600',
              lambda m, c: (m, c), '#define DSPN_HEAP_HI 0x0D836000U\n'),
+            ('a verified heap bound reused outside buffer discovery', '9052160',
+             lambda m, c: (m + '\nfftsa.nl.HEAP_LO = 9052160\n', c)),
+            ('a verified heap bound exposed to another firmware', '260710400',
+             lambda m, c: (m.replace("v ~= '1.7.18a'", "v ~= '1.7.19a'", 1), c)),
             # And one that is not page-aligned either, so neither exclusion could hide it.
             ('an arbitrary DRAM address in dsp_native.c', '0x03B53038',
              lambda m, c: (m, c + '\nstatic const unsigned r = 0x03B53038u;\n')),
@@ -393,7 +416,7 @@ def main():
     # what the native path is allowed to know about memory and judge it.
     print('  %d DRAM-range literals, each stated:' % len(seen))
     for v in sorted(seen):
-        print('    %-11d 0x%08X  %s' % (v, v, DRAM_ALLOW[v]))
+        print('    %-11d 0x%08X  %s' % (v, v, DRAM_ALLOW.get(v, VERIFIED_HEAP.get(v))))
     return 0
 
 

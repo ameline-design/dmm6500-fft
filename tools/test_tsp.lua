@@ -564,7 +564,8 @@ defbuffer1, defbuffer2 = newbuf(100000), newbuf(100000)
 
 -- The terminal selection is a front-panel button, so the mock carries it as state the
 -- tests can move under the app, which is what the panel does.
-dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', FUNC_DC_VOLTAGE = 'dcv', FUNC_NONE = 'none',
+dmm = {FUNC_DIGITIZE_VOLTAGE = 'digv', FUNC_DIGITIZE_CURRENT = 'digi',
+       FUNC_DC_VOLTAGE = 'dcv', FUNC_NONE = 'none',
        TERMINALS_FRONT = 'front', TERMINALS_REAR = 'rear'}
 dmm.terminals = dmm.TERMINALS_FRONT
 
@@ -1366,7 +1367,7 @@ local after1, bufs1 = live(), livebufs()
 check('start() created objects', after1 > 0, 'live=' .. after1 .. ' buffers=' .. bufs1)
 -- Two timers: the frame and the options preview. A display timer fires only while its own
 -- screen shows, so a screen with nothing to run carries none.
-check('the frame and preview timers are live', live('timer') == 2,
+check('the frame, preview and About timers are live', live('timer') == 3,
       'timers=' .. live('timer'))
 check('exactly four screens are live', live('screen') == 4,
       'screens=' .. live('screen') .. ' (cover + spectrum + options + about)')
@@ -1437,7 +1438,7 @@ check('rebuilding leaks NO display objects', live() == after1,
       'live=' .. live() .. ' vs ' .. after1)
 check('rebuilding leaks NO buffers', livebufs() == bufs1,
       'buffers=' .. livebufs() .. ' vs ' .. bufs1)
-check('still exactly two timers after rebuild', live('timer') == 2,
+check('still exactly three timers after rebuild', live('timer') == 3,
       'timers=' .. live('timer'))
 check('still exactly four screens after rebuild', live('screen') == 4,
       'screens=' .. live('screen'))
@@ -1835,7 +1836,7 @@ end)())
 
 -- arm() must never stack timers (two would double the frame rate and flood)
 fftsa.arm(0.3); fftsa.arm(0.3); fftsa.arm(0.3)
-check('arm() three more times still leaves two timers', live('timer') == 2,
+check('arm() three more times still leaves three timers', live('timer') == 3,
       'timers=' .. live('timer'))
 
 -- frames run clean
@@ -3023,8 +3024,7 @@ check('the distortion line dashes under over-range rather than reading NoSig', (
          and string.find(nosig, 'NoSig', 1, true) ~= nil,
          string.format('[%s] vs the NoSig case [%s]', over, nosig)
 end)())
--- The defect that garbled the panel: the volt column sits at a fixed x with the dB field 82
--- px away, so an unbounded %.4f overwrites it and the whole second column with it.
+-- The volt column sits at a fixed x, so an unbounded %.4f would overwrite the dB field.
 check('the volt column cannot print a 45-character field', (function()
   -- Through pk_hz/pk_v, which is the frame's own path into the formatter, so the amplitude
   -- under test is the one the table would really be handed.
@@ -3048,14 +3048,14 @@ end)())
 check('the microvolt column gains one decimal on the quiet ranges, within its width',
       (function()
   local r0 = fftsa.range
-  local widest = string.len(string.format('%.2f mV', 999.99))
-  local want = {{0.1, '999.9 uV'}, {1, '999.9 uV'}, {10, '1000 uV'}}
+  local widest = string.len(string.format('%.2f mVrms', 999.99))
+  local want = {{0.1, '999.9 uVrms'}, {1, '999.9 uVrms'}, {10, '1000 uVrms'}}
   local i
   for i = 1, table.getn(want) do
     fftsa.range = want[i][1]
     -- 999.94 uV reads differently at every precision, so a formatter that ignored the
     -- range cannot print the expected string for more than one of these three.
-    fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, {12500}, {999.94e-6})
+    fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, {12500}, {999.94e-6 * math.sqrt(2)})
     local got = obj_at(fftsa.sg_pk_v[1]).text
     fftsa.sg_pk_last, fftsa.sg_pk_lf, fftsa.sg_pk_lv = nil, {}, {}
     if got ~= want[i][2] or string.len(got) > widest then
@@ -3073,9 +3073,41 @@ check('the microvolt column gains one decimal on the quiet ranges, within its wi
   local none = fftsa.sg_uv_fmt(fftsa.range)
   fftsa.range = r0
   return off == fftsa.sg_uv_fmt_std and none == fftsa.sg_uv_fmt_std
-         and fftsa.sg_uv_fmt_fine == '%0.1f uV',
+         and fftsa.sg_uv_fmt_fine == '%0.1f uVrms',
          string.format('0.1 V and 1 V take %s within %d chars; 100 V [%s], nil [%s]',
                        fftsa.sg_uv_fmt_fine, widest, off, none)
+end)())
+check('peak voltage is RMS while dBV uses the graph reference', (function()
+  -- The FFT returns peak voltage. 4 Vpk -> 2.8284 Vrms but 12.0 dBV.
+  -- 1 Vpk must stay below 1 Vrms, including when choosing the printed prefix.
+  fftsa.sg_show_peaks_now(nil, nil, 2, 195.3125, {12500, 25000}, {4, 1})
+  local a, b = obj_at(fftsa.sg_pk_v[1]).text, obj_at(fftsa.sg_pk_d[1]).text
+  local c, d = obj_at(fftsa.sg_pk_v[2]).text, obj_at(fftsa.sg_pk_d[2]).text
+  fftsa.sg_pk_last = nil
+  return a == '2.8284 Vrms' and b == '12.0 dBV'
+         and c == '707.11mVrms' and d == '0.0 dBV', a .. ' ' .. b .. ' / ' .. c .. ' ' .. d
+end)())
+
+check('the RMS readouts fit both peak groups before the next field or lock button', (function()
+  local range, dbmin = fftsa.range, fftsa.sg_dbmin
+  fftsa.range, fftsa.sg_dbmin = 1, -140
+  local f = {12500, 25000, 37500, 50000, 62500, 75000}
+  -- Exercise the longest mV format, a two-digit voltage,
+  -- and the deepest floor. FONT_1 averages about 8 px per character on the panel.
+  local a, b, c = 0.99999 * math.sqrt(2), 14.99, 1e-8
+  fftsa.sg_show_peaks_now(nil, nil, 6, 195.3125, f, {a, b, c, a, b, c})
+  local ok, i = obj_at(fftsa.sg_pk_v[1]).text == '999.99mVrms', nil
+  for i = 1, 6 do
+    local v, d = obj_at(fftsa.sg_pk_v[i]), obj_at(fftsa.sg_pk_d[i])
+    local right = i <= 3 and obj_at(fftsa.sg_pk_f[4]).x or obj_at(fftsa.lockbtn).x
+    ok = ok and v.font == display.FONT_1 and d.font == display.FONT_1
+         and v.x + string.len(v.text) * 8 < d.x and d.x + string.len(d.text) * 8 < right
+  end
+  fftsa.sg_show_peaks_now(nil, nil, 1, 195.3125, f, {0.999999 * math.sqrt(2)})
+  ok = ok and obj_at(fftsa.sg_pk_v[1]).text == '1.0000 Vrms'
+  fftsa.range, fftsa.sg_dbmin = range, dbmin
+  fftsa.sg_pk_last = nil
+  return ok
 end)())
 -- End to end, through a real frame: the capture is clipped the way the instrument clips it,
 -- and the banner, its colour, the dashed table and the dashed distortion line all follow.
@@ -4073,9 +4105,8 @@ check('a NaN power bin is plotted at the floor, not written as a NaN', (function
          string.format('%d written outside the axis (%s), 0/0 is %s', bad,
                        tostring(seen), tostring(nan))
 end)())
--- Floored at the plot's own floor: a 1e-26 power bin reads -260 dBV against a
--- -120 dBV axis, which the trace cannot show.
-check('the peak table dB column is floored at the plot floor', (function()
+-- A bin below the plot floor stays at that floor in the table.
+check('the peak table dB column uses the same floor as the plot', (function()
   local save = fftsa.fft_pwr
   fftsa.fft_pwr = {}
   for k = 1, fftsa.sg_nbins do fftsa.fft_pwr[k] = 1e-30 end
@@ -4229,6 +4260,33 @@ check('raising the cover creates nothing', (function()
   local mid = live()
   fftsa.show_main()
   return mid == before and live() == before
+end)())
+check('intentional loading disarms Back until Apply leaves the cover', (function()
+  local cover = fftsa.loadscr
+  local apply = fftsa.apply
+  local safe = false
+  fftsa.apply = function()
+    safe = display.active == cover and display.events[cover][display.EVENT_PRESS] == nil
+    return apply()
+  end
+  fftsa.options()
+  local applied = fftsa.options_apply()
+  fftsa.apply = apply
+  return applied and safe and display.active == fftsa.sg_scr
+         and type(display.events[cover][display.EVENT_PRESS]) == 'string'
+end)())
+
+check('hardware Back from spectrum to the cover exits instead of leaving Loading', (function()
+  local cover = fftsa.loadscr
+  local handler = display.events[cover][display.EVENT_PRESS]
+  -- Firmware selects its previous screen, then dispatches the screen's on-show event.
+  -- This intentionally bypasses loading_front(), the app's own way of showing it.
+  display.changescreen(cover)
+  if handler ~= nil then assert(loadstring(handler))() end
+  local exited = display.active == display.SCREEN_HOME and fftsa.loadscr == nil
+                 and fftsa.sg_scr == nil and live('timer') == 0
+  fftsa.start()
+  return exited
 end)())
 -- The control: without the cover both screens build in full view. Without this the
 -- two checks above pass whether the cover works or not.
@@ -7022,7 +7080,7 @@ print('\ninstalled-App relaunch (real code)')
 fftsa.flo, fftsa.fhi, fftsa.range = 0, 50000, 10
 fftsa.start()
 local live_one, bufs_one = live(), livebufs()
-check('first launch is live', live_one > 0 and live('timer') == 2,
+check('first launch is live', live_one > 0 and live('timer') == 3,
       'live=' .. live_one .. ' timers=' .. live('timer'))
 -- Leave by HOME / another App: EVENT_ENDAPP never fires, nothing is torn down.
 for _, m in ipairs({'tsp/fft_core.tsp', 'tsp/fft_interp.tsp', 'tsp/spectrum_ui.tsp',
@@ -7037,7 +7095,7 @@ check('relaunching leaks NO display objects', live() == live_one,
       'live=' .. live() .. ' vs ' .. live_one)
 check('relaunching leaks NO buffers', livebufs() == bufs_one,
       'buffers=' .. livebufs() .. ' vs ' .. bufs_one)
-check('exactly two timers after a relaunch', live('timer') == 2, 'timers=' .. live('timer'))
+check('exactly three timers after a relaunch', live('timer') == 3, 'timers=' .. live('timer'))
 
 -- A REFUSED DELETE IS NOT A RAISE. The firmware posts an event and returns, and the
 -- buffer stays ALIVE -- which is what put 61 live buffers on the instrument when a bound
@@ -7303,6 +7361,89 @@ check('an exit after the panel moved to a measure function uses the measure side
   fftsa.start()
   fftsa.frame()
   return ok, why
+end)())
+
+-- ---------------------------------------------------------------------------
+-- A front-panel function change is an exit, including if it happens during a capture
+-- or while a form has the frame timer paused. Exercise the timer callback(s) and a
+-- queued Apply, not just the cleanup that End App already covered above.
+do
+  local cases = {
+    {name = 'DC voltage before capture'},
+    {name = 'DC voltage during capture', during = true},
+    {name = 'digitize current before capture', current = true},
+    {name = 'DC voltage on Options', options = true},
+    {name = 'DC voltage before Options Apply', options = true, apply = true},
+    {name = 'DC voltage on About', options = true, about = true},
+  }
+  for _, case in ipairs(cases) do
+    assert(fftsa.start())
+    if case.options then assert(fftsa.options()) end
+    if case.about then assert(fftsa.about()) end
+    local digread = dmm.digitize.read
+    local captures, active = 0, display.active
+    dmm.digitize.read = function(b)
+      if b == fftsa.cap then
+        captures = captures + 1
+        if case.during then
+          dmm.measure.func = dmm.FUNC_DC_VOLTAGE
+          b.startindex = 0
+          return nil
+        end
+      end
+      return digread(b)
+    end
+    DMM_EVENTS = {}
+    if case.current then
+      dmm.digitize.func = dmm.FUNC_DIGITIZE_CURRENT
+      dmm.digitize.count = 8
+    elseif not case.during then
+      dmm.measure.func = dmm.FUNC_DC_VOLTAGE
+    end
+    fftsa.retune_pending = true  -- a queued gesture must not re-select digitize voltage
+    if case.apply then
+      fftsa.options_apply()
+    else
+      for h, obj in pairs(OBJ) do
+        if obj.alive and obj.type == display.OBJ_TIMER and obj.parent == active then
+          assert(loadstring(display.events[h][display.EVENT_PRESS]))()
+          break
+        end
+      end
+    end
+    dmm.digitize.read = digread
+    local selected
+    if case.current then
+      selected = dmm.digitize.func == dmm.FUNC_DIGITIZE_CURRENT and dmm.digitize.count == 8
+    else
+      selected = dmm.measure.func == dmm.FUNC_DC_VOLTAGE and dmm.digitize.func == dmm.FUNC_NONE
+    end
+    check('selecting ' .. case.name .. ' returns Home and preserves the selection',
+          selected and captures == (case.during and 1 or 0) and table.getn(DMM_EVENTS) == 0
+          and display.active == display.SCREEN_HOME and live('timer') == 0
+          and fftsa.sg_scr == nil and fftsa.optscr == nil and fftsa.aboutscr == nil
+          and fftsa.errscr == nil and not fftsa.busy and not fftsa.retune_pending
+          and FFTSA_TRACE == nil and FFTSA_MARK == nil,
+          string.format('selected=%s captures=%d events=%d timers=%d', tostring(selected),
+                        captures, table.getn(DMM_EVENTS), live('timer')))
+  end
+  assert(fftsa.start())
+  fftsa.frame()
+end
+
+check('an empty native capture with startindex=0 skips DSP without falling back', (function()
+  local read, nl, enable, cap, init = dmm.digitize.read, fftsa.nl, fftsa.nl_enable,
+                                      fftsa.nl_cap, fftsa.fft_init
+  local short, rotated, calls = fftsa.nl_shortreads or 0, fftsa.nl_rotated, 0
+  dmm.digitize.read = function(b) b.startindex = 0 end
+  fftsa.nl = { ready = true, n = fftsa.n, call_dsp = function() calls = calls + 1 end }
+  fftsa.nl_enable, fftsa.nl_cap, fftsa.fft_init = true, {}, nil
+  fftsa.frame()
+  local ok = not fftsa.halted and display.active == fftsa.sg_scr and calls == 0
+             and fftsa.nl_rotated == rotated and fftsa.nl_shortreads == short + 1
+  dmm.digitize.read, fftsa.nl, fftsa.nl_enable, fftsa.nl_cap, fftsa.fft_init = read, nl, enable, cap, init
+  assert(fftsa.start())
+  return ok
 end)())
 
 -- ---------------------------------------------------------------------------
@@ -8006,27 +8147,20 @@ print('\nthe options screen does no work (real code)')
 -- Parentage is therefore the whole mechanism, and it is one display.create argument away from
 -- being wrong in a way nothing else would report: a timer parented to ROOT, or to the options
 -- screen, would keep digitizing behind a form the operator is trying to read.
-check('the frame timer belongs to the spectrum screen, and only the preview to Options',
+check('each timer belongs to its own screen',
       (function()
-  local ids, k, o = {}, nil, nil
+  local by_screen, k, o = {}, nil, nil
   for k, o in pairs(OBJ) do
-    if o.alive and o.type == display.OBJ_TIMER then ids[table.getn(ids) + 1] = k end
+    if o.alive and o.type == display.OBJ_TIMER then
+      by_screen[o.parent] = (by_screen[o.parent] or 0) + 1
+    end
   end
-  if table.getn(ids) ~= 2 then
-    return false, table.getn(ids) .. ' live timer(s), wanted 2'
-  end
-  local frame_on, other_on, i = nil, nil, nil
-  for i = 1, 2 do
-    if ids[i] == fftsa.timer then frame_on = OBJ[ids[i]].parent
-    else other_on = OBJ[ids[i]].parent end
-  end
-  return frame_on == fftsa.sg_scr and other_on == fftsa.optscr,
-         string.format('frame timer on %s (spectrum %s), other on %s (options %s)',
-                       tostring(frame_on), tostring(fftsa.sg_scr),
-                       tostring(other_on), tostring(fftsa.optscr))
+  return live('timer') == 3 and OBJ[fftsa.timer].parent == fftsa.sg_scr
+         and by_screen[fftsa.sg_scr] == 1 and by_screen[fftsa.optscr] == 1
+         and by_screen[fftsa.aboutscr] == 1
 end)())
 
--- And the one timer that IS the options screen's touches no hardware. It previews what the
+-- And the Options timer takes no readings. It previews what the
 -- fields say, so it reads display values and formats a line; a capture or a graph write here
 -- would be acquisition running behind the form, which is what the parentage above prevents.
 check('the options preview tick takes no capture and writes nothing to the graph',
@@ -8074,6 +8208,7 @@ check('a polled event reaches its own handler, and End App is not eaten', (funct
   fftsa.poll_lost, fftsa.poll_stale = 0, 0
   answer = fftsa.optbtn      ; local a = fftsa.press_poll()
   answer = fftsa.sg_scr      ; local b = fftsa.press_poll()
+  answer = fftsa.loadscr     ; local loading = fftsa.press_poll()
   answer = fftsa.lockbtn     ; local c = fftsa.press_poll()
   answer = fftsa.timer       ; local d = fftsa.press_poll()
   -- A press queued from a form that has since been dismissed. Named, so it can be dropped on
@@ -8086,8 +8221,8 @@ check('a polled event reaches its own handler, and End App is not eaten', (funct
   local lost, stale = fftsa.poll_lost, fftsa.poll_stale
   display.waitevent = realwait
   fftsa.options, fftsa.cleanup, fftsa.toggle_lock = ro, rc, rl
-  return a and b and c and not d and not e and not f and not g and not h
-         and opened == 1 and ended == 1 and locked == 1
+  return a and b and c and loading and not d and not e and not f and not g and not h
+         and opened == 1 and ended == 2 and locked == 1
          and stale == 2 and lost == 1,
          string.format('opt=%s/%d endapp=%s/%d lock=%s/%d tick=%s stale=%s,%s/%d'
                        .. ' unknown=%s lost=%d none=%s',
