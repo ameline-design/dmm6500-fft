@@ -12,8 +12,9 @@ live spectrum, the physical **EXIT** key exits the analyser too.
 
 ![DMM6500 spectrum screen showing a 6.000 kHz tone at 708.06 mVrms and 0.0 dBV. THD is 0.01%, S/N is 70.8 dB, and the noise floor is -100.4 dBV. The fast-path F indicator is on, and padlock and Options buttons sit to the right of the peak table.](manual-spectrum-current.png)
 
-+20 to −120 dBV against frequency, or to −140 on a DMM7510's 1 V and 0.1 V ranges. At the default
-2,048 samples and 100 kS/s, bins are 48.83 Hz wide. The screenshot shows the fast path at 20 fps.
+The graph spans +20 to −120 dBV by default and extends to −140 dBV in the low-range settings
+described below. At the default 2,048 samples and 100 kS/s, bins are 48.83 Hz wide. The screenshot
+shows the fast path at 20 fps.
 Options offers larger records for finer bin spacing at a slower update rate.
 
 ### The `F` at the start of the bottom line
@@ -21,8 +22,7 @@ Options offers larger records for finer bin spacing at a slower update rate.
 The bottom line reads `F  2048 pts  …` once the app is drawing by its **fast path**. Instead of
 appending 510 readings one at a time for the firmware's display task to copy, it writes the
 pixel records straight into the task's own ring in a single operation, and asks for one repaint.
-That is about twice the frame rate of appending. The *Limits* section keeps an older frame-rate
-benchmark for comparison.
+That is about twice the frame rate of appending under comparable settings.
 
 It should appear **within about three seconds of launch**, and then stay. A number after it --
 `F2`, `F3` -- counts how many times the path has had to re-acquire since the line last changed.
@@ -40,17 +40,12 @@ EEVblog thread [TSP and Lua scripts for modern Keithley DMMs, SMUs etc](https://
 saying which instrument and firmware version you have -- the About page's first line gives both.
 
 Those pages carry every address the fast path examined and the reason it stopped: which memory
-window it read, whether it found the app's own buffer name there, which link of the chain
-refused and with what value. The DMM6500's entire layout was worked out from one such
-photograph, so one from a model we have not been able to test is genuinely enough to act on.
+window it read, whether it found the app's own buffer name there, and which link of the chain
+refused and with what value. All pages help diagnose the fast path without access to your meter.
 
-**Both axes are labelled in the units you want: kHz across, dB down.** That is worth a note only
-because it was not always so, and the two mechanisms are worth knowing if you read the source. The
-graph object's X axis is labelled in seconds whenever it is bound to a reading's timestamp, with a
-suffix that cannot be switched off; binding it to the reading's *extra* field instead makes it the
-firmware's numeric plot, which labels the real frequency and picks the SI prefix itself. The Y values
-are decibels held in a buffer whose unit is a two-character custom one, `dB`, for the same reason: a
-volt-unit buffer labelled them `V`.
+**Both axes show their units: kHz across, dB down.** The app binds the graph's X axis to the
+reading's *extra* field, so the firmware labels the frequency instead of the timestamp. The Y
+values use a custom `dB` buffer unit.
 
 The `+` signs are the firmware's doing — it signs its numeric axes. The tick numbers are round
 because the axis is pinned from DC whenever the Start frequency is under one pixel of the span, which
@@ -61,14 +56,14 @@ limits, so the trace still fills the plot.
 Six peaks, strongest first, in two columns. The voltage is the RMS amplitude of each tone
 (`Vpeak / √2`). The dBV column uses the graph's peak-amplitude reference,
 `20 log10(Vpeak / 1 V)`, not the displayed RMS voltage. It matches the level of a peak marker
-on the graph. Older screenshots show the previous peak-voltage readout.
+on the graph.
 
 ```
 1  6.000 kHz   708.06mVrms   0.0 dBV
 ```
 
 The other rows show the next strongest peaks in the span. They can be harmonics or noise; rank
-does not identify them. The 16,384-sample comparison further down shows how finer bins can
+does not identify them. The 32,768-sample capture further down shows how finer bins can
 separate low-level harmonics from the noise floor.
 
 Two buttons sit to the right of the peak table: a **padlock**, which decides what a sideways drag
@@ -106,28 +101,19 @@ Being a per-bin level it improves as you raise the sample count, since the bins 
 
 **`NoSig` replaces both numbers when there is no tone to take them against**, the labels staying put. With the inputs
 shorted the strongest bin is just the largest noise bin, and both ratios built on it are arithmetic
-about nothing — measured at 16,384 samples, that read `THD: 31.84%` and `S/N: -22.0 dB`. The
-fundamental has to clear the per-bin noise mean by 30 dB before either is reported: that shorted peak
-stood 17.1 dB over the mean where an 8 Vp-p tone stood 92, so the margin sits between them. The noise
-floor is still shown, because shorted it is the instrument's own floor and the one useful number
-there — about −110 dBV, some 30 dB better than with a generator connected.
+about noise rather than a signal. The app checks for a tone before reporting either ratio. With
+the inputs shorted, the noise floor still reports the instrument's own per-bin noise.
 
 **The skirt follows the window.** Inside the window's main lobe the bins hold signal, not noise, so
 the number of bins withheld either side of each line is the window's own first null plus one: 3 for
 Hann, 4 for Blackman, 5 for Blackman-Harris, and up to 7 for Kaiser at beta 18, whose lobe reaches
-5.8 bins. A fixed 3 instead reported a −65.2 dBV floor on Kaiser 18 against a trace plainly sitting
-at −100, because three bins of pure signal each side were averaged in as noise.
+5.8 bins. Excluding too few bins counts part of the signal as noise and raises the reported floor.
 
 **Every window puts a ceiling on S/N**, measured on a pure tone with no noise in it at all: about
 102 dB for Hann at 16,384 samples, 114 for Blackman, 133 for Blackman-Harris, and 125 for Kaiser
 beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelobes are 30 and 40 dB
 down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
 telling you about the window rather than the instrument.
-
-![An earlier 12.5 kHz capture with Kaiser beta 18: the tone is at 12.0 dBV with visibly narrower skirts than
-Hann, and a distortion line reading THD 0.01%, S/N 77.0 dB and a noise floor of -103.9 dBV -- within
-two decibels of what Hann reports, where before the leakage outliers were clipped the two windows
-disagreed by 23](manual-spectrum-kaiser18.png)
 
 **For the most accurate S/N and noise floor, use Kaiser with beta = 18 at 16,384 samples.** Both
 figures are limited by the window before they are limited by the instrument, and Kaiser 18 is the
@@ -144,11 +130,10 @@ repeating until a pass drops nothing. On noise with no outliers that costs 0.5 d
 
 **Mains pickup is passed over, not measured.** A floating input picks up 50 or 60 Hz and its
 harmonics — disconnected, this reads 60 Hz at −25.4 dBV with harmonics out to 540 — and without a
-rule the hum becomes the fundamental and the display reports the *hum's* distortion as though it were
-the instrument's, which measured 11.04%. A candidate at any multiple of 50 or 60 Hz, below 1 kHz and
+rule the hum can become the fundamental and dominate the distortion reading. A candidate at any
+multiple of 50 or 60 Hz, below 1 kHz and
 at or under −22 dBV, is skipped and the search moves on. The fundamental also has to be a *local
-maximum*: the shoulder of the 60 Hz line, 8 dB down and one hertz outside the tolerance, was
-otherwise taken as the signal and gave 21.4% distortion on no input at all. With nothing else
+maximum* so that a bin on the shoulder of a mains peak is not taken as the signal. With nothing else
 present the signal margin — 45 dB over the per-bin floor — then answers `NoSig`. A loud mains-frequency tone is still a tone — above −22 dBV it is taken at face
 value — and so is a quiet one above 1 kHz, even on a mains multiple.
 
@@ -179,15 +164,13 @@ roughly twice that. A check that has had no gesture reported costs one clock rea
 reported on every check, and retuning to each reading would mean several captures during one drag,
 so a pair that has changed since the last check is noted and left alone. One drag, one retune.
 
-**The dB axis always goes back**, whatever the padlock says. The scale is fixed — +20 dBV at the top,
-and -120 at the bottom except on a DMM7510's 1 V and 0.1 V ranges, where it reaches -140 — and there
-is no setting behind it, so a dragged dB axis is only a worse view of the same data.
+**The dB axis always snaps back**, whatever the padlock says. A drag does not change the vertical
+scale or the data.
 
-**The floor follows the instrument and the range.** A DMM7510 measures a noise floor of -134 dBV on
-its 0.1 V range and -129 on 1 V, both of which sit under a -120 axis, so on those two ranges the plot
-goes to -140 and the peak table's dB column with it. Its 10 V range and every range on a DMM6500 keep
--120: a DMM6500 reads -123 and -121 on 0.1 V and 1 V, close enough to the axis to show. The floor
-moves on Apply, since that is where the range is committed.
+**The floor follows the instrument, input range, and sample count.** The top is +20 dBV and the
+default floor is −120 dBV. On the 1 V and 0.1 V ranges, the floor reaches −140 dBV on the DMM7510
+and at 16,384 samples or more on the DMM6500. The peak table's dB column uses the same floor.
+Press Apply to commit the range and sample count.
 
 **The padlock decides what a horizontal gesture means.** It is closed when the app starts.
 
@@ -246,11 +229,8 @@ both are just two limits to be snapped into range — so a drag that runs off an
 that edge sticks at the limit while the other keeps coming in. Adopted limits are rounded to whole
 hertz, so the Options fields can show and re-apply them unchanged.
 
-**An untouched view makes no graph call at all.** Writing an axis limit takes 60 ms and repaints the
-whole graph, which at 1024 samples is most of a 70 ms frame — doing it every frame collapses the
-update rate and visibly flickers the trace, which is what it did. So the app is told when to look:
-the graph reports its own pan and zoom, and a check that has had no report does nothing. One that has
-reads the limits back at 0.0094 ms each, and writes only a limit that has really moved.
+**Axis checks run only when the graph reports a change.** Writing a limit repaints the whole graph,
+so the app reads the limits after a pan or zoom report and writes only a limit that needs restoring.
 
 **Very narrow spans high up the range have a dead zone.** A movement smaller than about a millionth
 of the stop frequency is taken for rounding and left alone. On ordinary spans that is a thousandth of
@@ -405,9 +385,8 @@ which is usually the worse trade.
 There is no anti-alias filter in front of the digitizer. Anything above half the sample rate folds
 back into the display, at full amplitude, looking exactly like a tone that is there.
 
-Measured on this instrument: a pure 21.1 kHz sine digitized at 20 kS/s drew one 4.5135 V peak at
-**1.100 kHz** — 21100 reduced mod 20000. The amplitude was right to four digits. Nothing on the
-screen said the frequency was not.
+For example, a 21.1 kHz sine sampled at 20 kS/s appears at **1.100 kHz** — 21,100 modulo 20,000.
+The display does not mark the peak as an alias.
 
 **A narrow span is the exposed case**, because a narrow span is what lowers the sample rate. A stop
 at or below 25 kHz runs the digitizer at 50 kS/s, at or below 12 kHz at 25 kS/s, and at or below
@@ -424,57 +403,8 @@ Two ways to tell an alias from a tone: widen the span, and a real tone stays put
 moves; or change the signal and watch which peak follows. At the default 50 kHz span a 63 kHz tone
 appears at 37 kHz and an 84 kHz tone at 16 kHz.
 
-## Band-Pass
-
-**Not offered on the form.** It works, and it is measured flat to 0.02 dB across the span with 61 dB
-of rejection above the Nyquist, but it is not worth the frame time: the filter is one
-multiply-accumulate per tap per output, 51 taps over 512 outputs, and the frame goes from 0.08 s to
-around a quarter of a second for nothing an operator can see. At 4096 samples and up the read budget
-leaves no room for it at any span. **The app offers no way to turn it on**: the
-filter lives in `csrc/` behind `DSP_BANDPASS` and the shipped build compiles it out, with no
-remaining switch in `tsp/`. The rest of this section describes what it does, and is kept because the
-measurements behind the decision not to offer it are worth having. **Those figures were taken at 512
-samples**, below the counts the form offers, and on the interpreted path.
-
-On, the capture is low-pass filtered and then decimated to the span, so the transform
-sees only the band on screen. Two things come of that, and which one you get depends on the span.
-
-**A narrow span buys bin width.** The bin becomes the acquisition rate divided by the number of
-samples actually taken, so a span the filter can decimate hard reaches a resolution that would
-otherwise need a much longer transform. At 512 samples:
-
-| Stop | rate | decimation | taps | bin | bin with it off |
-|---|---|---|---|---|---|
-| 50 kHz | 100 kS/s | — | — | 195.31 Hz | 195.31 Hz |
-| 20 kHz | 200 kS/s | /3 | 51 | 130.21 Hz | 195.31 Hz |
-| 10 kHz | 100 kS/s | /3 | 51 | 65.10 Hz | 195.31 Hz |
-| 2 kHz | 100 kS/s | /7 | 65 | 27.90 Hz | 195.31 Hz |
-
-**A wide span gets nothing**, and that is deliberate. The rate goes up by one step at most, and at a
-50 kHz span neither 100 nor 200 kS/s leaves room to decimate, so the filter is left out and the line
-reads `BP:On (span too wide)`. Going further up the rate list would make it possible — 500 kS/s at
-/3 — but 51 taps over 512 outputs costs about 135 ms of arithmetic, which takes the frame from 0.08 s
-to a quarter of a second to produce a bin *coarser* than the unfiltered one.
-
-The readback line says which regime you are in. `BP:On /3` means the filter is in the path at a
-decimation of three. `BP:On` with a reason in brackets means it is not:
-
-| | |
-|---|---|
-| span too wide | No rate the hardware has leaves room to decimate this span. |
-| too many samples | The record needed is past the read budget — 4096 samples and up, whatever the span. |
-| filter will not fit | The transition that decimation leaves would need more taps than the ceiling. |
-
-**`fs` on the readback line is always the digitizer's rate**, never the decimated one. At `BP:On /3`
-and 200 kS/s the transform is seeing 66.667 kS/s, but the hardware is not running below its 100 kS/s
-floor and never does. The bin width and the record length are the decimated figures.
-
-It costs frame time: the filter reads several times as many samples and does one multiply-accumulate
-per tap per output. At a 2 kHz span and 512 samples that is an estimated 0.4 s a frame against 0.08 s.
-
-The filter is a Hamming-windowed sinc, cut off halfway between the span top and the decimated
-Nyquist, with taps sized from that transition. Measured through the real taps at a 20 kHz span: flat
-to **0.02 dB** across the span and **61 dB** down above the Nyquist.
+The app does not offer a band-pass or decimation control. If the input contains energy above
+half the sample rate, widen the span to raise the sample rate or filter the signal externally.
 
 ## About
 
@@ -489,15 +419,14 @@ anything to a measurement. It is there so that an instrument on which the app *w
 be reported on -- **page to the end and send a grab of that page** if you are asked how a
 particular model behaved.
 
-The state is re-read every time About is opened, so it describes the instrument as it is now
-and not as it was at launch. That matters when something has stopped working since: a compiled
-path that started and then gave up is recorded here and nowhere else.
+About refreshes the diagnostic data each time it opens, so it includes failures that occur
+during a run as well as the startup state.
 
 ## If the app stops, or will not start
 
 A red **FFT &lt;version&gt;** page replaces the analyser, with the model and the firmware version
 beside the build. Everything below it is a diagnostic dump: addresses, window
-ranges, counters and a dump of the memory words the bind was looking at.
+ranges, counters and a dump of the memory words examined during binding.
 
 **It is written to be read by whoever fixes the app, not by you.** Two things are worth doing
 with it:
@@ -508,12 +437,8 @@ with it:
 * Send the captures. There is nothing to act on at the instrument; the app has already cleaned
   up after itself, and **End App** exits.
 
-**The same page appears if the analyser stops after it has been running.** The compiled path
-can start, produce spectra, and then give up -- a capture that fails, a reduction that will not
-decode -- and this archive carries no interpreted transform to fall back on, so that is the end
-of the run. Earlier builds reported it as one line along the bottom of a frozen trace, which
-was cut off before it reached the reason. It now puts the full diagnostic up by itself, because
-the only thing that ever gets sent back is a photograph of whatever was on the glass.
+**The same page appears if the analyser stops during a run.** If the compiled transform cannot
+continue, the app displays the full diagnostic. The archive has no interpreted FFT fallback.
 
 ## How many points the trace carries
 
@@ -530,9 +455,8 @@ Three consequences, and the first is the point of it:
 - **The noise floor reads as a band, not a line**, because the minimum is drawn as well as the
   maximum. Maximum alone would lift the apparent floor by about 6 dB at 64 bins a column, since the
   largest of 64 noise samples sits well above their average.
-- **Below 256 points nothing is reduced**, and no count the app offers is below it any more. The
-  smallest, 1024, puts about 511 bins in a 10 Hz to 50 kHz span against 255 columns, so every
-  trace is now reduced.
+- **At every sample-count setting, a 10 Hz to 50 kHz span is reduced.** Even at the minimum
+  of 1,024 samples, about 511 bins fall within that span against 255 display columns.
 
 | FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
 |---|---|---|---|---|---|---|
@@ -542,22 +466,11 @@ Three consequences, and the first is the point of it:
 Points drawn rises towards 510 rather than towards 255, because a column contributes its minimum as
 well as its maximum wherever the two differ. 32768 is unmeasured.
 
-![The spectrum screen at 16384 samples: the 12.5 kHz tone as a narrow spike at 12.0 dBV, its second
-and third harmonics resolved as separate spikes at 25.002 and 37.501 kHz, and the noise floor drawn
-as a single line near -100 dB, with the padlock and cog buttons right of the peak table. The
-distortion line reads THD 0.02%, S/N 78.9 dB and a noise floor of -105.8 dBV -- 16 dB below the
-512-sample figure, which is the 3 dB a doubling a per-bin level gives. The axes are the firmware's own, +020.0dB to -120.0dB and +00.00kHz to
-+40.00kHz](manual-spectrum-16384.png)
+![At 32,768 samples with 3.05 Hz bins, a 6.000 kHz fundamental at 707.86 mVrms and 0.0 dBV stands above harmonics at 12, 18, 30 and 36 kHz. The noise floor reads -120.8 dBV.](manual-spectrum-harmonics.png)
 
-Compare the [earlier 512-sample shot](manual-spectrum.png), where the same tone is a single 195 Hz-wide
-lump and the harmonics are down in the noise of the trace — the table still finds them, a few tens
-of hertz out.
-
-Because each column reports its maximum, the noise floor reads about 6 dB high and as an upper
-envelope rather than a band. Writing the minimum as well is refused: it doubles the point count
-and makes every second segment span the whole noise band, about 45 px, where a single-valued trace
-moves a few pixels between neighbours -- and the firmware's cost of drawing a trace is per segment
-length.
+Finer bins separate low-level harmonics from the noise floor. The trace can make the floor look
+higher than the numeric Noise Floor readout: a column can contain multiple bins, and its maximum
+emphasizes the tallest one.
 
 Reducing the trace does not reduce the **table**: `find_peaks` reads every bin at full resolution, so
 a reported frequency is never a column edge. It is also what makes the larger counts usable at all --
@@ -601,7 +514,7 @@ for a tone within one main lobe of DC **the estimate is partly the tone**: remov
 Nothing fixes that. A finite record cannot tell a steady offset from a tone one bin away
 from it — they are the same resolution cell. Removing the plain arithmetic mean instead puts a
 spurious line of up to −27 dBc at bin 1 for any off-centre tone **anywhere** in the spectrum, which
-is 110 dB above the floor Kaiser β=18 is chosen for. Both were measured over every window and nine
+is 110 dB above the floor Kaiser β=18 is chosen for. The measurements cover every window and nine
 tone positions.
 
 So the app declines to put a number on those bins. The trace still draws them, which is where a tone
@@ -630,8 +543,7 @@ The two boundaries below are **in bins**, and the Hz are 1024 samples at 100 kS/
 
 A peak the app cannot place is refused rather than guessed: the estimator saturates when the three
 bins around a candidate are not one tone centred there, and a candidate whose own estimate lands a
-quarter bin below the lowest reported bin is dropped. Before that guard, Blackman and Kaiser β=9
-reported a 100 Hz tone at 390.6 Hz and 16 dB low.
+quarter bin below the lowest reported bin is dropped.
 
 **A bump at the left edge of the trace with nothing in the table is a tone below this limit.**
 
@@ -645,45 +557,13 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
 - **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
   tone the instrument can show.
-- **Earlier frame-rate benchmark.** The table below records a build that appended every point;
-  it does not show the current fast-path rates. In that benchmark the firmware's
-  shortest timer period is 0.05 s and a tick arriving mid-frame is dropped. The period itself is
-  **not restricted to multiples of 0.05**: asking for one off that grid posts event 1727 in the log
-  and the period is honoured anyway. So the rate is `1 / period` on a 10 ms grid, with 0.05 s a hard
-  floor -- `0.045` is refused outright. The app times its own frames and picks the smallest period
-  that still leaves 20 ms free:
-
-  | FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
-  |---|---|---|---|---|---|---|
-  | displayed | **10 fps** | **10** | **8.2** | **6.0** | **3.6** | **1.9** |
-  | period, derived | 0.10 s | 0.10 | 0.12 | 0.17 | 0.28 | 0.53 |
-
-  The displayed row was measured at every count on a DMM6500 1.7.17a. The period row is `1 / rate`
-  rounded to the 10 ms grid, which is derived and not read back -- the app chooses the period and
-  the displayed rate is what comes of it.
-
-  The benchmark used a folded pass, up the band and back down, to remove the dropout of an earlier
-  build that read 13 to 15 fps at 1024. Over 500 appends at about 76 us each is roughly 39 ms
-  of every frame. A single ascending lap costs half that and runs 17 fps at 1024, and it cannot be
-  used -- it draws the spectrum twice on alternate frames.
-
-  At the small counts the frame is dominated by work that does not depend on the sample count, which
-  is why 2048 is the default: it is twice the frequency resolution of 1024 for little. From 8192 up
-  acquisition dominates instead -- the record alone is 81.92 ms at 8192 and 327.68 ms at 32768 at
-  100 kS/s -- so the period cannot fall below that however fast the transform gets. The figure on the
-  settings line reads about 5 % low, because its window closes on the first frame past one second.
-
-  That reserved idle is what keeps the **padlock** and **cog** answering: `delay()` lets the display task
-  paint, but dispatching a press needs the Lua interpreter, and during a frame the interpreter is
-  busy. It costs the middle counts about a tick each against leaving the period at the floor, and in
-  exchange every size stays operable -- at the largest counts the trace repaints slowly and the
-  button still answers. **The two largest counts are usable rather than comfortable**: 32768 is
-  offered, and its record alone is a third of a second.
-
-- **The trace flickers slightly.** The firmware requires a writable buffer to be cleared before it
-  can be rewritten, so the trace buffer is empty for the 20 ms it takes to write 255 points, and a
-  repaint landing in that window draws a partial trace. Everything the refill needs is computed
-  before the clear to keep that window as short as the write calls themselves.
+- **Frame rate depends on acquisition time and the drawing path.** The DMM6500 screenshots show
+  20 fps at 2,048 samples and 2.3 fps at 32,768 samples, both at 100 kS/s with the fast path active.
+  Acquisition alone takes 20.48 ms and 327.68 ms, respectively. The app adjusts the frame timer
+  to leave time for front-panel input between frames. See [Performance](PERFORMANCE.md) for the
+  measurement details.
+- **The append path may update more slowly than the fast path.** The `F` indicator shows which
+  path is active.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
 - **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin
@@ -696,14 +576,13 @@ reported a 100 Hz tone at 390.6 Hz and 16 dB low.
 |---|---|
 | Trace pinned at the bottom | Range too high, or no signal. |
 | Peak flat-topped at +20 dBV | Over range. |
-| Peaks update but the trace is missing | A frame failed inside the refill, leaving the trace unbound. Fixed in this build; on an older one, change the span or the sample count to force a rebind. |
+| Peaks update but the trace is missing | Reapply the span or sample count. If the trace does not return, capture the About pages. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
 | No `F` at the start of the bottom line after five seconds | The fast path has not found the firmware's trace ring on this instrument, so the app is appending instead -- correct, about half the rate. Photograph all four **About** pages and post them to the EEVblog TSP scripts thread; they name the window it read and the link that refused. See *The `F` at the start of the bottom line*. |
 | The `F` number keeps climbing while you watch | The path is re-acquiring repeatedly. A few are normal after a span or sample-count change. Continuous climbing with the rate down is worth reporting, with the About pages. |
 | Options, or any front-panel key, slow to respond | Something is holding the instrument's control socket -- a LAN or USB session stops the display task dispatching keys. Close it and the presses arrive. Not related to the sample count. |
-| About half the frame rate the table above gives | The compiled transform did not install, so the app is running the interpreted one. It installs once per power cycle, so a second launch without a power cycle always lands here: power cycle and launch once. A firmware upgrade is not the explanation -- the compiled path holds no address belonging to a firmware build and finds what it needs on the instrument it is running on. |
 | Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
 | A red `FFT <version>` page instead of the analyser | The compiled path could not bind, or started and then gave up, and this archive has no interpreted fallback. See "If the app stops, or will not start" above: capture every page. |
-| A help dialog sits over the app after pressing HELP | Expected. Press EXIT to dismiss it. The firmware offers the app no way to receive that key, so the only way to notice the dialog is to poll the glass for it, and that poll waits on the display task: it cost 44 ms of every frame, a sixth of the rate at 16384 samples. It ships off. `fftsa.help_enabled = true` turns the recogniser back on, where it runs once a second rather than once a frame. |
+| A help dialog sits over the app after pressing HELP | Press EXIT to dismiss the firmware's help dialog. |
 | Peak width changes as you tune | Expected. See above. |
 | A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |

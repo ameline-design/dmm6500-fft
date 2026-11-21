@@ -4,12 +4,12 @@ A real-time FFT spectrum analyser for the Keithley DMM6500, DAQ6510 and DMM7510,
 on the instrument** as a TSP app. The digitizer captures, the native FFT computes the transform,
 and the firmware's own graph object draws the trace. No host, no PC software.
 
-![DMM6500 spectrum screen showing a 6.000 kHz tone at 708.06 mVrms and 0.0 dBV. The fast-path F indicator is on at 2,048 samples, 100 kS/s and 20 fps.](docs/manual-spectrum-current.png)
+![DMM6500 spectrum showing a 6.000 kHz fundamental at 707.86 mVrms and 0.0 dBV. The peak table lists harmonics at 12, 18, 30 and 36 kHz. The F indicator shows the fast path at 32,768 samples, 100 kS/s, 3.05 Hz bins and 2.3 fps.](docs/manual-spectrum-harmonics.png)
 
-A bench multimeter is not a spectrum analyser. This one has a 1 MS/s digitizer, a 400 MHz processor
-and a touchscreen. At 2,048 samples and 100 kS/s, the capture above shows 48.83 Hz bins and 20
-frames per second. An [earlier 10 kHz harmonic benchmark](docs/manual-spectrum-harmonics.png) shows
-six harmonics resolved at 16,384 samples, with 12.2 Hz bins.
+The 6 kHz tone sits at **0.0 dBV**. The peak table resolves the second harmonic at **12 kHz**
+(−83.2 dBV), the third at **18 kHz** (−89.2 dBV), the fifth at **30 kHz** (−94.0 dBV), and the
+sixth at **36 kHz** (−96.0 dBV). The separate 60.1 Hz peak is not a harmonic of the test tone.
+The display reports **0.0082% THD**, **78.9 dB S/N**, and a **−120.8 dBV** noise floor.
 
 `docs/MANUAL.md` is the user manual. Start there to operate it; read on for how it works.
 
@@ -48,7 +48,7 @@ responsive at every sample count.
   sample count, each carrying the **maximum of the bins it covers**, so a narrow tone always reaches
   it however many bins the span holds.
 - **Finds six peaks** to sub-bin accuracy, correcting both the frequency and the scalloping loss.
-  The peak table shows Vrms and graph-referenced dBV; older screenshots show the previous peak-voltage readout.
+  The peak table shows Vrms and graph-referenced dBV.
 - **Offers four windows**, Kaiser with six betas, and reads peaks exactly for each.
 - **Settles every gesture.** The firmware's graph pans and zooms on touch and will not be told not to,
   so a brushed screen slides the trace off its axes. The dB axis always goes back — there is no
@@ -60,33 +60,17 @@ responsive at every sample count.
 More samples give finer bins without reducing bandwidth: 16,384 samples at 100 kS/s give
 6.10 Hz spacing. Larger sizes cost update rate. `docs/PERFORMANCE.md` has every size measured.
 
-This earlier comparison uses a 12.5 kHz 4.0 V tone over the same 10 Hz to 50 kHz span.
-At 16,384 samples the second and third harmonics stand as separate lines:
+At 2,048 samples the app trades frequency resolution for faster updates. This view of a 6 kHz
+tone shows 48.83 Hz bins and 20 fps at 100 kS/s:
 
-![The spectrum screen at 16,384 samples: a 12.5 kHz 4.0024 V tone reading 12.0 dBV as a narrow spike, its 
-second and third harmonics resolved as separate lines at 25.002 and 37.501 kHz, 78 and 81 dB down, over a 10 Hz 
-to 50 kHz span with 6.1 Hz bins. Between the graph and the peak table, THD 0.02%, S/N 78.9 dB and a noise floor 
-of -105.8 dBV. The firmware labels the axes itself, +020.0dB down to -120.0dB and 
-+00.00kHz across to +40.00kHz](docs/manual-spectrum-16384.png)
+![Spectrum screen at 2,048 samples showing a 6.000 kHz tone at 708.06 mVrms and 0.0 dBV, with the fast-path F indicator and a 20 fps readout.](docs/manual-spectrum-current.png)
 
-In the older 512-sample capture they are in the floor, with 195 Hz bins at 10 frames a second:
+The noise floor is a per-bin level and falls as the bins narrow. S/N compares the signal with
+integrated noise across the span, not with the per-bin floor.
 
-![The same tone at 512 samples: one 195 Hz-wide lump and the harmonics barely clear of the
-noise floor, at 10 frames a second. S/N reads 78.4 dB, within a decibel of the 16,384-sample figure, while the 
-noise floor reads -89.7 dBV against -105.8: the floor is a per-bin level and narrows with the bins, where S/N is 
-against the integrated noise and does not move](docs/manual-spectrum.png)
-
-S/N barely moves between the two — 78.9 against 78.4 dB — while the noise floor reads 16 dB better at
-16,384. The floor is a per-bin level and narrows with the bins; S/N is against the integrated noise,
-which does not.
-
-**The plot's own floor follows the instrument and the range.** −120 dBV, except on a DMM7510's 1 V
-and 0.1 V ranges, where the axis reaches −140: a 7510 measures a noise floor of −134 dBV on 0.1 V and
-−129 on 1 V, both of which sit under a −120 axis altogether. A DMM6500 reads −123 and −121 on the same
-two ranges, close enough to show, and keeps −120 everywhere. The axis, the trace's clamp and the peak
-table's dB column use the same floor. It moves on
-Apply because that is where the range is committed. `localnode.model` picks it — matched on the digits, so a variant name still reads as a
-7510.
+**The plot floor follows the instrument, input range, and sample count.** The default is −120 dBV.
+On the 1 V and 0.1 V ranges, it reaches −140 dBV on the DMM7510 and at 16,384 samples or more on
+the DMM6500. The axis, trace clamp, and peak table share the same floor.
 
 The THD figure carries **two decimals below 8,192 samples, three at 8,192 and four at 16,384**, gated
 on the sample count the transform actually committed rather than on the form's. Each doubling halves
