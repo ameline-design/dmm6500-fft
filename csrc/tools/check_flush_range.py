@@ -37,9 +37,8 @@ LUA502 = os.environ.get('LUA502',
 
 # The helpers the refusal is built on, and the function itself. Taken as two slices of the
 # module so the code under test is the code that ships.
-HELPERS = ('local function align8(v)', '\n-- Progress breadcrumbs')
-FLUSH = ('-- Flush written code out of the D-cache',
-         '\nfftsa.nl.flush = flush')
+HELPERS = ('local function align8(v)', '\nlocal function trace(')
+FLUSH = ('local function flush(addr, len)', '\nfftsa.nl.flush = flush')
 
 # A trampoline placed 24 bytes into a line, so the line below it starts at 0x1000 and the
 # image can be made to end inside it.

@@ -1,9 +1,4 @@
-/* What does the filter's source-record length actually cost?
- *
- * DSP_FIR_MAXM caps the decimation dsp_fir_pick_decim will offer, through
- * (DSP_FIR_MAXM - maxtaps)/(n-1), and its stated reason is a 22 us-per-reading buffer cost.
- * That is the Lua's marshalling cost across the TSP boundary; on this side the readings are
- * doubles already in memory. So: measure what M costs here. */
+/* Isolate FIR kernel time as source length grows at a fixed FFT size. */
 #include "dsp.h"
 #include <math.h>
 #include <stdio.h>

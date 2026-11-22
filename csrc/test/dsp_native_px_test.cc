@@ -1,22 +1,4 @@
-// The graph ring fill, on the host.
-//
-// This is the loop the instrument runs to draw a frame: it writes three copies of a row
-// number into each record of the display task's own ring. It cannot be tested on the
-// instrument -- the ring is in the display task's heap and an error in the destination
-// arithmetic lands in the free list, which reaches PegRect::operator& on a freed widget and
-// bluescreens with no recovery but a power cycle. The arithmetic is pure, so it is proved
-// here, against a ring in ordinary host memory with guard bytes around and between the
-// records.
-//
-// WHAT THESE COVER THAT THE LUA GATES CANNOT. tools/test_nl_reattach.lua stubs the native
-// call, so it proves the block Lua packs and which writer a frame picks, and nothing about
-// the loop. A destination of `(s + 1) * stride` would put the last triple one record past the
-// window dsp_native_run validated and every one of those gates would still pass.
-//
-// Byte order is deliberately not asserted: the stores are plain uint32 and the instrument is
-// big-endian, so the bytes are the big-endian encoding the Lua writer packs by hand, while
-// this host is little-endian. What is asserted is the VALUE of each word, which is the claim
-// the loop makes, and that all three copies carry it.
+// Exercise the real pixel writer and slot-map validation on the host.
 
 #include <gtest/gtest.h>
 
@@ -31,16 +13,13 @@ extern "C" {
 
 namespace {
 
-// The geometry measured on a DMM6500: 56-byte records with the y triple at +12. The x pixel
-// triple is at +0 and the value and x float are past the y triple, so a fill that overran
-// either way would land on a field the firmware owns.
+// Use the DMM6500 record stride and Y offset for the baseline.
 constexpr uint32_t kStride = 56U;
 constexpr uint32_t kYoff = 12U;
 constexpr uint32_t kYmax = 479U;   // what Lua sends: the panel is 480 rows
 constexpr uint8_t kGuard = 0xA5U;
 
-// A ring, with a whole record of guard either side so an off-by-one record is caught rather
-// than clipped by the allocation.
+// Surround the ring with guard records so an off-by-one write is visible.
 class Ring {
  public:
   explicit Ring(uint32_t nrec) : nrec_(nrec), buf_((nrec + 2) * kStride, kGuard) {}
@@ -55,9 +34,7 @@ class Ring {
     return v;
   }
 
-  // Is every byte outside the nrec y triples still the guard value? That is the whole of the
-  // destination claim: the leading and trailing guard records, the record prefix holding the
-  // x pixel, and the suffix holding the value and the x float.
+  // Check all bytes except the mapped Y triples against the guard value.
   bool OnlyTriplesTouched() const {
     for (size_t i = 0; i < buf_.size(); i++) {
       const bool inside = i >= kStride && i < (nrec_ + 1) * kStride &&
@@ -73,7 +50,6 @@ class Ring {
   std::vector<uint8_t> buf_;
 };
 
-// A plain identity map, one slot per column.
 std::vector<uint32_t> Identity(uint32_t n) {
   std::vector<uint32_t> idx(n);
   for (uint32_t i = 0; i < n; i++) { idx[i] = i + 1U; }
@@ -82,9 +58,6 @@ std::vector<uint32_t> Identity(uint32_t n) {
 
 }  // namespace
 
-// Every store lands on its own record's y triple and nowhere else. The case that matters is
-// the last record: a destination off by one record writes past the range dsp_native_run
-// bounded, which on the instrument is somebody else's allocation.
 TEST(NativePx, WritesEveryTripleAndNothingElse) {
   const uint32_t n = 17U;
   Ring ring(n);
@@ -96,8 +69,7 @@ TEST(NativePx, WritesEveryTripleAndNothingElse) {
 
   EXPECT_TRUE(ring.OnlyTriplesTouched());
   for (uint32_t s = 0; s < n; s++) {
-    // row = floor(-2*db + 94 + 0.5), and every db here is a whole number so there is no
-    // rounding to argue about in this case.
+
     const uint32_t want = static_cast<uint32_t>(-2.0 * (-100.0 + s) + 94.0);
     EXPECT_EQ(ring.word(s, 0), want) << "record " << s;
     EXPECT_EQ(ring.word(s, 1), want) << "record " << s << " second copy";
@@ -105,14 +77,12 @@ TEST(NativePx, WritesEveryTripleAndNothingElse) {
   }
 }
 
-// The slot map is a permutation of the spectrum, which is what the ring's cursor leaves
-// behind: slot s carries column idx[s], one-based. A fill that ignored it would draw the
-// right spectrum at the wrong columns -- correct-looking and wrong.
+// Check a permuted map rather than assuming slot order is column order.
 TEST(NativePx, HonoursThePermutedSlotMap) {
   const uint32_t n = 8U;
   Ring ring(n);
   const dsp_real db[n] = {-10, -20, -30, -40, -50, -60, -70, -80};
-  // Reversed, then rotated by three: neither the identity nor a reversal alone.
+
   const uint32_t idx[n] = {4, 3, 2, 1, 8, 7, 6, 5};
 
   dspn_px_fill(ring.base(), kStride, kYoff, n, kYmax, -1.0, 100.0, idx, db);
@@ -124,8 +94,7 @@ TEST(NativePx, HonoursThePermutedSlotMap) {
   }
 }
 
-// A stride and an offset that are not the ones this was measured on. The geometry is derived
-// at runtime on the instrument, so a second layout has to work without a change here.
+// Exercise a different valid stride and Y offset to expose fixed-layout assumptions.
 TEST(NativePx, AnyStrideAndOffsetTheCallerPermits) {
   const uint32_t n = 5U;
   const uint32_t stride = 28U, yoff = 16U;   // yoff + 12 == stride: the tight case
@@ -148,9 +117,6 @@ TEST(NativePx, AnyStrideAndOffsetTheCallerPermits) {
   }
 }
 
-// Both ends of the panel. A decibel off the top of the trace window would otherwise store a
-// negative row, and the conversion of a negative double to uint32 is not the clamp anybody
-// intended.
 TEST(NativePx, ClampsBothEnds) {
   Ring ring(4U);
   const dsp_real db[4] = {1000, -1000, 0, -239};   // way above, way below, and two inside
@@ -164,8 +130,7 @@ TEST(NativePx, ClampsBothEnds) {
   EXPECT_EQ(ring.word(3, 0), 572U > kYmax ? kYmax : 572U);
 }
 
-// NaN and the infinities, which the comparisons alone do not catch: NaN fails both of them,
-// so without being named it would reach the conversion and the result would be undefined.
+// Clamp infinities to the panel and keep NaN out of integer conversion.
 TEST(NativePx, NanAndInfinitiesLandOnARealRow) {
   Ring ring(3U);
   dsp_real db[3];
@@ -182,14 +147,8 @@ TEST(NativePx, NanAndInfinitiesLandOnARealRow) {
   EXPECT_TRUE(ring.OnlyTriplesTouched());
 }
 
-// THE ROUNDING, AGAINST THE LUA WRITER'S. The two writers alternate frame by frame -- a frame
-// that re-points the series uses the Lua one -- so a row they disagree on is a column that
-// moves when nothing about the spectrum did.
-//
-// The figures are literal and not recomputed here, which is the point: `ay*db + by` fused
-// into one rounding gives 165.49999999999997 and a row of 165, while the Lua writer rounds
-// the product and then adds, giving exactly 165.5 and a row of 166. The shipped image used
-// fmadd here until dspn_px_row was made to round the product.
+// The native row must equal Lua's separate multiply and add; a fused result differs here.
+// Keep the expected row independent of the expression under test.
 TEST(NativePx, RoundsTheProductBeforeAddingTheIntercept) {
   const double ay = -7.7603470944719;
   const double by = 231.28555207927295;
@@ -203,18 +162,16 @@ TEST(NativePx, RoundsTheProductBeforeAddingTheIntercept) {
       << "a fused multiply-add gives 165 here, which is a row the Lua writer never draws";
 }
 
-// The row is the floor of the half-up sum, which is what the Lua writer computes. Checked at
-// the two edges of a row rather than in its middle, where any rounding rule agrees.
+// Check the half-up rounding boundary in both directions.
 TEST(NativePx, RowIsTheFloorOfTheHalfUpSum) {
   EXPECT_EQ(dspn_px_row(0.0, 1.0, 100.49, kYmax), 100U);
   EXPECT_EQ(dspn_px_row(0.0, 1.0, 100.5, kYmax), 101U);
   EXPECT_EQ(dspn_px_row(0.0, 1.0, 100.51, kYmax), 101U);
-  // Negative slope, which is the real one: rows grow downwards and decibels upwards.
+
   EXPECT_EQ(dspn_px_row(-20.0, -2.0, 94.0, kYmax), 134U);
 }
 
-// The map, checked whole before the first store. A slot naming a column outside the
-// reduction's array reads a dsp_real from whatever follows it.
+// An invalid map, even at the last slot, must be rejected before any store.
 TEST(NativePx, MapIsRefusedWholeOrAcceptedWhole) {
   std::vector<uint32_t> idx = Identity(6U);
   EXPECT_TRUE(dspn_px_map_ok(idx.data(), 6U, 6U));
@@ -232,8 +189,7 @@ TEST(NativePx, MapIsRefusedWholeOrAcceptedWhole) {
   EXPECT_FALSE(dspn_px_map_ok(nullptr, 6U, 6U));
 }
 
-// A full pass at the sizes the instrument actually runs: 510 records of the measured ring, and
-// the largest map the image carries room for.
+// Exercise a full folded pass of 510 records for 255 columns.
 TEST(NativePx, AFullPassAndTheLongestMap) {
   const uint32_t n = 510U;
   Ring ring(n);
@@ -241,8 +197,7 @@ TEST(NativePx, AFullPassAndTheLongestMap) {
   for (uint32_t i = 0; i < 255U; i++) {
     db[i] = static_cast<dsp_real>(-110.0 + 0.3 * static_cast<double>(i));
   }
-  // The fold a pass writes: up the band and back down it, so the ring holds two slots per
-  // column and the last slot is column 1 again.
+
   std::vector<uint32_t> idx(n);
   for (uint32_t i = 0; i < 255U; i++) {
     idx[i] = i + 1U;
@@ -253,8 +208,7 @@ TEST(NativePx, AFullPassAndTheLongestMap) {
   dspn_px_fill(ring.base(), kStride, kYoff, n, kYmax, -2.0, 94.0, idx.data(), db.data());
 
   EXPECT_TRUE(ring.OnlyTriplesTouched());
-  // The fold's two halves draw the same column at the same row, which is what makes the
-  // wrap seam a repeated point rather than a step across the plot.
+  // Both halves of the fold must draw each column at the same row.
   for (uint32_t i = 0; i < 255U; i++) {
     EXPECT_EQ(ring.word(i, 0), ring.word(509U - i, 0)) << "column " << (i + 1);
   }

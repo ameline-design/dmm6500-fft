@@ -1,9 +1,4 @@
-/*
- * string.h -- the subset of <string.h> dsp.c uses, for the freestanding PPC target.
- *
- * memset is the only one; dsp_native.c defines it.  See the note there on why it is not
- * bounds-checked.
- */
+/* String declarations for the freestanding PowerPC image; dsp_native.c supplies the definitions. */
 #ifndef DSP_FREESTANDING_STRING_H
 #define DSP_FREESTANDING_STRING_H
 

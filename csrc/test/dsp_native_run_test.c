@@ -1,39 +1,4 @@
-/* The image's entry point, on the host.
- *
- * dsp_native.c is built for powerpc-unknown-elf and entered by redirecting ki.peek8, so
- * until now nothing could call dsp_native_run and look at what it returned. Thirty-one
- * refusal sites, the mode dispatch and the status word were covered by reading alone -- which
- * is how DSP_EBETA came to be reported as DSPN_EOUTPUT for as long as it was.
- *
- * WHAT MAKES THIS POSSIBLE. Every address in dsp_native_params is a uint32_t, and a 64-bit
- * host reserves the low 4 GB, so no real pointer fits. DSPN_HOST switches DSPN_P and DSPN_A
- * (dsp_native_bounds.h) from the identity to base-relative, so the struct's addresses become
- * OFFSETS into one arena this file owns. The bounds checks are then exercised for real: an
- * offset inside DSPN_DRAM_LO..DSPN_DRAM_END passes the same comparison it passes on the
- * instrument, and one outside is refused by it.
- *
- * The shipped source is INCLUDED rather than linked, so the struct, the status codes and the
- * macros are the ones the image is built from and not a copy that could drift. The target
- * build is unaffected: with DSPN_HOST unset the macros are the cast this file always did, and
- * the built image is byte for byte the one built before they existed.
- *
- * THE MATH ENTRIES. sin_addr and the five beside it carry code addresses the loader resolved,
- * which an arena offset is not, so DSPN_FP goes through dspn_host_fp below: the six addresses
- * the caller puts in the struct are tokens, mapped here to the host's own libm. text_ok still
- * runs against the address in the struct, ahead of the mode dispatch, so the six still have
- * to sit inside the firmware text span to reach anything -- the token is what gets called,
- * not what gets validated.
- *
- * That is what makes a SUCCEEDING MODE_INIT and MODE_RUN reachable, and they are what the
- * frame actually does. The run path is exercised at both element layouts the two instruments
- * use: a DMM6500's 24-byte STYLE_STANDARD element, 8-aligned throughout, and a DMM7510's
- * 20-byte element, which leaves every other reading 4-aligned and is the case dsp_src_at
- * assembles a double from two word loads for. Nothing but reading covered that before.
- *
- * NOT bit-exactness against the instrument: the firmware's libm is not the host's and a
- * transcendental differs in the last places, so the figures here are checked against the
- * signal that was generated, with a tolerance, rather than against a recorded answer.
- */
+/* Exercise the real native entry point on the host, with wire addresses mapped into a test arena. */
 #include <dlfcn.h>
 #include <math.h>
 #include <stdarg.h>
@@ -44,30 +9,16 @@
 #define DSPN_HOST 1
 unsigned char *dspn_host_base;
 
-/* The shipped source DEFINES memset -- it has to, the target links no libc -- and this host
- * fortifies it into a macro, which turns the definition into a syntax error. The macro goes,
- * not the definition: the one under test is the one the image carries. */
+/* Undefine the fortified memset macro before including the freestanding definition. */
 #undef memset
 
 #include "../dsp_native.c"
 
-/* THE ARENA, AND WHY IT IS THIS BIG.
- *
- * Offsets have to satisfy the real bounds checks, and those are not just the DRAM window:
- * dspn_write_ok excludes DSPN_TEXT_LO..DSPN_TEXT_HI, 0x4000 to 0x527000, because that is the
- * firmware's own text and a write into it is not recoverable. So anything the image will
- * WRITE has to sit above 0x527000, which is what sets the size here -- an arena that merely
- * cleared DSPN_DRAM_LO was refused at the segment check, correctly.
- *
- * The params struct is different: it is only required to be in DRAM, so it goes below the
- * text at 0x3000, which is where the backstop starts. */
+/* Model the target's address windows with offsets into one writable host allocation. */
 #define ARENA_BYTES  0x800000U
 #define P_AT         0x3000U     /* the params struct: DRAM is all it must be */
 
-/* The writable window, clear of DSPN_TEXT_HI, and what is placed in it. The plan, the two
- * reduction arrays and the results block all have to miss the arena -- dsp_plan_init carves
- * its arrays out of the segment bases and would overwrite anything else there -- so they sit
- * below it with the arena at the top. */
+/* Place all plan and scratch allocations in the declared writable window. */
 #define W_AT         0x600000U
 #define W_BYTES      0x100000U
 #define SEGV_AT      0x600000U   /* the vector of segment addresses */
@@ -80,15 +31,13 @@ unsigned char *dspn_host_base;
 #define SEG_BYTES    0x40000U
 #define MAX_SEGS_HERE 4U         /* what the window above has room for */
 
-/* The capture, in a read window of its own: chunk payloads, DSPN_CHUNK_BYTES each, placed
- * apart the way the allocator places them rather than end to end. */
+/* Model independent capture chunks in their own read window. */
 #define R_AT         0x700000U
 #define R_BYTES      0x80000U
 #define CAP_CHUNKS   4U
 #define CAP_PITCH    0x10000U
 
-/* The six math tokens. Inside DSPN_TEXT_LO..DSPN_TEXT_HI, because that is what text_ok
- * demands, and never dereferenced as addresses -- dspn_host_fp maps them. */
+/* Use callable test tokens inside the target's accepted .text interval. */
 #define FN_SIN       (DSPN_TEXT_LO + 0x100U)
 #define FN_COS       (DSPN_TEXT_LO + 0x200U)
 #define FN_SQRT      (DSPN_TEXT_LO + 0x300U)
@@ -99,17 +48,7 @@ unsigned char *dspn_host_base;
 static int failures;
 static int checks;
 
-/* THE ENTRIES HAVE TO BE FETCHED PAST THE IMAGE'S OWN.
- *
- * dsp_native.c DEFINES sin, cos, sqrt, log10, floor and ceil, each one dispatching through
- * the global the params struct filled -- that is how dsp.c, compiled freestanding against
- * csrc/freestanding/math.h, reaches the firmware's libm without linking one. Those
- * definitions are in this translation unit and they are strong, so the name sin here is the
- * shim, and the linker binds dsp.c's calls to it as well.
- *
- * Which means returning &sin from dspn_host_fp points the shim at itself. Measured, not
- * reasoned: a hang in a two-instruction loop inside sin. RTLD_NEXT is what asks for the
- * entry AFTER this image's own, which is the host's real libm. */
+/* Resolve host libm symbols past the image's own wrappers to avoid recursion. */
 static uintptr_t host_libm(const char *name)
 {
     void *q = dlsym(RTLD_NEXT, name);
@@ -120,9 +59,7 @@ static uintptr_t host_libm(const char *name)
     return (uintptr_t)q;
 }
 
-/* A token the image asks for and this file did not install. Returned rather than refused so
- * that the failure is a loud abort at the call, not a jump to address zero: an unmapped entry
- * means this file set up the struct wrongly, and that is worth saying out loud. */
+/* Make an unexpected math token fail visibly instead of selecting a random function. */
 static double fp_unmapped(double x)
 {
     (void)x;
@@ -145,8 +82,7 @@ uintptr_t dspn_host_fp(uint32_t a)
     return (uintptr_t)unmapped;
 }
 
-/* A sine for this file's own use, for the same reason: calling sin here would go through the
- * shim, whose global points at whatever the last call installed. */
+/* Generate the fixture sine through host libm, not through the image's wrapper. */
 static double real_sin(double x)
 {
     static math1_fn f;
@@ -157,8 +93,6 @@ static double real_sin(double x)
     return f(x);
 }
 
-/* Declared printf-like, so the compiler checks the call sites rather than this file
- * suppressing the check that it should be passing. */
 static void ok(const char *name, int cond, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 
@@ -180,9 +114,7 @@ static dsp_native_params *params(void) {
     return (dsp_native_params *)(void *)(dspn_host_base + P_AT);
 }
 
-/* A struct that gets past the magic and the window checks, so a test can perturb one thing
- * and see one refusal. Deliberately NOT a runnable configuration: cap_n of zero means the run
- * path refuses on geometry, which is what the modes under test want anyway. */
+/* Start with a valid params block so each refusal test can perturb one condition. */
 static void setup(uint32_t mode) {
     dsp_native_params *p = params();
     memset(p, 0, sizeof(*p));
@@ -201,12 +133,7 @@ static int32_t run_status(void) {
     return (int32_t)params()->status;
 }
 
-/* The two words of a double, in the order pw_double reassembles them.
- *
- * The field names are the target's: there, w[0] is the IEEE754 high half and Lua packs it
- * first. Here they are simply the two words in memory order, which is what pw_double copies
- * them back as, so the value round-trips on either endianness without this file knowing
- * which one it is on. */
+/* Use the host union word order, matching pw_double on this build. */
 static void pack_double(double v, uint32_t *w0, uint32_t *w1)
 {
     union { double d; uint32_t w[2]; } u;
@@ -215,10 +142,7 @@ static void pack_double(double v, uint32_t *w0, uint32_t *w1)
     *w1 = u.w[1];
 }
 
-/* Elements per chunk, the descriptor's own invariant: as many as fit, and one more must not.
- * 24 bytes gives 1365 and 20 gives 1638, which are the two instruments' STYLE_STANDARD
- * figures. Computed rather than written down, so a stride added here cannot be inconsistent
- * with what the image will accept. */
+/* Set perchunk to the number of complete elements that fit a payload. */
 static uint32_t per_chunk(uint32_t stride)
 {
     return DSPN_CHUNK_BYTES / stride;
@@ -229,9 +153,7 @@ static uint32_t cap_chunk_at(uint32_t i)
     return R_AT + i * CAP_PITCH;
 }
 
-/* One reading into the capture, at the element layout the params describe. memcpy because a
- * 20-byte element puts half of them on a 4-boundary and a double store there is not this
- * host's to make -- which is the case dsp_src_at exists for. */
+/* Copy doubles as bytes because a 20-byte stride does not align every sample to eight bytes. */
 static void cap_put(uint32_t first, uint32_t per, uint32_t stride, int i, double v)
 {
     const uint32_t chunk = (uint32_t)i / per;
@@ -240,9 +162,7 @@ static void cap_put(uint32_t first, uint32_t per, uint32_t stride, int i, double
     memcpy(dspn_host_base + a, &v, sizeof v);
 }
 
-/* The whole struct for a real frame, both modes. mode is the only thing the two calls
- * differ in, which is what the image expects: Lua packs one struct per frame and changes the
- * mode word. */
+/* Use the same packed params for plan initialization and frame execution. */
 static void setup_frame(uint32_t mode, int n, uint32_t nsegs, uint32_t stride, uint32_t skew,
                         uint32_t nseg, int m, double binhz)
 {
@@ -263,9 +183,7 @@ static void setup_frame(uint32_t mode, int n, uint32_t nsegs, uint32_t stride, u
     p->cap_n        = (uint32_t)n;
     p->cap_stride   = stride;
     p->cap_perchunk = per_chunk(stride);
-    /* The record does not start at the base of its chunk, which is why cap_chunk1 is a field
-     * of its own and the vector's first entry is never read. skew is 4-aligned and not 8, the
-     * residue a content scan really lands on. */
+    /* Exercise a first sample inside a chunk, not just one at the payload base. */
     p->cap_chunk1   = cap_chunk_at(0U) + skew;
     p->cap_vec      = CAPV_AT;
     p->cap_nchunks  = CAP_CHUNKS;
@@ -283,8 +201,7 @@ static void setup_frame(uint32_t mode, int n, uint32_t nsegs, uint32_t stride, u
     p->init_decim       = 1U;
     p->init_method      = (uint32_t)DSP_FFT_RADIX2;
 
-    /* out_desc zero asks for the reduction and nothing else, which is what the app does: it
-     * writes the trace into the graph's own ring itself, through MODE_PX. */
+    /* out_desc == 0 selects reduction without writing a firmware reading buffer. */
     p->out_desc = 0U;
 
     p->red_nseg  = nseg;
@@ -304,8 +221,7 @@ static void setup_frame(uint32_t mode, int n, uint32_t nsegs, uint32_t stride, u
     p->res_mains = (uint32_t)(int32_t)DSP_THD_MAINS_BOTH;
 }
 
-/* A tone, exactly on a bin so that the window leaks nothing and the amplitude the peak
- * finder reports is the amplitude that went in. */
+/* Place the fixture tone exactly on a bin to isolate wrapper amplitude and frequency. */
 static void fill_tone(int n, uint32_t stride, uint32_t skew, double fs, double f, double amp)
 {
     const double two_pi = 6.283185307179586476925286766559;
@@ -322,7 +238,6 @@ static const double *res_doubles(void)
     return (const double *)(const void *)(dspn_host_base + RES_AT);
 }
 
-/* The strongest trace point, which is what the eye reads off the graph. */
 static int trace_argmax(uint32_t nseg)
 {
     const dsp_real *db = (const dsp_real *)(const void *)(dspn_host_base + DB_AT);
@@ -334,9 +249,7 @@ static int trace_argmax(uint32_t nseg)
     return (int)best;
 }
 
-/* One whole frame at one element layout: build the plan, fill the capture, transform,
- * reduce, rank. The figures are checked against the signal generated, not against a recorded
- * answer -- the instrument's libm is not this host's. */
+/* Exercise plan build, capture, reduction and peaks with the supplied element layout. */
 static void frame_case(const char *what, uint32_t stride, uint32_t skew)
 {
     const int    n     = 2048;
@@ -360,8 +273,6 @@ static void frame_case(const char *what, uint32_t stride, uint32_t skew)
        "dsp_plan_segs=%d", nsegs_needed);
     if (nsegs_needed <= 0 || (uint32_t)nsegs_needed > MAX_SEGS_HERE) { return; }
 
-    /* MODE_INIT, succeeding. Everything above this in the file refuses before the window
-     * table is built; this is the first call that reaches the math entries at all. */
     setup_frame(DSPN_MODE_INIT, n, (uint32_t)nsegs_needed, stride, skew, nseg, 0, binhz);
     st = run_status();
     snprintf(name, sizeof name, "%s: MODE_INIT builds the plan", what);
@@ -391,18 +302,14 @@ static void frame_case(const char *what, uint32_t stride, uint32_t skew)
     snprintf(name, sizeof name, "%s: it ranked the peaks it was asked for", what);
     ok(name, res[2 * DSPN_RES_PEAKS + 0] > 0.5, "npeaks=%.0f", res[2 * DSPN_RES_PEAKS + 0]);
 
-    /* The strongest peak, in hertz through the band map the caller supplied. One bin of
-     * tolerance: the sub-bin estimate is a real number and the tone sits on a bin centre. */
+    /* Use bin-width tolerance on the measured peak frequency. */
     snprintf(name, sizeof name, "%s: the strongest peak is the tone", what);
     ok(name, fabs(res[1] - f) < binhz, "f=%.2f Hz wanted %.2f +-%.2f", res[1], f, binhz);
 
-    /* Volts, not volts-squared and not decibels: writing the bins here instead of the
-     * reduction put volts-squared on a decibel axis once. */
+    /* Peak amplitude is returned in volts; the trace is in dBV. */
     snprintf(name, sizeof name, "%s: and its amplitude is the amplitude sent in", what);
     ok(name, fabs(res[0] - amp) < 0.05 * amp, "amp=%.4f V wanted %.4f", res[0], amp);
 
-    /* The trace the graph draws, which is the reduction and not the bins. k0..k1 is every
-     * bin, so each trace point covers m/nseg of them. */
     seg_want = kwant / (m / (int)nseg);
     seg_got  = trace_argmax(nseg);
     snprintf(name, sizeof name, "%s: the trace peaks in the segment holding the tone", what);
@@ -417,8 +324,7 @@ int main(void) {
 
     printf("dsp_native_run on the host\n");
 
-    /* THE PARAMS STRUCT ITSELF, refused before it is dereferenced. Nothing is written,
-     * because the word that would carry a status is inside the struct this refuses to trust. */
+    /* An invalid params address must be refused without dereferencing it, including status. */
     {
         setup(DSPN_MODE_SEGS);
         uint32_t keep = params()->status;
@@ -430,7 +336,6 @@ int main(void) {
         dspn_params_addr = P_AT;
     }
 
-    /* The magic, which is the first thing any mode passes through. */
     {
         setup(DSPN_MODE_SEGS);
         params()->magic = DSP_NATIVE_MAGIC ^ 1U;
@@ -440,7 +345,7 @@ int main(void) {
            "status=%d wanted %d, @%u", st, DSPN_EMAGIC, params()->fail_at);
     }
 
-    /* MODE_SEGS: pure arithmetic, and the one forward that is deliberately NOT shifted. */
+    /* MODE_SEGS returns an unsigned count and does not remap it into the plan-error space. */
     {
         setup(DSPN_MODE_SEGS);
         params()->cap_n     = 2048U;
@@ -450,9 +355,7 @@ int main(void) {
         ok("MODE_SEGS answers a chunk count", st > 0, "status=%d", st);
     }
 
-    /* The claim the shift rests on: dsp_plan_segs converts every invalid configuration to 0,
-     * so it has no negative to forward and shifting MODE_SEGS would be unreachable. Checked
-     * rather than read, because the whole PLAN_BASE design depends on it. */
+    /* Invalid sizing returns zero, not a forwarded negative error. */
     {
         setup(DSPN_MODE_SEGS);
         params()->cap_n     = 2048U;
@@ -468,8 +371,7 @@ int main(void) {
            a == 0 && b == 0, "seg_bytes=0 -> %d, n=3 -> %d", a, b);
     }
 
-    /* An unassigned mode. 3 was DSPN_MODE_BYTES and is now free; it must refuse rather than
-     * fall into the run path. */
+    /* An unassigned mode must not fall through to RUN. */
     {
         setup(3U);
         int32_t st = run_status();
@@ -479,12 +381,11 @@ int main(void) {
         ok("an unknown mode is refused", st < 0, "status=%d", st);
     }
 
-    /* MODE_FIND refusing its OWN arguments. It used to answer DSP_EARG, which is -1 and so
-     * read back as EMAGIC -- a bad needle length reported as a corrupt params struct. */
+    /* A malformed search reports EFIND, distinct from bad params magic. */
     {
         setup(DSPN_MODE_FIND);
         params()->find_addr = W_AT;
-        /* flen is the first word of the find block; zero is refused. */
+
         memset(dspn_host_base + W_AT, 0, 64);
         int32_t st = run_status();
         ok("a zero needle length is EFIND, not EMAGIC",
@@ -496,13 +397,7 @@ int main(void) {
         ok("a find block outside the backstop is refused", st < 0, "status=%d", st);
     }
 
-    /* The math entries, refused before anything calls through them -- which is what makes
-     * every refusal above reachable with no math at all.
-     *
-     * A WHOLE ARENA HAS TO BE PRESENTED TO REACH THIS TEST. The arena is validated first, so
-     * a struct carrying only a bad sin_addr refuses at the segment check instead and the
-     * check passes for the wrong reason; written without the arena, this one reported
-     * EBOUNDS @798. */
+    /* A bad math token must be refused before indirect calls. */
     {
         const int nsegs = dsp_plan_segs(2048, 1, DSP_FFT_RADIX2, (size_t)SEG_BYTES);
         setup_frame(DSPN_MODE_INIT, 2048, (uint32_t)nsegs, 24U, 0U, 256U, 0, 50.0);
@@ -512,18 +407,14 @@ int main(void) {
            st == DSPN_EMATH, "status=%d wanted %d @%u", st, DSPN_EMATH, params()->fail_at);
     }
 
-    /* THE FORWARDED SPACE, which is the whole reason this file exists. dsp_plan_init_segs
-     * refuses a Kaiser beta before it builds anything, and that refusal is DSP_EBETA, -6 --
-     * the same number as DSPN_EOUTPUT. It has to come back shifted. */
+    /* A rejected Kaiser beta reports DSP_EBETA in the forwarded error range. */
     {
         setup(DSPN_MODE_INIT);
         params()->cap_n       = 2048U;
         params()->seg_bytes   = SEG_BYTES;
         params()->nsegs       = 1U;
         params()->segs_addr   = SEGV_AT;
-        /* The vector holds the payload's address, which has to be writable inside the window
-         * and DSP_ALIGN-aligned -- both checked by the image, and getting it wrong is how this
-         * test first refused at @814 instead of reaching the plan builder. */
+        /* Use a real aligned segment so the failure comes from planner validation, not bounds checks. */
         *(uint32_t *)(void *)(dspn_host_base + SEGV_AT) = SEG_AT;
         params()->plan_addr   = PLAN_AT;
         params()->init_decim  = 1U;
@@ -544,18 +435,11 @@ int main(void) {
            st != DSPN_EOUTPUT, "status=%d DSPN_EOUTPUT=%d", st, DSPN_EOUTPUT);
     }
 
-    /* A WHOLE FRAME, at both instruments' element layouts.
-     *
-     * 24 bytes is a DMM6500's STYLE_STANDARD element and every reading in it is 8-aligned.
-     * 20 bytes is a DMM7510's, and it walks every 4-aligned residue, so half the readings
-     * take dsp_src_at's two-word assembly instead of a single load. The record starts
-     * 4 bytes into its first chunk in both cases, which is a residue a content scan really
-     * lands on and which the single-load path must not assume away. */
+    /* Run complete frames for both supported capture element layouts. */
     frame_case("6500 element, 24 bytes", 24U, 4U);
     frame_case("7510 element, 20 bytes", 20U, 4U);
 
-    /* And the same capture read as one 8-aligned block from the chunk base, which is the
-     * shape every figure in docs/PERFORMANCE.md was measured on. */
+    /* Also exercise an aligned capture that fits a single payload. */
     frame_case("8-aligned record start", 24U, 0U);
 
     printf("%d check(s), %d failure(s)\n", checks, failures);

@@ -1,13 +1,4 @@
-/* dsp.c -- see dsp.h. A translation of tsp/fft_core.tsp, tsp/spectrum_ui.tsp's peak
- * finder and tsp/spectrum_graph.tsp's segment reduction.
- *
- * Inner loops are written as explicit multiply-accumulate expressions over pointers the
- * loop advances, with two or more independent chains wherever a chain exists, because the
- * target's FPU issues one single-precision multiply-add a cycle through a three-stage
- * pipeline and a single dependent chain stalls every third instruction. Sums that run over
- * a whole record -- the window sum, the weighted mean, the gain-table cosines, the FIR --
- * accumulate in double.
- */
+/* Scalar DSP kernels and plan layout. The caller owns all storage; frame processing allocates nothing. */
 
 #include "dsp.h"
 
@@ -21,30 +12,13 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* Multiply by these rather than dividing by the constant: each folds, so no divide is
- * executed. A power of two is written as the literal at the site, 0.5 for 2.0. INV_M_PI
- * follows the guard above so it tracks whichever M_PI is in force. */
 #define INV_M_PI    (1.0 / M_PI)
 #define INV_DSP_GHX (1.0 / DSP_GHX)
 #define INV_DSP_DN  (1.0 / (double)DSP_DN)
 
-/* Transcendentals at the element precision.
- *
- * The e300c4's FPU is built around a single-precision multiply-add array, so the single
- * entry points are the cheaper ones -- a shorter polynomial, each term a single-precision
- * multiply-add. They are also accurate enough, which is the part that had to be measured
- * rather than assumed: against a double reference the gain table comes out 1.6e-9 relative
- * and the twiddles 2.4e-7 absolute, which puts a twiddle-induced spur at -132 dB against the
- * -103 dB floor the single-precision transform already has. 29 dB of margin.
- *
- * The double build keeps the double entry points, because its whole purpose is to measure
- * what double precision buys; single-precision trig there would cap its noise floor at -132
- * and the comparison would measure the library's trig instead of its arithmetic.
- *
- * floor and ceil stay double either way: they are exact, and the single versions would only
- * narrow the range they accept. Define DSP_NO_SINGLE_MATH to use the double entry points in
- * both builds -- a libm without sinf/cosf/sqrtf/log10f needs it, and those four are the only
- * external references this choice adds.
+/*
+ * Use element-width math where available. The freestanding image uses the
+ * firmware's double-precision entry points for transcendentals.
  */
 #if defined(DSP_DOUBLE) || defined(DSP_NO_SINGLE_MATH)
 #define DSP_SIN(x)   sin(x)
@@ -58,60 +32,35 @@
 #define DSP_LOG10(x) ((double)log10f((float)(x)))
 #endif
 
-/* Largest magnitude dsp_real holds. A double outside it is undefined to convert, not merely
- * rounded to an infinity, so anything computed in double and stored into an output array is
- * checked against this first. */
+/* Check range before converting a double to dsp_real. */
 #ifdef DSP_DOUBLE
 #define DSP_REAL_MAX DBL_MAX
 #else
 #define DSP_REAL_MAX FLT_MAX
 #endif
 
-/* A caller-supplied limit or scale has to be an ordinary finite number. These reach the trace
- * buffer directly, and a non-finite value there is a refused graph parameter and a modal
- * dialog on the front panel. Two ways in, which is why the test is for finiteness and not
- * just for a NaN: a NaN defeats any range test written as a negation, and an infinity passes
- * `> 0.0` and then makes `0 * binhz` a NaN. */
+/* Reject non-finite limits and scales before they reach the trace. */
 static int dsp_finite(const double v) {
     return isfinite(v) != 0;
 }
 
-/* Finite and representable in dsp_real. The second half matters in the single build, where a
- * perfectly good double can exceed FLT_MAX: converting it is undefined rather than saturating,
- * so the value is refused before the store rather than after. */
 static int dsp_storable(const double v) {
-    /* Cast, not promoted: FLT_MAX is a float, and -Wdouble-promotion is on because an
-     * implicit widening is how a precision decision goes unrecorded. */
+
     return isfinite(v) != 0 && v <= (double)DSP_REAL_MAX && v >= -(double)DSP_REAL_MAX;
 }
 
-/* Halving a non-negative int, as a shift. Signed division by two is not one instruction: C
- * rounds toward zero, so the compiler must add the sign bit in first. Every value halved in
- * this file is a count or an index. None of them sits in an inner loop -- the inner loops
- * have no divides at all -- so this is about the code the compiler emits, not a measured
- * saving. */
+/* Halve a nonnegative length without signed division or a signed right shift. */
 static int dsp_half(const int v) {
     return (int)((unsigned)v >> 1U);
 }
 
-/* Odd test without a signed bitwise operand. */
 static int dsp_is_odd(const int v) {
     return ((unsigned)v & 1U) != 0U;
 }
 
 #if DSP_CHECK_OVERLAP
-/* Do two objects share a byte? Every caller below knows both bases and both lengths from its
- * own arguments, so this is the real overlap test rather than a comparison of bases.
- *
- * Through uintptr_t: comparing unrelated pointers with < is undefined, where converting and
- * comparing integers is merely implementation-defined, and is well behaved on any target with
- * a flat address space. Subtracting the smaller from the larger keeps it clear of the overflow
- * that `pa + na` would risk at the top of the range.
- *
- * Applied only to pairs where at least one side is written. Two read-only buffers sharing
- * bytes cannot produce a wrong answer, so checking them would cost code for no failure. */
-/* Defined below, beside the bump walk they share their geometry with. Declared here because
- * the forms taking a plain pointer are defined above it. */
+/* Compare byte ranges by address difference so computing the end cannot overflow. */
+
 static void dsp_vec_flat(dsp_vec *v, dsp_real *p, int len);
 static void dsp_vec_flat_ro(dsp_vec *v, const dsp_real *p, int len);
 
@@ -128,16 +77,14 @@ static int dsp_overlaps(const void *a, const size_t na, const void *b, const siz
     return (pa - pb) < (uintptr_t)nb;
 }
 
-/* Bytes slice s of v holds. The last one carries only the remainder, which is what the bump
- * walk allocated for it. */
+/* The final slice holds only the remaining elements, not a full slice. */
 static size_t dsp_slice_bytes(const dsp_vec *v, const int s) {
     const int rest = v->len - s * v->per;
     const int take = (rest < v->per) ? rest : v->per;
     return (take > 0) ? (size_t)take * sizeof(dsp_real) : 0U;
 }
 
-/* A split array against a plain byte range: every slice, because they are scattered and an
- * overlap with any one of them is the aliasing the caller is being refused for. */
+/* Check every slice; a segmented array need not be physically contiguous. */
 static int dsp_vec_hits(const dsp_vec *v, const void *q, const size_t qz) {
     int s;
     if (v == NULL || q == NULL || qz == 0U)
@@ -161,19 +108,10 @@ static int dsp_vec_hits_vec(const dsp_vec *a, const dsp_vec *b) {
 }
 #endif /* DSP_CHECK_OVERLAP */
 
-/* floor() and ceil() to int, with the range check inside instead of at each call site.
- *
- * A cast applied straight to a function result is what -Wbad-function-cast flags. Converting
- * an out-of-range double to int is undefined, and not benignly so: clang at -O1 emits a trap
- * for it where other levels return a clamp. Routing every conversion through here lets that
- * flag stay on, so an unguarded one is a build failure.
- *
- * Callers still bound their own quotients, and that is where the meaning is: a filter
- * transition too narrow to realise is refused, not clamped. These two only guarantee the
- * arithmetic is defined when a caller has not. */
+/* Clamp before converting to int and handle NaN explicitly. */
 static int dsp_ifloor(const double v) {
     const double f = floor(v);
-    /* Positives, so a NaN takes the first branch rather than falling through both. */
+
     if (!(f >= (double)INT_MIN))
         return INT_MIN;
     if (!(f <= (double)INT_MAX))
@@ -190,17 +128,12 @@ static int dsp_iceil(const double v) {
     return (int)f;
 }
 
-/* The one definition with external linkage that is not a function. DSP_DOUBLE changes the
- * element type of every array in the interface, and a caller compiled without it against a
- * library compiled with it links without complaint, so there has to be something to compare. */
+/* The exported element size lets callers check that their header matches the linked library. */
 const int dsp_real_size = (int)sizeof(dsp_real);
 
-/* ------------------------------------------------------------------------- */
-/* windows                                                                   */
-/* ------------------------------------------------------------------------- */
+/* Windows */
 
-/* Index-parallel to the DSP_WINDOW_* enum: a0 - a1*cos + a2*cos2 - a3*cos3. Kaiser has no
- * entry, which is how dsp_window tells it apart. */
+/* Index-parallel cosine sums: a0 - a1*cos + a2*cos2 - a3*cos3. Kaiser has no coefficients here. */
 static const double dsp_wincos[DSP_WINDOW_COUNT][4] = {
     {1.0, 0.0, 0.0, 0.0},                 /* RECT */
     {0.5, 0.5, 0.0, 0.0},                 /* HANN */
@@ -209,16 +142,10 @@ static const double dsp_wincos[DSP_WINDOW_COUNT][4] = {
     {0.0, 0.0, 0.0, 0.0},                 /* KAISER: unused */
 };
 
-/* I0 by its power series, sum of ((x/2)^k / k!)^2. The term ratio is (x/2)^2/k^2, so the
- * series rises until k passes x/2 and converges only after: the cap has to clear that, not
- * just the point the terms get small. Beta 18 stops itself at 33 terms, DSP_KAISER_BETA_MAX
- * at 166. */
+/* I0(x) = sum ((x/2)^k/k!)^2. The next term multiplies by (x/2)^2/k^2. */
 #define DSP_I0_TERMS 200
 
-/* dk carries k as a double rather than converting it twice a term. Exact: k is far under
- * 2^53, so adding 1.0 never rounds, and the quotient is the one the conversion gave. The
- * conversion is a store and a load on a core with no direct move between the integer and
- * floating register files, and this runs up to 33 terms for each of n/2 window samples. */
+/* Increment an exact double index instead of converting it twice per term. */
 static double dsp_bessel_i0(const double x) {
     const double hh = (x * 0.5) * (x * 0.5);
     double t = 1.0, s = 1.0, dk = 0.0;
@@ -233,8 +160,6 @@ static double dsp_bessel_i0(const double x) {
     return s;
 }
 
-/* The body both forms share. w may be split, so every store goes through DSP_AT; the window
- * is built once a plan and never in a frame, so the indexing costs nothing that matters. */
 static int dsp_window_vec(dsp_vec *w, const int n, const int kind, const double beta) {
     double di;
     int half, i;
@@ -246,20 +171,16 @@ static int dsp_window_vec(dsp_vec *w, const int n, const int kind, const double 
 
     if (kind == DSP_WINDOW_KAISER) {
         double i0b, inv_i0b, ustep;
-        /* Both bounds as positives, so a NaN beta fails them rather than passing two
-         * negated comparisons and reaching the series. */
+        /* Ordered bounds reject NaN beta before it reaches the series. */
         if (!(beta >= DSP_KAISER_BETA_MIN) || !(beta <= DSP_KAISER_BETA_MAX))
             return DSP_EBETA;
         i0b = dsp_bessel_i0(beta);
         if (!(i0b > 0.0))
             return DSP_EBETA;
         inv_i0b = 1.0 / i0b;
-        /* Both reciprocals hoisted: the window spans u in [-1,1] in steps of 2/(n-1), and
-         * every sample is scaled by the same I0(beta). */
+        /* Hoist both the window step and the I0 normalization out of the loop. */
         ustep = 2.0 / (double)(n - 1);
-        /* di holds i exactly, so u is the value the conversion gave and the int-to-double
-         * stays out of the loop. Not u += ustep: that accumulates rounding along the
-         * window, where this does not. */
+        /* Compute u from an exact index so rounding does not accumulate as it would with u += ustep. */
         for (i = 0, di = 0.0; i < half; i++, di += 1.0) {
             double u = ustep * di - 1.0;
             double s = 1.0 - u * u;
@@ -292,35 +213,26 @@ int dsp_window(dsp_real *DSP_RESTRICT w, const int n, const int kind, const doub
     return dsp_window_vec(&v, n, kind, beta);
 }
 
-/* ------------------------------------------------------------------------- */
-/* interpolation tables                                                      */
-/* ------------------------------------------------------------------------- */
+/* Interpolation tables */
 
-/* G(x) from the window samples in use. The window is symmetric about (n-1)/2, so the full
- * sum is twice the half sum and only n/2 cosines are evaluated. */
-/* inv_wsum rather than wsum: this runs DSP_GN + DSP_KDCN + 1 times per plan against one
- * window sum, so the reciprocal is formed once by the caller. */
+/* Evaluate the symmetric window's transform with twice the half-sum plus any center sample. */
+
 static double dsp_gain_at(const dsp_vec *w, const int n, const double x, const double inv_wsum) {
     const double ctr = 0.5 * (double)(n - 1);
     const double a = 2.0 * M_PI * x / (double)n;
     double s = 0.0, d;
     int half = dsp_half(n), i;
-    /* d carries (double)i - ctr, incremented rather than converted. Exact at every step:
-     * ctr is a half-integer at most n/2, so the sum needs a fraction bit and 15 integer
-     * bits against 53. This is the hottest conversion in a plan -- n/2 of them for each of
-     * DSP_GN + DSP_KDCN + 1 calls, and on the target the conversion goes through memory. */
+    /* The centered index is an exact integer or half-integer; incrementing it adds no rounding. */
     for (i = 0, d = -ctr; i < half; i++, d += 1.0)
         s += (double)DSP_AT(w, i) * DSP_COS(a * d);
     s = 2.0 * s * inv_wsum;
     return s < 0.0 ? -s : s;
 }
 
-/* A lookup and, for Kaiser, one square root. No table and no window samples: the half-width
- * is a property of the window's shape, not of the record length. */
+/* The first null depends on the window shape, not the FFT length. */
 int dsp_window_lobe(const int kind, const double beta) {
     switch (kind) {
-    /* Rect nulls at one bin and Hann at two; two is the minimum the contract names, so
-     * they share an answer. */
+
     case DSP_WINDOW_RECT:
     case DSP_WINDOW_HANN:
         return 2;
@@ -329,8 +241,7 @@ int dsp_window_lobe(const int kind, const double beta) {
     case DSP_WINDOW_BLACKMAN_HARRIS:
         return 4;
     case DSP_WINDOW_KAISER: {
-        /* The first null is at sqrt(1 + (beta/pi)^2) bins. Refused betas never reach a
-         * plan, but the argument is reachable, so a NaN must not come out as an int. */
+        /* Kaiser's first null is at sqrt(1 + (beta/pi)^2) bins. */
         double a, v;
         if (!dsp_finite(beta) || !(beta >= 0.0))
             return 2;
@@ -359,11 +270,9 @@ static int dsp_win_tables(const dsp_vec *w, const int n, dsp_interp *ip, int *kd
     for (j = 0; j <= DSP_GN; j++)
         ip->gtab[j] = dsp_gain_at(w, n, (double)j * DSP_GHX, inv_wsum);
 
-    /* one and nd are node counts, not lengths: one bin and half a bin. */
     one = dsp_ifloor(INV_DSP_GHX + 0.5);
     nd = dsp_ifloor(0.5 * INV_DSP_GHX + 0.5);
-    /* The grid has to reach 1.5 bins; at the shipped constants it reaches exactly that.
-     * Shrinking DSP_GN without raising DSP_GHX would read past the end of gtab. */
+    /* The gain grid must reach 1.5 bins to cover the far neighbor at a half-bin offset. */
     if (one + nd > DSP_GN || nd > DSP_DN)
         return DSP_EARG;
 
@@ -380,7 +289,7 @@ static int dsp_win_tables(const dsp_vec *w, const int n, dsp_interp *ip, int *kd
     for (j = 0; j <= DSP_DN; j++)
         ip->dtab[j] = 0.0;
     if (mono && rt[nd] > 0.0) {
-        /* Inverted onto a grid uniform in r, so a lookup is an index rather than a search. */
+        /* Invert onto a uniform ratio grid so sub-bin lookup needs no search. */
         const double hr = rt[nd] * INV_DSP_DN;
         double target = 0.0;
         int mm;
@@ -403,10 +312,7 @@ static int dsp_win_tables(const dsp_vec *w, const int n, dsp_interp *ip, int *kd
         ip->inv_dhr = 0.0;
     }
 
-    /* How far up from DC dsp_load's mean removal reaches. Removing a weighted mean of
-     * D + A*G(b)*cos(phase) takes 2*A*G(b)^2 out of the tone's own bin: at bin 1 a 1.000 V
-     * tone reads 0.589 V under Hann. The largest b, not the first, since G is not
-     * monotonic. */
+    /* Mean removal changes near-DC amplitude by up to 2*G(b)^2; withhold affected bins. */
     kdc = 0;
     for (b = 1; b <= DSP_KDCN; b++) {
         double s = dsp_gain_at(w, n, (double)b, inv_wsum);
@@ -425,11 +331,7 @@ double dsp_win_gain(const dsp_interp *ip, double d) {
     if (d < 0.0)
         d = -d;
     t = d * INV_DSP_GHX;
-    /* The index is bounded after the conversion, not the quotient before it, because that is
-     * the bound the table actually needs and a static analyser can follow it. dsp_ifloor is
-     * total -- it clamps rather than converting an out-of-range double, which is undefined and
-     * traps at -O1 -- so a NaN arrives here as INT_MIN and a huge offset as INT_MAX, and both
-     * land on the same clamp as an offset past the end of the grid. */
+    /* Bound the index while retaining the fractional part for interpolation. */
     m = dsp_ifloor(t);
     if (m < 0 || m >= DSP_GN)
         return ip->gtab[DSP_GN];
@@ -442,8 +344,7 @@ int dsp_win_offset(const dsp_interp *ip, double r, double *d_out) {
     int neg = 0, m;
     if (ip == NULL || d_out == NULL)
         return DSP_EARG;
-    /* Gated on the step, scaled by its reciprocal: dhr is the sentinel the table documents
-     * and inv_dhr is formed with it, once a plan rather than once a line. */
+    /* A zero ratio step means the window has no usable inverse table. */
     if (!(ip->dhr > 0.0))
         return DSP_EDECLINE;
     if (r < 0.0) {
@@ -451,7 +352,7 @@ int dsp_win_offset(const dsp_interp *ip, double r, double *d_out) {
         neg = 1;
     }
     t = r * ip->inv_dhr;
-    /* The index bounded after the conversion, as in dsp_win_gain and for the same reasons. */
+
     m = dsp_ifloor(t);
     if (m < 0 || m >= DSP_DN) {
         d = ip->dtab[DSP_DN];
@@ -469,14 +370,11 @@ int dsp_peak_interp_vec(const dsp_interp *ip, const dsp_vec *pwr, const int k, c
     if (ip == NULL || pwr == NULL || pwr->nslice < 1)
         return DSP_EARG;
 #if DSP_CHECK_OVERLAP
-    /* Both outputs in one object would have the amplitude overwrite the offset, and either
-     * inside the bins would blank a bin still to be read. nbins bounds pwr only after the
-     * check below, so the extent used here is the three bins this actually touches. */
+    /* Refuse output aliasing before clearing estimates; neither result may overwrite bins. */
     if (dsp_overlaps(d_out, sizeof(*d_out), amp_out, sizeof(*amp_out)))
         return DSP_EARG;
 #endif
-    /* Before the subtraction below, which overflows at INT_MIN. A spectrum of fewer than
-     * three bins has no interior bin to estimate from, which is the same answer. */
+    /* Reject short spectra before subtracting from a potentially invalid bin count. */
     if (nbins < 3)
         return DSP_EDECLINE;
     if (k < 1 || k >= nbins - 1)
@@ -509,12 +407,9 @@ int dsp_peak_interp(const dsp_interp *ip, const dsp_real *DSP_RESTRICT pwr, cons
     return dsp_peak_interp_vec(ip, &v, k, nbins, d_out, amp_out);
 }
 
-/* ------------------------------------------------------------------------- */
-/* arena layout                                                              */
-/* ------------------------------------------------------------------------- */
+/* Arena layout */
 
-/* Where one array's slices landed in the virtual space. nslice 0 is an array this method
- * does not allocate, which is what an offset of 0 means for the scalars beside it. */
+/* A zero slice count marks an array the chosen method does not allocate. */
 typedef struct {
     size_t off[DSP_MAX_SLICES];
     int    nslice, per, sh, len;
@@ -525,13 +420,7 @@ typedef struct {
     dsp_vlay w, twr, twi, utr, uti, re, im, wkr, wki, pwr;
 } dsp_layout;
 
-/* The walk's state. `seg` is 0 for one contiguous arena, which is what dsp_plan_bytes and
- * dsp_plan_init ask for and the only behaviour this had before segments existed.
- *
- * With a non-zero `seg` the offsets returned are into a virtual space laid out as
- * consecutive segments, so `off / seg` selects the segment and `off % seg` is the position
- * inside it. That keeps every array flat and contiguous -- the transform is unchanged --
- * and confines the whole question to this walk. */
+/* The layout walk uses flat offsets or virtual offsets across fixed-size segments. */
 typedef struct {
     size_t at;
     size_t seg;
@@ -543,8 +432,7 @@ static size_t dsp_bump(dsp_walk *wk, const size_t bytes) {
     size_t off = wk->at;
     if (wk->seg != 0U && need != 0U) {
         size_t within;
-        /* Arrays are never split, so one has to fit a segment whole. The caller turns this
-         * into DSP_ESEG rather than laying out something that straddles. */
+        /* Each allocation must fit one segment; large arrays use multiple allocations through slices. */
         if (need > wk->seg) {
             wk->fail = 1;
             return 0;
@@ -564,24 +452,10 @@ static int dsp_log2_of(const int v) {
     return s;
 }
 
-/* Element i of a strided record. One block is the array case and takes a branch rather than
- * a divide, which is what every caller holding a plain array gets.
- *
- * An element only 4-aligned has its double assembled from two word loads, and the reason is
- * narrower than "a misaligned lfd traps". The e300 core reference (docs/e300coreRM.txt
- * 5.5.6.1, Table 5-18) takes an alignment interrupt on a double-word operand only when its
- * effective address ends in 0xFF9-0xFFF -- when the eight bytes straddle a page -- and fixes
- * up every other misaligned access in hardware, at a cost in cache cycles. A 20-byte element
- * walks every 4-aligned residue of a 4 KB page, so 4 in 4096 of them land there: two a frame
- * at n = 2048, which is rare, certain, and would read as intermittent. A 4-aligned lwz cannot
- * straddle a page at all, 4 dividing 4096, and the stack slot the pair is reassembled in is
- * 8-aligned, so neither load here can reach the interrupt. An 8-aligned stride never could,
- * which is why 24 and 32 have never needed it.
- *
- * The test is on the address and not on the stride: a 20-byte element leaves half of them
- * 8-aligned and those keep the single load. The two words are copied in the order they sit
- * in memory, so the byte image reaches the union unchanged and the endianness does not
- * enter. */
+/*
+ * Split a source index into block and in-block element. A single block needs no division.
+ * Assemble four-byte-aligned doubles from two word loads to avoid page-straddling faults.
+ */
 static double dsp_src_at(const dsp_src *s, const int i) {
     const unsigned char *q;
     if (s->nblock == 1)
@@ -598,7 +472,6 @@ static double dsp_src_at(const dsp_src *s, const int i) {
     return *(const double *)(const void *)q;
 }
 
-/* A contiguous array as a one-block record. */
 static void dsp_src_flat(dsp_src *s, const double *x, const int len) {
     int b;
     for (b = 0; b < DSP_MAX_SRC_BLOCKS; b++)
@@ -610,12 +483,7 @@ static void dsp_src_flat(dsp_src *s, const double *x, const int len) {
     s->len     = len;
 }
 
-/* A contiguous array as a one-slice vector, so that the functions taking a plain pointer and
- * the ones taking a plan share a body. per is rounded up past len, which is what makes the
- * shift zero and the mask the identity for every index the caller can pass. */
-/* The read-only form. The table is non-const because the writing forms share the type, and
- * a vector built here is only ever read; the union carries the value across without a cast
- * that drops the qualifier. */
+/* The read-only view shares the mutable vector type; callers must not store through it. */
 static void dsp_vec_flat_ro(dsp_vec *v, const dsp_real *p, const int len) {
     union { const dsp_real *c; dsp_real *m; } u;
     u.c = p;
@@ -629,9 +497,7 @@ static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len) {
     for (s = 0; s < DSP_MAX_SLICES; s++)
         v->tab[s] = NULL;
     v->tab[0]  = p;
-    /* An array or not, which is what the pointer beside it says. Not whether len is
-     * positive: a hostile bin count has to reach the check that declines it, and answering
-     * DSP_EARG from here instead would change what the published refusals mean. */
+    /* Decide whether a vector is present from its pointer, not its unvalidated length. */
     v->nslice  = (p != NULL) ? 1 : 0;
     v->per     = per;
     v->sh      = dsp_log2_of(per);
@@ -639,18 +505,7 @@ static void dsp_vec_flat(dsp_vec *v, dsp_real *p, const int len) {
     v->len     = len;
 }
 
-/* Elements one slice of a split array holds.
- *
- * A power of two, so an index splits with a shift and a mask, and a multiple of the longest
- * row the transform addresses -- rowmin, which is a power of two itself, so being at least
- * as large is enough. An array that fits a segment whole is one slice and this is its length
- * rounded up to a power of two, which leaves the placement and dsp_plan_bytes exactly as
- * they are without segments.
- *
- * A quarter of the segment for a split array rather than the largest that fits: the arena is
- * a bump space, so a slice too large to follow the last one wastes the rest of its segment,
- * and halving twice takes that waste from a half to an eighth. Returns 0 when no slice can
- * be both at least rowmin and small enough to fit, which the walk turns into DSP_ESEG. */
+/* A slice uses a power-of-two element count for shift/mask indexing and must hold one contiguous kernel run. */
 static int dsp_slice_of(const size_t len, const size_t r, const size_t seg_bytes,
                         const int rowmin) {
     int per = 1, cap = 1, want = 1;
@@ -671,8 +526,7 @@ static int dsp_slice_of(const size_t len, const size_t r, const size_t seg_bytes
     return per;
 }
 
-/* One array, as the slices it needs. The last slice takes only the remainder, so a
- * one-slice array bumps exactly the bytes it did before and no existing layout moves. */
+/* Only the last slice may be partial; allocate just its actual elements. */
 static void dsp_bump_vec(dsp_walk *wk, dsp_vlay *v, const size_t len, const size_t r,
                          const int per) {
     size_t left = len;
@@ -700,26 +554,22 @@ static void dsp_bump_vec(dsp_walk *wk, dsp_vlay *v, const size_t len, const size
     }
 }
 
-/* Both bounds matter. Without the upper one the layout walk wrapped a 32-bit size_t and
- * dsp_plan_bytes under-reported by four orders; see DSP_N_MAX. */
+/* Bound n before accumulating layout sizes in a potentially 32-bit size_t. */
 static int dsp_is_pow2(const int n) {
     return n >= 4 && n <= DSP_N_MAX && ((unsigned)n & ((unsigned)n - 1U)) == 0U;
 }
 
-/* Four-step factors, m1 the smaller: the gather's strided footprint is then m1 cache
- * blocks per array, and the sub-transform it feeds stays well inside 32 kB. */
+/* Keep m1 the smaller factor to limit the strided gather's working set. */
 static void dsp_fs_factors(const int m, int *m1, int *m2) {
     unsigned bits = 0, t;
-    /* Unsigned throughout: a shift of a signed value is implementation-defined once the sign
-     * bit is involved, and these are all counts. */
+
     for (t = (unsigned)m; t > 1U; t >>= 1U)
         bits++;
     *m1 = (int)(1U << (bits / 2U));
     *m2 = m / *m1;
 }
 
-/* Bit-reversal as a swap list over 0..len-1; only the pairs that move are kept, and
- * disjoint pairs out of len indices means never more than len/2 of them. */
+/* Keep only disjoint bit-reversal pairs that actually move. */
 static int dsp_build_swaps(const int len, int *a, int *b) {
     int ns = 0, i;
     unsigned j = 0;
@@ -741,41 +591,26 @@ static int dsp_build_swaps(const int len, int *a, int *b) {
     return ns;
 }
 
-/* Does the four-step work at this size, or does dsp_rfft substitute radix-2? The gather and
- * the scatter step a whole DSP_FS_BLOCK of columns with no partial case, so m2 has to reach
- * one block; DSP_FS_MIN is the separate, larger size it starts paying off at. */
+/* Four-step requires complete gather blocks; smaller transforms use radix-2. */
 static int dsp_fs_usable(const int m, const int m2) {
     return m2 >= DSP_FS_BLOCK && m >= DSP_FS_MIN;
 }
 
-/* Which decomposition the arena is built for, after the small-size substitution. Resolved
- * once here so the layout and the dispatch cannot disagree about what was allocated.
- *
- * Takes a method its callers have already range-checked; both do so before they get here, so
- * repeating it would add a branch nothing can reach. */
+/* Resolve the effective method before both sizing and initializing the plan. */
 static int dsp_method_of(const int m, const int m2, const int method) {
     if (method == DSP_FFT_FOURSTEP && !dsp_fs_usable(m, m2))
         return DSP_FFT_RADIX2;
     return method;
 }
 
-/* Which decomposition a built plan holds the arrays for. The two ask for disjoint extras --
- * radix-2 the swap list over m, the four-step an intermediate matrix plus a gather block and
- * the factor swap lists -- so the arena identifies its own method. */
+/* Dispatch by the allocated workspace, not a mutable method field. */
 static int dsp_method_built(const dsp_plan *p) {
     if (p->wkr != NULL && p->blkr != NULL && p->sw1_a != NULL)
         return DSP_FFT_FOURSTEP;
     return DSP_FFT_RADIX2;
 }
 
-/* One walk, used by dsp_plan_bytes and dsp_plan_init alike so the two cannot disagree.
- *
- * Sized for the one decomposition asked for, not for both. The arrays are not a superset of
- * each other -- radix-2 wants the bit-reversal swap list over m and nothing else, the
- * four-step wants an m-point intermediate matrix plus a gather block and the two factor swap
- * lists -- so sizing for the union carries whichever the plan will not run: at n = 16,384 in
- * single that is the 32,768-byte swap list, 8 % of the arena.
- * An offset of 0 means the array was not allocated and the plan's pointer stays NULL. */
+/* Sizing and initialization share one layout walk and allocate only the chosen method's workspace. */
 static int dsp_layout_of(int n, const int decim, const int method, const size_t seg_bytes,
                          dsp_layout *lay) {
     dsp_walk wk;
@@ -787,8 +622,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
         return DSP_EARG;
     if (!dsp_is_pow2(n))
         return DSP_EPOW2;
-    /* A segment smaller than the alignment, or not a multiple of it, would put arrays off a
-     * DSP_ALIGN boundary however well aligned the segment bases are. */
+    /* Each segment must preserve DSP_ALIGN for the allocations it contains. */
     if (seg_bytes != 0U && (seg_bytes < DSP_ALIGN || (seg_bytes & (DSP_ALIGN - 1U)) != 0U))
         return DSP_EARG;
     wk.at = 0;
@@ -798,10 +632,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     ntw = (m >= 4) ? m - 2 : 1; /* stages len=4..m contribute len/2 each: m-2 in total */
     dsp_fs_factors(m, &m1, &m2);
     meth = dsp_method_of(m, m2, method);
-    /* The longest contiguous run any kernel asks for: the four-step addresses rows of m2 in
-     * the intermediate matrix and rows of m1 in the transposed output, and gathers
-     * DSP_FS_BLOCK at a time. A slice at least that long and a power of two holds every one
-     * of them whole, so no run crosses a slice and the kernels keep taking a row pointer. */
+    /* Slices must fit the longest contiguous run: a four-step row or a radix-2 kernel run. */
     rowmin = (m1 > m2) ? m1 : m2;
     if (rowmin < DSP_FS_BLOCK)
         rowmin = DSP_FS_BLOCK;
@@ -809,8 +640,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     per_n  = dsp_slice_of((size_t)n, r, seg_bytes, rowmin);
     per_tw = dsp_slice_of((size_t)ntw, r, seg_bytes, rowmin);
     dsp_bump_vec(&wk, &lay->w, (size_t)n, r, per_n);
-    /* Radix-2's own swap list, needed when it is the decomposition or when the four-step has
-     * substituted it. */
+
     if (meth == DSP_FFT_RADIX2) {
         lay->swp_a = dsp_bump(&wk, (size_t)dsp_half(m) * sizeof(int));
         lay->swp_b = dsp_bump(&wk, (size_t)dsp_half(m) * sizeof(int));
@@ -818,7 +648,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
         lay->swp_a = 0;
         lay->swp_b = 0;
     }
-    /* The four-step bit-reverses its two factors instead, which is m1/2 + m2/2 against m/2. */
+
     if (meth == DSP_FFT_FOURSTEP) {
         lay->sw1_a = dsp_bump(&wk, (size_t)(dsp_half(m1) + 1) * sizeof(int));
         lay->sw1_b = dsp_bump(&wk, (size_t)(dsp_half(m1) + 1) * sizeof(int));
@@ -836,8 +666,7 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     dsp_bump_vec(&wk, &lay->uti, (size_t)m, r, per_m);
     dsp_bump_vec(&wk, &lay->re, (size_t)m, r, per_m);
     dsp_bump_vec(&wk, &lay->im, (size_t)m, r, per_m);
-    /* The four-step's intermediate matrix and its gather block. Radix-2 is in place and
-     * wants neither. */
+
     if (meth == DSP_FFT_FOURSTEP) {
         dsp_bump_vec(&wk, &lay->wkr, (size_t)m, r, per_m);
         dsp_bump_vec(&wk, &lay->wki, (size_t)m, r, per_m);
@@ -851,19 +680,12 @@ static int dsp_layout_of(int n, const int decim, const int method, const size_t 
     }
     dsp_bump_vec(&wk, &lay->pwr, (size_t)m, r, per_m);
     lay->h     = dsp_bump(&wk, (size_t)DSP_FIR_MAXTAPS * r);
-    /* Only when something will decimate. The read budget stops allowing even decim 2 from
-     * n = 3906 up -- (DSP_FIR_MAXM - maxtaps)/(n-1) falls below 2 there -- so this is
-     * nothing at every count the application offers above 2048. */
+    /* Reserve FIR scratch only for a decimating plan. */
     lay->fir_out = (decim > 1) ? dsp_bump(&wk, (size_t)n * sizeof(double)) : 0;
-    /* Checked once at the end rather than at every bump: the walk records the failure and
-     * keeps going, so there is one place that turns it into a status. */
+
     if (wk.fail)
         return DSP_ESEG;
-    /* Radix-2 indexes re, im and the twiddle table across the whole transform, so a split
-     * one has runs that cross a slice and there is no row for the kernel to take. It is the
-     * decomposition only below DSP_FS_MIN, where nothing is long enough to split, so this
-     * refuses a combination that does not arise rather than one that matters. The window and
-     * the power and untangle tables are read in order by both methods and may still split. */
+    /* Radix-2 requires whole working arrays; four-step can address slices at row boundaries. */
     if (meth != DSP_FFT_FOURSTEP &&
         (lay->re.nslice > 1 || lay->im.nslice > 1 ||
          lay->twr.nslice > 1 || lay->twi.nslice > 1))
@@ -886,27 +708,20 @@ int dsp_plan_segs(const int n, const int decim, const int method, const size_t s
         return 0;
     if (dsp_layout_of(n, decim, method, seg_bytes, &lay) != DSP_OK)
         return 0;
-    /* lay.total is the end of the last array in the virtual space, and no array straddles a
-     * boundary, so the ceiling divide is the count. */
+    /* Round the final virtual extent up to count all occupied segments. */
     segs = (lay.total + seg_bytes - 1U) / seg_bytes;
     if (segs > (size_t)DSP_N_MAX)
         return 0;
     return (int)segs;
 }
 
-/* Where an offset lands. With seg == 0 the virtual space is the one arena and this is the
- * addition it always was; otherwise the offset splits into a segment index and a position
- * inside it. Every array is whole, so one pointer per array is all the transform ever needs
- * and no inner loop learns about segments. */
+/* Translate virtual offsets to their segment base and in-segment offset. */
 static void *dsp_seg_at(void *const *segs, const size_t seg_bytes, const size_t off) {
     if (seg_bytes == 0U)
         return (void *)((unsigned char *)segs[0] + off);
     return (void *)((unsigned char *)segs[off / seg_bytes] + (off % seg_bytes));
 }
 
-/* One array's slice offsets as the addresses the kernels index through. An array this
- * method does not allocate leaves every slice NULL, which is the pointer beside it being
- * NULL as it always was. */
 static void dsp_bind_vec(dsp_vec *v, const dsp_vlay *lay, void *const *segs,
                          const size_t seg_bytes) {
     int s;
@@ -921,11 +736,7 @@ static void dsp_bind_vec(dsp_vec *v, const dsp_vlay *lay, void *const *segs,
         v->tab[s] = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay->off[s]);
 }
 
-/* The shared body of dsp_plan_init and dsp_plan_init_segs.
- *
- * seg_bytes == 0 is the flat case: segs holds one base and flat_bytes is its size, which is
- * what gets compared against the layout. Otherwise nsegs segments of seg_bytes each are
- * available and the count is what gets compared. */
+/* A zero segment size selects the contiguous arena case. */
 static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const size_t seg_bytes,
                           const size_t flat_bytes, int n, const int kind, const double beta,
                           const int decim, const int method) {
@@ -935,10 +746,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
 
     if (p == NULL)
         return DSP_EARG;
-    /* Before every other check, not after them, so that every refusal below leaves the plan
-     * entirely zero. That is what the header promises, and what stops a caller which ignores
-     * the return code from running a frame on the pointers of a plan it has already released:
-     * p->n == 0 fails dsp_spectrum_run's guard and p->m == 0 fails dsp_rfft's. */
+    /* Clear the plan on entry so any rejected configuration leaves it unusable. */
     memset(p, 0, sizeof(*p));
     if (segs == NULL || nsegs < 1)
         return DSP_EARG;
@@ -947,11 +755,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
             return DSP_EARG;
     }
 #if DSP_CHECK_OVERLAP
-    /* The plan against its own arena. Both extents are arguments, so this is checkable, and
-     * the failure it prevents is the worst in the library: the carve-up below writes table
-     * pointers into p while the tables themselves are built in the arena, so a plan sitting
-     * inside its arena has its own pointers overwritten by window samples and every later
-     * call reads whatever that left. Every segment is checked, not just the first. */
+    /* Reject overlap before acquiring pointers into the caller's arena. */
     for (si = 0; si < nsegs; si++) {
         if (dsp_overlaps(p, sizeof(*p), segs[si], (seg_bytes == 0U) ? flat_bytes : seg_bytes))
             return DSP_EARG;
@@ -967,8 +771,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         if ((size_t)nsegs * seg_bytes < lay.total)
             return DSP_ENOMEM;
     }
-    /* Every base, for the same reason the flat case checks its one: the offsets are aligned
-     * within a segment, so a misaligned base misaligns every array in it. */
+    /* Each base must be aligned; aligned offsets cannot fix an unaligned base. */
     for (si = 0; si < nsegs; si++) {
         if (((uintptr_t)segs[si] & (uintptr_t)(DSP_ALIGN - 1)) != 0)
             return DSP_EALIGN;
@@ -976,9 +779,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
 
     m = dsp_half(n);
     dsp_fs_factors(m, &p->m1, &p->m2);
-    /* The decomposition the arena was sized for, with the small-size substitution already
-     * applied, so dsp_rfft dispatches on a method whose arrays are certain to be there.
-     * dsp_layout_of has range-checked `method` by this point. */
+
     meth = dsp_method_of(m, p->m2, method);
     p->n      = n;
     p->m      = m;
@@ -994,9 +795,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     dsp_bind_vec(&p->re_v, &lay.re, segs, seg_bytes);
     dsp_bind_vec(&p->im_v, &lay.im, segs, seg_bytes);
     dsp_bind_vec(&p->pwr_v, &lay.pwr, segs, seg_bytes);
-    /* The first slice, which is the whole array while nslice is 1. Kept because every
-     * contiguous caller and the whole test suite index these, and because dsp_method_built
-     * reads them to identify the decomposition the arena was built for. */
+    /* The plain pointers alias slice zero for callers using contiguous storage. */
     p->w     = p->w_v.tab[0];
     p->twr   = p->twr_v.tab[0];
     p->twi   = p->twi_v.tab[0];
@@ -1006,8 +805,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     p->im    = p->im_v.tab[0];
     p->pwr   = p->pwr_v.tab[0];
     p->h     = (dsp_real *)dsp_seg_at(segs, seg_bytes, lay.h);
-    /* The rest only exist for the decomposition that reads them, by the same conditions the
-     * layout used. A pointer left NULL is an array this plan did not pay for. */
+
     if (meth == DSP_FFT_RADIX2) {
         p->swp_a = (int *)dsp_seg_at(segs, seg_bytes, lay.swp_a);
         p->swp_b = (int *)dsp_seg_at(segs, seg_bytes, lay.swp_b);
@@ -1032,8 +830,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         return rc;
     }
 
-    /* The scale comes from the window sum. Assuming n/2 for Hann rather than summing it
-     * reads every amplitude 0.2 % low at n = 512. */
+    /* Sum the actual window: the ideal coherent gain is not exact for a finite record. */
     wsum = 0.0;
     for (i = 0; i < n; i++)
         wsum += (double)DSP_AT(&p->w_v, i);
@@ -1043,8 +840,7 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     }
     p->wsum = wsum;
     p->cg = wsum / (double)n;
-    /* Volts would be 2/(n*cg); the untangle leaves every bin doubled, so 1/(n*cg), squared
-     * because the output is power. */
+    /* Untangling yields 2X; square 1/wsum to scale it to peak voltage squared. */
     {
         const double iw = 1.0 / wsum; /* one divide, squared */
         p->ksq = iw * iw;
@@ -1059,10 +855,6 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
     p->mono = p->ip.mono;
     p->ip.lobe = dsp_window_lobe(kind, beta);
 
-    /* Bit-reversal as swap lists, one per transform length the plan can run: m for the
-     * in-place radix-2, and the two four-step factors. Keeping them out of the frame matters
-     * -- the Gold-Rader walk has an unpredictable branch per element, and running it inside
-     * the four-step's inner passes cost 2.5x on the host measurement. */
     if (p->swp_a != NULL)
         p->nswp = dsp_build_swaps(m, p->swp_a, p->swp_b);
     if (p->sw1_a != NULL) {
@@ -1070,17 +862,12 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
         p->nsw2 = dsp_build_swaps(p->m2, p->sw2_a, p->sw2_b);
     }
 
-    /* Butterfly twiddles, flattened stage-major: the stage with half-length h occupies the
-     * next h entries. Stage 1 (len 2) has twiddle 1 and needs none. Because the layout is
-     * stage-major and every four-step factor divides m, the table for a sub-transform of
-     * length L is the first L-2 entries of this one, which is what lets the four-step reuse it
-     * without a second table. */
+    /* Flatten butterfly twiddles stage-major. The length-2 stage uses unity and stores nothing. */
     idx = 0;
     for (len = 4; len <= m; len *= 2) {
         const double ang = -2.0 * M_PI / (double)len;
         half = dsp_half(len);
-        /* One angle a step, formed from an exact double i rather than a conversion, and
-         * reused by both calls instead of converting twice. */
+
         for (i = 0, di = 0.0; i < half; i++, di += 1.0) {
             const double t = ang * di;
             DSP_AT(&p->twr_v, idx) = (dsp_real)DSP_COS(t);
@@ -1102,16 +889,14 @@ static int dsp_plan_build(dsp_plan *p, void *const *segs, const int nsegs, const
 
 int dsp_plan_init(dsp_plan *p, void *arena, const size_t bytes, int n, const int kind, const double beta,
                   const int decim, const int method) {
-    /* An lvalue so the one-segment case can share dsp_plan_build's interface. A NULL arena
-     * still reaches the segs[0] == NULL test and comes back DSP_EARG. */
+
     void *one = arena;
     return dsp_plan_build(p, &one, 1, 0U, bytes, n, kind, beta, decim, method);
 }
 
 int dsp_plan_init_segs(dsp_plan *p, void *const *segs, const int nsegs, const size_t seg_bytes, int n,
                        const int kind, const double beta, const int decim, const int method) {
-    /* Zero would mean the flat case, where nsegs and seg_bytes say nothing about how much
-     * memory there is. Callers with one contiguous block want dsp_plan_init. */
+    /* Zero segment size is reserved for the flat layout, which supplies a separate byte count. */
     if (seg_bytes == 0U) {
         if (p != NULL)
             memset(p, 0, sizeof(*p));
@@ -1128,15 +913,10 @@ int dsp_plan_set_fir(dsp_plan *p, const dsp_real *h, const int ntaps) {
         return DSP_EARG;
     if (ntaps > 0 && h == NULL)
         return DSP_EARG;
-    /* Taps on a plan that does not decimate are refused HERE, at configure time, rather
-     * than ignored in every frame. dsp_spectrum_run filters only where the decimation makes
-     * it necessary, and dsp_plan_init gives a decim-1 plan no output buffer to filter into,
-     * so accepting them promised a filter that could never run: a 500 Hz tone passed a
-     * 2-20 kHz band-pass at -0.08 dBV with nothing in any return value to say so. */
+    /* Reject taps for a plan that cannot decimate rather than ignoring the filter in each frame. */
     if (ntaps > 0 && p->decim < 2)
         return DSP_EARG;
-    /* h is copied rather than aliased: the taps live in the arena the plan already owns, so
-     * the caller's design buffer can be a local and nothing outlives it. */
+    /* Copy taps into the plan arena so the caller can release its design buffer. */
     for (i = 0; i < ntaps; i++)
         p->h[i] = h[i];
     p->ntaps = ntaps;
@@ -1151,21 +931,14 @@ int dsp_plan_set_yield(dsp_plan *p, const dsp_yield_fn fn, void *ctx) {
     return DSP_OK;
 }
 
-/* One null test per boundary, of which there are a fixed few a frame. Not in any inner loop:
- * the display task needs to run a handful of times across a frame, not per bin. */
+/* Yield at phase boundaries, never in an inner loop. */
 static void dsp_do_yield(const dsp_plan *p) {
     if (p->yield != NULL)
         p->yield(p->yield_ctx);
 }
 
-/* ------------------------------------------------------------------------- */
-/* load                                                                      */
-/* ------------------------------------------------------------------------- */
+/* Windowed load */
 
-/* The body both forms share. Every window read and every store into the packed record goes
- * through DSP_AT, because any of the three may have been split: at n = 16,384 the window is
- * four segments by itself. Two integer operations and a table load a sample, which is tens
- * of microseconds against a frame, and the alternative is two copies of this arithmetic. */
 static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
                         const double wsum, dsp_vec *re, dsp_vec *im, double *mean_out) {
     double s0 = 0.0, s1 = 0.0, mean;
@@ -1174,39 +947,25 @@ static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
         return DSP_EARG;
     if (x->nblock < 1 || x->nblock > DSP_MAX_SRC_BLOCKS || x->per < 1 || x->len < n)
         return DSP_EARG;
-    /* per blocks of nblock have to reach len, or an index inside len addresses a block past
-     * the end of the array: len = 1024 over nblock = 2 of per = 10 reads blk[102] of 32 and
-     * then dereferences whatever is after the caller's struct. */
+    /* The block vector must cover every source index the loader can address. */
     if ((long)x->nblock * (long)x->per < (long)x->len)
         return DSP_EARG;
-    /* A stride of at least a double, and 4-aligned.
-     *
-     * BOTH terms. dsp_src_at reads eight bytes an element, so a stride under eight makes the
-     * last element of a record overrun it -- the `& 7` test this replaced excluded 4 only
-     * incidentally, and dropping to `& 3` without the lower bound admitted stride 4 and
-     * over-read by four bytes, which ASan caught and the suite did not. `< sizeof(double)`
-     * also excludes every negative stride, which would otherwise wrap the pointer arithmetic.
-     *
-     * 4-aligned is the finest spacing dsp_src_at can assemble a double from. It does not
-     * follow that the elements are word-aligned: the BASE is the caller's to get right and is
-     * not examined here, so a 2-aligned base with an 8-byte stride reaches a half-word-aligned
-     * lwz. dsp_native.c refuses that at its own entry with `base & 3U`, which is where the
-     * addresses come from an instrument rather than from this library's callers. */
+    /*
+     * The stride must hold a double and preserve the firmware's four-byte alignment.
+     * The loader handles a four-byte-aligned double with two word loads.
+     */
     if (x->stride < (int)sizeof(double) || (x->stride & 3) != 0)
         return DSP_EARG;
     if (w->nslice < 1 || re->nslice < 1 || im->nslice < 1)
         return DSP_EARG;
     if (!dsp_is_pow2(n))
         return DSP_EPOW2;
-    /* Its own code: a window sum that is not positive is an argument this cannot divide by,
-     * and reporting it as EPOW2 named the one argument that was fine. */
+
     if (!(wsum > 0.0))
         return DSP_EARG;
     m = dsp_half(n);
 #if DSP_CHECK_OVERLAP
-    /* The two halves of the packed record against each other and against the source and the
-     * window they are built from. The packing loop reads x[i] and w[i] while writing re[k]
-     * and im[k] with k behind i, so an overlap reads samples it has already replaced. */
+    /* Check both writable halves against each other and every input extent. */
     {
         int b;
         if (dsp_vec_hits_vec(re, im) || dsp_vec_hits_vec(re, w) || dsp_vec_hits_vec(im, w)
@@ -1214,7 +973,7 @@ static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
             || dsp_vec_hits(im, mean_out, sizeof(*mean_out))
             || dsp_vec_hits(w, mean_out, sizeof(*mean_out)))
             return DSP_EARG;
-        /* The record block by block, at the extent the stride gives it. */
+
         for (b = 0; b < x->nblock; b++) {
             const int rest = x->len - b * x->per;
             const int take = (rest < x->per) ? rest : x->per;
@@ -1226,16 +985,13 @@ static int dsp_load_vec(const dsp_src *x, const int n, const dsp_vec *w,
         }
     }
 #endif
-    /* Two chains, split over the even and odd samples, which is also the pairing the packing
-     * loop below wants, so the record is walked the same way twice. */
+    /* Use independent even and odd accumulation chains, which also match the packed output. */
     for (i = 0; i < n; i += 2) {
         s0 = s0 + dsp_src_at(x, i) * (double)DSP_AT(w, i);
         s1 = s1 + dsp_src_at(x, i + 1) * (double)DSP_AT(w, i + 1);
     }
     mean = (s0 + s1) / wsum;
-    /* The subtraction happens in double and rounds once into the complex array: in the
-     * single build that is what keeps the pedestal residue at the rounding of the products
-     * rather than at the rounding of a difference of two large numbers. */
+    /* Subtract the mean in double before rounding into the complex arrays. */
     for (k = 0, i = 0; k < m; k++, i += 2) {
         DSP_AT(re, k) = (dsp_real)((dsp_src_at(x, i) - mean) * (double)DSP_AT(w, i));
         DSP_AT(im, k) = (dsp_real)((dsp_src_at(x, i + 1) - mean) * (double)DSP_AT(w, i + 1));
@@ -1261,13 +1017,9 @@ int dsp_load(const double *DSP_RESTRICT x, const int n, const dsp_real *DSP_REST
     return dsp_load_vec(&xs, n, &wv, wsum, &rv, &iv, mean_out);
 }
 
-/* ------------------------------------------------------------------------- */
-/* transform: two decompositions                                             */
-/* ------------------------------------------------------------------------- */
+/* FFT decompositions */
 
-/* Textbook in-place radix-2, decimation in time, bit reversal from the swap list. Streams
- * both arrays once per stage, so at 16,384 samples it moves 64 kB through a 32 kB cache
- * thirteen times. Kept as the accuracy and traffic baseline. */
+/* In-place decimation-in-time radix-2 with precomputed bit-reversal swaps. */
 static void fft_radix2(dsp_real *DSP_RESTRICT re, dsp_real *DSP_RESTRICT im, const int m,
                        const int *DSP_RESTRICT swp_a, const int *DSP_RESTRICT swp_b, const int nswp,
                        const dsp_real *DSP_RESTRICT twr, const dsp_real *DSP_RESTRICT twi) {
@@ -1314,11 +1066,7 @@ static void fft_radix2(dsp_real *DSP_RESTRICT re, dsp_real *DSP_RESTRICT im, con
     }
 }
 
-/* DSP_FS_BLOCK interleaved in-place radix-2 transforms of length `len`, element i of lane
- * c at s[i*DSP_FS_BLOCK + c]. The lane count is the macro rather than an argument so the
- * innermost loop unrolls: it is DSP_FS_BLOCK independent butterflies, which is what keeps
- * the three-stage FPU pipeline fed, and a runtime bound there left the compiler nothing to
- * work with. */
+/* Transform interleaved gather lanes; element i of lane c is at i*DSP_FS_BLOCK + c. */
 static void fft_block(dsp_real *DSP_RESTRICT sr, dsp_real *DSP_RESTRICT si, const int len,
                       const int *DSP_RESTRICT swa, const int *DSP_RESTRICT swb, const int nsw,
                       const dsp_real *DSP_RESTRICT twr, const dsp_real *DSP_RESTRICT twi) {
@@ -1376,45 +1124,31 @@ static void fft_block(dsp_real *DSP_RESTRICT sr, dsp_real *DSP_RESTRICT si, cons
     }
 }
 
-/* Four-step. With m = m1*m2, j = j1*m2 + j2 and k = k1 + k2*m1,
- *   X[k1 + k2 m1] = sum_j2 W_m^{j2 k1} W_m2^{j2 k2} [ sum_j1 x[j1 m2 + j2] W_m1^{j1 k1} ]
- * so the transform becomes m2 sub-transforms of length m1, a twiddle, m1 sub-transforms of
- * length m2, and a transpose. Each sub-transform is a few kB and runs entirely in cache,
- * which turns thirteen streaming passes over the data into three.
- *
- * The gather takes DSP_FS_BLOCK columns at a time so every byte of each 32-byte block it
- * fetches is used. One column at a time would read each block eight times, and the stride
- * maps the m1 streams onto four sets of an eight-way cache. */
+/*
+ * Four-step for m = m1*m2: run m2 length-m1 column FFTs, apply W_m^{j2*k1},
+ * run m1 length-m2 row FFTs, then transpose to k = k1 + k2*m1.
+ */
 static void fft_fourstep(dsp_plan *p) {
     const int m1 = p->m1, m2 = p->m2;
     const int h = dsp_half(p->m);
-    /* The four matrices as their slice tables: each is m entries and a segment holds fewer
-     * than that from n = 8192 up. Every run below is a row -- m2 in the intermediate matrix,
-     * m1 in the transposed output, DSP_FS_BLOCK in the gather -- and the slice length is a
-     * multiple of all three, so each row lies in one slice and the kernels still take a
-     * plain pointer. */
+    /* Index the intermediate and working matrices by slice; a segment can be smaller than a matrix. */
     dsp_vec *re = &p->re_v;
     dsp_vec *im = &p->im_v;
     dsp_vec *wkr = &p->wkr_v;
     dsp_vec *wki = &p->wki_v;
     dsp_real *DSP_RESTRICT blkr = p->blkr;
     dsp_real *DSP_RESTRICT blki = p->blki;
-    /* The sub-transforms read the first L-2 entries for a transform of length L, and the
-     * slice is at least as long as the longer factor, so both tables are in their first
-     * slice throughout. The twiddle-and-scatter pass below indexes the whole table and goes
-     * through the slices. */
+    /* Each sub-transform's twiddles are a prefix of the full table and fit the contiguous run. */
     const dsp_real *twr = p->twr, *twi = p->twi;
     const dsp_vec *twr_v = &p->twr_v, *twi_v = &p->twi_v;
     int log2h = 0, twbase, jb, k1, k2, kb, t;
 
     for (t = h; t > 1; t = dsp_half(t))
         log2h++;
-    /* W_m^idx for idx in [0,m) from the last stage's m/2 entries: the upper half is the lower
-     * half negated, since W_m^{idx + m/2} = -W_m^{idx}. */
+    /* Use the last stage for W_m^idx; the upper half is the lower half negated. */
     twbase = h - 2;
 
-    /* m2 is a power of two and at least DSP_FS_BLOCK for every m above DSP_FS_MIN, so every
-     * block is full and the loops below need no partial case. */
+    /* Powers of two and the lower size limit give full gather blocks. */
     for (jb = 0; jb < m2; jb += DSP_FS_BLOCK) {
         int j1, c;
 
@@ -1430,13 +1164,10 @@ static void fft_fourstep(dsp_plan *p) {
         }
 
         fft_block(blkr, blki, m1, p->sw1_a, p->sw1_b, p->nsw1, twr, twi);
-        /* One gather, one block of sub-transforms, one twiddle-and-scatter: the longest
-         * stretch the caller waits through. */
+
         dsp_do_yield(p);
 
-        /* Twiddle by W_m^{j2 k1} and scatter so the next pass reads each row contiguously. The
-         * index advances by k1 a column, so it is an add rather than the multiply the algebra
-         * writes. */
+        /* Apply W_m^{j2*k1} while scattering into the next pass's contiguous rows. */
         for (k1 = 0; k1 < m1; k1++) {
             const dsp_real *ar = blkr + (size_t)k1 * DSP_FS_BLOCK;
             const dsp_real *ai = blki + (size_t)k1 * DSP_FS_BLOCK;
@@ -1444,9 +1175,7 @@ static void fft_fourstep(dsp_plan *p) {
             dsp_real *o_i = DSP_ROW(wki, k1 * m2 + jb);
             int idx = jb * k1;
             for (c = 0; c < DSP_FS_BLOCK; c++) {
-                /* idx is a product of counts and never negative, so the masking and the
-                 * shift are done unsigned: a signed shift past the sign bit is
-                 * implementation-defined, and h is a power of two. */
+
                 const unsigned u   = (unsigned)idx;
                 const int      off = (int)(u & ((unsigned)h - 1U));
                 const int      neg = (int)(u >> (unsigned)log2h);
@@ -1461,16 +1190,13 @@ static void fft_fourstep(dsp_plan *p) {
         }
     }
 
-    /* Each row is m2 contiguous complex points, a few kB, so the whole sub-transform runs
-     * without leaving the cache. The in-place kernel is reused rather than a one-lane version
-     * of fft_block: a lane loop with a trip count of one is pure overhead. */
     for (k1 = 0; k1 < m1; k1++) {
         fft_radix2(DSP_ROW(wkr, k1 * m2), DSP_ROW(wki, k1 * m2), m2, p->sw2_a,
                    p->sw2_b, p->nsw2, twr, twi);
         dsp_do_yield(p);
     }
 
-    /* X[k1 + k2 m1] = wk[k1 m2 + k2]: a transpose, blocked so each tile stays resident. */
+    /* X[k1 + k2*m1] = wk[k1*m2 + k2]; transpose in cache-sized tiles. */
     for (kb = 0; kb < m2; kb += DSP_FS_BLOCK) {
         int khi = kb + DSP_FS_BLOCK;
         int jbb;
@@ -1496,11 +1222,7 @@ void dsp_rfft(dsp_plan *p) {
     int method;
     if (p == NULL || p->m < 2)
         return;
-    /* Read off the arena rather than out of p->method. Now that the arena is sized for one
-     * decomposition, the arrays present identify it uniquely, and a p->method overwritten by
-     * hand would otherwise reach a kernel whose buffers are NULL. dsp_plan_init records the
-     * same answer in p->method; this is the one that cannot be made to disagree with what
-     * was allocated. */
+    /* The workspace determines which kernel is safe to run. */
     method = dsp_method_built(p);
     if (method == DSP_FFT_FOURSTEP)
         fft_fourstep(p);
@@ -1508,33 +1230,24 @@ void dsp_rfft(dsp_plan *p) {
         fft_radix2(p->re, p->im, p->m, p->swp_a, p->swp_b, p->nswp, p->twr, p->twi);
 }
 
-/* ------------------------------------------------------------------------- */
-/* power                                                                     */
-/* ------------------------------------------------------------------------- */
+/* Power */
 
-/* The body both forms share. The mirror pair is addressed by index rather than by a pair of
- * walking pointers: a descending cursor cannot carry across a slice boundary, and j and
- * m - j are the indices those pointers held. */
+/* Use indices so mirrored pairs remain valid across non-contiguous slices. */
 static void dsp_power_vec(const dsp_vec *re, const dsp_vec *im, const int m,
                           const dsp_vec *utr, const dsp_vec *uti, dsp_vec *pwr,
                           const double scale) {
     int half = dsp_half(m), j;
-    /* Bin 0: X = Re Z[0] + Im Z[0], real. */
+    /* Bin 0 is real: X = Re Z[0] + Im Z[0]. */
     {
         const double s = 2.0 * ((double)DSP_AT(re, 0) + (double)DSP_AT(im, 0));
         DSP_AT(pwr, 0) = (dsp_real)(s * s * scale);
     }
-    /* Bin m/2: its own mirror with twiddle -i, X = Re Z - i Im Z. Skipped at m < 2, where
-     * m/2 is bin 0 and writing it again would overwrite the only bin there is with the
-     * wrong formula. No plan reaches that -- dsp_plan_init refuses n below 4 -- but this is
-     * published, so it answers for one bin rather than answering wrongly. */
+    /* Bin m/2 is its own mirror with twiddle -i. At m < 2 it is already bin 0. */
     if (half > 0) {
         double a  = (double)DSP_AT(re, half), b = (double)DSP_AT(im, half);
         DSP_AT(pwr, half) = (dsp_real)(4.0 * (a * a + b * b) * scale);
     }
-    /* The untangle runs in dsp_real so the multiply-adds are the native width; only the final
-     * scale is double, which keeps 1/wsum^2 exact for one multiply a bin. Mirror pairs share
-     * four loads, so the pass walks inwards from both ends. */
+    /* Untangle at element precision; keep the final power scale in double. */
     for (j = 1; j < half; j++) {
         const int jh = m - j;
         const dsp_real a = DSP_AT(re, j), b = DSP_AT(im, j);
@@ -1564,19 +1277,11 @@ void dsp_power(const dsp_real *DSP_RESTRICT re, const dsp_real *DSP_RESTRICT im,
     dsp_power_vec(&rv, &iv, m, &ur, &ui, &pv, scale);
 }
 
-/* ------------------------------------------------------------------------- */
-/* FIR                                                                       */
-/* ------------------------------------------------------------------------- */
+/* FIR */
 
-/* Smallest passband gain a design may normalise by. The gain is near 1 for any band the
- * arguments admit, so this only catches a degenerate kernel; what it exists to stop is a
- * divisor near zero multiplying every tap by an arbitrary factor. */
 #define DSP_FIR_GAIN_MIN 1e-6
 
-/* Decimating by D folds the spectrum into D zones of fs/(2D). A band survives only inside one
- * zone: a boundary within the band folds the band onto itself, which no tap count repairs. An
- * upper edge exactly on a boundary belongs to the zone BELOW it, which is where the fold puts
- * it, so a full-span low-pass is not a straddle; the adjustment is below. */
+/* Decimating by D folds the input into D zones of width fs/(2D); a passband must fit one zone. */
 static int dsp_zone_single(const double fs, const double flo, const double fhi, const int decim, int *zone) {
     int zlo, zhi;
     if (!(fs > 0.0) || !dsp_finite(fs) || !dsp_finite(flo) || !dsp_finite(fhi))
@@ -1594,10 +1299,7 @@ static int dsp_zone_single(const double fs, const double flo, const double fhi, 
         const double uhi = k * fhi;
         zlo = dsp_ifloor(k * flo);
         zhi = dsp_ifloor(uhi);
-        /* An upper edge exactly on a boundary belongs to the zone below it, which is where the
-         * fold puts it: zone k covers [k, k+1) going up and the reflection makes it closed at
-         * the top. Taking floor alone would read it as the zone above and call an ordinary
-         * full-span low-pass a straddle. Written as a positive so a NaN cannot reach here. */
+        /* Assign an exact upper edge to the zone below the boundary. */
         if (zhi > 0 && !(uhi > (double)zhi))
             zhi--;
     }
@@ -1622,8 +1324,7 @@ int dsp_band_map(const double fs, const double flo, const double fhi, const int 
     if (!(bw > 0.0) || !dsp_storable(bw))
         return DSP_EARG;
     zw = fs / (2.0 * (double)decim);
-    /* An even zone arrives offset by its lower edge, ascending; an odd zone arrives reversed,
-     * so bin 0 is the upper edge and frequency falls with the index. */
+    /* Even zones map upward from the lower edge; odd zones reverse from the upper edge. */
     out->zone  = zone;
     out->binhz = bw;
     if (!dsp_is_odd(zone)) {
@@ -1650,17 +1351,13 @@ int dsp_band_bins(const dsp_bandmap *m, const double flo, const double fhi, cons
                   int *k1_out) {
     double lo, hi;
     int k0, k1;
-    /* Zeroed before every refusal that can be, which is the convention dsp_band_map and
-     * dsp_thd_noise follow: a caller that ignores the code then reads bin 0 twice rather
-     * than whatever it happened to pass in. */
+
     if (k0_out == NULL || k1_out == NULL)
         return DSP_EARG;
     *k0_out = 0;
     *k1_out = 0;
 #if DSP_CHECK_OVERLAP
-    /* One object for both edges is refused rather than left undefined: the window would
-     * otherwise come back as k1 twice, which reads as a legal one-bin span. Equality is the
-     * whole of overlap for two single ints, so this needs no extents. */
+    /* A single output object cannot hold both ends of the selected bin range. */
     if (k0_out == k1_out)
         return DSP_EARG;
 #endif
@@ -1670,12 +1367,8 @@ int dsp_band_bins(const dsp_bandmap *m, const double flo, const double fhi, cons
         return DSP_EARG;
     if (!dsp_storable(flo) || !dsp_storable(fhi))
         return DSP_EARG;
-    /* Indices of the two edges. An odd zone arrives reversed, so the HIGH frequency is the
-     * low index: the edges swap but the ceil/floor do not, both following their own edge. */
-    /* Divided, not scaled by a reciprocal. Both quotients go straight into ceil() and
-     * floor(), so an edge that lands on an integer -- which the shipped spans do, binhz
-     * dividing flo exactly -- turns one ulp into one whole bin. Measured: scaling here put
-     * k0 at 4 where the divide gives 5. */
+    /* In an odd zone the high-frequency edge has the lower bin index. */
+    /* Divide directly before ceil/floor so an exact bin boundary is not perturbed by a reciprocal. */
     if (m->sense >= 0) {
         lo = (flo - m->f0) / m->binhz;
         hi = (fhi - m->f0) / m->binhz;
@@ -1683,14 +1376,10 @@ int dsp_band_bins(const dsp_bandmap *m, const double flo, const double fhi, cons
         lo = (m->f0 - fhi) / m->binhz;
         hi = (m->f0 - flo) / m->binhz;
     }
-    /* Both edges are rounded inward, which is what makes the window the bins whose centre
-     * frequency lies inside it. Rounding the low edge down would pull in the bin below --
-     * at zone 0 that is DC, and a start under one bin width would report the mean as a
-     * tone. */
+    /* Round inward to include only bins whose centers lie inside the band. */
     lo = ceil(lo);
     hi = floor(hi);
-    /* Outside anything storable the clamps below are the answer, and converting first is
-     * undefined where it does not fit an int. */
+    /* Clamp before integer conversion so out-of-range quotients cannot overflow it. */
     if (!(lo > -1.0e9))
         lo = -1.0e9;
     if (!(hi < 1.0e9))
@@ -1703,8 +1392,7 @@ int dsp_band_bins(const dsp_bandmap *m, const double flo, const double fhi, cons
         k0 = nbins - 1;
     if (k1 > nbins - 1)
         k1 = nbins - 1;
-    /* Never empty: one bin is what a span narrower than a bin can honestly report, and the
-     * callers that take k0..k1 all read at least one. */
+    /* A narrow span still supplies one plottable bin. */
     if (k1 < k0)
         k1 = k0;
     *k0_out = k0;
@@ -1715,15 +1403,13 @@ int dsp_band_bins(const dsp_bandmap *m, const double flo, const double fhi, cons
 double dsp_fir_transition(const double fs, const double flo, const double fhi, const int decim) {
     double zw, ghi, glo, inv_fs;
     int zone = 0;
-    /* Zero means no usable transition: a refusal, a straddle and a band on a zone edge all
-     * read the same, and every caller treats them the same. */
+
     if (dsp_zone_single(fs, flo, fhi, decim, &zone) != DSP_OK)
         return 0.0;
     zw = fs / (2.0 * (double)decim);
     inv_fs = 1.0 / fs;
     ghi = ((double)(zone + 1) * zw - fhi) * inv_fs;
-    /* Nothing folds across DC, so zone 0 has no lower transition to keep; with flo of 0 that
-     * is the low-pass case, where ghi is 1/(2*decim) - fhi/fs. */
+    /* Zone zero has no lower alias transition across DC. */
     if (zone == 0)
         return ghi;
     glo = (flo - (double)zone * zw) * inv_fs;
@@ -1737,11 +1423,9 @@ int dsp_fir_taps_for(const double fs, const double flo, const double fhi, const 
         return 0;
     if (!(wtr > 0.0))
         return 0;
-    /* Bounded in double before the truncation. A stop frequency just under the decimated
-     * Nyquist leaves a transition of order 1e-15, and the quotient is then 3.3e15, which no
-     * ceiling admits and which is undefined to convert to int in the first place. */
+    /* Bound the tap estimate before converting to an integer. */
     {
-        /* One divide, tested and then used. */
+
         const double want = DSP_FIR_TAPK / wtr;
         if (!(want <= (double)maxtaps))
             return 0;
@@ -1763,10 +1447,7 @@ int dsp_fir_pick_decim(const double fs, const double flo, const double fhi, cons
     dmax = dsp_ifloor((double)(DSP_FIR_MAXM - maxtaps) / (double)(n - 1));
     if (dmax > DSP_DECIM_MAX)
         dmax = DSP_DECIM_MAX;
-    /* Downward from the read budget's ceiling, taking the first decimation that holds the
-     * band in one zone with a realisable filter. A decimation derived from fhi alone cannot
-     * express the zone condition, which depends on where the band sits. Plan time only,
-     * bounded by DSP_DECIM_MAX. */
+    /* Search down from the source-read ceiling for the highest feasible decimation. */
     for (d = dmax; d > 1; d--) {
         if (dsp_zone_single(fs, flo, fhi, d, &zone) != DSP_OK)
             continue;
@@ -1813,18 +1494,14 @@ int dsp_fir_srclength(const int n, const int decim, const int ntaps) {
         return 0;
     if (decim < 2)
         return n;
-    /* Divide the bound rather than form the product: `(n-1)*decim` overflows int for
-     * arguments nothing else refuses, and `long long` would pull in a 64-bit division, which
-     * on a 32-bit target is a compiler runtime call (__divdi3) nothing else here needs. */
+    /* Compare against a divided bound before forming (n-1)*decim. */
     if (decim > (DSP_SRC_MAX - ntaps) / (n - 1))
         return 0;
     return (n - 1) * decim + ntaps;
 }
 
 double dsp_binwidth(const double fs, const int n, const int decim) {
-    /* A rate that is not positive and finite has no bin width, and 0 is what this reports for
-     * arguments it refuses. dsp_reduce then refuses the 0 rather than plotting against a
-     * negative or infinite frequency axis. */
+
     if (n < 1 || decim < 1 || !(fs > 0.0) || !dsp_finite(fs))
         return 0.0;
     return fs / ((double)decim * (double)n);
@@ -1838,13 +1515,10 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
         return DSP_EARG;
     if (!(fs > 0.0) || !(fhi > 0.0) || decim < 1)
         return DSP_EARG;
-    /* A low-pass at decim 1 is a no-op: the record goes through untouched. A band-pass at
-     * decim 1 is a real filter, because there the selectivity is the point and not the
-     * anti-aliasing. */
+    /* A low-pass at decimation one is a no-op; a band-pass can still require filtering. */
     if (decim < 2 && flo == 0.0)
         return 0;
-    /* Validates the rates, refuses a band that spans a zone boundary, and in a low-pass build
-     * refuses a non-zero flo. */
+
     rc = dsp_zone_single(fs, flo, fhi, decim, &zone);
     if (rc != DSP_OK)
         return rc;
@@ -1852,14 +1526,11 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
 
     if (order > 0) {
         l = order;
-        /* Odd, so the group delay is a whole sample. Up by one, except at the ceiling, where
-         * up by one would be refused: order == maxtaps is the ordinary way to ask for the
-         * longest filter the buffer holds, and rounding it up rejected it. */
+        /* Use odd taps for an integral group delay; do not round past capacity. */
         if (!dsp_is_odd(l))
             l = (l < maxtaps) ? l + 1 : l - 1;
     } else {
-        /* A transition needing more than the caller's buffer gets the ceiling, which is the
-         * Lua's behaviour: too few taps for the transition, but the best the budget allows. */
+
         l = dsp_fir_taps_for(fs, flo, fhi, decim, maxtaps);
         if (l == 0)
             l = maxtaps;
@@ -1871,12 +1542,7 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
     if (l > maxtaps)
         return DSP_EARG;
 
-    /* Each cutoff half a transition outside its band edge, so the edge sits in the flat part
-     * and not in the roll-off: a cutoff on the edge reads 3.5 dB low at 16.6 kHz of a 20 kHz
-     * span, measured on the instrument. The transition is the one the tap count delivers,
-     * bounded by the room the zone leaves. For a derived count the two coincide and this is
-     * half-way to the zone edge, where a low-pass cutoff sits; a forced longer filter hugs the
-     * band edge instead of widening the passband to a zone edge that may be far away. */
+    /* Place each cutoff half a transition outside the passband, within its Nyquist zone. */
     zw = 0.5 / (double)decim; /* zone width, in cycles a sample */
     {
         const double tw  = DSP_FIR_TAPK / (double)l;
@@ -1894,14 +1560,13 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
     if (!(fc_hi > fc_lo))
         return DSP_EARG;
 
-    /* A difference of sincs: at fc_lo zero the lower term vanishes, giving the low-pass. */
+    /* Subtract two sinc kernels; at fc_lo == 0 the lower term vanishes. */
     c = (double)(l - 1) * 0.5;
     {
-        /* The window's 1/(l-1) is hoisted: one divide, not one a tap. */
+
         const double wstep = 2.0 * M_PI / (double)(l - 1);
         const double whi = 2.0 * M_PI * fc_hi, wlo = 2.0 * M_PI * fc_lo;
-        /* One exact double i serves the sinc's offset and the window's angle, so neither
-         * converts and the tap loop holds no int-to-double at all. */
+
         double di;
         for (i = 0, di = 0.0; i < l; i++, di += 1.0) {
             const double mm = di - c;
@@ -1910,29 +1575,25 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
                 v = 2.0 * (fc_hi - fc_lo);
             else
                 v = (DSP_SIN(whi * mm) - DSP_SIN(wlo * mm)) * INV_M_PI / mm;
-            /* Hamming, which holds the first sidelobe near -43 dB at a tap count this small. */
+            /* Hamming window keeps the first sidelobe near -43 dB. */
             v *= 0.54 - 0.46 * DSP_COS(wstep * di);
             h[i] = (dsp_real)v;
         }
     }
 
     if (flo == 0.0) {
-        /* DC is in the passband, so its gain is the passband gain: the sum of the taps. Unit
-         * DC gain keeps the filter from changing a reading's amplitude. */
+        /* Normalize low-pass taps by their DC gain, the sum of all taps. */
         double sum = 0.0;
         for (i = 0; i < l; i++)
             sum += (double)h[i];
         divisor = sum;
     } else {
 #if DSP_BANDPASS
-        /* DC is a stopband here, so its gain nears zero with a data-dependent sign and
-         * dividing by it is unbounded. Unit gain is taken at the passband centre, where a
-         * symmetric kernel responds h[c] + 2*sum_{i<c} h[i]*cos(w0*(c-i)). */
+        /* For band-pass, normalize at the band center; DC lies in the stopband. */
         const double w0 = M_PI * (flo + fhi) * inv_fs;
         const int    ci = dsp_half(l - 1);
         double g  = (double)h[ci];
-        /* dci counts ci - i down exactly, so the distance from the centre is never
-         * converted. */
+
         double dci;
         for (i = 0, dci = (double)ci; i < ci; i++, dci -= 1.0)
             g += 2.0 * (double)h[i] * DSP_COS(w0 * dci);
@@ -1941,8 +1602,7 @@ int dsp_fir_design(dsp_real *DSP_RESTRICT h, const int maxtaps, const double fs,
         return DSP_EUNSUPPORTED;
 #endif
     }
-    /* Positive, not just non-zero: the centre response is positive for any band admitted
-     * here, and a negative divisor would invert every tap. */
+
     if (!(divisor > DSP_FIR_GAIN_MIN))
         return DSP_EARG;
     {
@@ -1962,17 +1622,12 @@ int dsp_fir_run(const double *DSP_RESTRICT x, const int nx, const dsp_real *DSP_
         return DSP_EARG;
     ny = (nx - ntaps) / decim + 1;
 #if DSP_CHECK_OVERLAP
-    /* The output against both inputs, by extent and not just by base: output j reads inputs
-     * j*decim through j*decim+ntaps-1, so a y starting anywhere inside x destroys readings
-     * the later outputs still need. In place is the case a caller reaches for first. */
+    /* Refuse overlap with source or taps before writing the output convolution. */
     if (dsp_overlaps(y, (size_t)ny * sizeof(*y), x, (size_t)nx * sizeof(*x))
         || dsp_overlaps(y, (size_t)ny * sizeof(*y), h, (size_t)ntaps * sizeof(*h)))
         return DSP_EARG;
 #endif
-    /* Four chains, because one would stall the three-stage pipeline every third instruction.
-     * The accumulation stays in double: the source is the instrument's double readings and
-     * the output feeds the same loader as an unfiltered capture. csrc/README.md records what
-     * a single-precision chain would buy on the target and why it is not taken here. */
+    /* Use four independent multiply-accumulate chains and accumulate in double. */
     for (j = 0; j < ny; j++) {
         const double *xp = x + (size_t)j * (size_t)decim;
         const dsp_real *hp = h;
@@ -1995,9 +1650,7 @@ int dsp_fir_run(const double *DSP_RESTRICT x, const int nx, const dsp_real *DSP_
     return ny;
 }
 
-/* ------------------------------------------------------------------------- */
-/* reduction and peak search                                                 */
-/* ------------------------------------------------------------------------- */
+/* Reduction and peak search */
 
 int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, const int nseg,
                    const dsp_bandmap *map, const double dbmin, const double dbmax,
@@ -2010,66 +1663,47 @@ int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, co
     if (nbins < 1 || k0 < 0 || k0 >= nbins || nseg < 1 || nseg > DSP_NSEG_MAX)
         return DSP_EARG;
 #if DSP_CHECK_OVERLAP
-    /* The two traces against each other and against the bins they are reduced from. Both are
-     * nseg long and written point by point, so sharing bytes with pwr would have a segment
-     * reduce bins an earlier segment had already overwritten. */
+    /* The two reduction arrays must not overlap each other or their source bins. */
     if (dsp_overlaps(db, (size_t)nseg * sizeof(*db), hz, (size_t)nseg * sizeof(*hz))
         || dsp_vec_hits(pwr, db, (size_t)nseg * sizeof(*db))
         || dsp_vec_hits(pwr, hz, (size_t)nseg * sizeof(*hz)))
         return DSP_EARG;
 #endif
-    /* k1 clamped rather than refused, which is what dsp_peaks does over the same array: a
-     * caller passing the bin count instead of the last index is the ordinary off-by-one, and
-     * this runs every frame. nbins is the only thing that bounds it. */
+
     if (k1 > nbins - 1)
         k1 = nbins - 1;
     if (k1 < k0)
         return DSP_EARG;
     binhz = map->binhz;
-    /* No usable frequency scale yet, which is the state before the first plan. */
+    /* Reject a missing or invalid frequency scale before forming the axis. */
     if (!(binhz > 0.0) || !dsp_finite(binhz) || !dsp_finite(map->f0))
         return DSP_EARG;
     if (map->sense != 1 && map->sense != -1)
         return DSP_EARG;
-    /* The dB window. Every segment that does not clear the floor is written as dbmin and
-     * every one over the ceiling as dbmax, so a limit that is not storable is a trace that is
-     * not storable whatever the bins hold, and an inverted window describes no segment. */
+
     if (!dsp_storable(dbmin) || !dsp_storable(dbmax) || !(dbmin < dbmax))
         return DSP_EARG;
-    /* Squared below, so a negative floor would silently become a positive one. */
+    /* Require a nonnegative voltage floor before squaring it. */
     if (!dsp_finite(vfloor) || !(vfloor >= 0.0))
         return DSP_EARG;
     npts = k1 - k0 + 1;
-    /* Hoisted: the step is one divide for the whole trace instead of one a point, leaving a
-     * multiply and an add per point. Not accumulated -- c * fstep is formed each time, so
-     * the rounding does not walk along the axis. The series starts at whichever end of the
-     * window is the lowest frequency -- k0 ascending, k1 descending -- and climbs from
-     * there. That one substitution is the whole reversal, because sense*sense is 1. */
+    /* Reuse one frequency step per trace; native Lua reconstruction uses the same series. */
     f0 = dsp_bin_hz(map, (map->sense > 0) ? k0 : k1);
     fstep = ((double)npts / (double)nseg) * binhz;
-    /* The frequencies are an affine series in binhz, so a width that is finite but large
-     * enough to overflow the series puts an infinity in hz -- or, at segment 0 where the
-     * multiplier is zero, the product 0 * inf, which is a NaN. The endpoints bound every
-     * value between them, and fstep is checked for the ones that are not endpoints. */
+    /* Check the endpoint so even a finite bin width cannot overflow the generated series. */
     if (!dsp_storable(f0) || !dsp_storable(fstep) ||
         !dsp_storable(f0 + (double)(nseg - 1) * fstep))
         return DSP_EARG;
 
-    /* Segmentation by addition, not `c * npts / nseg`: that product needs more than 32 bits
-     * at the argument limits, and widening it pulls in a 64-bit division. Carrying the
-     * quotient and remainder gives the same floor exactly, in int, with no division in the
-     * loop. q0 is segment c's first offset, q1 segment c+1's, so q1-1 is this one's last. */
+    /* Carry the division remainder instead of multiplying two potentially wide indices. */
     qstep = npts / nseg;
     rstep = npts % nseg;
     q0 = 0;
     q1 = qstep;
     r1 = rstep;
 
-    /* dc holds c exactly, so the product below is the one a conversion would have given and
-     * the segment loop converts nothing. */
     for (c = 0, dc = 0.0; c < nseg; c++, dc += 1.0) {
-        /* Offsets, then bins. Descending maps offset o to bin k1 - o, mirroring the range
-         * while the frequency still rises with c. */
+        /* Mirror descending bin maps so plotted frequencies still rise from left to right. */
         int oa = q0, ob = q1 - 1;
         int a, b;
         dsp_real top;
@@ -2086,24 +1720,14 @@ int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, co
             a = k1 - ob;
             b = k1 - oa;
         }
-        /* A ternary rather than an if with a branch body, so a floating select can take it.
-         * A NaN loses the comparison either way, so every NaN bin is dropped and the
-         * segment reports the largest bin that is not one. Seeded below the floor rather
-         * than from the first bin: seeding from it made a NaN THERE stick, since nothing
-         * compares greater than a NaN, and one bin then suppressed a whole segment -- 32
-         * bins at 16,384 samples, hiding a tone 4 bins away. Power is never negative, so
-         * -1 cannot win against a real bin, and an all-NaN segment keeps it and plots at
-         * the floor. */
-        /* By index rather than a walking pointer: the segment this reduces may be split
-         * across slices, and a run that crosses one has no single pointer to advance. */
+        /* A ternary allows floating select; NaN still loses against the current maximum. */
+        /* Index each element so a segment may cross non-contiguous slices. */
         top = (dsp_real)-1;
         for (run = a; run <= b; run++) {
             const dsp_real v = DSP_AT(pwr, run);
             top = (v > top) ? v : top;
         }
-        /* Anything at or below the floor plots at the floor, so the logarithm never sees zero.
-         * The range tests are positives because every comparison with a NaN is false: written
-         * the other way round a NaN would pass straight through to the trace buffer. */
+        /* Clamp power before log10 so zero and non-finite bins do not reach the display. */
         d = dbmin;
         if ((double)top > vfl) {
             d = 10.0 * DSP_LOG10((double)top);
@@ -2115,7 +1739,6 @@ int dsp_reduce_vec(const dsp_vec *pwr, const int nbins, const int k0, int k1, co
         db[c] = (dsp_real)d;
         hz[c] = (dsp_real)(f0 + dc * fstep);
 
-        /* Advance both offsets by npts/nseg, carrying the remainder. */
         q0 = q1;
         q1 += qstep;
         r1 += rstep;
@@ -2144,15 +1767,11 @@ int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, 
         return DSP_EARG;
     if (want > DSP_PEAKS_MAX)
         return DSP_EARG;
-    /* nbins first, as dsp_reduce does over the same array: without it `nbins - 1` below
-     * overflows at INT_MIN, and the kdc clamp has nothing to bound it with. */
+    /* Validate nbins before deriving the highest index or clamping the DC region. */
     if (nbins < 1)
         return DSP_EARG;
 #if DSP_CHECK_OVERLAP
-    /* The three result arrays against each other and against the bins. bin is seeded before
-     * the search and frac and amp are filled after it, so an overlap would have the seed
-     * wipe a result or a result wipe the bins still being searched. frac and amp are
-     * optional, and dsp_overlaps answers 0 for a NULL side. */
+    /* Clear the result buffers only after checking that they do not alias the input or each other. */
     {
         const size_t zb = (size_t)want * sizeof(*bin);
         const size_t zf = (size_t)want * sizeof(*frac);
@@ -2168,8 +1787,7 @@ int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, 
         bin[s] = -1;
         bv[s] = -1.0;
     }
-    /* Clamped, not trusted: kdc is reachable in the struct, and `1 + kdc` overflows at
-     * INT_MAX. Inside the array it can only narrow the search. */
+    /* Clamp the DC exclusion before adding one to avoid signed overflow. */
     if (kdc < 0)
         kdc = 0;
     if (kdc > nbins - 1)
@@ -2182,20 +1800,13 @@ int dsp_peaks_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int kdc, 
 
     for (k = k0; k <= k1; k++) {
         double v = (double)DSP_AT(pwr, k);
-        /* A missing neighbour is the end of the spectrum and counts as lower. Inside a zoom
-         * window the neighbours are real bins even when off-screen, so the flank of an
-         * out-of-window tone does not read as a peak. Branching comparisons on purpose: a NaN
-         * fails both, which keeps a NaN bin and its neighbours out of the table, and a
-         * floating select would have to reproduce that by hand. */
+        /* A display span edge is not a spectrum edge: compare its real neighboring bins. */
         const double vl = (k > 0) ? (double)DSP_AT(pwr, k - 1) : -1.0;
         const double vr = (k + 1 < nbins) ? (double)DSP_AT(pwr, k + 1) : -1.0;
         if (!(v > vl) || !(v >= vr))
             continue;
         if (k == kfloor && ip != NULL) {
-            /* A tone inside the DC region leaks enough into the first reportable bin to make it a
-             * local maximum, which then reports the tone a whole bin and 16 dB out. The estimator
-             * saturates at -0.5 there, so a peak estimating a quarter bin or more below the lowest
-             * reportable bin is refused. */
+            /* Reject a first reportable peak whose fitted offset puts it in the DC leakage region. */
             double d = 0.0;
             if (dsp_peak_interp_vec(ip, pwr, k, nbins, &d, NULL) != DSP_OK)
                 d = 0.0;
@@ -2251,16 +1862,10 @@ int dsp_peaks(const dsp_real *DSP_RESTRICT pwr, const int nbins, int k0, int k1,
     return dsp_peaks_vec(&v, nbins, k0, k1, kdc, want, ip, bin, frac, amp);
 }
 
-/* ------------------------------------------------------------------------- */
-/* one frame                                                                 */
-/* ------------------------------------------------------------------------- */
+/* Frame processing */
 
 int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double *mean_out) {
-    /* A pointer and not a copy: dsp_src carries DSP_MAX_SRC_BLOCKS addresses, and assigning
-     * one is a structure copy the compiler emits a memcpy for -- which the freestanding
-     * target does not link. The firmware has one, and calling it would make a fifth address
-     * that belongs to one build; fwmem-NATIVEC.md has what the other four cost. Not copying
-     * is cheaper than either. */
+    /* Pass the source record by pointer so the freestanding build need not copy its block vector. */
     const dsp_src *from = src;
     dsp_src filtered;
     int need, rc;
@@ -2268,27 +1873,21 @@ int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double
         return DSP_EARG;
     if (p->n < 4)
         return DSP_EARG;
-    /* ntaps is reachable in the struct, so it is checked here rather than trusted: h holds
-     * DSP_FIR_MAXTAPS entries and is last in the layout at decim == 1, so a larger count
-     * reads outside the arena entirely. dsp_plan_set_fir refuses the same range. */
+    /* Bound the mutable tap count before indexing the plan's allocated filter storage. */
     if (p->ntaps < 0 || p->ntaps > DSP_FIR_MAXTAPS)
         return DSP_EARG;
-    /* A decimating plan with no filter is refused, not run unfiltered: dsp_binwidth reports
-     * the decimated width either way, so an unfiltered run would put every frequency out by
-     * the decimation factor with nothing in the return value to say so. */
+    /* Refuse decimation without a filter rather than labeling unfiltered samples at a decimated rate. */
     if (p->decim > 1 && (p->ntaps == 0 || p->fir_out == NULL))
         return DSP_EARG;
     need = dsp_fir_srclength(p->n, p->decim, p->ntaps);
-    /* 0 is dsp_fir_srclength refusing the configuration, and `nsrc < 0` would not catch it. */
+
     if (need <= 0)
         return DSP_EARG;
     if (nsrc < need)
         return DSP_ESHORT;
 
     if (p->decim > 1) {
-        /* The filter reads the record as an array, so a decimating plan takes a contiguous
-         * one. Nothing reaches this with a strided source: the read budget stops allowing
-         * even decim 2 from n = 3906 up, which is below every count a split arena serves. */
+        /* A decimating plan requires contiguous source data for the FIR kernel. */
         const int ny = (src->nblock == 1 && src->stride == (int)sizeof(double))
                            ? dsp_fir_run((const double *)(const void *)src->blk[0], need, p->h,
                                          p->ntaps, p->decim, p->fir_out)
@@ -2297,8 +1896,7 @@ int dsp_spectrum_run_src(dsp_plan *p, const dsp_src *src, const int nsrc, double
             return (ny < 0) ? ny : DSP_ESHORT;
         dsp_src_flat(&filtered, p->fir_out, p->n);
         from = &filtered;
-        /* The filter is the longest single stretch in a decimating frame: 384 taps over
-         * 16,384 outputs is 6.3 M multiply-accumulates. */
+        /* Yield after filtering, the longest individual phase for a decimating plan. */
         dsp_do_yield(p);
     }
     rc = dsp_load_vec(from, p->n, &p->w_v, p->wsum, &p->re_v, &p->im_v, mean_out);
@@ -2320,10 +1918,7 @@ int dsp_spectrum_run(dsp_plan *p, const double *DSP_RESTRICT src, const int nsrc
     return dsp_spectrum_run_src(p, &s, nsrc, mean_out);
 }
 
-/* ------------------------------------------------------------------------- */
-
-/* The amplitude of the line at bin k, interpolated where the tables allow it: a bin
- * maximum alone reads up to 3.9 dB low on a tone sitting between bins. */
+/* Interpolated amplitude corrects the scalloping loss in a raw peak bin. */
 static double dsp_line_amp(const dsp_interp *ip, const dsp_vec *pwr, const int k,
                            const int nbins, const double p, double *d_out) {
     double amp = DSP_SQRT(p);
@@ -2340,9 +1935,7 @@ static double dsp_line_amp(const dsp_interp *ip, const dsp_vec *pwr, const int k
     return amp;
 }
 
-/* Sum and count the bins that are neither a line nor a skirt and do not exceed ceil_v.
- * The line list is ascending, so it is walked alongside the bins: one comparison a bin,
- * not one a line a bin. */
+/* Walk ascending line exclusions while summing bins below the noise clip. */
 static void dsp_noise_pass(const dsp_vec *pwr, const int k0, const int k1,
                            const int *DSP_RESTRICT line, const int nline, const int skirt, const double ceil_v,
                            const int stride, double *DSP_RESTRICT sum_out,
@@ -2356,7 +1949,7 @@ static void dsp_noise_pass(const dsp_vec *pwr, const int k0, const int k1,
         if (e < nline && k >= line[e] - skirt)
             continue;
         v = (double)DSP_AT(pwr, k);
-        /* Positive tests, so a NaN bin is skipped instead of poisoning the sum. */
+
         if (!(v >= 0.0) || !(v <= ceil_v))
             continue;
         sum += v;
@@ -2366,9 +1959,7 @@ static void dsp_noise_pass(const dsp_vec *pwr, const int k0, const int k1,
     *cnt_out = cnt;
 }
 
-/* Is this candidate mains pickup rather than the signal? Level first: it is the cheap test
- * and the common answer. Called only where a candidate beats the running maximum, which is
- * a handful of times over a spectrum rather than once a bin. */
+/* Check level before testing whether a candidate is a mains harmonic. */
 static int dsp_is_mains(const double fhz, const double p, const double binhz, const int mains) {
     double tol = binhz;
     int i;
@@ -2381,9 +1972,7 @@ static int dsp_is_mains(const double fhz, const double p, const double binhz, co
         const int fi = (i == 0) ? DSP_THD_MAINS_A : DSP_THD_MAINS_B;
         const double f = (double)fi;
         double n, d;
-        /* One frequency or both. Selecting one gives back every multiple of the other:
-         * at 50 Hz the rule covers 50 to 950, which is most of the band under
-         * DSP_THD_MAINS_FMAX. Compared as ints, so no float compares an equality. */
+        /* Selecting one mains frequency leaves harmonics of the other eligible. */
         if (mains != DSP_THD_MAINS_BOTH && mains != fi)
             continue;
         n = floor(fhz / f + 0.5);
@@ -2407,24 +1996,20 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
 
     if (pwr == NULL || pwr->nslice < 1 || out == NULL)
         return DSP_EARG;
-    /* Before every refusal below, so that `out` is zeroed on all of them and not only on
-     * the late ones. A caller that reads the struct after an EARG sees zeros, never the
-     * previous frame's figures. */
+    /* Clear the outputs before validation so a refusal cannot leave stale figures. */
     memset(out, 0, sizeof(*out));
 #if DSP_CHECK_OVERLAP
-    /* The figures against the bins they are taken from: the zeroing above would otherwise
-     * blank part of the spectrum before it is read. */
+    /* Refuse aliasing between the results and input bins. */
     if (dsp_vec_hits(pwr, out, sizeof(*out)))
         return DSP_EARG;
 #endif
     if (nbins < 8)
         return DSP_EARG;
-    /* Refused rather than ignored: a frequency that is neither mains would discount a band
-     * nothing picks up, and the caller would see plausible figures over a hole. */
+    /* Reject unsupported mains settings rather than discounting the wrong bands. */
     if (mains != DSP_THD_MAINS_BOTH && mains != 0 && mains != DSP_THD_MAINS_A
         && mains != DSP_THD_MAINS_B)
         return DSP_EARG;
-    /* Clamped for the same reason as in dsp_peaks: `1 + kdc` overflows at INT_MAX. */
+
     if (kdc < 0)
         kdc = 0;
     if (kdc > nbins - 1)
@@ -2436,19 +2021,10 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         k1 = nbins - 1;
     if (k1 - k0 < 4)
         return DSP_EARG;
-    /* Inside the window's main lobe the bins hold signal, not noise, so the skirt follows
-     * the window rather than a constant: a fixed three capped S/N at 38.5 dB on Kaiser 18
-     * against the 102 dB the window allows. One bin of guard past the null. */
+    /* Exclude each line's window-dependent main lobe from noise estimation. */
     skirt = (ip != NULL && ip->lobe > 0) ? ip->lobe + 1 : DSP_THD_SKIRT;
 
-    /* The fundamental, which must be a local maximum. Otherwise the shoulder of a louder
-     * line qualifies: measured on the instrument with its inputs floating, the 60 Hz line
-     * was discounted as mains but the bin one along -- its own skirt, 8 dB down and a hertz
-     * outside the mains tolerance -- became the fundamental and reported 21.4% distortion
-     * on no signal. A monotonic skirt has no local maximum; a real tone is one.
-     *
-     * Comparisons written as positives, so a NaN bin can never win and neither can its
-     * neighbours. A missing neighbour is the end of the spectrum and counts as lower. */
+    /* Require a local maximum so a louder tone's shoulder cannot become the fundamental. */
     for (k = k0; k <= k1; k++) {
         const double v = (double)DSP_AT(pwr, k);
         double l, r;
@@ -2463,9 +2039,7 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         pf = v;
         kf = k;
     }
-    /* No fundamental is not an error and does not end it: the floor is the useful number
-     * with the inputs disconnected, and a flat spectrum has no local maximum at all. The
-     * noise passes below run either way, with nothing excluded when there is no line. */
+    /* Without a fundamental only the noise floor is meaningful. */
     nline = 0;
     vf = 0.0;
     if (kf >= 0) {
@@ -2484,21 +2058,12 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         const double c = fb * (double)h;
         double bp = -1.0;
         int a, b, bk = -1;
-        /* Positive again: a NaN fb ends the search rather than running it on garbage. */
+
         if (!(c + (double)DSP_THD_HALFW <= (double)k1))
             break;
         a = dsp_ifloor(c - (double)DSP_THD_HALFW + 0.5);
         b = dsp_ifloor(c + (double)DSP_THD_HALFW + 0.5);
-        /* Both bounds clamped. The upper one looks redundant -- the break above establishes
-         * c + HALFW <= k1 with k1 an integer, so floor(c + HALFW + 0.5) <= k1 -- but that
-         * argument holds only while the guard and this line agree to the last bit about
-         * c + HALFW, and they are separate expressions. An optimiser free to inline c and
-         * fuse the multiply into the add at one site and not the other makes them disagree,
-         * and a value sitting exactly on k1 then gives b = k1 + 1 and a read one element
-         * past the window. It would be a wrong distortion figure rather than a fault, since
-         * the read stays inside the arena, which is why it is cheaper to clamp than to
-         * reason about: an array bound should not rest on two floating-point expressions
-         * rounding identically. */
+        /* Clamp the candidate harmonic interval to valid bin indices before reading it. */
         if (a < k0)
             a = k0;
         if (b > k1)
@@ -2512,9 +2077,7 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         }
         if (bk < 0 || !(bp > 0.0))
             continue;
-        /* Inside the previous line's skirt the two are not resolvable and counting both
-         * counts one twice. Skipping also keeps the list ascending, which the noise pass
-         * below relies on. */
+        /* Skip harmonics inside the prior line's skirt; they cannot be resolved as separate tones. */
         if (bk <= line[nline - 1] + skirt)
             continue;
         {
@@ -2526,19 +2089,17 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         nh++;
     }
 
-    /* One in every stride bins; see ::DSP_THD_NSAMPLE for why the figures sample. */
     stride = (k1 - k0 + 1) / DSP_THD_NSAMPLE;
     if (stride < 1)
         stride = 1;
     dsp_noise_pass(pwr, k0, k1, line, nline, skirt, DBL_MAX, stride, &sum, &cnt);
-    /* Again with the outliers clipped: see ::DSP_THD_CLIP for why the plain mean is not
-     * the floor. One extra pass, no transcendentals. */
+    /* Re-estimate noise after clipping outliers. */
     for (h = 0; h < DSP_THD_CLIPS && cnt > 0 && sum > 0.0; h++) {
         double csum = 0.0;
         int ccnt = 0;
         dsp_noise_pass(pwr, k0, k1, line, nline, skirt,
                        (sum / (double)cnt) * DSP_THD_CLIP, stride, &csum, &ccnt);
-        /* Converged: the clip removed nothing, so another pass would remove nothing. */
+
         if (ccnt == cnt || ccnt < 1 || !(csum > 0.0))
             break;
         sum = csum;
@@ -2550,13 +2111,10 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         const double mean = sum / (double)cnt;
         out->nnoise = cnt;
         out->noise_db = 10.0 * DSP_LOG10(mean);
-        /* NO FUNDAMENTAL, NO RATIOS. The strongest bin of a spectrum with nothing in it is
-         * a noise peak, and both ratios taken against it are arithmetic about nothing. The
-         * floor above still stands: shorted, it is the instrument's own. */
+
         if (vf > 0.0 && vf * vf > mean * DSP_THD_MINRATIO) {
             out->signal = 1;
-            /* The halves of the two mean squares cancel, leaving the power ratio.
-             * sum * stride is the integrated noise: the sampled sum scaled back up. */
+            /* Scale sampled noise by the stride to estimate integrated power; mean-square halves cancel in the ratio. */
             out->snr_db = 10.0 * DSP_LOG10((vf * vf) / (sum * (double)stride));
         }
     }
@@ -2565,20 +2123,14 @@ int dsp_thd_noise_vec(const dsp_vec *pwr, const int nbins, int k0, int k1, int k
         if (nh > 0)
             out->thd = DSP_SQRT(hsum) / vf;
     }
-    /* Nothing non-finite leaves here, which is what dsp_reduce enforces for the trace and
-     * what these figures reach the front panel through. Bins near DBL_MAX overflow the
-     * harmonic sum and the noise sum, and an infinity formatted into a display string is a
-     * refused parameter and a modal dialog. A figure that cannot be computed is reported as
-     * absent -- its flag cleared -- rather than as a number no test could predict. */
+    /* Publish ratios only when they are finite. */
     if (!dsp_finite(out->thd) || !dsp_finite(out->snr_db)) {
         out->thd = 0.0;
         out->snr_db = 0.0;
         out->signal = 0;
         out->nharm = 0;
     }
-    /* noise_db needs no guard of its own: the sum is tested for finiteness where the mean is
-     * formed, and a positive finite mean over a positive count has a finite logarithm. An
-     * overflowed sum leaves nnoise at 0, which is the flag saying there is no floor. */
+
     if (!dsp_finite(out->f0) || !dsp_finite(out->f0_hz) || !dsp_finite(out->amp0)) {
         out->f0 = 0.0;
         out->f0_hz = 0.0;

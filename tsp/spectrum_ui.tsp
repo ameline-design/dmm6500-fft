@@ -1,31 +1,23 @@
--- spectrum_ui.tsp -- the loading cover.
---
--- A screen holding nothing but a line of text, kept in front while the real screens are
--- built and while Apply reconfigures the hardware. Creating a screen makes it active, so
--- every screen build raises this again before its first child, or the operator watches a
--- screen assemble itself one create at a time. Made once and deleted once by stop(): raising
--- it is a changescreen and nothing else, a create/delete per raise churning the 463-object
--- pool.
+-- Loading cover for startup and Apply. Creating a screen makes it active;
+-- raise the cover again before building the new screen's children.
 
-fftsa = fftsa or {}   -- the single global this app exposes
+fftsa = fftsa or {}
 
 if fftsa.load_handles_inited == nil then
   fftsa.loadscr = nil
   fftsa.loadtxt = nil
   fftsa.load_handles_inited = true
 end
--- x for the string below on FONT_MEDIUM, measured on the panel.
 fftsa.load_x = 261
 fftsa.load_y = 214
 
 function fftsa.loading_build()
   if fftsa.loadscr ~= nil then return fftsa.loadscr end
   fftsa.loadscr = display.create(display.ROOT, display.OBJ_SCREEN, "FFT SPECTRUM ANALYSER")
-  if fftsa.loadscr == nil then return nil end     -- pool exhausted; a visible build is the cost
+  if fftsa.loadscr == nil then return nil end
   fftsa.loadtxt = display.create(fftsa.loadscr, display.OBJ_TEXT, fftsa.load_x, fftsa.load_y,
                                  "Loading, please wait...", 16777215, display.FONT_MEDIUM)
-  -- End App is hooked here too: the firmware may deliver EVENT_ENDAPP only to the
-  -- visible screen, and this is the visible one while Apply rebuilds the tables.
+  -- Hook End App on the cover too: the firmware can dispatch it to the visible screen.
   display.setevent(fftsa.loadscr, display.EVENT_ENDAPP,
                    "if fftsa ~= nil then fftsa.cleanup() end")
   return fftsa.loadscr
@@ -33,8 +25,7 @@ end
 
 function fftsa.loading_front()
   if fftsa.loadscr == nil then return false end
-  -- Intentional visits (startup and Apply) are not exits. Unregister the show event
-  -- before raising the cover, so there is no delayed callback to run after Apply.
+  -- Disarm the Back handler before showing the cover intentionally.
   if fftsa.loadwatch then
     display.setevent(fftsa.loadscr, display.EVENT_PRESS, 0)
     fftsa.loadwatch = false
@@ -44,9 +35,8 @@ function fftsa.loading_front()
   return true
 end
 
--- The physical EXIT key is firmware Back, not EVENT_ENDAPP. If it returns to the
--- retained cover, the screen's on-show event must exit instead of stranding the app
--- on a screen whose frame timer never runs. Arm only after switching off the cover.
+-- Physical EXIT can return to the retained cover instead of sending EVENT_ENDAPP.
+-- Arm its on-show cleanup only after switching away.
 function fftsa.loading_watch_back()
   if fftsa.loadscr == nil or fftsa.loadwatch then return end
   display.setevent(fftsa.loadscr, display.EVENT_PRESS,
@@ -54,8 +44,7 @@ function fftsa.loading_watch_back()
   fftsa.loadwatch = true
 end
 
--- Put a real screen in front, then take the cover away. Switch first, delete
--- second: deleting the screen on show leaves the panel black.
+-- Switch away before deleting the cover; deleting the active screen leaves it black.
 function fftsa.loading_destroy(showscr)
   if showscr == nil then showscr = display.SCREEN_HOME end
   fftsa.loadwatch = false
@@ -63,7 +52,6 @@ function fftsa.loading_destroy(showscr)
     display.changescreen(showscr)
     return false
   end
-  -- The text is a child and not a screen, so it takes no yield of its own; the cover does.
   fftsa.del_obj(fftsa.loadtxt)
   fftsa.del_scr(fftsa.loadscr, showscr)
   fftsa.loadtxt, fftsa.loadscr = nil, nil

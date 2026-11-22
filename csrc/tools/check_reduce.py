@@ -32,16 +32,11 @@ MODULE = os.path.join(ROOT, 'tsp', 'native_link.tsp')
 LUA502 = os.environ.get('LUA502',
                         os.path.expanduser('~/tmp/lua502/lua-5.0.2/bin/lua'))
 
-# Three spans: the packing helpers the decode needs, both unpackers, and the function
-# itself. Markers rather than line numbers, and a miss is a failure rather than a silent
-# empty extraction.
+# Select the packing helpers, unpackers and reduction by code boundaries.
 SPANS = [
-    ('local function hx', '\n-- An IEEE-754 binary64 as the two'),
+    ('local function hx(', '\nlocal function f64_words('),
     ('local function u32_pack', '\nfftsa.nl._f32_unpack'),
-    # From the width helper rather than from reduce itself: the decode moved behind
-    # nl.reduce_db, and a span that started at reduce would extract a function calling three
-    # things that were left behind.
-    ('local function red_unpack', "\n-- Describe a buffer's storage"),
+    ('local function red_unpack(', '\nfunction fftsa.nl.describe('),
 ]
 
 # The arena addresses the fake memread answers for, and the gap between the two arrays:

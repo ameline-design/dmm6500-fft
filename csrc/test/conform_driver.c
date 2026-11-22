@@ -1,17 +1,4 @@
-/*
- * conform_driver.c -- drive the C library over one conformance case and print the results.
- *
- *   dsp_conform_double <case> <out> [radix2|fourstep]
- *
- * The other half of notes/dsp-private/conform: the Lua driver runs the same case through
- * dsp.* and a comparator diffs the two. Everything printed here is something the proposed
- * TSP API hands a caller -- the trace, the peaks, the three distortion figures and the
- * window they were computed over -- because that is all the switch can change.
- *
- * The map is taken over the whole spectrum and the window comes from dsp_band_bins, which
- * is how a native TSP binding would do it: dsp.out.lowfreq/highfreq are hertz and the
- * primitive owns the conversion.
- */
+/* Run one DSP conformance vector and emit results for the Lua comparison harness. */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +33,7 @@ static int readspec(const char *path, struct spec *s) {
         if (sscanf(line, "%63s", key) != 1)
             continue;
         if (strcmp(key, "samples") == 0) {
-            /* Everything after this key is one sample a line. */
+            /* Numeric lines after the samples marker form the input record. */
             while (fgets(line, (int)sizeof(line), f) != NULL) {
                 if (sscanf(line, "%lf", &v) != 1)
                     continue;
@@ -163,8 +150,7 @@ int main(int argc, char **argv) {
     rc = dsp_spectrum_run(&p, s.samples, s.nsamples, &mean);
     fprintf(o, "spectrum %d\n", rc);
     if (rc > 0) {
-        /* Zone 0 over the whole spectrum, which is what an undecimated plan produces and
-         * what the Lua assumes: f0 of 0 and frequency rising with the bin. */
+        /* Use an undecimated bin map over the whole spectrum. */
         rc = dsp_band_map(s.fs, 0.0, s.fs / 2.0, s.n, 1, &map);
         if (rc != DSP_OK) {
             fprintf(o, "bandmap %d\n", rc);
@@ -202,8 +188,7 @@ int main(int argc, char **argv) {
             return 2;
         rc = dsp_peaks(p.pwr, nbins, k0, k1, p.kdc, npk, &p.ip, bin, frac, amp);
         for (i = 0; i < rc; i++) {
-            /* The peak's frequency, from the map and the sub-bin offset -- the same
-             * composition the Lua does, so a bin-versus-hertz mix-up cannot hide. */
+
             const double f = dsp_bin_hz(&map, bin[i]) +
                              (double)map.sense * (double)frac[i] * map.binhz;
             fprintf(o, "peak %d %.17g %.17g\n", i, f, (double)amp[i]);
@@ -213,11 +198,8 @@ int main(int argc, char **argv) {
         rc = dsp_thd_noise(p.pwr, nbins, k0, k1, p.kdc, binhz, s.thd_mains, &p.ip, &thd);
         fprintf(o, "thd_rc %d\n", rc);
         if (rc == DSP_OK) {
-            /* nil where the Lua returns nil: both ratios are meaningless with no tone, and
-             * the floor is a number regardless. */
-            /* thd is meaningful only with a harmonic inside the window: 0 % on a panel
-             * reads as a perfect signal where the harmonics are merely off-screen, so a
-             * binding reports nothing. snr needs only a fundamental. */
+            /* Encode unavailable ratios as nil; a noise floor can exist without a signal. */
+            /* THD is meaningful only when a harmonic lies inside the window. */
             if (thd.signal && thd.nharm > 0)
                 emitnum(o, "thd", thd.thd);
             else

@@ -99,7 +99,7 @@ MANIFEST = [
     # tree or an install cannot be told from the one it replaced. The minor part stays two
     # digits: the field may be compared as a string, where "8.9" sorts above "8.10", so a
     # one-digit minor would read as newer than this.
-    ('Version', '9.57'),
+    ('Version', '9.58'),
     # Stated minimum firmware. Kept low deliberately: the app is developed against
     # 1.7.17a, and if the installer compares this field as a STRING then "1.7.3c"
     # sorts above "1.7.17a" and the app refuses to install on the very unit it was
@@ -108,14 +108,7 @@ MANIFEST = [
     ('Icon', ICON),
 ]
 
-ENTRY = '''
--- ==================== TTI App entry point ====================
--- fftsa.start() builds the screens, hooks End App (EVENT_ENDAPP -> fftsa.cleanup)
--- as soon as the spectrum screen exists, configures the hardware and arms the
--- frame timer -- all under pcall, so a failure part-way through tears its own
--- display objects back down instead of stranding them until the next power cycle.
-fftsa.start()
-'''
+ENTRY = 'fftsa.start()'
 
 
 def png_icon(W=60, H=60):
@@ -321,7 +314,7 @@ def main():
     out.append('')
 
     for m in MODULES:
-        out.append('-- ================= %s =================' % m)
+        out.append('-- %s' % m)
         with open(os.path.join(ROOT, m)) as f:
             for ln in f.read().split('\n'):
                 out.append(ln.rstrip('\r'))
