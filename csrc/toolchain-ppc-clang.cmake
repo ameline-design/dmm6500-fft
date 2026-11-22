@@ -11,10 +11,12 @@
 #         -DCMAKE_TOOLCHAIN_FILE=$PWD/csrc/toolchain-ppc-clang.cmake \
 #         -DDSP_DST_NATIVE=ON
 #   cmake --build build-ppc
+# If reusing a build directory configured with the old triple, reconfigure with
+# -U CMAKE_C_FLAGS -U CMAKE_CXX_FLAGS so CMake picks up the new flag defaults.
 #
 # Processor notes
 # ---------------
-# The DMM6500 uses a Freescale MPC5200B (PowerPC e300c4, ~400 MHz).
+# The DMM6500 uses a Freescale MPC5125 (PowerPC e300c4, 400 MHz).
 # The e300c4 is derived from the 603e: 32-bit, big-endian, EABI ABI,
 # hardware single and double-precision FPU, no AltiVec/VMX.
 #
@@ -36,10 +38,9 @@ set(CMAKE_C_COMPILER   "${LLVM_CLANG}")
 set(CMAKE_CXX_COMPILER "${LLVM_CLANG}++")
 set(CMAKE_ASM_COMPILER "${LLVM_CLANG}")
 
-# No -mabi=: clang rejects it for this triple ("unsupported option '-mabi='") and does not
-# need it. powerpc-unknown-elf already selects the 32-bit System V EABI, which is the
-# convention the firmware's own code uses.
-set(CLANG_TARGET "powerpc-unknown-elf")
+# The bare-metal triple selects the 32-bit PowerPC ABI without Linux runtime defaults.
+# Clang rejects -mabi=elfv1 here; ELFv1 is a PPC64 ABI, not a 32-bit EABI selector.
+set(CLANG_TARGET "powerpc-none-eabi")
 set(COMMON_FLAGS
     "--target=${CLANG_TARGET} -mcpu=603e -mhard-float -mbig-endian \
      -ffreestanding -fno-PIC")

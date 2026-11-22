@@ -12,7 +12,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 # googletest only in a host tree. The PPC tree has no hosted C++ runtime to link it against,
-# and a gtest binary built for powerpc-unknown-elf could not be run anyway.
+# and a gtest binary built for powerpc-none-eabi could not be run anyway.
 if(NOT CMAKE_CROSSCOMPILING)
   include(FetchContent)
   FetchContent_Declare(
@@ -295,7 +295,7 @@ target_compile_options(dsp_native_px_test PRIVATE ${DSP_CXX_FLAGS} -ffp-contract
 add_test(NAME dsp_native_px COMMAND dsp_native_px_test)
 
 # THE ENTRY POINT ITSELF, which until now nothing could call. dsp_native.c is built for
-# powerpc-unknown-elf and entered by redirecting ki.peek8, so thirty-one refusal sites, the
+# powerpc-none-eabi and entered by redirecting ki.peek8, so thirty-one refusal sites, the
 # mode dispatch and the status word were covered by reading alone -- which is how DSP_EBETA
 # came to be reported as DSPN_EOUTPUT, the two error spaces sharing -6.
 #
@@ -515,7 +515,7 @@ if(DSP_DST_NATIVE)
   add_executable(dsp_native_elf
       dsp_native.c
       dsp.c)
-  # freestanding/ first: the bare powerpc-unknown-elf triple ships no C library headers,
+  # freestanding/ first: the bare powerpc-none-eabi triple ships no C library headers,
   # so <math.h> and <string.h> come from there. They declare only what dsp.c calls, and
   # dsp_native.c defines every one of them.
   target_include_directories(dsp_native_elf PUBLIC
@@ -553,7 +553,12 @@ if(DSP_DST_NATIVE)
   # more accurate, one rounding rather than two, so the error bounds the host suite measures
   # with contraction off remain upper bounds on what the target does.
   target_compile_options(dsp_native_elf PRIVATE
-      -Os -fno-common -Wno-int-to-pointer-cast
+      -O2 -fno-common -Wno-int-to-pointer-cast
+      # Tune scheduling for a dual-issue core without changing -mcpu=603e instruction
+      # selection. The e300c4 does not implement fsqrt/fsqrts; Clang has no -mno-fsqrt
+      # driver flag. Keep both -Xclang arguments together through CMake's deduplication.
+      -mtune=e500mc
+      "SHELL:-Xclang -target-feature -Xclang -fsqrt"
       # One section per function and per datum: it lets the linker script place
       # dsp_native_run first, and it lets --gc-sections below drop everything
       # dsp_native_run does not reach. dsp.c is a library with about seventy entry points
@@ -623,7 +628,7 @@ if(DSP_DST_NATIVE)
       COMMAND ${CMAKE_C_COMPILER} ${DSPN_ASM_FLAGS} -c
               ${CMAKE_CURRENT_SOURCE_DIR}/flush_tramp.S
               -o ${CMAKE_CURRENT_BINARY_DIR}/flush_tramp.o
-      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/flush_tramp.S
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/flush_tramp.S ${CMAKE_TOOLCHAIN_FILE}
       COMMENT "Assembling the cache-flush trampoline")
   add_custom_target(flush_tramp ALL DEPENDS flush_tramp.o)
 
