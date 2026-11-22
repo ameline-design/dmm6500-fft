@@ -1,7 +1,8 @@
 # FFT Spectrum Analyser
 
-Runs entirely on the instrument: the digitizer captures, the instrument computes the transform, the
-firmware's own graph object draws the trace. DMM6500, DAQ6510 and DMM7510.
+Runs entirely on the DMM6500, DAQ6510 or DMM7510: the digitizer captures, the native DSP computes
+the FFT, and the firmware's graph draws the trace. Choose **1,024 to 32,768 samples** per frame
+in Options; the default is **2,048**.
 
 Install `FFT_Spectrum.tspa` from a USB key under **MENU > Manage Apps**. **End App** frees the app's
 screens and graph buffers. Selecting a different measurement or digitize function with the
@@ -14,34 +15,31 @@ live spectrum, the physical **EXIT** key exits the analyser too.
 
 The graph spans +20 to −120 dBV by default and extends to −140 dBV in the low-range settings
 described below. At the default 2,048 samples and 100 kS/s, bins are 48.83 Hz wide. The screenshot
-shows the fast path at 20 fps.
-Options offers larger records for finer bin spacing at a slower update rate.
+shows the fast path at 20 fps. At the same rate, the **32,768-sample** setting gives **3.05 Hz** bins
+and the harmonic screenshot below shows **2.3 fps**. More samples improve bin spacing without
+changing bandwidth, but each frame takes longer.
 
 ### The `F` at the start of the bottom line
 
 The bottom line reads `F  2048 pts  …` once the app is drawing by its **fast path**. Instead of
 appending 510 readings one at a time for the firmware's display task to copy, it writes the
 pixel records straight into the task's own ring in a single operation, and asks for one repaint.
-That is about twice the frame rate of appending under comparable settings.
+This makes the most difference at short records, where drawing is a larger share of the frame.
 
-It should appear **within about three seconds of launch**, and then stay. A number after it --
-`F2`, `F3` -- counts how many times the path has had to re-acquire since the line last changed.
-Changing the span or the sample count does that, and so does anything that makes the firmware
-rebuild its trace: the count going up by one now and then is normal and costs a few frames each
-time, during which the app falls back to appending.
+At default settings, it usually appears within a few seconds. A number after it, such as `F2`,
+reports restarts since the previous settings-line refresh. Changing the span or sample count can
+make the indicator disappear for a few frames while the app keeps drawing with appends.
 
-**If no `F` appears within five seconds**, the fast path has not found what it needs on your
-instrument. Nothing is wrong with the measurements -- the append path is correct and shows the
-same spectrum -- but you are getting about half the frame rate, and we would like to fix it.
+**If no `F` appears within about five seconds at default settings**, the app is drawing through
+the append path. It shows the same spectrum and peak readings, but may update more slowly.
+Allow more time after changing settings or selecting a long capture.
 
-Go to **Options → About** and page through with **PgDn**. There are four pages; the later ones
-are short. **Photograph every page** and post them to the
+Go to **Options → About** and page through with **PgDn**. **Photograph every page** and post them to the
 EEVblog thread [TSP and Lua scripts for modern Keithley DMMs, SMUs etc](https://www.eevblog.com/forum/testgear/tsp-and-lua-scripts-for-modern-keithley-dmms-smus-etc/),
-saying which instrument and firmware version you have -- the About page's first line gives both.
+saying which instrument and firmware version you have. The diagnostics include both, along with
+the app version.
 
-Those pages carry every address the fast path examined and the reason it stopped: which memory
-window it read, whether it found the app's own buffer name there, and which link of the chain
-refused and with what value. All pages help diagnose the fast path without access to your meter.
+The diagnostic pages show where the fast path looked for the trace and why it could not use it.
 
 **Both axes show their units: kHz across, dB down.** The app binds the graph's X axis to the
 reading's *extra* field, so the firmware labels the frequency instead of the timestamp. The Y
@@ -55,8 +53,7 @@ limits, so the trace still fills the plot.
 
 Six peaks, strongest first, in two columns. The voltage is the RMS amplitude of each tone
 (`Vpeak / √2`). The dBV column uses the graph's peak-amplitude reference,
-`20 log10(Vpeak / 1 V)`, not the displayed RMS voltage. It matches the level of a peak marker
-on the graph.
+`20 log10(Vpeak / 1 V)`, not the displayed RMS voltage.
 
 ```
 1  6.000 kHz   708.06mVrms   0.0 dBV
@@ -75,29 +72,25 @@ means, and a **cog**, which opens Options.
 THD: 0.42%    S/N: 86.3 dB    Noise Floor: -102.3 dBV
 ```
 
-**THD** is the root of the summed harmonic powers over the fundamental's amplitude, as a percentage.
-The fundamental is the strongest bin in the plotted window; harmonics are taken at 2f, 3f and so on
-for as many as fall inside that window, each measured with the same sub-bin estimator the peak table
-uses. A harmonic too close to the line below it is not counted, because the two are not resolvable.
-`THD: ---` means no harmonic fits in the window at all — which is not the same as a clean signal, and
-is why it is not shown as `0.00%`. Widen the span or lower the fundamental to get a reading.
+**THD** is `100 × √(summed harmonic power / fundamental power)`. The fundamental is the
+strongest eligible local peak in the plotted
+span. Harmonics at 2f, 3f and so on are measured with the same sub-bin estimator as the peak table.
+Harmonics outside the span or too close to the preceding line are not counted. With a detected
+signal, `THD: ---` means no harmonic was measured, not that the signal is clean. Widen the span
+if it excludes the harmonics of interest.
 
-The reading carries **two decimals below 8,192 samples, three at 8,192 and four at 16,384**: 0.016 %
-and 0.019 % are the same number at two decimals, 0.0163 % and 0.0165 % the same at three, and each
-digit is only offered on a record long enough to earn it — every doubling of the sample count halves
-the bin width and the power leaking out of a harmonic into its neighbours. Past 100 % — a clipped
-input — it carries none.
+The display uses **two decimal places at 1,024–4,096 samples, three at 8,192, and four at both
+16,384 and 32,768**. These are display precision, not an accuracy specification. At 100% THD
+or above, it displays no decimals.
 
-**S/N** is the fundamental against the **integrated** noise — the total power of every non-harmonic
-bin, not the per-bin mean. That distinction matters: S/N does not move when you change the sample
-count, because narrower bins and more of them come to the same total, whereas the noise floor
-improves by 3 dB each time you double the count. Harmonics are excluded from the sum, which is what
-keeps S/N from re-reporting what THD already says.
+**S/N** compares the fundamental with **integrated** noise across the plotted span, excluding the
+signal and its harmonics. At the same bandwidth, doubling the sample count ideally lowers
+broadband noise per bin by about 3 dB without changing the total noise power. In practice, leakage,
+the window and which bins the app excludes can affect the reading.
 
-**Noise Floor** is the mean power of every bin that is not a harmonic line or its skirt, in dBV —
-the same reference the peak table's dB column uses, so the two are directly comparable. It is a mean
-of powers, not of decibels: averaging decibels lets one deep null drag the figure down several dB.
-Being a per-bin level it improves as you raise the sample count, since the bins get narrower.
+**Noise Floor** is the estimated mean power per bin after excluding the signal, harmonics, their
+skirts and outliers, in the same dBV reference as the peak table. The native estimator can sample
+the remaining bins rather than reading each one. It averages power before converting to decibels.
 
 **`NoSig` replaces both numbers when there is no tone to take them against**, the labels staying put. With the inputs
 shorted the strongest bin is just the largest noise bin, and both ratios built on it are arithmetic
@@ -109,56 +102,44 @@ the number of bins withheld either side of each line is the window's own first n
 Hann, 4 for Blackman, 5 for Blackman-Harris, and up to 7 for Kaiser at beta 18, whose lobe reaches
 5.8 bins. Excluding too few bins counts part of the signal as noise and raises the reported floor.
 
-**Every window puts a ceiling on S/N**, measured on a pure tone with no noise in it at all: about
-102 dB for Hann at 16,384 samples, 114 for Blackman, 133 for Blackman-Harris, and 125 for Kaiser
-beta 18. Kaiser beta 4 and 6 are the exceptions at 37 and 48 dB — their sidelobes are 30 and 40 dB
-down and integrate across the whole band, which no skirt can exclude. A reading near the ceiling is
-telling you about the window rather than the instrument.
+**Window leakage can limit the reported S/N** even for a noise-free tone. The limit depends
+on the window, FFT length, span and how the tone falls between bins. Low-beta Kaiser windows
+have higher sidelobes and are a poor choice for measuring very low noise beside a strong tone.
 
-**For the most accurate S/N and noise floor, use Kaiser with beta = 18 at 16,384 samples.** Both
-figures are limited by the window before they are limited by the instrument, and Kaiser 18 is the
-only shipped window whose leakage is both tiny and independent of where the tone falls between bins:
-measured on a pure tone, it reads the same within 0.1 dB at any offset, where Hann swings 62 dB.
-Hann at 16k reports about -80 dBV against a trace sitting at -100; Kaiser 18 reports -102.9 dBV, and
-75.8 dB S/N that is genuinely the instrument rather than the window. 16,384 samples because the
-floor is a per-bin level, so it improves 3 dB every time the count doubles.
+**To measure a low noise floor in the presence of a strong tone, try Kaiser β=18 at 32,768
+samples.** Its low sidelobes help keep leakage out of the noise estimate, but its wide main lobe
+can merge closely spaced tones. At 100 kS/s, 32,768 samples give half the bin spacing of 16,384;
+use 16,384 when faster updates matter more. Start with Hann for general work and nearby tones
+of similar amplitude.
 
-**Outliers are clipped before the mean is taken**, which is what lets a figure like that be quoted
-at all: the plain mean of a windowed spectrum is set by whichever few bins carry a line's leakage
-skirt, not by the floor. Bins above four times the running mean are dropped and the mean retaken,
-repeating until a pass drops nothing. On noise with no outliers that costs 0.5 dB, measured.
+**Outliers are clipped before reporting the floor.** Bins above four times the running mean
+are dropped from the next estimate. The app repeats the calculation until no more bins are
+dropped or the pass limit is reached.
 
-**Mains pickup is passed over, not measured.** A floating input picks up 50 or 60 Hz and its
-harmonics — disconnected, this reads 60 Hz at −25.4 dBV with harmonics out to 540 — and without a
-rule the hum can become the fundamental and dominate the distortion reading. A candidate at any
-multiple of 50 or 60 Hz, below 1 kHz and
-at or under −22 dBV, is skipped and the search moves on. The fundamental also has to be a *local
-maximum* so that a bin on the shoulder of a mains peak is not taken as the signal. With nothing else
-present the signal margin — 45 dB over the per-bin floor — then answers `NoSig`. A loud mains-frequency tone is still a tone — above −22 dBV it is taken at face
-value — and so is a quiet one above 1 kHz, even on a mains multiple.
+**The distortion calculation skips likely mains pickup when choosing the fundamental.** A weak
+peak near a multiple of 50 or 60 Hz, within the 1 kHz and −22 dBV limits, is not used as the
+fundamental. It can still appear in the peak table. A detected signal must clear a 45 dB margin
+over the per-bin noise estimate.
 
-Both update once a second, on the same clock as the peak table. The noise figure is a pass over every
-plotted bin, measured at 4.3 µs a bin — 2.2 ms at 1024 samples and 35 ms at 16,384, about 2.1% of one
-frame at that size, once a second.
+The peak table, THD, S/N and noise-floor readouts refresh about once a second when frames are
+available. A capture that takes longer than a second limits how often they can update.
 
 **The line along the bottom reads back what is applied** — sample count, digitizer rate, bin width,
-record length, window, input range, and the terminal selection last. It describes the settings in
-force, not the fields being edited.
+acquisition duration, window, input range, measured frame rate when available, and terminal
+selection. It describes the settings in force, not the fields being edited.
 
 **`FRONT` or `REAR` at the end of that line is the terminal selection.** FRONT/REAR is a front-panel
 button the app cannot refuse, and the pair that is not selected is an open input: a signal wired to
 the front with the switch on REAR reads as a *dead signal* rather than as a wrong setting, which on
-the trace alone is indistinguishable from a broken transform. The selection is checked once a second
-and the line rewritten when it moves, so pressing that button with the app running is visible
-immediately and without opening Options.
+the trace alone is indistinguishable from a broken transform. The setting refreshes on the
+periodic display update; there is no need to open Options to check it.
 
 ## Dragging and zooming the trace
 
 The firmware's graph pans and zooms on touch, and offers no way to decline — `display.setstate`
 refuses both `STATE_DISABLE` and `STATE_READONLY` on a graph. So every gesture is settled after the
-fact. The check runs every 0.15 s, floored by the frame period because it is driven from the frame:
-about 0.10 s at 1024 and 2048 samples and 0.53 s at 32768, so the settle follows the finger by
-roughly twice that. A check that has had no gesture reported costs one clock read and no graph call.
+fact. The app checks for changes at intervals of at least 150 ms, when a frame reaches the check.
+Long records can make that interval longer, and an unlocked gesture must settle before it is adopted.
 
 **A frequency gesture is adopted only once the axis stops moving.** A finger still on the glass is
 reported on every check, and retuning to each reading would mean several captures during one drag,
@@ -169,7 +150,7 @@ scale or the data.
 
 **The floor follows the instrument, input range, and sample count.** The top is +20 dBV and the
 default floor is −120 dBV. On the 1 V and 0.1 V ranges, the floor reaches −140 dBV on the DMM7510
-and at 16,384 samples or more on the DMM6500. The peak table's dB column uses the same floor.
+and at 16,384 or 32,768 samples on the DMM6500 and DAQ6510. The peak table uses the same dB floor.
 Press Apply to commit the range and sample count.
 
 **The padlock decides what a horizontal gesture means.** It is closed when the app starts.
@@ -187,35 +168,30 @@ span already in force stays in force until something is dragged.
 **What a retune costs depends on whether the sample rate has to change.** The digitizer runs at the
 slowest rate whose declared stop frequency covers the span:
 
-| stop frequency | rate | bin at 2048 samples | capture at 2048 |
+| Stop frequency | Sample rate | Bin spacing at 2,048 samples | Record duration at 2,048 samples |
 |---|---|---|---|
-| up to 5 kHz | 12.5 kS/s | 6.1 Hz | 164 ms |
-| up to 12 kHz | 25 kS/s | 12.2 Hz | 82 ms |
-| up to 25 kHz | 50 kS/s | 24.4 Hz | 41 ms |
-| up to 50 kHz | 100 kS/s | 48.8 Hz | 20 ms |
-| up to 100 kHz | 200 kS/s | 97.7 Hz | 10 ms |
-| up to 250 kHz | 500 kS/s | 244.1 Hz | 4 ms |
-| up to 500 kHz | 1 MS/s | 488.3 Hz | 2 ms |
+| 500 Hz–5 kHz | 12.5 kS/s | 6.1 Hz | 164 ms |
+| >5–12 kHz | 25 kS/s | 12.2 Hz | 82 ms |
+| >12–25 kHz | 50 kS/s | 24.4 Hz | 41 ms |
+| >25–50 kHz | 100 kS/s | 48.8 Hz | 20 ms |
+| >50–100 kHz | 200 kS/s | 97.7 Hz | 10 ms |
+| >100–250 kHz | 500 kS/s | 244.1 Hz | 4 ms |
+| >250–500 kHz | 1 MS/s | 488.3 Hz | 2 ms |
 
 The three slow rates are there for resolution: a 5 kHz stop at 12.5 kS/s gives a bin width that a
 100 kS/s span would need eight times the samples to reach, and at 32,768 samples it is **0.38 Hz**.
-What it costs is the capture column — 2.6 s a frame at that corner — and aliasing, which is worst
-at these three rates. See *Aliasing* below.
+The record alone takes **2.62 s** at that setting, before processing and display. Lower sample
+rates also make aliasing more likely. See [Aliasing](#aliasing-a-peak-can-be-real-and-still-be-at-the-wrong-frequency).
 
-Every rate in the table is one the hardware delivers exactly. The digitizer divides a 66 MHz
-clock, so only a divisor of 66 MHz arrives as asked, and `dmm.digitize.samplerate` reads back the
-request either way: 102,400 S/s is accepted, reported verbatim and delivered as 102,325.5, which
-puts every bin 0.073 % out.
+These rates divide the DMM6500's 66 MHz digitizer clock. The app uses capture timestamps to measure
+the actual rate rather than relying on the requested-rate readback.
 
-- A pan, or a zoom in, that leaves the stop inside the rate in force costs one axis write — those
-  bins are captured already, and zooming in there gives more plot columns per bin rather than
-  finer resolution.
+- A pan or zoom within the same rate band reuses the existing FFT plan. It shows more detail
+  from the bins already available, without changing bin spacing.
 - Crossing a ceiling in the table re-plans the digitizer, in either direction, between frames. The
   settings line reads `retuning to ... Hz` while it reconfigures the digitizer and takes
-  one capture. The window and interpolation tables are **not** rebuilt: they depend only on the sample
-  count and the window, and a drag changes neither — so the pause is one capture (20 ms at 2048
-  samples and 100 kS/s, 1.31 s at 32,768 and 25 kS/s) and one axis write, rather than that plus the
-  table rebuild — 0.163 ms a sample, which is 167 ms at 1024 samples and 5.3 s at 32,768.
+  one capture. The app also reapplies the native plan. At 32,768 samples and 25 kS/s the record
+  alone takes 1.31 s; the full retune also includes plan and display work.
 
 Note that the **default stop of 50 kHz sits exactly on a rate step**, so the first drag to
 the right from a fresh start re-plans: 55 kHz needs 200 kS/s, which doubles the bin width at the same
@@ -232,17 +208,13 @@ hertz, so the Options fields can show and re-apply them unchanged.
 **Axis checks run only when the graph reports a change.** Writing a limit repaints the whole graph,
 so the app reads the limits after a pan or zoom report and writes only a limit that needs restoring.
 
-**Very narrow spans high up the range have a dead zone.** A movement smaller than about a millionth
-of the stop frequency is taken for rounding and left alone. On ordinary spans that is a thousandth of
-a pixel, but on a 10 Hz window at 499 kHz it is some thirty pixels — the trace can be nudged visibly
-and be neither restored nor adopted. Such a window holds no bins at all, so the trace is empty before
-this matters, but it is a limit rather than a fault.
+**Very narrow spans high up the range can have a visible dead zone.** The app ignores tiny relative
+changes in the axis limits so rounding does not trigger a retune. Zooming in cannot create new FFT
+bins: the settings line flags spans with fewer than three bins available for plotting.
 
-**A write costs a visible pause.** It lands inside a frame, so that frame takes 141 ms instead of 81
-for one axis and 202 for both, and the app re-arms its timer from the slowest frame it has seen: 5
-frames a second for about a second and a half, or 3.3 for two and a half, while that peak decays. So
-a gesture costs a brief stutter and then recovers; holding a finger down and dragging continuously
-keeps paying it, and with the padlock open keeps retuning as well.
+**An axis write can cause a brief stutter.** An earlier DMM6500 bench test measured about 60 ms per
+axis write. The app writes only limits that need changing, rather than repainting the axes every
+frame. See [Performance](PERFORMANCE.md) for the measurement context.
 
 Both buttons lose their icon for a moment when they take the yellow focus highlight, because the
 firmware paints the highlight over everything inside the button. The app redraws the icons once a
@@ -254,75 +226,57 @@ works either way.
 
 ![The Options form shows a 10 Hz to 50 kHz span, 10 V input range, Hann window and 2,048 FFT samples. The preview shows 100 kS/s and 48.83 Hz bins. About, Reset, Apply and Cancel sit along the bottom.](manual-options.png)
 
-**If the Options key is slow to respond, something is talking to the instrument.** Front-panel
-keys are dispatched by the firmware's display task, and that dispatch stops while a LAN or USB
-session is connected -- a script, a probe, anything holding the control socket. Presses queue
-rather than land, and arrive together when the session closes. Close it and the key is immediate
-again. On its own the app stays responsive at every sample count.
+**If Options is slow, close any LAN or USB control session first.** A script or probe can delay
+front-panel event dispatch. A long capture can also delay the press until the frame finishes;
+at 32,768 samples and 12.5 kS/s, allow a few seconds before pressing again.
 
 | Field | |
 |---|---|
-| Start Freq | Low edge of the display. Floor 10 Hz, because bin 1 is DC. The peak table has its own floor two or three bins up — see *The lowest frequency the table reports*. |
-| Stop Freq | Top of the display, 500 Hz to 500 kHz. It sets the sample rate, and so the bin width: at or below 5 kHz the digitizer runs at 12.5 kS/s, at or below 12 kHz at 25 kS/s, at or below 25 kHz at 50 kS/s, then 100 kS/s to 50 kHz and up from there. Below 5 kHz the rate is already at its floor, so a lower stop narrows the view and not the bin. |
+| Start Freq | Low edge of the display, at least 10 Hz. The peak table also excludes bins affected by DC removal; see [The lowest frequency the table reports](#the-lowest-frequency-the-table-reports). |
+| Stop Freq | Top of the display, 500 Hz to 500 kHz. It sets the sample rate; see the rate table above. At 5 kHz and below the rate is already 12.5 kS/s, so a lower stop narrows the view without changing bin spacing. |
 | Input Range | 0.1, 1 or 10 V full scale. |
 | Window | Hann, Blackman, Blk-Harris or Kaiser. |
 | Kaiser Beta | Sidelobe level, −30 to −139 dB. Inert for the other three windows. |
-| FFT Samples | 1024, 2048 (default), 4096, 8192, 16384 or 32768. More samples give finer bins. At small counts, per-frame overhead means doubling the sample count does not necessarily halve the frame rate. |
+| FFT Samples | 1,024, 2,048 (default), 4,096, 8,192, 16,384 or **32,768**. More samples give finer bins and slower updates at the same sample rate. |
 
 Start Freq and Stop Freq are also written by a drag or a pinch on the trace while the padlock is
 open, so the form opens on whatever the last gesture asked for — see *Dragging and zooming the
 trace*. Apply supersedes a gesture the app has not finished acting on.
 
 The centered line under the fields previews **sampling rate** (using kS/s or MS/s as appropriate),
-**bin spacing** (`fs / N`) and **acquisition
-duration** (`N / fs`, in milliseconds). It refreshes as you edit the stop frequency or sample count,
-without changing acquisition until you press Apply. Cancel discards the edits.
+**bin spacing** (`fs / N`) and **acquisition duration** (`N / fs`, in milliseconds). It refreshes
+as you edit the stop frequency or sample count. Apply changes acquisition; Cancel discards the edits.
 
 **Reset** puts all six fields back to their shipped values — 10 Hz, 50 kHz, 10 V, Hann, beta 12 and
-2048 samples — and does nothing else. Acquisition is untouched until you press Apply, so Cancel after
+2,048 samples — and does nothing else. Acquisition is untouched until you press Apply, so Cancel after
 Reset leaves the analyser exactly as it was and a mis-press costs a press.
 
-On reopening Options,
-the readout uses the rate measured from the active capture's timestamps. For an unapplied change to
-the sampling rate, it uses the rate the app will request: 12.5, 25, 50, 100, 200, 500 or
-1000 kS/s.
+On reopening Options, the readout uses the rate measured from the active capture's timestamps.
+If an edit selects a different rate, the preview uses the requested rate until Apply.
 
-At 100 kS/s (stop frequency up to 50 kHz):
+At 100 kS/s (stop frequency above 25 kHz and up to 50 kHz):
 
 | FFT samples | Bin spacing | Acquisition duration |
 |---:|---:|---:|
-| 1024 | 97.66 Hz | 10.24 ms |
-| 2048 | 48.83 Hz | 20.48 ms |
-| 4096 | 24.41 Hz | 40.96 ms |
-| 8192 | 12.21 Hz | 81.92 ms |
-| 16384 | 6.10 Hz | 163.84 ms |
-| 32768 | 3.05 Hz | 327.68 ms |
+| 1,024 | 97.66 Hz | 10.24 ms |
+| 2,048 | 48.83 Hz | 20.48 ms |
+| 4,096 | 24.41 Hz | 40.96 ms |
+| 8,192 | 12.21 Hz | 81.92 ms |
+| 16,384 | 6.10 Hz | 163.84 ms |
+| **32,768** | **3.05 Hz** | **327.68 ms** |
 
-Acquisition duration is the record length, not the complete frame time or the timestamp difference
-between the first and last samples (which is `(N - 1) / fs`). Processing and display add overhead.
+Acquisition duration is the nominal record length, not the time for the instrument to return the
+capture or to finish a frame. Buffer storage, processing and display all add work.
 Windowing spreads each tone across several bins, so bin spacing is not a guarantee of tone separation.
 
-Apply rebuilds the window and its tables behind the loading screen, and resizes the acquisition
-buffer if needed. It rebuilds them only when they would differ: they are a function of the sample
-count and the window alone, so an Apply that changed only the span or the input range
-skips the rebuild — which is what keeps a Kaiser window from costing 0.3 s on a press that did not
-touch it. The graph buffer is one fixed size for every sample count and stays attached throughout,
-because the trace is capped at the graph's width (see **How many points the trace carries** below).
+Apply configures the digitizer, takes one capture, and rebuilds the native FFT plan behind the
+loading screen. It normally reuses the acquisition buffer and native workspace, both allocated
+to support 32,768-sample FFTs. Trace capacity is unchanged by FFT size. Apply takes longer with long records;
+the duration shown on the form is for the record only, not Apply as a whole.
 
-**Apply costs roughly 0.2 ms per sample**, measured and linear in the count. The
-32768 figure follows that law rather than a measurement of its own:
-
-| FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
-|---|---|---|---|---|---|---|
-| Apply | 0.22 s | 0.38 s | 0.74 s | 1.46 s | **2.89 s** | ~5.8 s |
-
-Most of it is the gain table and the window: both are rebuilt for the new size, and both are
-proportional to it. The loading screen is up for all of it.
-
-If Apply fails, the message appears beneath the spectrum. Frames stop only when the **sample count
-changed**, because a half-finished resize is the one case where the transform and the buffers can
-disagree; a failure at an unchanged count leaves the previous tables intact and the trace running.
-Reopen Options and apply again to retry.
+If Apply fails, the message appears beneath the spectrum. For a failed resize the app tries to
+restore the previous sample count; `[kept … samples]` confirms it recovered. If it cannot restore
+a working setup, frames may stop. Reopen Options and apply again to retry.
 
 ## Windows
 
@@ -382,26 +336,19 @@ which is usually the worse trade.
 
 ## Aliasing: a peak can be real and still be at the wrong frequency
 
-There is no anti-alias filter in front of the digitizer. Anything above half the sample rate folds
-back into the display, at full amplitude, looking exactly like a tone that is there.
+The app does not apply an anti-alias filter before sampling. Input above half the sample rate
+can fold into the displayed span and look like a real in-band tone. The display does not mark
+aliased peaks.
 
-For example, a 21.1 kHz sine sampled at 20 kS/s appears at **1.100 kHz** — 21,100 modulo 20,000.
-The display does not mark the peak as an alias.
+**Watch for aliases when narrowing the span.** A stop of 10 kHz selects 25 kS/s, so a 21.1 kHz
+tone appears at 3.9 kHz. A stop of 5 kHz selects 12.5 kS/s, so a 10 kHz tone appears at 2.5 kHz.
 
-**A narrow span is the exposed case**, because a narrow span is what lowers the sample rate. A stop
-at or below 25 kHz runs the digitizer at 50 kS/s, at or below 12 kHz at 25 kS/s, and at or below
-5 kHz at 12.5 kS/s — that is what buys the finer bins, and it is also what brings the folding
-frequency down into the range of ordinary signals. The same 21.1 kHz tone viewed over a 10 kHz span,
-at 25 kS/s, lands at 3.9 kHz — and at 12.5 kS/s an ordinary 10 kHz tone lands at 2.5 kHz.
+The app uses a 1 µs digitizer aperture, not an anti-alias filter. Even a 10 µs boxcar aperture
+has its first null at 100 kHz, far above the 6.25 kHz folding frequency at 12.5 kS/s.
 
-**Nothing in the instrument can filter it out first.** The digitize aperture is the only analog
-averaging available, it clamps at 10 µs, and a 10 µs boxcar first nulls at 100 kHz — so it
-attenuates nothing near a 6.25 kHz folding frequency. A longer aperture would not help either: at
-the whole sample interval it costs 23 % of the amplitude in band, measured.
-
-Two ways to tell an alias from a tone: widen the span, and a real tone stays put while an alias
-moves; or change the signal and watch which peak follows. At the default 50 kHz span a 63 kHz tone
-appears at 37 kHz and an 84 kHz tone at 16 kHz.
+To check for aliasing, widen the span enough to change the sample rate: a real in-band tone
+stays at its frequency, while a folded peak can move or disappear. At the default 50 kHz span,
+a 63 kHz tone appears at 37 kHz and an 84 kHz tone at 16 kHz.
 
 The app does not offer a band-pass or decimation control. If the input contains energy above
 half the sample rate, widen the span to raise the sample rate or filter the signal externally.
@@ -442,66 +389,50 @@ continue, the app displays the full diagnostic. The archive has no interpreted F
 
 ## How many points the trace carries
 
-The plotted area is 680 pixels wide, measured off a panel capture, so every sample count the app
-offers gives more bins than there are columns to draw them in -- 511 at 1024 and 8191 at 16384. The app therefore
-draws a fixed **255 columns** at every sample count, and the reduction is not a stride: each column
-reports the **maximum** of the bins that fall in it.
+The app plots **255 columns** at every FFT size. Each column shows the **maximum** of the bins
+assigned to it, not a minimum/maximum pair or every nth bin. A narrow tone therefore still reaches
+the trace when many bins share a column. The display ring contains two copies of the trace, one in
+each direction, so its **510 records** do not represent 510 independent points.
 
-Three consequences, and the first is the point of it:
+| FFT samples | 1,024 | 2,048 | 4,096 | 8,192 | 16,384 | 32,768 |
+|---|---:|---:|---:|---:|---:|---:|
+| Bins in the 10 Hz–50 kHz span at 100 kS/s | 511 | 1,023 | 2,047 | 4,095 | 8,190 | 16,380 |
+| Plotted columns | 255 | 255 | 255 | 255 | 255 | 255 |
 
-- **A narrow tone always reaches the trace.** Taking every nth bin would miss a tone that lands in a
-  skipped one. Measured over 72 consecutive bin positions at 16384 samples, max-per-column draws all
-  72; taking each column's first bin draws 2.
-- **The noise floor reads as a band, not a line**, because the minimum is drawn as well as the
-  maximum. Maximum alone would lift the apparent floor by about 6 dB at 64 bins a column, since the
-  largest of 64 noise samples sits well above their average.
-- **At every sample-count setting, a 10 Hz to 50 kHz span is reduced.** Even at the minimum
-  of 1,024 samples, about 511 bins fall within that span against 255 display columns.
+![At 32,768 samples and 100 kS/s, the fast path runs at 2.3 fps with 3.05 Hz bins. A 6.000 kHz fundamental at 707.86 mVrms and 0.0 dBV stands above harmonics at 12, 18, 30 and 36 kHz. THD is 0.0082%; the noise floor is −120.8 dBV.](manual-spectrum-harmonics.png)
 
-| FFT Samples | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 |
-|---|---|---|---|---|---|---|
-| bins in a 50 kHz span | 511 | 1023 | 2047 | 4095 | 8191 | 16383 |
-| points drawn | 380 | 441 | 475 | 496 | 502 | |
+Finer bins help separate low-level harmonics from the noise floor. The trace can make the floor
+look higher than the numeric Noise Floor readout: each column highlights its highest bin rather
+than estimating mean noise power.
 
-Points drawn rises towards 510 rather than towards 255, because a column contributes its minimum as
-well as its maximum wherever the two differ. 32768 is unmeasured.
-
-![At 32,768 samples with 3.05 Hz bins, a 6.000 kHz fundamental at 707.86 mVrms and 0.0 dBV stands above harmonics at 12, 18, 30 and 36 kHz. The noise floor reads -120.8 dBV.](manual-spectrum-harmonics.png)
-
-Finer bins separate low-level harmonics from the noise floor. The trace can make the floor look
-higher than the numeric Noise Floor readout: a column can contain multiple bins, and its maximum
-emphasizes the tallest one.
-
-Reducing the trace does not reduce the **table**: `find_peaks` reads every bin at full resolution, so
-a reported frequency is never a column edge. It is also what makes the larger counts usable at all --
-writing 8191 points costs 51.6 us each, about 0.42 s a frame, against 0.035 s for 255.
+The **peak table** still searches the available FFT bins in the span at full resolution. Its
+sub-bin estimates are independent of the 255 plotted columns.
 
 ## The peak table is more accurate than the trace
 
 A tone almost never lands on a bin centre, and reading the tallest bin pays for that twice: the
-frequency is quantised to the bin grid, up to 98 Hz out at 195.3 Hz bins, and the amplitude reads low
-by the scalloping loss, up to 1.42 dB with Hann.
+frequency is quantised to the bin grid (up to half a bin off), and the amplitude reads low by the
+scalloping loss (up to 1.42 dB with Hann).
 
 The table recovers both from the tallest bin and its two neighbours. On hardware, a 12.000 kHz
 1.000 V tone reads 11.914 kHz / 0.883 V from the tallest bin alone and 11999.8 Hz / 1.0016 V in the
 table.
 
-So the apex of the trace can sit 1.4 dB below the number printed under it. The number is right. Over
-83 sub-bin offsets and every window the worst case **in the middle of the spectrum** is 4.0e-6 bins
-and 0.0035 dB; the estimator reads the window's own transform, so it carries no per-window
-approximation. Both ends of the spectrum are worse, and by a long way:
+The trace apex can therefore sit below the corrected level in the table. These estimator tests
+use isolated tones; they are not accuracy specifications for an instrument or for overlapping tones.
 
 | where | frequency | amplitude |
 |---|---|---|
-| middle of the span | 4.0e-6 bins | 0.0035 dB |
+| middle of the FFT spectrum | 4.0e-6 bins | 0.0035 dB |
 | three bins up from DC and above | 0.07 bins | 0.11 dB |
 | lowest bin the table reports | 0.11 bins | 0.19 dB |
 | below that bin, where it reports at all | 0.28 bins | 1.7 dB |
-| top bin of the span | 0.494 bins | 2.3 to 7.1 dB low |
+| highest available FFT bin | 0.494 bins | 2.3 to 7.1 dB low |
 
-The top bin has no neighbour above it, so there is nothing to interpolate against and the table falls
-back to the bin itself: 49.805 kHz at the default span, read up to 98 Hz low with the full scalloping
-loss. Widen the span by one step if a tone sits in it.
+The highest available FFT bin has no neighbour above it, so the table falls back to the raw bin
+frequency and amplitude there. At 100 kS/s that bin is 49.951 kHz at the default 2,048 samples, or
+49.997 kHz at 32,768. If a tone is near the Nyquist edge, raise Stop Freq enough to select the
+next sample rate; merely changing an axis limit without changing the rate does not add neighbours.
 
 ## The lowest frequency the table reports
 
@@ -520,54 +451,52 @@ tone positions.
 So the app declines to put a number on those bins. The trace still draws them, which is where a tone
 below the limit shows up:
 
-| window | bins not reported | lowest frequency the table reports, at 195.3 Hz bins |
-|---|---|---|
-| Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | **390.6 Hz** |
-| Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | **585.9 Hz** |
+| Window | Bins excluded | First bin eligible by window | At 2,048 samples, 100 kS/s | At 32,768 samples, 100 kS/s |
+|---|---|---:|---:|---:|
+| Hann, Blackman, Kaiser β=4, β=6, β=9 | DC and 1 | 2 | 97.66 Hz | 6.10 Hz |
+| Blk-Harris, Kaiser β=12, β=15, β=18 | DC, 1 and 2 | 3 | 146.48 Hz | 9.16 Hz |
 
-The limit is in **bins**, so it moves with both the sample rate and the sample count: at a 500 kHz
-span and 1024 samples the bins are 977 Hz and two of them is 1.95 kHz, while at 16384 samples and a
-50 kHz span they are 6.10 Hz and two of them is 12.2 Hz. A narrower window main lobe reaches closer
-to DC, which is the one thing Kaiser β=4 is better at than β=18.
+These are bin centres, not the app's minimum reportable frequencies. Only bins in the selected
+span are searched, and **Start Freq cannot go below 10 Hz**. At 32,768 samples and 100 kS/s,
+for example, a 10 Hz start makes bin 4 (12.21 Hz) the first candidate for either window group;
+the interpolated peak can fall between bin centres.
 
-What you get either side of it, measured over a 1.000 V tone swept in 0.01-bin steps at four phases:
-
-The two boundaries below are **in bins**, and the Hz are 1024 samples at 100 kS/s. At
-16384 samples the same 0.3 bins is 1.8 Hz rather than 29.3.
+These near-DC sweep results describe the estimator in **bins**, before imposing the display span.
+For scale, 0.3 bins is 29.3 Hz at 1,024 samples or 0.92 Hz at 32,768 samples, both at 100 kS/s.
 
 | tone sits | the table |
 |---|---|
 | at or above the lowest reported bin | always reports it, within **0.11 bins and 0.19 dB** |
 | between 0.3 bins and that bin | usually empty; where it does report, within **0.28 bins and 1.7 dB** |
-| below **0.3 bins** (29.3 Hz at 1024 samples, 1.8 Hz at 16384) | never reports it |
+| below **0.3 bins** | never reports it |
 
 A peak the app cannot place is refused rather than guessed: the estimator saturates when the three
 bins around a candidate are not one tone centred there, and a candidate whose own estimate lands a
 quarter bin below the lowest reported bin is dropped.
 
-**A bump at the left edge of the trace with nothing in the table is a tone below this limit.**
+**A bump at the left edge with nothing in the table can be a tone below this limit.**
 
 ## Limits
 
-- **Bin width is the sample rate divided by the selected sample count**, so either knob moves it.
-  At 2048 samples and 100 kS/s bins are 48.8 Hz; at 32768 and 12.5 kS/s they are **0.38 Hz**, which
-  is the finest the app reaches.
+- **Bin width is the sample rate divided by the sample count.** At 32,768 samples and
+  12.5 kS/s it is **0.38 Hz**, the finest spacing the app offers. The record takes 2.62 s.
 - **The span sets the rate**, so zooming in below 25 kHz, 12 kHz or 5 kHz does make the bins finer —
-  see the rate table under *Gestures*. It costs capture time in proportion, and it brings the folding
+  see the rate table under [Dragging and zooming the trace](#dragging-and-zooming-the-trace).
+  It costs capture time in proportion, and it brings the folding
   frequency down with it; read *Aliasing* before trusting a peak at one of the slow rates.
-- **A span wider than 50 kHz raises the rate** and coarsens the bins with it. 500 kHz is the highest
-  tone the instrument can show.
+- **A stop above 50 kHz raises the rate** and coarsens the bins with it. The highest Stop Freq is
+  500 kHz; the FFT's highest available bin is one bin below Nyquist.
 - **Frame rate depends on acquisition time and the drawing path.** The DMM6500 screenshots show
   20 fps at 2,048 samples and 2.3 fps at 32,768 samples, both at 100 kS/s with the fast path active.
-  Acquisition alone takes 20.48 ms and 327.68 ms, respectively. The app adjusts the frame timer
+  The nominal record durations are 20.48 ms and 327.68 ms, respectively. The app adjusts the frame timer
   to leave time for front-panel input between frames. See [Performance](PERFORMANCE.md) for the
   measurement details.
 - **The append path may update more slowly than the fast path.** The `F` indicator shows which
   path is active.
 - **No rectangular or flat-top window.** Rectangular nulls one bin from the peak, which makes the
   three-bin estimate unusable; flat-top is seven bins wide.
-- **The peak table starts two or three bins above DC** and the top bin of the span has no sub-bin
-  estimate. See above for both.
+- **The peak table skips bins affected by DC removal.** Its lowest candidate also depends on the
+  span. The highest FFT bin has no sub-bin estimate.
 - **No averaging and no peak hold.** Each frame is one capture.
 
 ## Troubleshooting
@@ -578,11 +507,11 @@ quarter bin below the lowest reported bin is dropped.
 | Peak flat-topped at +20 dBV | Over range. |
 | Peaks update but the trace is missing | Reapply the span or sample count. If the trace does not return, capture the About pages. |
 | Trace frozen, peaks static | A capture is returning short. The app holds the last good frame rather than show a false spectrum. |
-| No `F` at the start of the bottom line after five seconds | The fast path has not found the firmware's trace ring on this instrument, so the app is appending instead -- correct, about half the rate. Photograph all four **About** pages and post them to the EEVblog TSP scripts thread; they name the window it read and the link that refused. See *The `F` at the start of the bottom line*. |
-| The `F` number keeps climbing while you watch | The path is re-acquiring repeatedly. A few are normal after a span or sample-count change. Continuous climbing with the rate down is worth reporting, with the About pages. |
-| Options, or any front-panel key, slow to respond | Something is holding the instrument's control socket -- a LAN or USB session stops the display task dispatching keys. Close it and the presses arrive. Not related to the sample count. |
-| Text where `X: kHz  Y: dBV` belongs | A failure message. It clears at the next span change. |
+| No `F` at the start of the bottom line after a few frames | The trace may still be using the append path, which draws the same spectrum more slowly. If it persists at default settings, photograph all **About** pages. See [The `F` at the start of the bottom line](#the-f-at-the-start-of-the-bottom-line). |
+| `F` keeps disappearing or showing a restart count | A few restarts are normal after a span or sample-count change. If they continue with the settings unchanged, capture the About pages. |
+| Options, or any front-panel key, slow to respond | Close any LAN or USB control session. When using a long record, allow the current capture to finish. |
+| An `APPLY FAILED` message replaces the settings line | Reopen Options and apply again. If the app stops, capture its diagnostic pages. |
 | A red `FFT <version>` page instead of the analyser | The compiled path could not bind, or started and then gave up, and this archive has no interpreted fallback. See "If the app stops, or will not start" above: capture every page. |
 | A help dialog sits over the app after pressing HELP | Press EXIT to dismiss the firmware's help dialog. |
 | Peak width changes as you tune | Expected. See above. |
-| A bump at the left edge, nothing in the table | A tone below the lowest reported bin. See above. |
+| A bump at the left edge, nothing in the table | It may be below the lowest reportable bin. See [The lowest frequency the table reports](#the-lowest-frequency-the-table-reports). |
